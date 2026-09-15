@@ -5,11 +5,16 @@ pipeline steps those commits require the user to re-run.
 Used by .github/workflows/tag-on-push.yml to annotate each auto-tag, but it
 runs standalone against any two revisions:
 
-    python tools/release/release_notes.py                     # last tag -> HEAD
-    python tools/release/release_notes.py --from 1.07 --to HEAD
-    python tools/release/release_notes.py --tag 1.08          # title the notes
+    python -m tools.release.release_notes                  # last tag -> HEAD
+    python -m tools.release.release_notes --from 1.07 --to HEAD
+    python -m tools.release.release_notes --tag 1.08       # title the notes
 
-The step mapping mirrors gui.py's STEPS table (the numbered checkboxes) and
+Run it with `-m` from the repo root: it imports version.STEP_KEYS, which a
+by-path invocation cannot resolve.
+
+STEP_ORDER is DERIVED from core/gui/config.py's STEPS and GLOBAL_ACTIONS (via
+version.STEP_KEYS), so the GUI's order is the only place it is written.
+The step mapping mirrors that table (the numbered checkboxes) and
 the phase_* functions in convert.py that each one invokes.  Anything that
 changes the plugin body (tes5_import) implies Import; mesh/creature/sound/LOD
 work implies its own asset step; and because Pack BSAs / Pack Mod Zip consume
@@ -26,6 +31,35 @@ Keeping the answer honest means being narrow where the code is narrow:
     Genuinely unrecognised paths select nothing -- they are listed verbatim so
     the reader can judge them (and add a rule), rather than blanket-ticking
     every step over one stray file.
+
+Four RULES entries are not obvious from their pattern alone.  Every LOD module
+feeds ONE step: the whole load order's LOD, plus the sibling merge, comes from
+the single "Create LOD" action, so there is no per-plugin LOD step to
+distinguish sibling_lod.py from.  worldmap_clouds.py is generated from BOTH
+sides -- per worldspace by the import (record_types/world.py) and as a merged
+union by the sibling pass.  skin_replacement.py is imported by nif_converter,
+so it is a mesh change as well as a body-patch one.  skyrim_assets.py is the
+vanilla-asset provider that mesh conversion, creature skeletons
+(extract_skeleton_bones) and the slot-44 body patch all pull from.
+
+The asset_convert patterns allow any folder depth: the package is organised
+into subpackages, and a rule that matched only one level would drop a nested
+module through to the mesh catch-all and silently mis-scope its rebuild.
+
+Four tools under tools/ ARE global actions rather than debug utilities, and
+their rules precede the blanket tools/ rule (first match wins): a change to one
+alters the artefact the user installs, so it stales that action exactly as a
+stage module does.  convert_ui.py is joined by asset_convert/ui/'s ui_menus,
+ui_cursor and swf, which are the reskin's source; book_inam.py is deliberately
+excluded, being the per-plugin book-icon step.
+
+The core/ rules run narrow-to-broad.  worker_budget/subprocess_flags/
+process_job are process-pool plumbing every worker-based stage runs through, so
+they imply ALL; run_log and plugin_masters only report, producing no conversion
+output, so they stale nothing.  The bare `^core/` tail of the GUI rule is the
+safety net: a new module added there reads as a GUI change (which costs the
+user no re-runs) instead of falling through to the unmatched bucket, which asks
+for every step.
 """
 from __future__ import annotations
 
@@ -35,38 +69,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+from version import STEP_KEYS
+
 SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
 
-# Ordered exactly as the GUI lists them, so output reads as a run order.
-STEP_ORDER = [
-    "1. Export",
-    "2. Extract",
-    "3. Meshes",
-    "4. SpeedTrees",
-    "5. Creatures",
-    "6. Import",
-    "7. Sounds",
-    "8. Scripts",
-    "9. Pack BSAs",
-    "10. Pack Mod Zip",
-    # Global actions: not numbered, because they are not positions in the
-    # per-plugin pipeline. Each runs once for the whole load order and the GUI
-    # offers them as buttons rather than step checkboxes.
-    #
-    # Their ORDER here mirrors the GUI's button grid and version.STEP_KEYS --
-    # test_version_upgrade.py asserts all three agree -- so rearranging the
-    # buttons moves these too.
-    #
-    # LOD is here, not in the numbered list: tiles live on a grid every plugin
-    # in a worldspace shares, so it is generated once for the whole load order
-    # rather than once per plugin. Packing it follows immediately, the way
-    # "10. Pack Mod Zip" follows the per-plugin steps.
-    "Create LOD",
-    "Pack LOD",
-    "Convert to Master",
-    "Package Start Mod",
-    "Patch Skyrim",
-]
+#: Every step label in GUI run order. See: docs/commentary/version_upgrade_planning.md#one-table-not-four
+STEP_ORDER = [label for _key, label in STEP_KEYS]
 
 # Steps that only repackage what earlier steps produced.  Added automatically
 # whenever any producing step fires, never a reason to run on their own.
@@ -88,39 +96,27 @@ RULES: list[tuple[str, list[str]]] = [
     (r"^tes5_import/",            ["6. Import"]),
     (r"^script_convert/",         ["8. Scripts"]),
 
-    # ── asset_convert: split by which phase_* function pulls the module ───
-    (r"^asset_convert/bsa_extract\.py",        ["2. Extract"]),
-    (r"^asset_convert/(spt_\w+|flipbook)\.py", ["4. SpeedTrees"]),
-    (r"^asset_convert/(creature_pipeline|hkx_\w+|animation_data|"
+    (r"^asset_convert/(?:\w+/)*bsa_extract\.py",        ["2. Extract"]),
+    (r"^asset_convert/(?:\w+/)*(spt_\w+|flipbook)\.py", ["4. SpeedTrees"]),
+    (r"^asset_convert/(?:\w+/)*(creature_pipeline|hkx_\w+|animation_data|"
      r"extract_skeleton_bones|kf_decode|kf_writer)\.py",
                                                ["5. Creatures"]),
     # Pre-built behavior/skeleton assets shipped with the converter.
     (r"^asset_convert/generated/",             ["5. Creatures"]),
-    (r"^asset_convert/(audio_converter)\.py",  ["7. Sounds"]),
-    # Every LOD module now feeds ONE step: the whole load order's LOD, plus the
-    # sibling merge, is generated by the single "Create LOD" action, so there is
-    # no longer a per-plugin LOD step to distinguish sibling_lod.py from.
-    (r"^asset_convert/(sibling_lod|lod_gen|lod_far_gen|terrain_lod|"
+    (r"^asset_convert/(?:\w+/)*(audio_converter)\.py",  ["7. Sounds"]),
+    (r"^asset_convert/(?:\w+/)*(sibling_lod|lod_gen|lod_far_gen|terrain_lod|"
      r"terrain_lod_textures|landscape_normals)\.py",
                                                ["Create LOD"]),
-    # The cloud bank is generated from BOTH sides: per worldspace by the import
-    # (record_types/world.py) and as a merged union by the sibling pass.
-    (r"^asset_convert/worldmap_clouds\.py",    ["6. Import", "Create LOD"]),
-    (r"^asset_convert/modify_body_meshes\.py", ["Patch Skyrim"]),
-    # skin_replacement is also imported by nif_converter, so it is a mesh
-    # change as well as a body-patch one.
-    (r"^asset_convert/skin_replacement\.py",   ["3. Meshes", "Patch Skyrim"]),
-    (r"^asset_convert/(bsa_pack)\.py",         ["9. Pack BSAs"]),
-    (r"^asset_convert/texture_prune\.py",      ["3. Meshes"]),
-    # Vanilla-asset provider: mesh conversion, creature skeletons
-    # (extract_skeleton_bones) and the slot-44 body patch all pull from it.
-    (r"^asset_convert/skyrim_assets\.py",
+    (r"^asset_convert/(?:\w+/)*worldmap_clouds\.py",    ["6. Import", "Create LOD"]),
+    (r"^asset_convert/(?:\w+/)*modify_body_meshes\.py", ["Patch Skyrim"]),
+    (r"^asset_convert/(?:\w+/)*skin_replacement\.py",   ["3. Meshes", "Patch Skyrim"]),
+    (r"^asset_convert/(?:\w+/)*(bsa_pack)\.py",         ["9. Pack BSAs"]),
+    (r"^asset_convert/(?:\w+/)*texture_prune\.py",      ["3. Meshes"]),
+    (r"^asset_convert/(?:\w+/)*skyrim_assets\.py",
                                                ["3. Meshes", "5. Creatures",
                                                 "Patch Skyrim"]),
-    # Everything else under asset_convert is mesh conversion (nif_converter,
-    # collision, cms, mopp, skin_retarget, body_wrap, book_inam, bow_rig,
-    # furniture_markers, inv_marker, sse_nif, pyffi_monkey_patch, ...).
-    (r"^asset_convert/",                       ["3. Meshes"]),
+    (r"^asset_convert/ui/(?:ui_menus|ui_cursor|swf)\.py$", ["Convert UI"]),
+    (r"^asset_convert/(?:\w+/)*",                       ["3. Meshes"]),
 
     # ── Native / shared code: conservatively wide ─────────────────────────
     # Docs and build notes shipped alongside the extension are not inputs to
@@ -132,21 +128,18 @@ RULES: list[tuple[str, list[str]]] = [
     # convert.py is resolved per-phase-function instead (see PHASE_STEPS);
     # "ALL" here is only the fallback when the hunks can't be attributed.
     (r"^convert\.py$",            ["CONVERT"]),
-    (r"^gui\.py$|^gui\.pyw$",     ["GUI"]),
-    (r"^collision_options\.py$",  ["3. Meshes"]),
-    # Process-pool plumbing: every worker-based stage runs through these.
-    (r"^worker_budget\.py$|^subprocess_flags\.py$|^process_job\.py$", ["ALL"]),
+    (r"^core/collision_options\.py$",  ["3. Meshes"]),
+    (r"^core/(?:worker_budget|subprocess_flags|process_job)\.py$", ["ALL"]),
+    (r"^core/(?:run_log|plugin_masters)\.py$", []),
+    (r"^gui\.py$|^gui\.pyw$|^core/gui/|^core/", ["GUI"]),
 
     # ── Non-pipeline: never a reason to re-run anything ───────────────────
     (r"^docs/",                   []),
     (r"^tests/",                  []),
-    # ...except the three tools that ARE global actions, not debug utilities.
-    # Listed BEFORE the blanket tools/ rule (first match wins): a change to one
-    # of these changes the artefact the user installs, so it makes that action's
-    # output stale exactly as a stage module does.
     (r"^tools/release/create_lod\.py$",       ["Create LOD"]),
     (r"^tools/release/pack_lod\.py$",         ["Pack LOD"]),
     (r"^tools/release/package_start_mod\.py$", ["Package Start Mod"]),
+    (r"^tools/misc/convert_ui\.py$",          ["Convert UI"]),
     (r"^tools/",                  []),
     (r"^references/",             []),
     (r"^external/",               []),

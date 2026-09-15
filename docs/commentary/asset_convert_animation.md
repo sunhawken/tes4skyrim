@@ -1,11 +1,11 @@
-# asset_convert/hkx_anim.py — animation and behaviour graphs
+# asset_convert/havok/hkx_anim.py — animation and behaviour graphs
 
-**Code:** `asset_convert/hkx_anim.py`, `asset_convert/hkx_animobject.py`, `asset_convert/hkx_behavior.py`, `asset_convert/kf_decode.py`, `asset_convert/kf_writer.py`
+**Code:** `asset_convert/havok/hkx_anim.py`, `asset_convert/havok/hkx_animobject.py`, `asset_convert/havok/hkx_behavior.py`, `asset_convert/havok/kf_decode.py`, `asset_convert/havok/kf_writer.py`
 
 ## Contents
 
 - [NIF animated mesh conversion](#nif-animated-mesh-conversion)
-- [Animated-object behaviour graphs (asset_convert/hkx_animobject.py)](#animated-object-behaviour-graphs)
+- [Animated-object behaviour graphs (asset_convert/havok/hkx_animobject.py)](#animated-object-behaviour-graphs)
 
 ## NIF animated mesh conversion
 <a id="nif-animated-mesh-conversion"></a>
@@ -234,7 +234,7 @@ entry scrolls all four. Skyrim gives every converted shape its own
 `BS*ShaderProperty`, so only the named shape animated (lower tier moving, upper
 frozen). `_process_controller_manager` now indexes property controllers →
 wearing shapes once per manager (`_property_ctrl_index`) and, for each
-retargeted texture-transform / alpha / material-colour entry, appends one entry
+retargeted texture-transform / alpha / material-color entry, appends one entry
 per sibling with a cloned controller + interpolator (`_fan_out_shared_entries`,
 key data shared; `_attach_seq_shader_controllers` then hangs each off its own
 shader). 33 Oblivion.esm meshes / 703 entries (oblivionwargateani02 168,
@@ -352,7 +352,7 @@ without touching the bool-key machinery.
 > "same file, different cell, freezes *sometimes*".  Untested.
 >
 > ### What "reverted" means concretely
-> `_emulate_morphs` is the pre-`90d04a3` body (`git show 90d04a3^:asset_convert/nif_converter.py`),
+> `_emulate_morphs` is the pre-`90d04a3` body (`git show 90d04a3^:asset_convert/nif/nif_converter.py`),
 > plus its `_init_blend_interpolator` helper which `90d04a3` had deleted.
 > Output for `ctrigtripwire01.nif` is block-for-block identical to that build
 > (the only delta is `BSBehaviorGraphExtraData`, added by a later, unrelated
@@ -398,7 +398,7 @@ extra-target + palette registration, and zero surviving NiVisController).
 > for 4 and none drive scale.  Treat the original census as unreliable.
 
 Historical note — **the two CTDs the vis-swap path caused**, kept because
-`_normalize_blend_interpolators` still repairs blocks COPIED from Oblivion:
+`normalize_blend_interpolators` still repairs blocks COPIED from Oblivion:
 
 1. **NiBoolData keys must be `CONST_KEY` (5), never `LINEAR` (1).**  Writing 1
    CTD'd on entering Vilverin — an access violation at `0x0` inside
@@ -443,7 +443,7 @@ the usual "never touch unknown_*" rule does not apply, because they are real
 named fields PyFFI failed to describe.  Critically this hits blocks **copied**
 from Oblivion as well as synthesized ones: PyFFI reads them under the old
 version's layout and rewrites them under Skyrim's, and the flags do not survive.
-`_normalize_blend_interpolators` therefore stamps the header onto every blend
+`normalize_blend_interpolators` therefore stamps the header onto every blend
 interpolator in the tree after all controller passes, and
 `tools/validate/nif_block_type_audit.py` checks it (check 4).  261 blocks across 26
 Oblivion meshes were affected — gates, magic effects, creatures and the enemy
@@ -495,7 +495,7 @@ would shift every other generated FormID.
 
 Oblivion also lets a door's sound live ONLY in the mesh (the record has no
 SNAM/ANAM at all — StoneWallGateDoor01 and 57 other doors).  Skyrim's record
-channel is what vanilla relies on, so `asset_convert/door_sounds.py` reads the
+channel is what vanilla relies on, so `asset_convert/audio/door_sounds.py` reads the
 model's `Open`/`Close` sequence text keys and `items.load_door_model_sounds`
 lifts those names onto SNAM/ANAM.  The sequence NAME decides the slot, so the
 NIF is parsed rather than byte-scanned.
@@ -516,10 +516,10 @@ wins — which also matches Oblivion's own queue-depth-1 PlayGroup semantics).
 - BSXFlags must have bit 0 set (ANIMATED) → value 139 (0x8B) for animated meshes. Detect via NiControllerManager on root.
 - Animation data: NiControllerSequence StringPalette offsets MUST be resolved BEFORE version upgrade (UV2=11→83). After upgrade, PyFFI switches to direct-string mode and offsets are ignored → empty node_name → crash.
 - **EVERY `NiTimeController` needs "Compute Scaled Time" (flags bit 6, 0x40) or a `PlayAnimation()`d sequence NEVER MOVES — the CharacterGen secret-wall fix (2026-07-26, `_fix_controller_flags`)**: `nif.xml` `TimeControllerFlags` declares bit 6 `default="true"`, and Oblivion's engine computed scaled time unconditionally without ever writing the bit — every controller in the Chargen secret-wall/switch NIFs stores 12 / 40 / 44, always 0x40 **clear**. Skyrim reads the flag: the sequence binds its targets, `ObjectReference.PlayAnimation("Forward")` returns success and logs **no Papyrus error**, but scaled time never advances so the object sits on frame 0 forever. Symptom was maximally misleading — the quest stage said the wall had opened (the switch fired, `secretDoor` flipped 0→1, the timer ran; all visible in the `TES4CharGen` user log) while the wall physically stayed shut. Census: across 62 vanilla animated door/activator meshes (Windhelm animated secret doors, Nordic animated doors, Dwemer doors, Labyrinthian panel, Winterhold anim door) **157/157 `NiMultiTargetTransformController` have flags=108 (0x6C)** and every other controller — `NiTransformController`, `NiControllerManager`, `NiVisController`, `NiFloatExtraDataController` — has **76 (0x4C)**; both set 0x40, and 108 vs our 44 differs *only* in this bit. Fix ORs 0x40 into every `NiTimeController` in the tree before the version upgrade, so activators/doors/traps/levers are all covered. This generalizes the emitter-controller rule below (which had it only for `NiPSysEmitterCtlr`/`NiPSysUpdateCtlr`) and the `0x48` already hardcoded on the flip-book `BSEffectShaderPropertyFloatController`.
-  - **Things that were NOT the cause** (all verified fine, don't re-investigate): the Papyrus conversion (`PlayGroup` correctly routed to `PlayAnimation` via base-signature lookup); the dropped `prisonSecretWall01`/`... NonAccum` controlled blocks (genuinely empty — `data=None`, zero translation — the real motion is on the `bed`/`wall` transform tracks, which survive with all 111/21 keys); the missing `NiStringPalette` (correct — Skyrim uses direct strings); sequence names `Forward`/`Backward` (vanilla `VolunruudLeftDoor`/`RightDoor` use exactly these); and the absent ACTI `PNAM`/`FNAM` (marker colour + flags, cosmetic — 1739/1753 vanilla write FNAM=0).
+  - **Things that were NOT the cause** (all verified fine, don't re-investigate): the Papyrus conversion (`PlayGroup` correctly routed to `PlayAnimation` via base-signature lookup); the dropped `prisonSecretWall01`/`... NonAccum` controlled blocks (genuinely empty — `data=None`, zero translation — the real motion is on the `bed`/`wall` transform tracks, which survive with all 111/21 keys); the missing `NiStringPalette` (correct — Skyrim uses direct strings); sequence names `Forward`/`Backward` (vanilla `VolunruudLeftDoor`/`RightDoor` use exactly these); and the absent ACTI `PNAM`/`FNAM` (marker color + flags, cosmetic — 1739/1753 vanilla write FNAM=0).
   - **CORRECTION (2026-07-26): the "needs no BGED" claim previously recorded here was WRONG.** The earlier note reasoned that because 227 ACTI + 196 DOOR vanilla records ship `NiControllerManager` meshes, the in-NIF sequence was sufficient. That census is real but does not support the conclusion: `ObjectReference` exposes **two different animation paths** — `PlayGamebryoAnimation` drives an in-NIF `NiControllerSequence`, while **`PlayAnimation`/`PlayAnimationAndWait` drive the BEHAVIOUR GRAPH and require an animation graph manager**, which exists only when the root carries a `BSBehaviorGraphExtraData` naming an hkx project. `PlayGroup` converts to `PlayAnimation`, so without a BGED the call is accepted, returns immediately, logs no Papyrus error, and nothing moves. Fixed by generating the graph (below).
 
-## Animated-object behaviour graphs (`asset_convert/hkx_animobject.py`)
+## Animated-object behaviour graphs (`asset_convert/havok/hkx_animobject.py`)
 <a id="animated-object-behaviour-graphs"></a>
 
 **ONLY meshes whose sequences carry SCRIPT-DRIVEN group names get a GENERATED graph** — `Forward`, `Backward`, `FastForward`, `FastBackward`, `Left`, `Right`, `Equip`, `Unequip`, `SpecialIdle`, `Stagger` (`_SCRIPT_DRIVEN_SEQUENCES` in `nif_converter.py`; 161 trees on Oblivion.esm). Ambient `AutoPlay`/`AutoLoop` meshes point at vanilla's shared `GenericBehaviors\Autoplay.hkx` instead (next section). Generated by `collect_sequence_names` + `_add_animobject_bged`. Layout, sibling to the mesh so two animated NIFs in one folder never collide:
@@ -636,7 +636,7 @@ Every one was invisible to structural inspection **and to NifSkope, which render
 - Class signatures for all of these are registered in `hkx_xml.SIGNATURES`, read off the vanilla file.
 - Sequences that `_process_controller_manager` stripped to zero controlled blocks are **excluded** — a state for a dead sequence makes `PlayAnimation()` succeed while animating nothing, reintroducing the original silent failure.
 - **The skeleton needs exactly ONE `referencePose` entry per bone, emitted ONCE.** `HkxPackfile` happily writes a duplicate `hkparam` and hkxcmd keeps the **FIRST**, so an empty `referencePose` emitted before the real one yields a skeleton with 1 bone and 0 poses; binding a sequence then indexes past the end and null-derefs (this was the second half of the prisonCellGate01 CTD).
-- **hkxcmd compiles the identity pose into a ZERO QUATERNION — patch the bytes (`_fix_identity_quat`).** The XML text `(0 0 0)(0 0 0 1)(1 1 1)` is exactly what every shipped creature skeleton uses, but for this file hkxcmd writes the rotation slot as all zeros. A zero quaternion is not a rotation, so the single bone the graph drives has no valid bind pose and **the entire object renders nothing** — while the graph loads without error and no Papyrus message appears. Havok's **binary** quaternion is **w-first** `(1,0,0,0)`, unlike the XML's xyzw, so the fix rewrites the 48-byte pose block (trans/quat/scale hkVector4 slots) in the compiled WIN32 file, before the AMD64 step. Verified **byte-identical to vanilla `clutter\beehive\characterassets\SingleBoneSkeleton.hkx`** (1104 bytes, 0 diffs) — that file is the reference for any single-bone animated object.
+- **hkxcmd compiles the identity pose into a ZERO QUATERNION — patch the bytes (`fix_identity_quat`).** The XML text `(0 0 0)(0 0 0 1)(1 1 1)` is exactly what every shipped creature skeleton uses, but for this file hkxcmd writes the rotation slot as all zeros. A zero quaternion is not a rotation, so the single bone the graph drives has no valid bind pose and **the entire object renders nothing** — while the graph loads without error and no Papyrus message appears. Havok's **binary** quaternion is **w-first** `(1,0,0,0)`, unlike the XML's xyzw, so the fix rewrites the 48-byte pose block (trans/quat/scale hkVector4 slots) in the compiled WIN32 file, before the AMD64 step. Verified **byte-identical to vanilla `clutter\beehive\characterassets\SingleBoneSkeleton.hkx`** (1104 bytes, 0 diffs) — that file is the reference for any single-bone animated object.
 - **`hkbCharacterData`'s field list is not what the name suggests** — copy `clutter\beehive\characters\Character00.hkx`: `characterControllerInfo, modelUpMS, modelForwardMS, modelRightMS, characterPropertyInfos, numBonesPerLod, characterPropertyValues (this is where the hkbVariableValueSet hangs), footIkDriverInfo (null POINTER, not an array), handIkDriverInfo (null), stringData, mirroredSkeletonInfo, scale`. There is **no `variableInitialValues` and no `aiControlDriverInfo`**. Getting it wrong made hkxcmd silently drop the `hkbVariableValueSet` — detectable by diffing the packfile's `__classnames__` string table against vanilla's, which is a fast sanity check for any generated hkx.
 - Vanilla lays these files out in the mesh's OWN folder (`clutter\beehive\{behaviors,characters,characterassets}\`), not a `<stem>_behavior\` subfolder; ours nests them so two animated NIFs in one directory cannot collide on `Character01.hkx`. Both work — the paths inside the character file resolve relative to the project file's folder. Our project hkx is byte-identical to vanilla's (880 bytes).
 - Final step is `convert_hkx_to_amd64` on every file: SSE loads only 64-bit packfiles (verified pointer-size byte 8 on all 161×4 outputs).
@@ -644,8 +644,8 @@ Every one was invisible to structural inspection **and to NifSkope, which render
 ## Accum-bone bind pose leaks into every clip (user patches, 2026-08-30)
 <a id="accum-bind-pose-leak"></a>
 
-**Code:** `asset_convert/kf_decode.py` `split_root_motion`,
-`asset_convert/hkx_behavior.py` `generate_creature_project`.
+**Code:** `asset_convert/havok/kf_decode.py` `split_root_motion`,
+`asset_convert/havok/hkx_behavior.py` `generate_creature_project`.
 
 Four user patches (`AshVampireFixedAnimations`, `AshCreaturesFixedAnims`,
 `WingedTwilightFixedAnims`, `FixedAshCreatureOrientation`) covering
@@ -654,39 +654,31 @@ ascendedsleeper, ashghoul, ashslave, ashvampire, ashzombie and wingedtwilight.
 40-bit compressed quaternion (`_read_40bit_quat`, 5 bytes) on **track 1
 (`Bip01 NonAccum`)**, replaced with the identity `01 18 80 01 38`.
 
-### Bug 1 — `split_root_motion` flattens to sample 0, not to identity
+### Bug 1 — the accum ROOT was played twice (SUPERSEDED diagnosis)
 
-`split_root_motion` extracts locomotion, then rewrites the accum track as
-`np.tile(best.rotations[0], ...)` / `np.tile(best.translations[0], ...)`.
-Sample 0 is not identity in Morroblivion KFs: the authored `Bip01 NonAccum`
-frame-0 transform carries the creature's whole bind orientation. That constant
-is baked into the clip as a static rotation and the actor faces the wrong way
-in every state.
+The first reading of these patches — "NonAccum's frame-0 rotation is a
+leak, flatten it to identity" — was wrong, and shipping it turned every
+super mutant 90° and put the centaur on its back once track 0 stopped
+carrying the rest pose. The real contract is
+[the accum root plays as identity](asset_convert_falloutnv.md#accum-root-identity):
+the patches only *looked* like a NonAccum fix because our track 0 still held
+the skeleton rest pose, and rest pose + NonAccum composed the same heading
+twice. The user zeroed the copy on track 1; the converter now zeroes the
+copy on track 0 and keeps NonAccum's authored frame 0 (54.18° / 67.11° /
+89.99° / 32.67° above are the correct static headings, not leaks).
 
 Measured frame-0 accum yaw, ashvampire source KFs:
 
-| clip | our static yaw | patched |
+| clip | NonAccum frame-0 yaw (kept) | track 0 |
 |---|---|---|
-| idle / turnleft / attack / equip / awarevocal / ragdollpose | 54.18° | 0° |
-| stagger | 67.11° | 0° |
-| death | 54.18° | 0° |
-| wingedtwilight cast | 89.99° | 0° |
-| ashslave / ashzombie | 32.67° | 0° |
+| idle / turnleft / attack / equip / awarevocal / ragdollpose | 54.18° | identity |
+| stagger | 67.11° | identity |
+| wingedtwilight cast | 89.99° | identity |
+| ashslave / ashzombie | 32.67° | identity |
 
-Only the ROTATION is wrong. The patches keep every accum translation
-(85.17 / 56.547 all preserved) — the creature's height must survive — so the
-fix flattens rotation to identity and leaves translation alone.
-
-Separately, ashvampire `idle.kf` (alone in the corpus) authors a STATIC
-Z 85.17 on `Bip01` itself. Span 0.000, so `split_root_motion` never touches
-it and the height double-counts against NonAccum's own 85.155. The patch
-zeroes it. NOT fixed here — one clip in one creature, no general rule
-established.
-
-Not Oblivion-specific by skeleton — 34/44 Oblivion, 47/64 Morroblivion and
-52/71 Nehrim creature skeletons have a non-identity root node. The
-discriminator is that Morroblivion KFs author a non-identity frame 0 on the
-accum bone itself.
+Ashvampire `idle.kf` authors a STATIC `Bip01` track (54.2°, Z 85.17), a copy
+of the bind pose: `ACCUM_ROOT_BONES` tracks are always written as identity,
+so it no longer double-counts against NonAccum's 85.155.
 
 ### Bug 2 — the walk speed-bake cap truncates the clip
 

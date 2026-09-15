@@ -1,6 +1,6 @@
 # script_convert/ - TES4 script to Papyrus
 
-**Code:** `script_convert/converter.py`, `tes5_import/constants.py`, `script_convert/tes5/blocks.py`, `tes5_import/record_types/actors.py`
+**Code:** `script_convert/converter.py`, `tes5_import/base/constants.py`, `script_convert/tes5/blocks.py`, `tes5_import/record_types/actors.py`
 
 ## Contents
 
@@ -58,6 +58,26 @@
 - [Testing Strategy](#testing-strategy)
 - [Known Limitations](#known-limitations)
 - [Creation Kit Papyrus Compiler Contracts (2026-07-12)](#creation-kit-papyrus-compiler-contracts)
+- [The command table: what a row is, and what it is not](#command-rows)
+- [A neutralised command must be inert IN POSITION](#neutralised-command-inert-in-position)
+- [Zero-argument reads need a `FUNCTION_MAP` entry to be seen at all](#zero-arg-reads-need-function-map)
+- [Receiver and argument are not interchangeable](#receiver-and-argument-not-interchangeable)
+- [An argument that looks ignorable usually is not](#argument-that-looks-ignorable)
+- [Weather holds are RE-APPLICATION in TES4, a LOCK in Skyrim](#weather-holds-reapplication-vs-lock)
+- [Commands whose Skyrim equivalent is a different SUBSYSTEM](#equivalent-in-a-different-subsystem)
+- [Reads Skyrim genuinely cannot answer](#reads-skyrim-cannot-answer)
+- [OBSE constructs with no shape to translate](#obse-constructs-no-shape-to-translate)
+- [Commands that must NOT be promoted to `Actor`](#commands-that-must-not-promote)
+- [Papyrus VALUE types, and why a global is one](#papyrus-value-types)
+- [Command families matched by PREFIX](#command-prefix-families)
+- [FO3/FNV commands that reach the compiler unrouted](#fnv-unrouted-commands)
+- [An unmapped AV command silently became a READ](#unmapped-av-command-became-a-read)
+- [A digit-leading member name swallowed its dot](#digit-leading-member-names)
+- [`Kill` takes only the killer](#kill-takes-only-the-killer)
+- [An inert read must never FIRE a guard](#an-inert-read-must-never-fire)
+- [A ref tested against `1` is still a null test](#ref-compared-to-one)
+- [A declaration can nest at ANY depth](#declarations-nest-at-any-depth)
+- [Not every INFO needs a fragment — the dialogue stutter](#info-fragment-stutter)
 
 ## Papyrus / Script Conversion Notes
 <a id="papyrus-script-conversion-notes"></a>
@@ -156,6 +176,212 @@ actually want. Two rules fall out:
 Settings with no actor-value equivalent keep a `;TODO` marker — a call that
 compiles and silently does nothing is the dangerous outcome, not the honest one.
 
+## FO3/FNV script blocks
+<a id="fo3fnv-script-blocks"></a>
+
+**Code:** `script_convert/constants_falloutnv.py`
+
+`assemble` looks a block type up in `BLOCK_MAP` and, on a miss, `continue`s --
+dropping the block **body and all**, silently. Oblivion's vocabulary covers
+Oblivion, so a FO3/FNV-only block type was pure data loss.
+
+Measured over `export/FalloutNV.esm/SCPT.txt`: 2,581 scripts, **3,876 `begin`
+blocks**, of which 183 are types Oblivion never emits.
+
+| FO3/FNV block | blocks | Papyrus |
+|---|---:|---|
+| `saytodone` | 133 | none -- no dialogue-complete event |
+| `oncombatend` | 26 | `OnCombatStateChanged`, guard `aeCombatState == 0` |
+| `ondestructionstagechange` | 11 | `OnDestructionStageChanged(int, int)` |
+| `ongrab` | 4 | `OnGrab()` |
+| `onrelease` | 3 | `OnRelease()` |
+| `onfire` | 3 | none -- FNV weapon-fire hook |
+| `onopen` | 2 | `OnOpen(ObjectReference akActionRef)` |
+| `onclose` | 1 | `OnClose(ObjectReference akActionRef)` |
+
+Signatures are taken verbatim from
+`references/SkyrimCKWiki_210522/skyrim/<Event>_-_ObjectReference.html`, never
+invented. `oncombatend` reuses the existing `COMBAT_STATE_GUARDS` mechanism
+that already merges `onalarm` and `onstartcombat` into the one event.
+
+`saytodone` and `onfire` have no Skyrim equivalent: 136 blocks whose bodies
+still reach the script, now as an inert `;TODO:` rather than vanishing.
+
+## Comparing an inert operand
+<a id="comparing-an-inert-operand"></a>
+
+**Code:** `_inert_note` / `_bool_literal_cmp` in `script_convert/emit/expr.py`
+
+A command with no Papyrus equivalent yields `note()`'s inert `0`, which is
+right in a VALUE position (`getdeadcount X + 3`) and wrong in a COMPARISON:
+the authored test supplies its own literal, so `Target.isActor == 0` converts
+to `0 == 0` — always true.
+
+Nehrim's freeze and impact spells are the case in point. All six author
+
+```
+if (Target.isActor == 0) || (Target.getDead == 1) || (Target.isRidingHorse == 1)
+    Return
+endif
+```
+
+`isActor` has no Papyrus native, so the guard returned unconditionally and the
+spell never fired — a silent kill that still compiled. Measured over the three
+test plugins, 9 scripts hit this: `SpellEinfrieren10/15/18/100Prozent`,
+`SpellEinschlag12/100Prozent`, `TrigZoneEMCStopHoldMusicSCRIPT` and two more.
+
+The comparison therefore hands the note back instead of an answer, and the
+term drops out of its `&&`/`||` chain exactly as a bare unknown operand does.
+Dropping a term from an `&&` widens the guard and from an `||` narrows it;
+inventing `0 == 0` instead decides it.
+
+### An inert read must never FIRE a guard
+<a id="an-inert-read-must-never-fire"></a>
+
+Outside a chain the note used to stay inert (`0`), on the reasoning that a lone
+`If <unknown> == 0` has no surviving term to carry the line, and handing the
+note back would comment out the `If` itself.
+
+That reasoning covers the LINE but not the LOGIC. `0` compared against the
+author's own literal is still a decided answer, and half the time it decides
+wrong in the dangerous direction:
+
+| Authored | Emitted | Effect |
+|---|---|---|
+| `if <unknown> == 1` | `If (0 == 1)` | always false — body dead, **safe** |
+| `if <unknown> == 0` | `If 0 == 0` | always TRUE — **guard gone** |
+
+Nehrim's `Nexusplanet01SCN` is the clear case: `if GetIgnoreFriendlyHits == 0`
+means "friendly hits are not ignored, so retaliate". `GetIgnoreFriendlyHits`
+has only a Papyrus setter, so the read is inert and the guard became
+unconditional — the NPC force-combats the player every time.
+
+The comparison therefore folds to the literal `false` when its operand went
+inert, which keeps the `If` intact (no paren swallowing), keeps the `;NE:` note
+on the line, and makes both directions fail SAFE. This matches what the `== 1`
+half already did by accident.
+
+Measured across all four plugins before the fix: **668 constant guards from a
+neutralised read** — FalloutNV 538 in 377 files, Nehrim 92 in 39, Morroblivion
+25 in 10, Oblivion 13 in 5. The dangerous `== 0` direction is 272 of FNV's and
+32 of Nehrim's.
+
+### When EVERY term drops
+
+`DAMephalaUlfgarFactionScript` guards on
+`(GetCrimeKnown 0 Player NivanDalviluRef == 1) || (GetCrimeKnown 1 ... == 1)`.
+`GetCrimeKnown` has no Papyrus native, so both sides vanish and the chain has
+nothing left. Falling back to `True` sets `BleakerCrime` on every frame — the
+Bleaker's Way massacre quest treats the player as a known criminal from the
+start. The fallback therefore follows the operator's own direction: `False`
+for `||`, `True` for `&&`. Measured over the three test plugins, 32 scripts
+emit the `||` fallback — 29 in Oblivion (the Mephala faction pair plus 27
+`QF_*` quest scripts guarding on `GetCrimeKnown`) and 3 in Morroblivion;
+Nehrim has none.
+
+## Block type mapping
+<a id="block-type-mapping"></a>
+
+**Code:** `script_convert/blocks.py`
+
+`BLOCK_MAP` is the vocabulary of what survives conversion: `assemble` looks the
+block type up and, on a miss, drops the block body and all. The rationale that
+used to sit as comments beside the table:
+
+**`OnTrigger` is per-frame, not an edge.** TES4 `Begin OnTrigger` runs EVERY
+FRAME an object is inside the volume -- Nehrim's Magieverbot (magic-ban)
+scripts count 25 and 100 *executions* in it, which is only meaningful under
+repeat semantics. Skyrim keeps the same three-way split (all three are distinct
+engine events in SkyrimSE.exe): `OnTrigger` is sent repeatedly while inside,
+`OnTriggerEnter`/`OnTriggerLeave` are the edges. Mapping `OnTrigger` ->
+`OnTriggerEnter` froze every such state machine on its first state, which left
+the Erothin bell latch stuck and re-ringing.
+
+**`OnTriggerActor` / `OnTriggerMob`** differ from `OnTrigger` only in WHAT trips
+them (any actor / any creature), not in edge-vs-repeat, so they take the
+repeating event too. Skyrim has no actor-vs-creature split, so the filter is
+left to the block body.
+
+**`OnAlarm`** (actor noticed a crime/attack) has no Papyrus event; entering
+combat/search via `OnCombatStateChanged` is the closest trigger. The block loop
+adds an `aeCombatState` guard per block type so several block types merge
+cleanly into the one event -- that is what `COMBAT_STATE_GUARDS` is for.
+
+**The `scripteffect*` signatures are fixed by `ActiveMagicEffect.psc`** -- an
+invented one fails to compile ("the parameter types of function oneffectstart
+... do not match the parent script activemagiceffect").
+
+**Block filters** (`begin OnEquip player`) restrict a block to one object;
+Papyrus has no such filter, so the body is wrapped in a guard on the event
+parameter that carries the filtered object. A block type absent from
+`BLOCK_FILTER_PARAM` has no such parameter, so its filter is dropped with a
+TODO.
+
+## Block filter guards
+<a id="block-filter-guards"></a>
+
+**Code:** `block_filter_guard` in `script_convert/blocks.py`
+
+`begin OnEquip player` fires the block ONLY when the player equips the item;
+`begin OnPackageDone SomePkg` only when that package ends. Papyrus events carry
+no filter, so the restriction becomes an `If` around the body testing the event
+parameter that holds the filtered object. Without it the block runs for every
+actor / container / package -- which is how an item's "you can't equip this"
+message ended up firing for NPCs the moment they loaded in.
+
+**A block type with no parameter naming an object cannot be guarded.**
+MenuMode's argument is a menu ID and OnAlarm's a crime type, so neither is in
+`BLOCK_FILTER_PARAM` and their filters are dropped.
+
+**The comparison has to typecheck against the event parameter.** On an ACTOR
+script `begin OnEquip SomePotion` filters the ITEM equipped, not the equipper --
+but Skyrim's `OnEquipped` only hands us the actor, so there is nothing to test
+the item against. Emitting the comparison anyway gives
+`akActor == SomePotion`, which does not compile; the filter is lost instead.
+
+**A property already bound at another type is not automatically a conflict.**
+A `TES4_*` script type extends Actor/ObjectReference, so the comparison still
+compiles and the existing binding is kept -- dropping the guard there ran
+CGRenote's `begin onHit CGAssassin01Ref` bodies on EVERY hit, so any stray arrow
+killed her and jumped CharacterGen's stages out of order. A base record likewise
+compares to a `Form` parameter perfectly well, and the body converts BEFORE the
+guard, so the property is normally already bound at its own narrow type.
+
+Genuinely incomparable (bound as Faction/GlobalVariable, say) returns None: an
+unguarded body is WRONG for every event the filter excluded, so the caller keeps
+the body but does not execute it.
+
+## Unknown commands must be inert
+<a id="unknown-commands-must-be-inert"></a>
+
+**Code:** `_is_known` / `emit_command` in `script_convert/emit/dispatch.py`
+
+`_emit_mapped` renders a call under its **TES4** spelling when no row matches.
+For a name Papyrus does not define that is an undefined function, and the
+compiler rejects the whole script -- which then cascades, because one bad
+script disables every script naming its type.
+
+A name with no row, no handler and no prefix family therefore becomes a
+`;TODO:` line instead of a call. The same rule already covered
+`HANDLED_COMMANDS` (a handler-only command that fell past its handler); it now
+covers genuinely unknown names too, which is what a non-TES4 source hits.
+
+Measured over `export/FalloutNV.esm/SCPT.txt` -- 2,581 scripts, 3,876 `begin`
+blocks -- **116 distinct unknown commands across 3,956 call sites**, none of
+which has a Papyrus spelling. Highest-frequency, with their real equivalents:
+
+| TES4 command | sites | Papyrus |
+|---|---:|---|
+| `setobjectivedisplayed` | 777 | `Quest.SetObjectiveDisplayed` |
+| `setobjectivecompleted` | 404 | `Quest.SetObjectiveCompleted` |
+| `setenemy` | 159 | `Faction.SetEnemy` |
+| `setreputation` | 127 | none (FNV reputation) |
+| `setquestdelay` | 110 | none (Papyrus has no poll delay) |
+| `rewardxp` | 87 | `Game.AdvanceSkill` (approximate) |
+
+Making the fallthrough inert is what lets those rows land incrementally: the
+corpus compiles at every step instead of only once the last row is written.
+
 ## Silent mis-conversion — the unmarked loss
 <a id="silent-mis-conversion-unmarked-loss"></a>
 
@@ -164,6 +390,67 @@ the ones that emit a plausible call which compiles, runs, and does nothing.**
 Audited output carries only 2 `;TODO:` markers across 18,566 scripts, so marker
 counts measure honesty, not correctness — never treat a clean output scan as
 evidence the conversion is complete.
+
+### <a id="generated-script-types"></a>🔴 A generated script type is recognized by PREFIX, and the prefix is per-game
+
+**`is_generated_script_type()` in `script_convert/constants.py` is the ONLY way
+to ask "did this pipeline emit that class". Never test `startswith('TES4_')`.**
+
+The prefix comes from `script_prefix()`, which is `current_namespace().upper()`
+— `TES4_` for Oblivion/Nehrim but `FALLOUTNV_` for FalloutNV.esm. A generated
+class is the carrier of the source script's variable table, so the prefix test
+is what these passes key on:
+
+| Site | Answers False → |
+|---|---|
+| `converter.remote_type_of` | `Owner.Var` member type unresolved; no `as Int` cast on a `GetValue()` |
+| `assemble._specific` | script type stops winning type inference |
+| `emit/expr._is_form` | form-vs-number pun undetected |
+| `blocks._rebind_existing` | two script classes compared directly |
+| `constants.wants_placed_reference` | VMAD binds the BASE, property reads None |
+| `commands._as_actor` | missing `as Actor` cast |
+
+13 sites hardcoded `'TES4_'`. Under the FalloutNV namespace every one answered
+False and **67 FalloutNV scripts stopped compiling** — `Float cannot be assigned
+to Int` (the `remote_type_of` family), `field or property not found`, and
+`you can't compare type X with type Y`. Oblivion was unaffected throughout,
+which is exactly how a namespace-scoped regression hides.
+
+`TES4_SecondsPassed`, `TES4_LastTick`, `TES4_pendingRelock`, `TES4_MsgButton`
+and friends are generated LOCAL VARIABLE names, not script classes. They are
+internal to one emitted script and never namespaced — leave them alone.
+
+#### <a id="stem-a-script-type-via-script-edid-for"></a>Stem a script type with `_script_edid_for`, never by slicing
+
+A longer prefix makes names truncate that never truncated before.
+`GomorrahCasinoEnterTriggerScript` fits under `TES4_` (37 chars) but not under
+`FALLOUTNV_`, so it becomes `FALLOUTNV_GomorrahCasinoEnterTrig_B9F2`. Slicing
+the prefix off yields `gomorrahcasinoentertrig_b9f2`, which matches no
+EditorID in `script_all_vars`.
+
+`generated_script_stem()` is the plain slice and is only safe when the caller
+does not need to hit `script_all_vars`. `_script_edid_for()` falls back to a
+reverse map built from `papyrus_script_name(edid)`, so it recovers the real
+EditorID through the truncation hash. **Any lookup keyed by script EditorID
+must use it.** `_owning_scripts` and `_dangling_cross_script_target` both
+sliced, so under FalloutNV their owner silently read as "unresolved" — which
+in the dangling check means "don't fire", letting a genuinely bad cross-script
+access through to the compiler.
+
+#### <a id="dangling-cross-script-read"></a>A dangling cross-script access is AUTHORED, not a conversion bug
+
+`GomorrahHotelDoorScript` writes `GomorrahCasinoEnterTriggerREF.Follower1`,
+but that script declares only `Companion1REF`/`Companion2REF` — `Follower1` is
+a variable of the CALLING script that the author also used as if it were the
+target's. TES4 silently ignored the write; Papyrus rejects it at compile time.
+The same area's `NVCCPlayerStorageActivatorScript` carries
+`showWarning "Add Lily's ref ID to GomorrahCasinoEnterTriggerScript"`, so this
+corner shipped unfinished.
+
+`_dangling_cross_script_target` exists to convert these to a `;NE:` marker
+rather than emit an access that cannot compile. It fires ONLY when the owner
+resolves to a script whose variable table is KNOWN and lacks the name — an
+unresolved owner is left alone, so it never suppresses a legitimate access.
 
 ### 🔴 An `as Actor` cast on a non-actor INVERTS every guard around it (2026-08-09)
 
@@ -562,9 +849,9 @@ injects the same registry as `well_known_props`, so `QF_*`/`TIF_*` fragments
 bound correctly — which is why a verification counting the 4,762 *dialogue*
 bindings reported all-clear while every object script was broken.
 
-- `import_main.get_well_known_properties()` exposes the registry (an accessor,
-  not a direct import, because `import_main` imports `object_scripts`).
-  `_resolve_props` consults it before falling through to the EditorID lookup.
+- `synth_records.WELL_KNOWN_PROPERTIES` is the registry, imported directly by
+  `object_scripts`. `_resolve_props` consults it before falling through to the
+  EditorID lookup.
 - Worst case found: `TGStolenGoodsScript`, the **Thieves Guild rank driver** —
   all ten of its gates read `TES4GoldFenced.GetValue()`, so a None property
   threw on the first tick and no TG rank ever advanced.
@@ -722,6 +1009,7 @@ The general rule: when a converted call blocks, ask whether its caller
 repeats. A `Return` is only correct where something will call again.
 
 ### A "no equivalent → 0" fallback can shadow a working handler (2026-07-31)
+<a id="no-equivalent-fallback-shadows-handler"></a>
 
 `_convert_expression` keeps a list of argument-less commands that have no Skyrim
 equivalent and returns the literal `'0'` for them. Two entries on that list
@@ -749,6 +1037,7 @@ one is `>= 2`, `>= 3` or `== 3`, i.e. "is the target detected", which
 `IsDetectedBy` answers exactly.
 
 ### A compound `player.X` entry can shadow a handler too (2026-08-02)
+<a id="compound-playerx-shadows-handler"></a>
 
 Same family as above, different mechanism. `_emit_function` short-cuts any
 `ref.func` whose **compound** key (`player.moveto`) exists in `FUNCTION_MAP`,
@@ -779,6 +1068,7 @@ name, so **one dead line in the mod took down the whole start-menu script**, and
 with it the Imperial City transport.
 
 ### A script that fails to COMPILE takes its dependents down with it (2026-08-07)
+<a id="compile-failure-takes-dependents-down"></a>
 
 **Symptom:** Morroblivion's Fighters Guild handed out no quests after joining.
 The Papyrus log named a *linking* failure, not a compile one:
@@ -846,6 +1136,7 @@ Chargen-and-Transport start menu imports — so the failure propagated to the
 transport NPCs.
 
 ### A Bool cannot carry a multi-valued TES4 threshold (2026-07-31)
+<a id="bool-cannot-carry-multivalued-threshold"></a>
 
 Mapping `GetDetectionLevel` onto `IsDetectedBy` is only half the fix, and the
 missing half fails *silently*. Papyrus rejects a bare `Bool >= 2` outright
@@ -868,6 +1159,7 @@ range** — do not let the generic `as Int` cast decide, because it collapses th
 range to 0/1 and quietly kills every threshold above 1.
 
 ### Skyrim has NO attributes — the AV tables share nothing (2026-08-06)
+<a id="skyrim-has-no-attributes"></a>
 
 **The two games' actor-value tables do not overlap at a single index.** TES4 0 is
 Strength, TES5 0 is Aggression; TES4 5 is Endurance, TES5 5 is Assistance
@@ -908,7 +1200,7 @@ no way to raise an attribute, so enforcing it would lock the content away
 *permanently* rather than merely early.
 
 Three places must agree, and a change to one needs the same change in the others:
-`tes5_import/dialog_conditions.py` (`_TES4_AV_ATTRIBUTES` / `_TES4_AV_TO_TES5`,
+`tes5_import/base/conditions.py` (`_TES4_AV_ATTRIBUTES` / `_TES4_AV_TO_TES5`,
 applied in `convert_ctda` for functions 14 `GetActorValue` and 277
 `GetBaseActorValue`), `script_convert/constants.py` (`TES4_ATTRIBUTES`,
 `ATTRIBUTE_STUB_VALUE`, `ACTOR_VALUE_MAP`), and
@@ -922,6 +1214,7 @@ are also *not* the UI names: use `Speechcraft` (not Speech) and `Marksman` (not
 Archery) in Papyrus strings; the CTDA side uses the numeric indices 17 and 8.
 
 ### Aggression/Confidence are ENUMS in TES5, not 0-100 (2026-07-28)
+<a id="aggression-confidence-are-enums"></a>
 
 TES4 stores the AI traits on a 0-100 scale; TES5 defines them as small enums
 (xEdit `wbDefinitionsCommon.pas`: `wbAggressionEnum` 0-3, `wbConfidenceEnum` 0-4,
@@ -1008,7 +1301,7 @@ and diff it against the no-op sets before assuming a command was dropped for a
 good reason.
 
 Losses that ARE correct and should not be re-litigated: `AddTopic` (223 `;NE:`)
-is deliberate — `tes5_import/dialog_unlocks.py` re-expresses topic visibility as
+is deliberate — `tes5_import/dialogue/unlocks.py` re-expresses topic visibility as
 `TES4Unlock_*` GLOB gates and scans SCPT sources *because* script_convert leaves
 an inert comment. `ModDisposition` (414) is a genuine engine removal, with the
 `<= -100` hostility case already converting to `StartCombat`.
@@ -1032,7 +1325,7 @@ an inert comment. `ModDisposition` (414) is a genuine engine removal, with the
   body is routinely the only thing that ever calls `Enable()` on that same
   reference. See "The self-enable deadlock" below.
 
-### Say() timers — `TES4Polyfill.SayLine` (2026-08-16)
+### <a id="polled-conversations"></a>Say() timers — `TES4Polyfill.SayLine` (2026-08-16)
 
 **The single design fact.** TES4's `Say`/`SayTo` were **synchronous**: the
 engine picked the INFO, started the audio and **returned its length before the
@@ -1121,7 +1414,7 @@ engine.**
 * Bare `Say`/`SayTo` (no assignment) stay plain fire-and-forget `Say()`
   (Nehrim's 727 hand-timed speech state machines). The measure-then-deliver
   pair (`set L to ref.Say T` / `ref.Say T`) collapses to the SayLine alone.
-* The NPC-to-NPC driver (`tes5_import/npc_conversations.py`) uses the same
+* The NPC-to-NPC driver (`tes5_import/dialogue/conversations.py`) uses the same
   primitive: `Utility.Wait(TES4Polyfill.SayLine(A, T, fallback) + 0.6)`.
 
 #### Why results stay in the END fragment
@@ -1193,6 +1486,92 @@ CharGen `- .4`, one `= 1`, one unrelated `timer = 0`).
   SayLine would wait on the busy flag (bounded) before Saying — no repeat is
   possible because the state has advanced by then, but the pause would show.
   Raise `SAY_TAIL` in `TES4Polyfill.psc` if that is ever observed.
+
+#### <a id="sequenced-fragment-surgery"></a>Sequenced fragment surgery — `conversation_sequence.py`
+
+**Code:** `script_convert/conversation_sequence.py`, consumed only by
+`pipeline._info_batch`.
+
+A polled conversation is a **sequencer**: each INFO is gated on an exact
+counter (`GetQuestVariable CharacterGen.convCount == 8`) and its result script
+steps that counter to hand the turn to the next line. Because TES4's `Say` was
+synchronous the whole body ran in the frame the line STARTED; running the same
+body at OnEnd breaks it four different ways, each fixed by one helper.
+
+- <a id="sequence-gate"></a>**`sequence_gate` — the counter is re-seeded
+  out-of-band.** Quest stages re-seed it ("make sure we're at the right spot",
+  10 of them in CharacterGen alone) and those stages fire off *package
+  completion*, which lands whenever the actor arrives, not when the line ends.
+  A re-seed landing mid-line makes the in-flight line's `+1` overshoot:
+  CharacterGen stage 12 sets `convCount=8` for "What's this prisoner doing
+  here?" while line 7 is still audible, line 7's fragment makes it 9, and the
+  cell-door exchange never plays (runtime trace: `FRAG 00032B0A cnt=8` →
+  `cnt=9 spk=0`). Gating the fragment on the counter the INFO itself requires
+  makes the re-seed authoritative. Applied **only** when the body actually
+  steps that counter — a line the quest script advances for is not a sequencer
+  and must never be gated.
+
+- <a id="turn-handoff"></a>**`split_turn_handoff` — the handoff cannot wait for
+  OnEnd.** In TES4 the result script set `convCount`/`speaker` and charged
+  `convTimer` in the frame the line started, so the next speaker's guard
+  (`speaker == N && convTimer <= 0`) was already open and only the timer paced
+  him. Emitting the handoff at OnEnd makes every line pay a serial round trip
+  (measured, `temp/chargen_rec_5.log`):
+
+  ```
+  79.11  LineBegan Renault len=2.06     <- line starts
+  81.54  LineEnded Renault              <- 2.43s later
+  81.57  request   Baurus ("Yessir.")   <- only now does he ask
+  ```
+
+  Only the counter step and `speaker`/`target` literal writes move to OnBegin.
+  Stage advances, AddTopic unlocks and item/faction changes stay in OnEnd:
+  those are consequences of the line having been DELIVERED, not of whose turn
+  it is.
+
+- <a id="stepped-gate"></a>**`stepped_gate` — OnEnd must test the STEPPED
+  value.** Once OnBegin performs the handoff the counter has already moved, so
+  the original `convCount == 8` is false by OnEnd and the rest of the body —
+  item grants, faction changes, the author's other writes — would be silently
+  dropped. The compared value is shifted by the same delta the step applies.
+
+- <a id="stage-advances-survive"></a>**`split_stage_advances` — a stage advance
+  must survive a REJECTED turn.** The gate originally swallowed the fragment's
+  `SetStage` too, and that line is frequently the only path to the next quest
+  beat: a package-completion re-seed landed while CharacterGen line 11 was
+  still audible, line 11's End fragment was rejected, its `SetStage(13)` never
+  ran, and the quest stalled forever — the Emperor greeted generically and
+  offered only 'Rumors', with nothing in the Papyrus log because a rejected
+  gate is silent by design. Advances are lifted OUTSIDE the gate behind a
+  monotonic guard, which is safe because TES4 stages are flags and `GetStage`
+  returns the highest set: past N already → skipped; turn rejected but the
+  advance still owed → it runs. Only TOP-LEVEL
+  `<quest>.SetStage(<literal>)` lines are lifted.
+
+- <a id="writes-before-setstage"></a>**`state_writes_before_setstage` —
+  `SetStage` runs its fragment INLINE.** Those fragments call
+  `EvaluatePackage()`, and the engine arbitrates packages against whatever
+  state is committed at that instant, so a `speaker`/`convCount` write placed
+  after the SetStage is invisible to it. CharacterGen stage 18 showed it
+  directly: the package was selected then kicked back within the same second
+  (`PKGSTART 04D84D` → `PKGCHANGE` back to `032B14`), and whether it stuck
+  varied run to run purely on engine latency. Only literal assignments are
+  hoisted, and only from a FLAT tail — a nested block after the SetStage may
+  depend on what the stage did, and `classify` is the shared barrier (it also
+  stops on a `Return`, which this pass's own regex did not; measured: no
+  fragment body has one in the tail, 0 of 75,170). Hoisting a write above the
+  SetStage can strand it below a `Start()` on the same quest, the one
+  reordering that silently destroys it — Skyrim's `Start()` resets every Auto
+  property, losing the seeded value (`ArenaICGrandChampion`'s `CrazyIdea`, 2
+  sites) — so `hoist_quest_start_above_writes` re-establishes that invariant on
+  the reordered result. That is a fixup of this pass's own output, not a second
+  pass over the script.
+
+The two narrow regexes exist for the same reason. `_STATE_WRITE_RE` matches a
+bare literal assignment or a counter step on ITSELF — no calls, nothing whose
+value depends on anything a `SetStage` could change, because 13 CharacterGen
+stage fragments re-seed `convCount`. `_HANDOFF_WRITE_RE` matches a bare literal
+assignment to a field whose name says it selects the next talker.
 
 ## Magic / condition helpers
 <a id="magic-condition-helpers"></a>
@@ -1426,6 +1805,20 @@ Neen), it never ran: the player paid 1000 gold, the dialogue fragment set the
 destination code, and nothing ever moved them.
 
 ### A script on the PLAYER base needs a quest alias (2026-08-01)
+<a id="player-base-script-needs-quest-alias"></a>
+
+**A type-0 script's base must be one EVERY attaching record can bind.** Papyrus
+refuses a script whose declared base does not match the form ("Unable to bind
+script X because their base types do not match"), so a script shared between an
+actor and a non-actor record cannot be `Actor` — the non-actor copies would
+silently never attach. Scanning for the FIRST actor attachment and returning
+early did exactly that to `NoActivationScript`, which Oblivion puts on **both a
+DOOR and an NPC_**. `Actor extends ObjectReference`, so the shared base binds to
+both and every inherited event still resolves.
+
+The player-base case is the exception, and only when the player base is the
+script's SOLE attachment — a script shared with real NPCs still has to bind to
+them as an `Actor`.
 
 Oblivion let a plugin script the player by attaching a SCPT to the player's base
 `NPC_ 0x00000007`. **Skyrim has no equivalent binding**, and the relocation above
@@ -1487,6 +1880,7 @@ which previously emitted un-parseable Papyrus because the assignment target and
 its value took different code paths). Genuine string literals are untouched.
 
 ### `AdvancePCLevel` → the Level actor value (2026-08-01)
+<a id="advancepclevel-level-actor-value"></a>
 
 Vanilla `Game.psc` (from `Data/Scripts.zip`) has **no level setter** —
 `Game.SetPlayerLevel` exists only in mod-supplied headers, so it will not
@@ -2000,7 +2394,7 @@ distinct ids, across Nehrim, Morrowind_ob and Translation), but both
 `_QUOTED_MEMBER_RE` and `_QUOTED_NAME_RE` required a letter or underscore
 first, so those kept their quotes. Only `_safe_property_name` saved them: it
 strips the quotes *and* prefixes the `d` that makes the name legal Papyrus, so
-quoted and unquoted spellings happened to normalise to the same property
+quoted and unquoted spellings happened to normalize to the same property
 (verified for all 12 sampled ids). Anything reading the name without going
 through it would have hit the `_MQ01Tate_` failure that
 `_QUOTED_NAME_RE`'s own comment describes — a property bound to nothing,
@@ -2565,6 +2959,786 @@ writes a GLOBAL GMST, so leaving it set disables fall damage permanently. The
 flag had no setter after the rewrite; now derived in `_load_facts` from the
 tree, and the restore MERGES into the script's existing `OnEffectFinish`
 rather than declaring a second one.
+
+
+
+## The command table: what a row is, and what it is not
+<a id="command-rows"></a>
+
+`command_rows.py` holds one `Cmd` row per TES4 command whose whole conversion is
+"resolve a receiver, convert a couple of arguments, register a property type,
+emit one expression". Each row replaced a name-guarded branch in
+`_emit_function`. Anything needing real logic stays a handler in `commands.py`;
+`HANDLED_COMMANDS` names those so the parser still reads them AS commands, and
+`KNOWN_COMMANDS` is the union.
+
+**Every derived set is a PROJECTION of `COMMAND_ROWS`, so it is derived below
+the table and never above it.** `_flagged()` builds `_ACTOR_ONLY_FUNCTIONS`,
+`_BOOL_VALUED_FUNCTIONS` and the rest by scanning row flags. Deriving one before
+the FNV rows merged in froze them out of `KNOWN_COMMANDS`, and `cross_ref.py`'s
+pre-pass reads `_ACTOR_ONLY_FUNCTIONS` to type ref-vars BEFORE emission — so a
+row missing from the table is a missing CAST at the call site, not just a
+missing conversion. Removing the `kill` row cost three Oblivion scripts their
+compile that way (`ObjectReference cannot be assigned to Actor`).
+
+Three flags carry type information the emitters cannot recover from the
+template: `actor_only` (promote the subject to `Actor`), `objref_shared` (do
+NOT — the method is declared on `ObjectReference`, and `(Self as Actor)` on a
+STAT or DOOR yields `None`), and `bool_valued` (the `X == 1` / `X == 0` idiom
+collapses to `X` / `!X`).
+
+### Papyrus VALUE types, and why a global is one
+<a id="papyrus-value-types"></a>
+
+`_PAPYRUS_VALUE_TYPES` names the types that hold a VALUE. Everything else is an
+object type, which cannot be assigned an integer — TES4 wrote `set myRef to 0`
+to clear a reference, and that has to become `None`. `GlobalVariable` is listed
+even though it IS an object, because a TES4 write to a global is a write to its
+VALUE (`GlobalVariable.SetValue(0)`), so its integer must survive.
+
+### Command families matched by PREFIX
+<a id="command-prefix-families"></a>
+
+`COMMAND_PREFIXES` matches a family by prefix rather than whole name, longest
+prefix first so a specific family can override a broader one. The Elys music
+family additionally requires a longer name: `emcount` is a local VARIABLE in
+some scripts rather than a command, and a bare `emc` prefix would swallow it.
+
+## A neutralised command must be inert IN POSITION
+<a id="neutralised-command-inert-in-position"></a>
+
+A command with no Skyrim equivalent emits an inert value plus a `;NE:` note.
+**Which inert value depends on where the command is written**, and getting it
+wrong is not cosmetic:
+
+- **Operand position** (inside a larger condition or arithmetic) takes a BARE
+  literal. A trailing `;` comment swallows the rest of the expression —
+  `If True  ;(False ;NE: ...)` silently drops the other terms. `isKeyPressed`,
+  `getControl`, `getObjectType`, `GetGameRestarted` and the OBSE form-type
+  tests are all read this way.
+- **Statement position** takes the note AS the whole line. `SkipAnim` and
+  `SetNumericIniSetting` are written on their own line (Nehrim's portcullis
+  calls `<ref>.SkipAnim`), so the comment IS the emission.
+- **Never an undefined identifier.** An unrouted name fails the CHECKER, which
+  emits no `.pex` for the owning script and takes every dependent down with it
+  ([why](#compile-failure-takes-dependents-down)). This is what kept
+  `mwMorroDefaultQuestScript` from running, and with it the `PlayerInMorrowind`
+  global gating Fargoth's greeting.
+
+**Polarity is a decision, not a default.** `FileExists` answers PRESENT: every
+caller uses it as an installation check against Oblivion-side artifacts that do
+not exist after conversion BY DESIGN, so answering 0 fired every "missing file"
+branch and greeted the player with a bogus installation-error box on load.
+`GetModIndex` lands on the not-an-error side of the `> 1` mis-order test for the
+same reason.
+
+`AddActorValues` (an OBSE plugin) is the clean case: every caller already guards
+the block with `IsPluginInstalled "AddActorValues" == 0 / return`, so the body
+is dead by construction and only needed to stop failing the checker.
+
+Some neutralised names are reachable through SKSE
+(`docs/audits/skse_conversion.md`); nothing here targets SKSE today, so this is
+the current behaviour rather than a judgement that SKSE is off the table.
+
+## Zero-argument reads need a `FUNCTION_MAP` entry to be seen at all
+<a id="zero-arg-reads-need-function-map"></a>
+
+A command taking no arguments is always written bare, and the dotted member path
+(`NextActor.IsCreature`) resolves a name as a FUNCTION only when it is a
+`FUNCTION_MAP` key. Without an entry the read falls through to raw member access
+on a type with no such property — `field or property not found`, fatal to the
+whole file. This is why both spellings of a command are listed even when they
+convert identically: `IsCreature`/`GetIsCreature`, `GetIsGhost`/`GetUnconscious`
+(only the SETTERS had been mapped), `GetTalkedToPC`/`GetTalkedToPCP`,
+`GetPlayerHasLastRiddenHorse`/`IsPlayersLastRiddenHorse` (one engine function,
+`0x1153`, under two authored spellings).
+
+See also [routing zero-argument commands](#zero-argument-commands-must-be).
+
+## Receiver and argument are not interchangeable
+<a id="receiver-and-argument-not-interchangeable"></a>
+
+Several TES4 commands name their subject on the opposite side from the Papyrus
+call, so a positional mapping asks the mirror-image question and compiles
+cleanly while being wrong.
+
+- **`GetDetected` is the OBSERVER's question; `IsDetectedBy` is the TARGET's**,
+  so receiver and argument SWAP. `CharGenQuest`'s `GlenroyRef.getdetected
+  player` ("has Glenroy spotted the player", which advances the Ambush-B stage)
+  became "has the player spotted Glenroy" — true the moment the player looks
+  down the corridor.
+- **`GetDetectionLevel`** has the same shape (UESP opcode `0x10B4`) and the same
+  swap, plus a RESCALE: TES4 levels run 0..3 but `IsDetectedBy` is a Bool, and
+  all 56 call sites read `>= 2`, `>= 3` or `== 3`. Scaling to TES4's top level
+  yields 0 or 3, satisfying every threshold exactly when detected; a bare
+  `Bool >= 2` is rejected by the CK compiler
+  ([why](#bool-cannot-carry-multivalued-threshold)).
+- **`IsActorDetected` takes NO argument** (UESP opcode `0x10B5`) — "am I
+  detected by ANYONE", which Skyrim has no primitive for. Mapped to
+  `IsDetectedBy` the bare form defaulted to the player and emitted
+  `Game.GetPlayer().IsDetectedBy(Game.GetPlayer())`, always true.
+- **`UncompleteQuest <Quest>`** names the quest as an ARGUMENT; Papyrus spells
+  `Reset()` as a method ON the quest, so the argument becomes the receiver.
+  Mapped straight it emitted `Reset(fbmwEBBone)` — "function takes 0 parameters
+  not 1".
+- **`ref.Update3D`** is written as a receiver method, so the polyfill must
+  CONSUME the receiver as its argument; `ActorRef.TES4Polyfill.Update3D()` is
+  not Papyrus. With no receiver the subject is the player. Papyrus has no direct
+  call (`QueueNiNodeUpdate` is SKSE), but the engine's own refresh idiom is a
+  disable/enable cycle, which rebuilds exactly the same 3D.
+- **`StopCombatAlarmOnActor`** stops all combat and alarms AGAINST this actor —
+  the opposite direction from `StopCombat`, which ends the actor's OWN
+  aggression. Skyrim has the exact native, `Actor.StopCombatAlarm()`.
+  `player.SCAOnActor` is the idiom for calming a mob attacking the player
+  (`Dark19Whispers` holds the player still through the Night Mother's speech);
+  with `StopCombat` everyone stayed hostile.
+- **`IsOwner`** asks whether the ACTOR owns this reference and is written bare
+  to mean the player. `IsInFaction` was a different question, and the bare form
+  emitted the argument-less `IsInFaction()` — a hard compile error.
+  `GetActorOwner()` answers it.
+
+## An argument that looks ignorable usually is not
+<a id="argument-that-looks-ignorable"></a>
+
+- **`SetDoorDefaultOpen <flag>`** takes a BOOLEAN, not a flag to drop: per
+  UESP (opcode `0x10D8`) "a value of 1 will make the door open by default", so 0
+  CLOSES it. Hardcoding `SetOpen(true)` inverted the `0` form — MQ16's endgame
+  `ICPalaceElderCouncilMainDoor.SetDoorDefaultOpen 0`, whose own authored
+  comment reads "close Elder Council door", flung it open instead.
+- **`ToggleFirstPerson <0|1>`** is one command with an argument in Oblivion and
+  two argument-free globals in Skyrim, so the argument picks which. The bare
+  form is a true toggle, which Papyrus cannot express (it cannot READ the
+  camera mode — `GetCameraState` is SKSE), so it takes the third-person branch,
+  the mode every caller is refreshing in. Skyrim's own model-swap script for
+  the same job, `DLC1PlayerVampireChangeScript`, calls `ForceThirdPerson()`
+  unconditionally rather than testing.
+- **`SetCanFastTravelFromWorld <worldspace> <flag>`** toggles per worldspace;
+  Skyrim's `Game.EnableFastTravel(bool)` is GLOBAL, so the worldspace operand is
+  dropped and the widened scope noted. The arity difference is why this needs a
+  handler — a straight map passed the worldspace where the bool goes.
+- **`SetCurrentHealth <value>`** (OBSE) takes only the value; the actor value is
+  implicit in the name. Mapped onto `SetActorValue` it swallowed the number as
+  the AV NAME and set nothing.
+- **The OBSE `...NS` / `...Silent` / `...2` spellings** differ from the vanilla
+  command only in suppressing the pickup sound and the "item added" message, or
+  in widening argument types. Papyrus carries `abSilent` on the SAME natives, so
+  these are the same command, not a missing feature.
+- **`PlaySound`** is written QUOTED as often as bare, and the property must be
+  registered under the name actually EMITTED. Registering the raw argument kept
+  the quotes and `_safe_property_name` turned each into an underscore, declaring
+  a second, never-bindable `Sound Property _X_` beside the real one — 75 dead
+  properties across 23 files.
+- **`con_Save` / `Autosave` / `con_SaveGame`** take a save-slot NAME, which
+  Papyrus does not accept, so it is dropped and the engine picks the slot.
+
+### FO3/FNV commands that reach the compiler unrouted
+<a id="fnv-unrouted-commands"></a>
+
+FO3/FNV name commands Oblivion never had, and an unrouted name reaches the
+compiler as an undefined identifier — which fails the CHECKER, so no `.pex` is
+written for the owning script
+([why that cascades](#compile-failure-takes-dependents-down)). They live in
+`constants_falloutnv.py`, which merges into `COMMAND_ROWS` before every derived
+set is projected from it.
+
+Routed to a real native, verified against the vanilla headers:
+
+| FO3/FNV | Papyrus | Note |
+|---|---|---|
+| `ShowMessage <MESG> [args]` | `Message.Show(afArg1..afArg9)` | takes exactly the substitution values FNV passes (807 sites, max 2) |
+| `AddToFaction <fac> <rank>` | `Actor.SetFactionRank(Faction, int)` | "Adds the actor to the faction if necessary", so one native covers both |
+| `RemoveFromFaction <fac>` | `Actor.RemoveFromFaction(Faction)` | |
+| `GetFactionRelation <actor>` | `Actor.GetFactionReaction(Actor)` | returns 0=Neutral 1=Enemy 2=Ally 3=Friend, the enum FNV's own source comments document |
+| `GetHealthPercentage` | `Actor.GetActorValuePercentage("Health")` | 0.0-1.0, matching the authored `< 0.5` tests |
+| `GetDestructionStage` | `ObjectReference.GetCurrentDestructionStage()` | the honest native; returns 0 because this conversion writes no DEST |
+| `GetMapMarkerVisible` | `ObjectReference.IsMapMarkerVisible()` | `bare_bool cmp_bool`, so `== 0` collapses to `!(...)` rather than comparing Bool to Int |
+
+Neutralised — no equivalent exists: `GetFurnitureMarkerID`, `GetHitLocation`,
+`IsHardcore`, `GetWeaponHealthPerc`, `GetActorFactionPlayerEnemy`,
+`GetAnimAction`, `GetIgnoreCrime`, `IsGoreDisabled`, `GetXPForNextLevel`.
+`IsWin32` answers **1**: it guards a platform branch, and the Windows build is
+the one that exists.
+
+**A row whose emit reads arguments must match how the command is WRITTEN.**
+`getfactionrelation` was first written `{p0}.GetReaction({p1})`, reading
+arguments 0 and 1 — but all 3 authored sites name the actor as the RECEIVER
+(`VFSGloriaRef.GetFactionRelation player`), so `{p0}` took `player` and `{p1}`
+found nothing, emitting `player.GetReaction(var_)` plus a bogus
+`Faction Property player`.
+
+### An unmapped AV command silently became a READ
+<a id="unmapped-av-command-became-a-read"></a>
+
+`commands.py`'s AV handler is registered for every `av`-flagged command and
+picked its Papyrus name with `_AV_PAPYRUS.get(call.name, 'GetActorValue')`.
+That default is a trap: a command absent from the table converted into a
+**read** whatever it meant. FO3/FNV's `RestoreAV`/`DamageAV` (18 + 37 + 49 + 6
+authored sites, and **zero** in Oblivion, Nehrim or Morroblivion) fell through
+it, so `Player.RestoreAV perceptioncondition 100` — a heal — emitted
+`GetActorValue("perceptioncondition", 100)`, which is both the wrong operation
+and a two-argument call to a one-argument native.
+
+The fallback is now the ROW's own `emit`, with `_AV_PAPYRUS` kept as the
+override for the two commands whose row cannot say it (`advancepcskill` has no
+emit; `modpcskill` deliberately differs — `Game.AdvanceSkill` adds skill USAGE,
+not the skill itself). Every other entry already agreed with its row, so no
+TES4 call site moves. `Actor.psc` declares both natives with exactly the TES4
+argument shape: `RestoreActorValue(string, float)`, `DamageActorValue(string,
+float)`.
+
+### A digit-leading member name swallowed its dot
+<a id="digit-leading-member-names"></a>
+
+FO3/FNV declare variables whose names start with a digit — `int 1stFloorDetect`
+in `RepconHQFreeform` — which the declaration path already renames through
+`_safe_property_name` (`d1stFloorDetect`). A REMOTE access did not survive the
+LEXER: `.` starts a number when a digit follows, so `RepconHQFreeform.1stFloor
+Detect` lexed as one IDENT `.1stFloorDetect` with the dot inside the name. The
+parser never saw a member access, so the whole `set <quest>.<var> to <n>`
+statement passed through as raw TES4 text and the compiler rejected it —
+"(block statement) invalid token: ." on 38 FNV sites.
+
+The dot is emitted as its own OP when a digit-leading identifier follows it.
+TES4 is unaffected: a digit-leading name there is always an EditorID in
+argument position (`1TrapFireMineWorldRef`), never a member, and those still
+lex as one token because no `.` precedes them.
+
+### `Kill` takes only the killer
+<a id="kill-takes-only-the-killer"></a>
+
+`Actor.psc` declares `Function Kill(Actor akKiller = None) native` — one
+optional argument. TES4 matches it (measured: Oblivion 115 bare calls and 6 with
+a killer, Nehrim 97/9, Morroblivion 6 bare — never more), but FO3/FNV's `Kill
+killer dismember caused-by-explosion` adds two flags Papyrus has no target for:
+48 FNV sites pass 2 or 3 arguments and failed the checker with "function takes 1
+parameters not 2".
+
+The row therefore renders `{ref}.Kill({a0})` rather than mapping the argument
+list through, which is identical to the old output for every TES4 call and drops
+only the flags that cannot be expressed. It keeps `actor_only`: that flag is
+what `cross_ref.py` reads to type a ref-var before emission, and removing it
+cost three Oblivion scripts their compile (`ObjectReference cannot be assigned
+to Actor`).
+
+### `Self` compared against a SCRIPT-typed reference
+<a id="self-compared-to-a-script-typed-ref"></a>
+
+A property naming a placed reference whose base carries a script is typed as
+that SCRIPT (`_add_scro_ref` prefers it so cross-script variable reads work).
+`Self` is likewise the script's own class, so an identity test between two such
+references compares two unrelated classes:
+
+```
+If Self == vHVLevel02MainDoorREF || Self == vHVLevel01DownstairsDoorREF
+you can't compare type `TES4_NVEcvDoorBG01SCRIPT` with type `TES4_HVLevel1To2DoorScript`
+```
+
+`_self_cast` already handled `Self == <Actor>` and `Self == <script>.member`;
+the bare script-typed property fell through. It casts the OTHER side to
+`ObjectReference` — the type both really are — rather than casting `Self` to
+Actor, because a door is not an actor and the comparison only asks whether the
+two references are the same object.
+
+🛑 **Guard the arm on `_self_reference(extends) == 'Self'`.** In an
+ActiveMagicEffect, TopicInfo or PlayerAlias script, TES4's `Self` is NOT the
+script's own object — it redirects to `GetTargetActor()`, `akSpeakerRef` or
+`GetReference()`. Without the guard, `MS40PotionEffect`'s
+`if (GetSelf == RonaHassildorRef)` emitted
+`(Self as ObjectReference) == (RonaHassildorRef as ObjectReference)`, comparing
+the MAGIC EFFECT against an NPC instead of the effect's target — a test that can
+never be true. Caught by the semantic diff as `calls[gettargetactor/0]: 3 -> 2`.
+
+### `GetFactionRelation` has TWO receiver kinds
+<a id="getfactionrelation-has-two-receivers"></a>
+
+**Code:** `script_convert/commands_falloutnv.py`
+
+FNV writes `<x>.GetFactionRelation <actor>` against two different receivers.
+Censused over all 9 authored sites (FNV-only; Oblivion, Nehrim and Morroblivion
+have none):
+
+| Receiver | Sites | Papyrus |
+|---|---:|---|
+| ACHR (a placed actor) | 8 | `Actor.GetFactionReaction(Actor)` — exact |
+| FACT (a faction) | 1 | none |
+
+`Faction.psc` offers only `int Function GetReaction(Faction akOther)`, which
+takes a FACTION, so the faction-toward-actor question has no reader. The
+handler declines for an actor receiver — letting the row emit the real native —
+and neutralises only the faction one.
+
+⚠️ The row alone got this wrong in both directions earlier: first reading the
+ARGUMENT as the receiver (emitting `player.GetReaction(var_)` plus a bogus
+`Faction Property player`), then typing the FACT receiver as an Actor.
+
+### A TRUNCATED script name breaks cross-script member types
+<a id="truncated-script-names"></a>
+
+Papyrus caps a ScriptName at 38 characters, so `papyrus_script_name` truncates a
+long EditorID and appends a 4-hex hash — `VHDLegionPowerPlant01BattleControllerScript`
+becomes `TES4_VHDLegionPowerPlant01BattleC_AD35`.
+
+`remote_type_of` stripped the `TES4_` prefix and looked the stem up in
+`script_all_vars`, which is keyed by the AUTHORED EditorID. For a truncated name
+that lookup always misses, so the member's type came back `''` and
+`_typed_assign` skipped the coercion it exists to apply:
+
+```
+Replacement = VHDLegionPP01BCREF.CurrentBackup
+value with type `ObjectReference` cannot be assigned to a variable with type `Actor`
+```
+
+The transform is the single source of truth, so re-applying it to each known
+script EditorID identifies the original. The mapping is built once and cached —
+it is a hot path.
+
+🛑 **Build it from ORIGINAL-CASE EditorIDs.** The suffix is an MD5 of the whole
+prefixed name, so it is case-sensitive:
+
+| Input | `papyrus_script_name` |
+|---|---|
+| `VHDLegionPowerPlant01BattleControllerScript` | `TES4_VHDLegionPowerPlant01BattleC_AD35` |
+| `vhdlegionpowerplant01battlecontrollerscript` | `TES4_vhdlegionpowerplant01battlec_B88E` |
+
+`script_all_vars` is keyed lowercase, so a map built from ITS keys computes the
+wrong hash and never matches. `script_formid_to_edid` carries the authored
+spelling and is the right source.
+
+### A cross-script READ was never checked for danglingness
+<a id="dangling-cross-script-read"></a>
+
+`_dangling_cross_script_target` already comments out a WRITE to `Owner.Var` when
+the owner resolves to a script whose variable table is known and lacks the name.
+The matching READ in `emit_member` had no such check — its last branch ("not a
+command anywhere, so a cross-script variable read") emitted the property access
+unconditionally, and the compiler rejected the script:
+
+```
+field or property `behemoth` not found      If (Game.GetPlayer().behemoth == 1)
+field or property `HasBeenEaten` not found  If ... && FortCaesarRef.HasBeenEaten
+```
+
+Censused over `export/FalloutNV.esm/SCPT.txt`, `behemoth` and `HasBeenEaten` are
+declared by **no script at all** — dangling in Bethesda's own data. `Follower1`
+and `CurrentBackup` ARE declared, but by a different script than the ref
+resolves to (`GomorrahCasinoEnterTriggerREF` carries
+`GomorrahCasinoEnterTriggerScript`, which has no `Follower1`), which is the same
+defect seen from the other side.
+
+The read now takes the note the write already took. The DETECTOR is unchanged:
+it still fires only when the owner resolves to a script whose variable list is
+known and lacks the name.
+
+🛑 **Do not widen it to "the record resolved but carries no SCRI".** That looks
+like it should catch `player.behemoth`, and it does — but a placed reference
+carries its script on the BASE OBJECT, not the REFR, so `record_scri` misses it
+and the rule condemns perfectly good cross-script access. Measured: the
+widening changed **480 Oblivion scripts**, dropping writes such as
+`DAClavicusDogStatueREF.dogtalk1` and `HorsePCWhiteAnvilREF.respawnhorse`, and
+it hit the play-tested `TES4_CharGenQuest`. Reverted; the four FNV names are
+left to their own row entries instead.
+
+### Five zero-argument commands were listed but never ROUTED
+<a id="listed-but-unrouted-commands"></a>
+
+`ZERO_ARG_REF_FUNCTIONS` named `getalarmed`, `getdisease`, `getwantblocking`,
+`ismoving` and `isturning`, but none had a row in `COMMAND_ROWS` — so nothing
+ever emitted them and `Ref.GetAlarmed` fell through `emit_member` to a property
+read that does not exist.
+
+The CK wiki's own "Papyrus Version" section names `IsAlarmed - Actor` as
+GetAlarmed's equivalent, so that one converts properly; the other four have no
+Papyrus section at all and become inert reads. With rows in place the literal
+set collapses to `isactor`, the rest arriving through `_flagged('zero_arg')`.
+
+Authored use: `getalarmed` 1 (FNV), `getfriendhit` 2 (Nehrim) + 2 (FNV),
+`getcontainerinventorycount` 3 (FNV); the other four are unused in all four
+plugins. `GetContainerInventoryCount` maps to `ObjectReference.GetNumItems()`
+(`Int Function GetNumItems() Native`), an exact equivalent.
+
+## The stage-arrival latch
+<a id="stage-arrival-latch"></a>
+
+**Code:** `script_convert/stage_latch.py`
+
+🛑 A `GetStage()==N && <timer> <= 0` guard waits on a timer that **stage N's own
+fragment charges**, and nothing makes that charge land before the guard is first
+tested. At or below zero is the timer's NORMAL resting state — it also goes
+negative whenever a line is dropped — so the instant stage N arrives the guard
+is ALREADY satisfied and the body runs before stage N's fragment has spoken.
+
+Measured (`temp/chargen_rec_4.log`, 14:47:14–18): CharacterGen sat at
+`convTimer = -0.076` for four seconds after Renault's line was dropped, so
+`GetStage()==16 && convTimer<=0` fired the moment stage 16 was set. `SetStage(17)`
+ran, the force-greet pulled the player into the menu, and the Emperor's stage-16
+line was never spoken — INFO `00032B11` ("You ... I've seen you") is gated on
+`GetStage CharacterGen == 16` and is the ONLY CharGenVoice entry for that stage,
+so once the stage reads 17 nothing qualifies at all.
+
+The fix is a latch: remember which stage the quest was on last pass, and require
+one full poll pass at stage N before honouring the guard — that pass is what lets
+stage N's fragment run and charge the timer. 25 guards of this shape exist in the
+Oblivion build; the CharacterGen ones are simply the ones that show.
+
+The latch is keyed CASE-INSENSITIVELY. One TES4 file spells the same quest both
+ways (CharacterGen's poll uses `characterGen` on some lines and `CharacterGen` on
+others); keying on the raw spelling emitted TWO latches, and a guard could then
+compare against the one the poll tail never updates — so it would never open.
+Papyrus is case-insensitive, so the duplicate declarations compiled and the fault
+would only have shown in game.
+
+### A bare ref command on a receiver parses as a MEMBER
+<a id="a-bare-ref-command-parses-as-member"></a>
+
+TES4 writes a zero-argument command without parentheses, so `rSelf.GetLinkedRef`
+reaches the tree as a `Member` (owner `rSelf`, name `GetLinkedRef`) rather than
+a `Call`. `is_ref_typed` answered the Call spelling from `_REF_RETURNING` but
+sent the Member spelling to the remote-variable lookup, which of course has no
+entry for a COMMAND name — so the null test never fired and
+`rSelf.GetLinkedRef != 0` emitted literally:
+
+```
+you can't compare type `ObjectReference` with type `Int`
+```
+
+The Member arm now checks `_REF_RETURNING` first. Both spellings mean the same
+read; only the punctuation differs.
+
+The rest of that arm is unchanged, and both its lookups are still required:
+`remote_type_of` resolves through the owner's declared `TES4_<script>` property
+type, while a quest named bare (`SE09.rebuiltGatekeeperRef`) has no such
+property and is reached by `_is_ref_typed_access` via EditorID → SCRI.
+
+### Code after a `Return` fails the whole script
+<a id="unreachable-after-return"></a>
+
+TES4 accepted unreachable code and simply never ran it. Bethesda shipped some:
+
+```
+If Button == 0
+    Return
+    Set FailMessage to 0        ; never executed, in the ORIGINAL
+    Set DisplayOnce to 0
+```
+
+Papyrus rejects the whole script for it — reported, confusingly, as
+`(block statement) invalid token: =,` on the assignment. Since the statement
+provably cannot run, replacing it with a `;NE:` marker changes no behaviour and
+saves the script.
+
+Measured: 17 statements across 5 scripts — FalloutNV 13 in 3
+(`LegateCampMongrelCageScript`, `VERT4BloodborneStalkerScript`,
+`VMS21aSupportScript`), Morroblivion 4 in 2. Oblivion and Nehrim have none.
+The Morroblivion pair already compiled, and dropping dead code cannot change
+what they do.
+
+### The cross-ref declaration scan did not know `int`
+<a id="cross-ref-scan-missed-int"></a>
+
+`cross_ref.py` builds `script_all_vars` — the table `remote_type_of` consults
+to type `Owner.member` — with its own regex over the SCTX text, and that regex
+listed `short|long|float|ref`. `TYPE_MAP` and the PARSER'S `VAR_TYPES` both
+accept `int`; only this one scan did not.
+
+A member declared `int` therefore resolved to `''`, so `_typed_assign` saw no
+target type and skipped the coercion it exists to apply:
+
+```
+VFSAtomicPimp.iChipTimeA = GameDaysPassed.GetValue()
+value with type `Float` cannot be assigned to a variable with type `Int`
+```
+
+Measured declarations by keyword: FalloutNV **1,789 `int`** (of 7,837),
+Oblivion 11, Nehrim 1, Morroblivion 0. `int` is legal TES4, so this is a shared
+bug that FNV merely exposes at scale — the three TES4 plugins have 12 members
+that were invisible to every cross-script type lookup.
+
+### `GetIsReference` is an IDENTITY test, not an actor test
+<a id="getisreference-not-an-actor-test"></a>
+
+The row rendered `{ref} == {a0}` under the `AV` subject, and `AV` passes
+`actor_func=True` into `_resolve_self_ref` — which promotes the receiver, and
+the local it was assigned from, to `Actor`. So a TRIGGER script's
+`set ThisTrigger to GetSelf` / `if ThisTrigger.GetIsReference <ref>` declared
+`Actor Property ThisTrigger` and compared it against a property typed as the
+script attached to the named record:
+
+```
+you can't compare type `Actor` with type `TES4_VHDOliverPlayerInRoomScript`
+```
+
+`GetIsReference` asks whether two references are the same object. It reads no
+actor value and calls no actor-only native, so `OBJREF` is the right subject —
+and a trigger, a door or a terminal is not an Actor, so the promotion was also
+wrong on its own terms (the `as Actor` cast on a non-actor hazard this file
+documents at #an-as-actor-cast-on-a-non-actor).
+
+9 FNV scripts failed on this. The emitted comparison text is unchanged for
+every TES4 call site — only the DECLARED type of the operands moves.
+
+### A ref tested against `1` is still a null test
+<a id="ref-compared-to-one"></a>
+
+TES4 refs coerce to 0 when unset, so scripts test them against a literal. The
+ordering forms (`ref > 0`, `ref >= 1`, `ref <= 0`) were already folded to
+`!= None` / `== None`, and so was `ref == 0` — but `ref == 1` fell through to
+the Bool-literal rule and emitted `ObjectReference == 1`, which the checker
+rejects ("you can't compare type `ObjectReference` with type `Int`").
+
+`== 1` means "is set", so it inverts: `ref == 1` → `ref != None`, and
+`ref != 1` → `ref == None`.
+
+Measured across all four plugins, this idiom appears only in FNV — 4 sites
+(`LinkedRef == 1` twice, `Companion1REF != 1`, `Companion2REF != 1`). Oblivion,
+Nehrim and Morroblivion have none once `ref`-declared names are separated from
+similarly-spelled `short`/`Int` ones.
+
+It applies to a DECLARED ref variable only (`_is_ref_variable`), never to a
+ref-RETURNING command. Only a stored reference can be unset; a command without
+a Papyrus native converts to an inert `0`, and rewriting that to `!= None`
+would DECIDE a guard the inert-operand path exists to drop. The first attempt
+skipped that distinction and broke `GetCrimeKnown ... == 1`, whose whole `||`
+chain is supposed to collapse — caught by
+`test_an_or_chain_that_loses_every_term_stays_shut`.
+
+### A declaration can nest at ANY depth
+<a id="declarations-nest-at-any-depth"></a>
+
+TES4 variables are script-global wherever they are written, so the parser hoists
+every `VarDecl` into one declaration list. The block hoist walked only
+`block.body` — the block's IMMEDIATE statements — so a declaration inside an
+`if` was never collected:
+
+```
+begin ScriptEffectStart
+    if myself == player
+        float randomTime                 ; <- invisible to the hoist
+        set randomTime to 5.0 + 20.0/99.0 * GetRandomPercent
+```
+
+The assignment then emitted against a name Papyrus had never seen: "undefined
+identifier `randomTime`". The hoist now uses `walk_stmts`, which already
+recursed through `body`/`orelse`/`elifs` for other callers.
+
+Measured: 12 FNV failures across 8 scripts (`randomTime`, `legToDisable`,
+`mytarget`, `targetREF`, `rLink`). Zero TES4 scripts nest a declaration, so the
+three Oblivion-family plugins are unaffected — but the fix is theirs too, since
+nothing in TES4 forbids the shape.
+
+## Weather holds are RE-APPLICATION in TES4, a LOCK in Skyrim
+<a id="weather-holds-reapplication-vs-lock"></a>
+
+`ForceActive(bool abOverride=false)` is the instant switch,
+`SetActive(bool abOverride, bool abAccelerate)` the gradual one — signatures
+verified against vanilla `Weather.psc`. WTHR/CLMT/REGN weather is fully
+converted, so scripted weather moments drive the real converted records.
+
+**`abOverride` must be FALSE on both.** Oblivion holds scripted weather by
+CONTINUOUS RE-APPLICATION: the gate scripts re-force the storm every `GameMode`
+pass while the player is near, and stop running when the ref unloads, after
+which the sky rolls naturally. Skyrim's `abOverride=True` is a GLOBAL lock that
+survives the caller unloading, so mapping to True let a fast-travel away from an
+Oblivion gate strand `OblivionStormTamriel` over the whole world forever — the
+release call lives in the same unloaded script's update loop and can never run.
+
+## Commands whose Skyrim equivalent is a different SUBSYSTEM
+<a id="equivalent-in-a-different-subsystem"></a>
+
+Where Skyrim has no matching call, the engine's own mechanism is preferred over
+a Papyrus approximation.
+
+- **`ForceFlee` / `Flee`** (UESP index 407): Skyrim has no flee call — fleeing
+  is driven by the Confidence actor value, so dropping the actor to Cowardly and
+  re-evaluating its package makes the ENGINE break off combat.
+- **`SetForceRun`** → the `SpeedMult` actor value; Skyrim has no force-run flag
+  and the AV is what the engine reads for movement speed. Its getter reads the
+  live sneak state for the same reason. `setforcerun` is deliberately absent
+  from the plain rows: it carried `SetDontMove`, the exact INVERSE, unreachable
+  only because the handler runs first
+  ([the shadowing defect](#13-twelve-commands-were-treated)).
+- **`GetPCFaction{Murder,Attack,Steal}`** have no native, so they are rebuilt
+  from the crime-gold split: Steal = non-violent, Attack = violent below the
+  murder bounty, Murder = violent at or above. All 14 Skyrim.esm crime factions
+  use murder=1000 assault=40, which the importer also writes. One shared
+  `GetCrimeGoldViolent()` had shadowed every murder branch (`FGExpulsionScript`,
+  `TGCastOut`, both MGExpulsion scripts). `IsPCAMurderer` is the 1000-gold band;
+  `> 0` was the *Attack* test and made the player a murderer for a bar brawl.
+- **`GetNextRef`** — OBSE's walk over every reference in the loaded cells. An
+  ACTOR walk becomes repeated `FindRandomActorFromRef` sampling: the authored
+  loop re-assigns the variable each pass, so a fresh sample per pass is exactly
+  the iteration it asked for. `GetFirstRef` carries the form TYPE and has its
+  own handler — only form type 69 (actors) has an Actor-typed primitive behind
+  it. Neither may be neutralised: listing them as inert left the loop body
+  walking a ref that was never assigned.
+- **`ResetFallDamageTimer`** (OBSE) has a console command (opcode 4404) but no
+  Papyrus binding, so the substitute is the GMST the fall-damage formula reads
+  (`fJumpFallHeightMin`, default 600): pushing the threshold beyond any
+  reachable fall makes the landing survivable, which is the whole observable
+  behaviour. `TES4Polyfill` restores the original on release.
+- **`ModAmountSoldStolen`** adds GOLD to the "amount fenced" counter, which
+  Skyrim exposes only as a condition function, so it is backed by the
+  synthesized `TES4GoldFenced` global — NOT the vanilla "Items Stolen" stat,
+  which counts items and is engine-driven on every theft.
+- **`GetLocalGravity`** (OBSE) reads per-axis gravity on the calling reference.
+  Papyrus exposes no accessor (the value lives in the `fGravity` INI setting,
+  present in both engines and reachable from neither script language), so the
+  literal constant IS the faithful translation: Skyrim gravity is a world
+  constant pointing straight down, so X and Y are always 0 and only Z carries
+  the magnitude, signed to match OBSE's downward-acceleration callers.
+- **`GetPlayerControlsDisabled`** has no getter: Skyrim exposes the two WRITERS
+  as natives (`Game.DisablePlayerControls`/`EnablePlayerControls`) and nothing
+  to read them back, so the writers also shadow the state into a synthesized
+  global and the read returns that. Flattening the read to 0 was actively wrong
+  rather than merely inert — `MG18Script` polls it three times to sequence
+  Mannimarco's confrontation, and a constant 0 made the force-greet branch
+  (`== 1`) permanently false while the combat branch (`== 0`) fired
+  immediately, so Mannimarco never spoke and attacked at once.
+- **`CreateFullActorCopy`** places a fresh instance of the actor's BASE, which
+  is the copy TES4's callers use it for.
+- **`SetActorRefraction`** has no Papyrus refraction control; a translucent
+  alpha fade is the closest visual, and 0 restores full opacity.
+- **`GetAttacked`** → `IsAlarmed`, the nearest Skyrim state: an actor that has
+  noticed a hostile action against it.
+- **`HasVampireFed`** reads `PlayerVampireQuestScript.VampireStatus`, which is 1
+  exactly while the vampire has recently fed.
+- **`IsAnimPlaying`** is exposed by the behavior graph as an animation variable,
+  cast to Int because TES4 call sites compare and assign 0/1.
+- **`IsCasting`** (OBSE) asks "is this actor playing a cast animation", which
+  the animation graph answers natively — no SKSE dependency.
+- **`GetIsCreature`**: Skyrim marks people with the `ActorTypeNPC` race keyword,
+  and converted creatures use generated races without it.
+- **`LoopGroup`** plays an idle on repeat; `PlayGamebryoAnimation` is Skyrim's
+  own looping Gamebryo-animation call.
+- **`IsOnGround`** (OBSE) is the complement of `IsFlying` — both engines only
+  distinguish "supported by the ground" from "not".
+- **`IsModLoaded "Foo.esp"`**: `Game.GetFormFromFile` returns `None` for an
+  unloaded file, answering the same question in vanilla Papyrus. `Morrowind_ob`
+  guards every Oblivion XP hand-off with it.
+- **`print`/`printc`** write to the console log; `Debug.Trace` is Papyrus's own
+  log write, the same capability.
+- **`GetPCExpelled`/`SetPCExpelled`** have exact natives on both sides —
+  `Faction.psc` declares `IsPlayerExpelled()` and `SetPlayerExpelled(bool)`.
+  Reading it as `GetFactionRank(...) < 0` was asymmetric with the setter, which
+  touches an engine flag and never rank, so nothing ever drove rank negative and
+  every read was permanently false.
+- **`IsArrested`** is "serving a jail sentence", NOT faction expulsion, which is
+  what all four spellings used to emit. `Actor.psc` declares
+  `bool Function IsArrested() native` (condition form `GetArrestedState`, index
+  656). All 9 TES4 sites are jail mechanics — the prison cell doors, the
+  Leyawiin jailor, Amusei, the tutorial prison start, and
+  `TG00FindThievesGuildScript`, whose stage 10 is the ENTRY POINT of the Thieves
+  Guild questline. Expulsion is never set on `TES4CyrodiilCrimeFaction` for the
+  player, so every one read false.
+
+## Reads Skyrim genuinely cannot answer
+<a id="reads-skyrim-cannot-answer"></a>
+
+Checked against `Actor.psc`, `ObjectReference.psc`, `Form.psc`, `Game.psc` and
+`Utility.psc`, and absent from all five:
+
+| TES4 read | Why there is no target |
+|---|---|
+| `GetIgnoreFriendlyHits` | `IgnoreFriendlyHits` is a SETTER only |
+| `GetObjectType`, `IsDoor`/`IsActivator`/`IsContainer` | Skyrim's form-type numbering differs entirely; `GetType` is SKSE |
+| `GetDisplayName` / `SetName` | no name accessor on any vanilla script |
+| `GetGodMode` | third-party SKSE plugins only |
+| `GetModIndex` | Papyrus cannot read load order |
+| `isKeyPressed`, `getControl`, `getMenuHasTrait` | no vanilla input or UI API |
+| `SetPlayerSkeletonPath` | Skyrim's skeleton is fixed by race |
+| `GetPlayerHasLastRiddenHorse` | the engine tracks no "last ridden" horse |
+| `HasFlames` | Skyrim lights carry no scriptable flame state |
+| `GetGameRestarted`, `IsPlayerMovingIntoNewSpace` | a one-off engine transition Skyrim does not expose; False is safe because the guarded body is a re-initialisation allowed to be skipped |
+
+**`WakeUpPC` is the instructive one.** It kicks the player OUT OF SLEEP — it
+does not move them, change the camera or play an animation, so the old mapping
+to `Game.ForceThirdPerson()` did none of the right things. No native in
+`Game`/`Debug`/`Actor`/`ObjectReference` ends an active sleep and SKSE registers
+none (grepped every `NativeFunction` in `references/skse64-master`); vanilla's
+closest case, the Dark Brotherhood abduction, runs its whole sequence inside
+`OnSleepStart` rather than waking the player with a function. That is exactly
+where the converted body already runs: all 5 TES4 call sites sit in a `MenuMode`
+block reading `isPCSleeping`, which this converter routes into
+`OnSleepStart`/`OnSleepStop`. So the surrounding code runs at the right moment
+and only "cut the sleep short" has no target — a no-op keeps that faithful and
+visible instead of inventing a side effect the original never had.
+
+**`PositionCell`** teleports to raw coordinates in a named cell; `MoveTo` takes
+a TARGET REFERENCE and Skyrim exposes no cell-coordinate move.
+**`GetInWorldSpace`** becomes a WorldSpace comparison, but `GetPlayerInSEWorld`
+stays literal 0: an SI interior has no worldspace and no invariant to key on,
+and 11 of 16 sites test `== 0` (suppression guards, right in Cyrodiil).
+
+## OBSE constructs with no shape to translate
+<a id="obse-constructs-no-shape-to-translate"></a>
+
+- **`runScriptLine "<console command>"`** compiles and runs a console command at
+  runtime. Papyrus cannot execute the console at all, and `Morrowind_ob` uses it
+  exclusively to poke the OPTIONAL ObXP mod's globals — not part of the
+  conversion, so there is no target even in principle. The payload carries
+  OBSE's escaped-quote token and apostrophes, which as emitted broke the Papyrus
+  string literal it was pasted into.
+- **`SetEventHandler "OnDeath" <script> "object"::Player`** registers a callback.
+  Papyrus binds an event by DECLARING it (`Event OnDeath()`) on a script
+  attached to the form, so there is no registration API of this shape. The
+  argument syntax carries OBSE's `::` type-tag operator, which is not Papyrus
+  syntax at all and failed the parse of every script importing this one.
+- **`ar_*` / `sv_*`** are OBSE's dynamic arrays and string-variables. Papyrus has
+  real arrays and strings but nothing equivalent, and the surrounding logic
+  reads them element-by-element — there is nothing to translate call-for-call.
+  The `sv_` builder has its own handler; the inert catch-all would leave it
+  undefined.
+- **`forEach <it> <- <container> ... loop`** converts as the OPENER only; the
+  walker comments out the body (`emit/script.py`), which is what makes the
+  iterator's absence harmless.
+- **`MessageBoxEX`**'s `|`-separated button list has no Papyrus equivalent, so
+  only the message text survives — the closest faithful rendering without a UI
+  menu.
+- **Elys Music Control** (`emcMusicStop`, `emcSetMusicHold`,
+  `emcIsBattleOverridden`, bundled with Nehrim) controls the PLAYLIST rather
+  than naming a track, so there is no equivalent even with MUSC authored.
+- **The math globals** (`sin`, `cos`, `atan2`...) are written with a bare
+  whitespace operand (`set x to sin angleZ`), which is why they reached the
+  Papyrus parser unconverted as "no viable alternative at input 'sin'".
+  `Math.psc` has the same set and BOTH engines take and return DEGREES, so no
+  unit conversion is needed. `exp`/`log` have no native — see `_EXP_POLYFILL`.
+- **The raw-input family** is kept as ONE group rather than enumerated a build
+  at a time: that is how `disableKey` survived to fail on its own.
+
+## Commands that must NOT be promoted to `Actor`
+<a id="commands-that-must-not-promote"></a>
+
+`objref_shared` marks rows whose Papyrus method is declared on
+`ObjectReference`. The subject must stay un-promoted because TES4 calls these on
+plain scenery and an `Actor Property` on a STAT or ACTI never binds, so the read
+comes back `None`:
+
+- **`GetPos`/`GetAngle`/`GetStartingAngle`** — the Xeddefen puzzle rotates
+  `SEXedPuzStatue1-5`, which are STATs.
+- **`sms`/`StopMagicShaderVisuals`** — `EffectShader.Stop` takes an
+  `ObjectReference`, and TES4 casts these shaders on markers and statues (the
+  SE05 spell markers).
+- **`GetInSameCell`** — `GetParentCell` is an `ObjectReference` method.
+
+The reverse case is `_ACTOR_ONLY_FUNCTIONS`: commands naming their target as an
+ARGUMENT (`GetDeadCount X`, `SetEssential X 0`) are declared on `ActorBase`, so
+a bare occurrence says nothing about the script's OWN type. They are listed only
+to stop `_infer_extends` upgrading an ACTI or DOOR script to `extends Actor`,
+which will not bind; the call site still needs its cast. A separate set covers
+commands whose Papyrus signature declares an `Actor` PARAMETER (`StartCombat`,
+`IsHostileToActor`, `Get`/`SetRelationshipRank`), where a script-typed argument
+must be cast or the checker rejects it; `SetLookAt`, `Say` and `GetDistance` are
+absent because their parameters are `ObjectReference`, which converts
+implicitly. Full rules: [Actor promotion](#actor-promotion-must-follow-declaring).
+
+**`ref.` commands written with a COMMA** are the third case. Oblivion let the
+receiver follow a comma instead of a dot — `StopCombat, Player` and
+`IsInCombat, Player == 1` mean `Player.StopCombat` / `Player.IsInCombat`.
+Generic comma-stripping treats what follows as an argument, so these emitted
+`IsInCombat(Player)` ("function takes 0 parameters not 1") or dropped the token
+and acted on the wrong actor. The set is derived from the `ref.` rows with an
+empty argument column in `docs/reference/skyrim_commands.md`, intersected with
+`FUNCTION_MAP`; `IsInCombat`'s "Integer" column there is its RETURN type, not a
+parameter.
 
 
 ## script_convert: measurements and failure modes
@@ -3324,6 +4498,90 @@ The converter now wraps the OnUpdate body of any `extends Quest` script in
 `If (!IsRunning()) … Return`, re-arming the poll while stopped so it resumes on its own
 once the quest legitimately starts (211 quest scripts affected).
 
+### <a id="batch-compilation"></a>Batch compilation, and why a failure is quarantined
+
+**Code:** `papyrus_compile.py`.
+
+`papyrus.exe` parses the ~3,000 Skyrim headers once **per invocation**, so
+compiling per file paid that cost 15,961 times — ~82 ms each, about 22 minutes
+of serial CPU, which is what a 4-core machine actually experiences. Batch mode
+is ~2.4 ms/script marginal: the whole plugin in ~40 s in a single process, with
+no dependence on core count at all.
+
+The catch, and why this is not a plain swap: **the compiler ABORTS the run on
+the first bad file and writes NO `.pex` at all** (measured: 1 broken script of
+201 → 0 `.pex`). So a failing file must be quarantined and the batch retried.
+Scanner and parser errors surface one file at a time; checker errors surface
+for every bad file at once. Either way each error line names its file, so the
+quarantine set grows by at least one entry per pass and the loop terminates
+(capped at `_MAX_BATCH_RETRIES`).
+
+A quarantined file has to leave the input directory, so once anything fails the
+batch runs against a **staging copy**, built once and then maintained
+incrementally — re-copying ~16k scripts on every retry costs far more than the
+compile, and each retry only ever removes files.
+
+Quarantined scripts are then re-checked **individually**, because a file is
+frequently dragged into a batch failure by a *dependency's* error and compiles
+perfectly well alone. Only a batch that cannot name any new failing file gives
+up and falls back to the per-file path.
+
+### <a id="operator-table"></a>The lexer operator table is longest-first
+
+`lexer._OPERATORS` is scanned in order and the first prefix match wins, so a
+two-character operator MUST precede its one-character prefix:
+
+| operator | must beat | or else |
+|---|---|---|
+| `<>` (TES4 inequality) | `<` | `x <> 5` lexes `x < >` — not an expression |
+| `->` (TES3 member) | `-` | `player->GetPos` lexes `player - >` |
+
+`:=` is not TES4 at all, but costs nothing to recognise and keeps a mis-typed
+script from lexing as two tokens that silently reparse.
+
+**`->` is TES3's explicit-reference operator and means exactly what TES4 spells
+`.`** — OpenMW's scanner lexes it as `S_ref` (`scanner.cpp:524-538`) and
+`exprparser.cpp:475-485` consumes `S_ref` and `S_member` identically. So
+`_OPERATOR_ALIASES` rewrites the token text to `.` at lex time and every
+`Member` path downstream is untouched; no parser or emitter knows two
+spellings.
+
+Measured: 8,164 uses across 1,508 of TR_Mainland's 3,569 scripts, which failed
+with "invalid right operand in infix expression" before the token existed.
+**Zero** occurrences in Oblivion.esm's scripts, and no `- >` (spaced) anywhere
+in either corpus, so the longest-first match is unambiguous.
+
+### <a id="vanilla-headers"></a>Where the vanilla headers come from
+
+The CK ships the vanilla `.psc` sources in one of two loose layouts —
+`Data/Source/Scripts` (modern) or `Data/Scripts/Source` — or not at all, as
+just `Data/Scripts.zip` on a fresh install. That archive is unpacked in place
+into `Data/Source/Scripts`, which is also where the loose search looks first.
+Without these headers nothing compiles: they carry the native type definitions.
+
+An override plugin additionally needs its **masters'** converted sources on the
+header path. Its scripts declare properties typed as the master's converted
+scripts (`TES4_NQ16Script Property …`) because the record they name carries
+that master's SCRI, and those `.psc` live in the master's own output — 198 of
+Translation.esp's scripts fail with "undefined type" without them. They are
+headers only; the master's own run compiles and ships the `.pex`.
+
+**The walk is TRANSITIVE, not one level.** `TES4Polyfill` is owned by the
+MASTERLESS plugin alone (see the static-script deploy in `pipeline.py`), and
+every generated body calls it, so a plugin whose own master is itself a
+dependent never sees it. Resolving one level left TR_Mainland
+(TR → `Morrowind_ob.esm` → `Oblivion.esm`, and only `Oblivion.esm` is
+masterless) with 2,324 scripts failing on `undefined identifier TES4Polyfill`;
+walking the whole chain took it from 64 to 850 compiled. Nothing about this is
+Morrowind-specific — any plugin two or more levels from the masterless root
+hit it.
+
+Order is **nearest master first, then its masters**, so a nearer plugin's
+override of a script still wins the `-h` search ahead of the root's copy.
+Each master is resolved through `record_dir`, never by joining its name onto
+the export root: plugins imported from one mod archive share a folder named
+for the MOD, so a plain join misses them.
+
 ## The Say fallback line length
 <a id="say-line-fallback-duration"></a>
 
@@ -3478,3 +4736,81 @@ table is hand-read, not derived.
 so it can never reveal an objective the rules close WRONGLY. That is why
 `objective_completion_audit.py --against` sweeps all 6,338 objectives; it is
 what caught the 51 and the 109 above, neither of which appears in the residue.
+
+## <a id="property-names-go-through-safe-property-name"></a>Every property name goes through `safe_property_name`
+
+**Code:** `script_convert/constants.py`, `script_convert/converter.py`,
+`script_convert/pipeline.py`, `tes5_import/dialogue/quest.py`
+
+`safe_property_name` (and `sanitize_name` / `record_type_to_papyrus` beside it)
+are the cross-package spelling contract for Papyrus identifiers. They carry no
+leading underscore precisely because `tes5_import` imports them across the
+package boundary -- 66 call sites in 13 files.
+
+The rule is that a name reaches Papyrus through this function on **every** path,
+because the same identifier must be spelled identically in the declaration, in
+the body, and in the VMAD key. Three separate bugs came from one path skipping
+it:
+
+**Quest refs in the body.** An Oblivion quest EditorID can collide with a Skyrim
+script name (`MS14`). Emitting it raw left the body calling `MS14.SetStage()`
+while the declaration said `myMS14`; the CK then reads `MS14` as the TYPE and
+fails with "cannot call the member function SetStage ... on a type".
+
+**Sequence-counter conditions.** TES4 allows names Papyrus reserves (`endstate`,
+`MS40`), so a raw variable name in a generated condition is a parser error.
+
+**SCRO property keys.** Keying on the raw EditorID created a SECOND entry for any
+renamed EditorID: the generic `Quest` from the SCRO and the specific
+`TES4_MS14Script` from `_convert_ref` lived under different keys, so the
+type-downgrade guard never fired and the generic one won the declaration --
+leaving the body calling `myMS14.QuestDone` on a plain `Quest` ("field or
+property QuestDone not found"). The key must be the Papyrus-SAFE name, which is
+what `_convert_ref` stores and what `_collect_scro_properties` writes into the
+VMAD.
+
+A type already upgraded by `_convert_ref` (`Quest` -> `TES4_FGQuestTrack`) must
+not be downgraded: `_preload_stage_scro_refs` runs once per stage and would
+otherwise reset types promoted when an earlier stage's result script accessed
+cross-script variables.
+
+## Not every INFO needs a fragment — the dialogue stutter
+<a id="info-fragment-stutter"></a>
+
+**Code:** `script_convert/pipeline.py:info_needs_fragment`
+
+🛑 **`info_needs_fragment` is the single source of truth.** The fragment
+EMITTER (`_info_batch`) and the VMAD WRITER (`tes5_import.dialogue.converter`)
+must agree exactly: a VMAD flag bit with no function behind it makes the engine
+bind a missing function, and a `.pex` nothing attaches is dead weight. Both
+call it.
+
+### Why not always — the stutter fix
+
+Every INFO used to get one, so the plugin shipped **19,278 per-INFO `.pex`
+files** against vanilla Skyrim's ~5,500 — 100% of INFOs carrying a fragment
+where vanilla carries one on **17.6%**, and **141 bytes of VMAD per INFO**
+against vanilla's 14.
+
+That cost falls **on the line-selection path**: when the engine picks a
+dialogue line it must bind that INFO's fragment — load the `.pex`, link it,
+resolve its properties — *before* anything is spoken. This matches every
+symptom the other theories could not:
+
+- it fires on plain NPC activation (no script of ours runs, but the greeting's
+  fragment is still bound);
+- it happens even when the voice file is **missing**, because binding precedes
+  playback;
+- it warms up on repeat, because a bound script stays loaded;
+- consecutive lines reusing an already-loaded fragment do not stutter.
+
+**54% of the fragments (10,417) contained nothing but the LineBegan/LineEnded
+timing calls.** Those matter only for a topic a converted SCRIPT drives through
+`TES4Polyfill.SayLine`, which blocks until `OnBegin` reports the line started.
+A line the PLAYER picks never goes through SayLine, so its timing-only fragment
+was pure per-line cost with no behaviour attached.
+
+So a fragment is emitted only when it actually does something: the INFO has a
+TES4 result script to run; it reveals AddTopic unlock globals; it opens a
+service (barter/training) menu; or its topic is script-driven, so SayLine needs
+the Begin/End hooks.

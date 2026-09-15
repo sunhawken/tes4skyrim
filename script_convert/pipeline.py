@@ -7,12 +7,23 @@ import os
 import re
 import struct
 
-from tes5_import.text_reader import parse_export_file
-from worker_budget import worker_count
+from tes5_import.base.text_reader import parse_export_file
+from core.worker_budget import worker_count
 
-from script_convert.constants import (_sanitize_name, _safe_property_name, _record_type_to_papyrus, papyrus_script_name,
-                                     KNOWN_COMMANDS, SERVICE_MENU_CALL,
-                                     UDF_WIDE_TYPES)
+from asset_convert.game_paths import (current_namespace,
+                                      set_namespace)
+from script_convert.constants import (sanitize_name, safe_property_name, record_type_to_papyrus, papyrus_script_name,
+                                     SERVICE_MENU_CALL, UDF_WIDE_TYPES,
+                                     script_prefix)
+from script_convert.command_rows import KNOWN_COMMANDS
+from script_convert.conversation_sequence import (
+    sequence_gate,
+    split_counter_step,
+    split_stage_advances,
+    split_turn_handoff,
+    state_writes_before_setstage,
+    stepped_gate,
+)
 from script_convert.cross_ref import CrossRefGraph, master_names
 from script_convert.converter import ScriptConverter
 from script_convert.objective_completion import (
@@ -21,13 +32,8 @@ from script_convert.objective_completion import (
     sweep_targets,
 )
 from script_convert.symbols import property_declarations, IMPLICIT_NAMES
-from script_convert.tes5.blocks import (
-    Kind,
-    classify,
-    hoist_quest_start_above_writes,
-    scan,
-)
-from output_layout import assets_for  # noqa: E402
+from script_convert.tes5.blocks import Kind, classify
+from output_layout import assets_for
 
 
 # ===========================================================================
@@ -108,12 +114,20 @@ def _script_worker_init(xref, output_dir, info_reveals, service_topics,
                         quest_edid_by_fid=None, topic_unlock_globals=None,
                         message_menus=None, mesh_bounds_cache=None,
                         chargen_menus=None, say_topics=None,
-                        music_cues=None):
+                        music_cues=None, namespace=None):
+    """Seed one worker with the parent state that spawning does not carry.
+
+    `namespace` is installed FIRST: the generated-script prefix derives from
+    the active namespace, so any name built before it is wrong.
+    See: docs/commentary/asset_convert_texture.md#per-game-asset-namespace
+    """
+    if namespace:
+        set_namespace(namespace)
     # Windows spawns workers, so module-level caches loaded in the parent do
     # NOT carry over — each worker reloads the mesh-bounds cache or every
     # needs_havok_release() lookup answers 0 and no trap gets its release.
     if mesh_bounds_cache:
-        from tes5_import.mesh_bounds import load_mesh_bounds
+        from tes5_import.base.mesh_bounds import load_mesh_bounds
         load_mesh_bounds(mesh_bounds_cache, quiet=True)
     _WORKER_CTX.update(xref=xref, output_dir=output_dir,
                        info_reveals=info_reveals,
@@ -219,13 +233,8 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
                     pass
     os.makedirs(output_dir, exist_ok=True)
 
-    # Mesh physics facts, so a converted `playgroup` can ask whether the object
-    # it animates is HELD until a script releases it (breakaway pieces,
-    # constrained trap islands).  Without this the lookup silently answers 0
-    # for every mesh and no trap ever gets its SetMotionType release — see
-    # CrossRefGraph.needs_havok_release.
-    from tes5_import.mesh_bounds import load_mesh_bounds
-    from asset_convert.collision_extract import bounds_cache_is_current
+    from tes5_import.base.mesh_bounds import load_mesh_bounds
+    from asset_convert.collision.collision_extract import bounds_cache_is_current
     _bounds_cache = str(assets_for(export_dir) / 'mesh_bounds_cache.json')
     # A cache from before the HELD bit existed loads fine and answers 0 for
     # every mesh, so the release silently vanishes from every converted script.
@@ -294,10 +303,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
         if xref.ref_as_int:
             print(f'    {len(xref.ref_as_int)} ref variables detected as integer-only (cross-script)')
 
-    # Phase 1.6: AddTopic unlock plan — MUST be the same analysis the importer
-    # runs, so the SetValue lines in the generated fragments match the VMAD
-    # property bindings and GLOB records written into the ESM.
-    from tes5_import.dialog_unlocks import build_unlock_plan
+    from tes5_import.dialogue.unlocks import build_unlock_plan
     by_type = {}
     for sig in ('DIAL', 'INFO', 'QUST', 'SCPT', 'NPC_'):
         path = os.path.join(export_dir, f'{sig}.txt')
@@ -308,10 +314,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
 
     stats = _new_stats()
 
-    # Service-menu topics (Barter/Training): INFOs under them whose fragment
-    # is generated here must ALSO open the Skyrim menu — the importer attaches
-    # the shared static script only to INFOs WITHOUT their own fragment.
-    from tes5_import.dialog_converter import SERVICE_MENU_TOPICS, DIAL_TYPE_SERVICE
+    from tes5_import.dialogue.converter import (DIAL_TYPE_SERVICE, SERVICE_MENU_TOPICS)
     service_topics = {}
     for rec in by_type.get('DIAL', []):
         edid = rec.get('EditorID', '')
@@ -357,8 +360,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
     # worker pool, so every process sees the same set (see scan_say_topics).
     say_topics = scan_say_topic_fids(by_type)
     ScriptConverter.say_topics = say_topics
-    print(f'    script-driven topics: {len(say_topics)} '
-          f'(their INFOs keep Say() timing fragments)')
+    print(f'    script-driven topics: {len(say_topics)}')
 
     quest_script_vars = build_quest_script_vars(by_type)
     quest_edid_by_fid = {int(r.get('FormID','0'),16) & 0xFFFFFF:
@@ -374,7 +376,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
     # only, mirroring the importer's gate (a dependent plugin's copy would
     # collide with its master's script name).
     if not master_names(export_dir):
-        from tes5_import.npc_conversations import (build_conversation_plan,
+        from tes5_import.dialogue.conversations import (build_conversation_plan,
                                                    generate_driver_psc)
         conv_by_type = dict(by_type)
         for sig in ('ACHR', 'ACRE'):
@@ -446,7 +448,7 @@ def build_script_context(export_dir: str, output_dir: str) -> dict:
                 unlock_plan['stage_reveals'], say_durations,
                 quest_script_vars, quest_edid_by_fid, topic_unlock_globals,
                 message_menus, _bounds_cache, chargen_menus, say_topics,
-                _load_music_cues(output_dir))
+                _load_music_cues(output_dir), current_namespace())
     return {'initargs': initargs, 'scpt_work': scpt_work,
             'info_work': info_work, 'qust_work': qust_work, 'stats': stats}
 
@@ -654,7 +656,7 @@ def _scpt_batch(records: list, output_dir: str, xref: CrossRefGraph, stats: dict
             # the engine runs off (see resolve_scro_aliases).
             conv.set_scro_aliases(resolve_scro_aliases(
                 sctx, _scro_list(rec), xref))
-            name = _sanitize_name(edid or f'Script_{formid}')
+            name = sanitize_name(edid or f'Script_{formid}')
             papyrus = conv.convert_standalone(name, sctx, extends, edid)
 
             # The FILENAME must match the ScriptName the converter emitted, or
@@ -724,269 +726,61 @@ def build_quest_script_vars(by_type: dict) -> dict:
 
 
 
-_GET_QUEST_VARIABLE = 79        # TES4 func index; param2 = script-local index
 
 
-def _seq_counter_condition(rec: dict):
-    """(quest_edid, var_name, int_value) from this INFO's
-    `GetQuestVariable <q>.<v> == N` condition, or None. Equality only — a
-    `>=`/`<` gate is not a sequencer."""
-    script_vars = _WORKER_CTX.get('quest_script_vars') or {}
-    names = _WORKER_CTX.get('quest_edid_by_fid') or {}
-    i = -1
-    while True:
-        i += 1
-        raw = rec.get(f'Condition[{i}].Raw')
-        if raw is None:
-            return None
-        try:
-            d = bytes.fromhex(raw)
-        except ValueError:
-            continue
-        if len(d) < 20 or struct.unpack_from('<H', d, 8)[0] != _GET_QUEST_VARIABLE:
-            continue
-        if (d[0] >> 5) != 0:                      # operator must be '=='
-            continue
-        comp = struct.unpack_from('<f', d, 4)[0]
-        if comp != int(comp):
-            continue
-        quest_fid = struct.unpack_from('<I', d, 12)[0] & 0x00FFFFFF
-        var_idx = struct.unpack_from('<I', d, 16)[0]
-        name = script_vars.get(quest_fid, {}).get(var_idx)
-        quest = names.get(quest_fid, '')
-        if name and quest:
-            return quest, name, int(comp)
+def _info_begin_fragment(body_lines: list, seq_gate: str,
+                         length: float) -> list:
+    """Fragment_1 (OnBegin): report the line, then hand the turn over.
 
-
-def _sequence_gate(rec: dict) -> str:
-    """`<quest>.<var> == <n>` guard for a polled-conversation INFO, else ''.
-
-    These conversations are a sequencer: each INFO is gated on an exact counter
-    (`GetQuestVariable CharacterGen.convCount == 8`) and its result script does
-    `convCount + 1` to hand off to the next line. The counter is ALSO re-seeded
-    out-of-band by quest stages ("make sure we're at the right spot", 10 of them
-    in CharacterGen alone), and those stages fire off package completion —
-    which lands whenever the actor arrives, not when the line ends.
-
-    A re-seed can land while a line is still playing. The in-flight line's End
-    fragment then applies `+1` to the RE-SEEDED value and overshoots:
-    CharacterGen stage 12 sets convCount=8 for "What's this prisoner doing
-    here?" while line 7 is still audible, line 7's fragment makes it 9, and the
-    cell-door exchange never plays (verified from a runtime trace:
-    `FRAG 00032B0A cnt=8` -> `cnt=9 spk=0`).
-
-    Guarding the fragment on the counter the INFO itself requires makes the
-    re-seed authoritative — a line whose turn has passed applies nothing. The
-    gate is only APPLIED when the body actually steps that counter (see
-    _split_counter_step): a line the quest script advances for is not a
-    sequencer and must never be gated.
+    The handoff belongs here rather than in OnEnd because TES4's synchronous
+    Say let the result script hand over in the frame the line STARTED. Only a
+    body that steps the gate's own counter is a sequencer and gets one.
+    See: docs/commentary/script_convert.md#turn-handoff
     """
-    var = _seq_counter_condition(rec)
-    if not var:
-        return ''
-    quest, name, value = var
-    # The VARIABLE name needs the same sanitising the converter gives every
-    # property it declares — TES4 allows names Papyrus reserves (`endstate`,
-    # MS40) and a raw name here is a parser error.
-    return (f'{_safe_property_name(quest)}.'
-            f'{_safe_property_name(name)} == {value}')
+    handoff = []
+    if seq_gate and body_lines:
+        counter_step, rest = split_counter_step(body_lines, seq_gate)
+        if counter_step:
+            gated_rest, _ = split_stage_advances(rest)
+            handoff, _ = split_turn_handoff(counter_step, gated_rest)
+    out = ['Function Fragment_1(ObjectReference akSpeakerRef)',
+           f'  TES4Polyfill.LineBegan(akSpeakerRef, {length:g})']
+    if handoff:
+        out.append(f"  If {seq_gate}  ; still this line's turn")
+        out.extend('  ' + b for b in handoff)
+        out.append('  EndIf')
+    return out + ['EndFunction', '']
 
 
-_SETSTAGE_RE = re.compile(r'^\s*\w[\w.]*\.SetStage\s*\(', re.IGNORECASE)
-# The conversation bookkeeping: `<quest>.<field> = <literal>` (speaker, target)
-# and the counter handoff `<quest>.<field> = <quest>.<field> +/- <literal>`
-# (convCount). Deliberately narrow — no calls, nothing whose value depends on
-# anything a SetStage could change except the counter itself, which MUST be
-# hoisted: 13 CharacterGen stage fragments RE-SEED convCount, and a `+ 1`
-# landing after such a SetStage overshoots the re-seeded value (the very drift
-# _sequence_gate exists to stop).
-_STATE_WRITE_RE = re.compile(
-    r'^\s*(?P<lhs>\w[\w.]*)\s*=\s*'
-    r'(?:[-+]?[\d.]+|(?P<base>\w[\w.]*)\s*[-+]\s*[\d.]+)\s*(;.*)?$')
+def _info_end_fragment(body_lines: list, seq_gate: str, reveals,
+                       service_kind, length: float) -> list:
+    """Fragment_0 (OnEnd): unlocks, the TES4 result, then LineEnded LAST.
 
-
-def _is_state_write(line: str) -> bool:
-    """A bare literal assignment, or a counter step `x = x + n` on ITSELF."""
-    m = _STATE_WRITE_RE.match(line)
-    if not m:
-        return False
-    base = m.group('base')
-    return base is None or base.lower() == m.group('lhs').lower()
-
-
-def _split_counter_step(lines: list, seq_gate: str) -> tuple:
-    """Split off the `<counter> = <counter> + n` step the sequence gate tests.
-
-    The gate is `<quest>.<counter> == K`. Emitting that step FIRST closes the
-    gate against a re-fire, so the timer release can follow immediately —
-    before the body's SetStage hands control to the engine. Returns
-    (counter_lines, rest) preserving order; (,[]) when there is no such step,
-    in which case the caller just emits the body unchanged.
+    A poll waiting on this speaker must see the result's state writes before
+    it can issue the next line. The body is gated only when it owns the
+    handoff; when the QUEST SCRIPT advances the counter instead, the value has
+    already moved on and gating here would discard the whole body.
+    See: docs/commentary/script_convert.md#sequenced-fragment-surgery
     """
-    m = re.match(r'\s*(\S+)\s*==', seq_gate or '')
-    if not m:
-        return [], list(lines)
-    counter = m.group(1)
-    step = re.compile(
-        r'^\s*' + re.escape(counter) + r'\s*=\s*' + re.escape(counter)
-        + r'\s*[-+]\s*[\d.]+\s*(;.*)?$', re.IGNORECASE)
-    idx = next((i for i, ln in enumerate(lines) if step.match(ln)), None)
-    if idx is None:
-        return [], list(lines)
-    return [lines[idx]], lines[:idx] + lines[idx + 1:]
-
-
-_STAGE_ADVANCE_RE = re.compile(
-    r'^(\s*)([A-Za-z_]\w*)\.SetStage\((\d+)\)\s*(;.*)?$', re.IGNORECASE)
-
-
-# `<quest>.speaker = N` / `<quest>.target = N` -- the TURN HANDOFF of a polled
-# conversation.  Deliberately narrow: a bare literal assignment to a field
-# whose name says it selects the next talker.
-_HANDOFF_WRITE_RE = re.compile(
-    r'^\s*\w[\w.]*\.(?:speaker|target)\s*=\s*'
-    r'(?:-?[\d.]+|[A-Za-z_]\w*)\s*(;.*)?$', re.IGNORECASE)
-
-
-def _split_turn_handoff(counter_step, gated_rest):
-    """Split the turn handoff out of an End-fragment body.
-
-    Returns (handoff, remainder): the counter step plus any speaker/target
-    literal writes, and everything else in original order.
-
-    THE HANDOFF CANNOT WAIT FOR OnEnd.  TES4's Say was SYNCHRONOUS -- it
-    returned the line's length, so the result script set `convCount` /
-    `speaker` and charged `convTimer` IN THE SAME FRAME THE LINE STARTED.
-    The next speaker's guard (`speaker == N && convTimer <= 0`) was then
-    already open, held off only by the timer -- the pacing the author wrote.
-
-    Emitting the handoff in the End fragment makes every line pay a serial
-    round trip: the next speaker cannot even LOOK until the previous line
-    has completely finished.  Measured (temp/chargen_rec_5.log):
-
-        79.11  LineBegan Renault len=2.06     <- line starts
-        81.54  LineEnded Renault              <- 2.43s later
-        81.57  request   Baurus ("Yessir.")   <- only now does he ask
-
-    Moving ONLY these writes to OnBegin restores the TES4 timing.  Stage
-    advances, AddTopic unlocks and item/faction changes stay in OnEnd: those
-    are consequences of the line having been DELIVERED, not of whose turn
-    it is.
-    """
-    handoff = list(counter_step)
-    rest = []
-    for line in gated_rest:
-        if _HANDOFF_WRITE_RE.match(line):
-            handoff.append(line)
-        else:
-            rest.append(line)
-    return handoff, rest
-
-
-def _stepped_gate(seq_gate, counter_step):
-    """The sequence gate rewritten for AFTER the counter step has applied.
-
-    Fragment_1 (OnBegin) now performs the handoff, so by the time
-    Fragment_0 (OnEnd) runs the counter has already moved.  `convCount == 8`
-    would be false and the REST of the body -- item grants, faction changes,
-    the author's other result-script writes -- would be silently dropped.
-    Shift the compared value by the same delta the step applies.
-    """
-    m = re.match(r'(.*?==\s*)(-?[\d.]+)\s*$', seq_gate or '')
-    if not m or not counter_step:
-        return seq_gate
-    step = re.search(r'([-+])\s*([\d.]+)', counter_step[0].split('=', 1)[1])
-    if not step:
-        return seq_gate
-    delta = float(step.group(2))
-    if step.group(1) == '-':
-        delta = -delta
-    val = float(m.group(2)) + delta
-    txt = str(int(val)) if val == int(val) else ('%g' % val)
-    return m.group(1) + txt
-
-
-def _split_stage_advances(body: list) -> tuple:
-    """Split a sequenced fragment body into (gated writes, stage advances).
-
-    The sequence gate exists to stop an out-of-turn `counter + 1` and stale
-    speaker/target writes from clobbering a mid-line re-seed. Its original
-    form swallowed the fragment's SetStage too, and that line is frequently
-    the ONLY path to the next quest beat: a package-completion re-seed landed
-    while CharacterGen line 11 was still audible (Say() is async), line 11's
-    End fragment was rejected, its `SetStage(13)` never ran, and the quest
-    stalled forever — the Emperor greeted generically and offered only
-    'Rumors', with nothing in the Papyrus log because a rejected gate is
-    silent by design.
-
-    A stage advance is safe OUTSIDE the gate because it is emitted behind a
-    monotonic guard: TES4 stages are flags and its GetStage returns the
-    highest one set, so an authored `SetStage N` can only mean "beat N is
-    reached". Past N already → the guard skips it; turn rejected but the
-    advance still owed → it runs.
-
-    Only TOP-LEVEL `<quest>.SetStage(<literal>)` lines are lifted; one nested
-    in the body's own If/While block stays where the author put it.
-    """
-    gated, advances = [], []
-    # A fragment body carries no header of its own, so `scan` is given one
-    # to track against; `not stack` is then "top level of the body".
-    for ln in scan(['Function _()'] + list(body)):
-        if ln.kind is Kind.HEADER:
-            continue
-        m = _STAGE_ADVANCE_RE.match(ln.text) if not ln.stack else None
-        if not m:
-            gated.append(ln.text)
-            continue
-        indent, quest, stage, comment = m.groups()
-        advances.append(f'{indent}If {quest}.GetStage() < {stage}'
-                        '  ; advance survives a rejected turn')
-        advances.append(f'{indent}  {quest}.SetStage({stage})'
-                        + (f'  {comment}' if comment else ''))
-        advances.append(f'{indent}EndIf')
-    return gated, advances
-
-
-def _state_writes_before_setstage(lines: list) -> list:
-    """Move plain state assignments ahead of the first SetStage call.
-
-    `SetStage(N)` executes stage N's fragment INLINE, and those fragments call
-    `EvaluatePackage()`. The engine then arbitrates packages against whatever
-    state is committed at that instant — so a `speaker`/`convCount` write that
-    comes after the SetStage is invisible to it. CharacterGen stage 18 showed
-    this directly: the package was selected and then kicked back within the
-    same second (`PKGSTART 04D84D` -> `PKGCHANGE` back to `032B14`), and
-    whether it stuck varied run to run purely on engine latency.
-
-    Only literal assignments are hoisted, and only from AFTER the first
-    SetStage. Anything with a call, an expression, or a conditional keeps its
-    place, so no side-effecting statement is ever reordered.
-    """
-    first = next((i for i, ln in enumerate(lines) if _SETSTAGE_RE.match(ln)),
-                 None)
-    if first is None:
-        return lines
-    # Only hoist from a FLAT tail — a nested block (If/While) after the
-    # SetStage may depend on what the stage did.  `classify` is the shared
-    # barrier; it also stops on a Return, which this pass's own regex did
-    # not (measured: no fragment body has one in the tail, 0 of 75,170).
-    tail = lines[first + 1:]
-    if any(classify(ln) is not Kind.OTHER for ln in tail):
-        return lines
-    hoist = [ln for ln in tail if _is_state_write(ln)]
-    if not hoist:
-        return lines
-    rest = [ln for ln in tail if not _is_state_write(ln)]
-    out = lines[:first] + hoist + [lines[first]] + rest
-    # Moving a write ABOVE the SetStage can strand it below a `Start()` on the
-    # same quest, which is the one reordering that silently destroys it:
-    # Skyrim's Start() resets every Auto property, so the seeded value is gone
-    # (ArenaICGrandChampion's `CrazyIdea`, 2 sites).  The converter already
-    # hoists Start() above such writes, but it ran BEFORE this pass, so the
-    # invariant "no Start() below a write to its own quest" has to be
-    # RE-ESTABLISHED on the reordered result.  It is a fixup of this
-    # function's own output, not a second pass over the script.
-    return hoist_quest_start_above_writes(out)
+    out = ['Function Fragment_0(ObjectReference akSpeakerRef)']
+    out += [f'  {gname}.SetValue(1)' for gname in reveals]
+    body_lines = state_writes_before_setstage(body_lines)
+    counter_step, rest_body = split_counter_step(body_lines, seq_gate)
+    if seq_gate and body_lines and counter_step:
+        gated_rest, stage_advances = split_stage_advances(rest_body)
+        _, end_rest = split_turn_handoff(counter_step, gated_rest)
+        if end_rest:
+            out.append(f"  If {stepped_gate(seq_gate, counter_step)}"
+                       f"  ; turn still ours (counter stepped in OnBegin)")
+            out.extend('  ' + b for b in end_rest)
+            out.append('  EndIf')
+        out.extend(stage_advances)
+    else:
+        out.extend(body_lines)
+    if service_kind:
+        out.append(SERVICE_MENU_CALL[service_kind])
+    out.append(f'  TES4Polyfill.LineEnded(akSpeakerRef, {length:g})')
+    return out + ['EndFunction', '']
 
 
 def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
@@ -1048,7 +842,8 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             length = float(say_durations.get(f'info:{formid.upper()}') or 0.0)
         except (TypeError, ValueError):
             length = 0.0
-        seq_gate = _sequence_gate(rec)
+        seq_gate = sequence_gate(rec, _WORKER_CTX.get('quest_script_vars') or {},
+                             _WORKER_CTX.get('quest_edid_by_fid') or {})
 
         if has_script:
             stats['info_total'] += 1
@@ -1064,7 +859,7 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
                 body_lines = conv.convert_fragment(result_script, 'TopicInfo')
                 prop_refs = dict(conv.sc.property_refs)
 
-            script_name = f'TES4_TIF__{formid}'
+            script_name = f'{script_prefix("_TIF__")}{formid}'
             out_lines = [
                 f'ScriptName {script_name} extends TopicInfo Hidden',
                 '',
@@ -1088,76 +883,9 @@ def _info_batch(records: list, output_dir: str, xref: CrossRefGraph,
             if declared:
                 out_lines.append('')
 
-            # OnBegin: the engine has selected this line and started it.
-            #
-            # The TURN HANDOFF belongs here, not in OnEnd: TES4's synchronous
-            # Say let the result script hand the turn over in the frame the
-            # line STARTED, so the next speaker's guard was already open and
-            # only `convTimer` paced him.  See _split_turn_handoff.
-            _begin_handoff = []
-            if seq_gate and body_lines:
-                _cs, _rest = _split_counter_step(body_lines, seq_gate)
-                if _cs:
-                    _gr, _ = _split_stage_advances(_rest)
-                    _begin_handoff, _ = _split_turn_handoff(_cs, _gr)
-            out_lines.append('Function Fragment_1(ObjectReference akSpeakerRef)')
-            out_lines.append(
-                f'  TES4Polyfill.LineBegan(akSpeakerRef, {length:g})')
-            if _begin_handoff:
-                out_lines.append(f"  If {seq_gate}  ; still this line's turn")
-                out_lines.extend('  ' + b for b in _begin_handoff)
-                out_lines.append('  EndIf')
-            out_lines.append('EndFunction')
-            out_lines.append('')
-
-            # OnEnd: the line has finished.  Unlock the AddTopic-revealed
-            # topics first (right before the topic menu refreshes), then the
-            # TES4 result, then the "line over" hook LAST — a poll waiting on
-            # this speaker must see the result's state writes before it can
-            # issue the next line.
-            out_lines.append('Function Fragment_0(ObjectReference akSpeakerRef)')
-            for gname in reveals:
-                out_lines.append(f'  {gname}.SetValue(1)')
-            body_lines = _state_writes_before_setstage(body_lines)
-            # A polled-conversation line whose turn has already passed (a quest
-            # stage re-seeded the counter mid-line) must apply NOTHING, or its
-            # `counter + 1` overshoots the re-seeded value. See _sequence_gate.
-            #
-            # ONLY when THIS fragment owns the handoff, i.e. its own body steps
-            # the counter the gate tests (`convCount = convCount + 1`).  That
-            # step is the AUTHORED marker of a sequencer.  When the QUEST
-            # SCRIPT advances the variable instead, it does so as it STARTS
-            # each line (`set waittimer to X.SayTo ...` then `set JiubSpeak to
-            # 3`) and the value has already moved on by the time this End
-            # fragment runs; gating there would discard the whole body
-            # (Morroblivion's Jiub set `Guard01Stage = 1` inside an
-            # `If JiubSpeak == 2` that was 3 by then, so the guard never got
-            # his move package and never walked to the player).
-            counter_step, rest_body = _split_counter_step(body_lines, seq_gate)
-            if seq_gate and body_lines and counter_step:
-                # The quest's stage advance must survive a REJECTED turn — see
-                # _split_stage_advances. Only the counter/speaker state writes
-                # stay inside the gate.
-                gated_rest, stage_advances = _split_stage_advances(rest_body)
-                # The counter step and speaker/target writes already ran in
-                # Fragment_1 (OnBegin); repeating them here would apply the
-                # `+ 1` twice and skip a line.  What remains must gate on the
-                # STEPPED value, or it would all be silently discarded.
-                _, end_rest = _split_turn_handoff(counter_step, gated_rest)
-                if end_rest:
-                    out_lines.append(
-                        f"  If {_stepped_gate(seq_gate, counter_step)}"
-                        f"  ; turn still ours (counter stepped in OnBegin)")
-                    out_lines.extend('  ' + b for b in end_rest)
-                    out_lines.append('  EndIf')
-                out_lines.extend(stage_advances)
-            else:
-                out_lines.extend(body_lines)
-            if service_kind:
-                out_lines.append(SERVICE_MENU_CALL[service_kind])
-            out_lines.append(f'  TES4Polyfill.LineEnded(akSpeakerRef, {length:g})')
-            out_lines.append('EndFunction')
-            out_lines.append('')
+            out_lines += _info_begin_fragment(body_lines, seq_gate, length)
+            out_lines += _info_end_fragment(body_lines, seq_gate, reveals,
+                                            service_kind, length)
 
             # GetInCell prefix-family helpers the fragment body calls by name.
             # Only a scripted INFO has a converter (and therefore a body).
@@ -1247,7 +975,7 @@ def _qust_batch(records: list, output_dir: str, xref: CrossRefGraph,
             conv = ScriptConverter(xref)
             # Pre-populate external references from SCRO entries
             _preload_scro_refs(conv, rec, xref)
-            script_name = papyrus_script_name(edid, 'TES4_QF_')
+            script_name = papyrus_script_name(edid, script_prefix('_QF_'))
             out_lines = [
                 f'ScriptName {script_name} extends Quest Hidden',
                 '',
@@ -1534,7 +1262,7 @@ def _add_scro_ref(conv: 'ScriptConverter', fid: str, xref: CrossRefGraph):
     if not edid:
         return
     rtype = xref.record_type.get(fid, '')
-    ptype = _record_type_to_papyrus(rtype)
+    ptype = record_type_to_papyrus(rtype)
     # Prefer attached SCPT-derived type for cross-script property accesses
     # (e.g. Arena.AnnounceWin). For QUST records, start with 'Quest' base type —
     # the specific type will be promoted later if the script body uses dot-notation
@@ -1543,18 +1271,7 @@ def _add_scro_ref(conv: 'ScriptConverter', fid: str, xref: CrossRefGraph):
         script_type = xref.get_record_script_type(edid)
         if script_type:
             ptype = script_type
-    # Key on the Papyrus-SAFE name, which is what _convert_ref stores and what
-    # _collect_scro_properties writes into the VMAD.  Keying on the raw EditorID
-    # instead created a SECOND entry for any EditorID that gets renamed (MS14 is
-    # a vanilla Skyrim script name, so it becomes myMS14): the generic 'Quest'
-    # from this SCRO and the specific 'TES4_MS14Script' from _convert_ref lived
-    # under different keys, so the downgrade guard below never fired and the
-    # generic one won the declaration — leaving the body calling myMS14.QuestDone
-    # on a plain Quest ("field or property QuestDone not found").
-    key = _safe_property_name(edid)
-    # Don't downgrade a type already upgraded by _convert_ref (e.g. Quest → TES4_FGQuestTrack).
-    # _preload_stage_scro_refs is called once per stage and would otherwise reset types
-    # that were promoted when a prior stage's result script accessed cross-script vars.
+    key = safe_property_name(edid)
     cur = conv.sc.property_refs.get(key, '')
     if cur and cur != 'Quest' and ptype == 'Quest':
         return
@@ -1600,7 +1317,7 @@ def build_vmad_quest_fragments(quest_edid: str, stage_fragments: list[tuple[int,
 
     Returns VMAD binary data.
     """
-    script_name = papyrus_script_name(quest_edid, 'TES4_QF_')
+    script_name = papyrus_script_name(quest_edid, script_prefix('_QF_'))
     buf = bytearray()
 
     # VMAD header
@@ -1749,39 +1466,13 @@ def info_needs_fragment(rec: dict, info_reveals: dict = None,
                         service_topics: dict = None) -> bool:
     """Does this INFO need a Papyrus fragment script at all?
 
-    🛑 THE SINGLE SOURCE OF TRUTH.  The fragment EMITTER (_info_batch) and the
-    VMAD WRITER (tes5_import.dialog_converter) must agree exactly: a VMAD flag
-    bit with no function behind it makes the engine bind a missing function,
-    and a .pex nothing attaches is dead weight.  Both call THIS.
+    🛑 THE SINGLE SOURCE OF TRUTH: the fragment emitter (`_info_batch`) and the
+    VMAD writer (`tes5_import.dialogue.converter`) must agree exactly, so both
+    call this.  True when the INFO has a TES4 result script, reveals AddTopic
+    unlock globals, opens a service menu, or sits on a script-driven topic
+    whose SayLine needs the Begin/End hooks.
 
-    WHY NOT ALWAYS (the stutter fix)
-    -------------------------------------------
-    Every INFO used to get one, so the plugin shipped 19,278 per-INFO .pex
-    files against vanilla Skyrim's ~5,500 -- 100% of INFOs carrying a fragment
-    where vanilla carries one on 17.6%, and 141 bytes of VMAD per INFO against
-    vanilla's 14.
-
-    That costs time ON THE LINE-SELECTION PATH: when the engine picks a
-    dialogue line it must bind that INFO's fragment -- load the .pex, link it,
-    resolve its properties -- BEFORE anything is spoken.  Measured against the
-    user's report, this matches every symptom the other theories could not:
-    it fires on plain NPC activation (no script of ours runs, but the greeting's
-    fragment is still bound), on topic selection, and on Say(); it happens even
-    when the voice file is MISSING, because binding precedes playback; it warms
-    up on repeat, because a bound script stays loaded; and consecutive lines
-    that reuse an already-loaded fragment do not stutter.
-
-    54% of the fragments (10,417) contained nothing but the LineBegan/LineEnded
-    timing calls.  Those are only meaningful for a topic a converted SCRIPT
-    drives through TES4Polyfill.SayLine, which blocks until OnBegin reports the
-    line started.  A line the PLAYER picks never goes through SayLine, so its
-    timing-only fragment was pure per-line cost with no behaviour attached.
-
-    So a fragment is emitted only when it actually DOES something:
-      * the INFO has a TES4 result script to run;
-      * it reveals AddTopic unlock globals;
-      * it opens a service (barter/training) menu;
-      * or its topic is script-driven, so SayLine needs the Begin/End hooks.
+    See: docs/commentary/script_convert.md#info-fragment-stutter
     """
     from script_convert.converter import ScriptConverter
     info_reveals = info_reveals or {}
@@ -1829,7 +1520,7 @@ def build_vmad_info_fragment(info_formid: str, property_values: dict = None,
 
     Returns VMAD binary data.
     """
-    script_name = script_name or f'TES4_TIF__{info_formid}'
+    script_name = script_name or f'{script_prefix("_TIF__")}{info_formid}'
     buf = bytearray()
 
     # VMAD header

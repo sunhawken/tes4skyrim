@@ -13,7 +13,7 @@ import struct
 import pytest
 
 from tes5_import.record_types import equipment as eq
-from tes5_import.skyrim_overrides import (
+from tes5_import.base.equivalents import (
     ARMA_ADDITIONAL_RACES,
     ARMA_ADDITIONAL_RACES_NONBEAST,
     ARMA_BEAST_RACES,
@@ -205,7 +205,7 @@ def test_beast_fields_move_head_gear_off_the_beast_skull():
     pytest.importorskip('scipy')
     from scipy.spatial import cKDTree
 
-    from asset_convert import head_fit
+    from asset_convert.character import head_fit
 
     if not head_fit.fit_available(False):
         pytest.skip('head-fit data not built')

@@ -8,7 +8,7 @@ import os
 import struct
 
 from .common import (
-    _prefix_path,
+    prefix_path,
     get_formid,
     get_int,
     get_str,
@@ -152,7 +152,7 @@ def _shipped_name(name: str) -> str:
 
 def _sound_path(name: str) -> str:
     """One SNDR ANAM value: `tes4\\<path>`, relative to `Sound\\`."""
-    return _prefix_path(_shipped_name(name))
+    return prefix_path(_shipped_name(name))
 
 
 def _sound_anam_paths(filename: str) -> list:
@@ -179,7 +179,13 @@ def _sound_anam_paths(filename: str) -> list:
                 if e.lower().endswith(_AUDIO_EXTS)]
     return variants or literal
 
-def _sndr_record(rec: dict, writer, edid: str, filename: str) -> tuple:
+
+def sndr_editor_id(edid: str, fid: int) -> str:
+    """The EditorID of a SOUN's companion SNDR."""
+    return f"TES4_{edid}_SNDR" if edid else f"TES4_SOUN_{fid:08X}_SNDR"
+
+
+def _sndr_record(rec: dict, writer, edid: str, filename: str) -> tuple:
     """Build this SOUN's companion SNDR.  Returns (sndr_bytes, sndr_formid).
 
     SNDR order: EDID CNAM GNAM SNAM ANAM[] ONAM LNAM BNAM.
@@ -197,8 +203,7 @@ def _sound_anam_paths(filename: str) -> list:
     sndr_fid = writer.derive_formid('SNDR', fid)
     record_sndr_for_soun(fid, sndr_fid)
 
-    sndr_edid = f"TES4_{edid}_SNDR" if edid else f"TES4_SOUN_{fid:08X}_SNDR"
-    subs = pack_string_subrecord('EDID', sndr_edid)
+    subs = pack_string_subrecord('EDID', sndr_editor_id(edid, fid))
     subs += pack_uint32_subrecord('CNAM', 0x1EEF540A)
     subs += pack_formid_subrecord('GNAM', _sndr_gnam(tes4_flags, is_2d))
     for anam in _sound_anam_paths(filename):

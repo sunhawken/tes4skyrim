@@ -19,14 +19,18 @@ argument text -- so those are properties of the CALL and live on it.
 from script_convert import resolve_name as _resolve_name
 from script_convert.constants import (
     ACTOR_VALUE_MAP, ANIM_GROUP_EVENTS, ATTRIBUTE_STUB_VALUE, CASTABLE,
-    GMST_TO_ACTOR_VALUE, param_types,
-    PLACED_REF_SIGS, TES4_ATTRIBUTES, _ACTOR_VALUE_FUNCTIONS,
-    _ACTOR_VALUE_READ_FUNCTIONS, TES4_ASSAULT_BOUNTY, TES4_MURDER_BOUNTY,
-    TES4_STEAL_BOUNTY, _safe_property_name, papyrus_script_name,
+    PLACED_REF_SIGS, TES4_ASSAULT_BOUNTY, TES4_ATTRIBUTES, TES4_MURDER_BOUNTY,
+    TES4_STEAL_BOUNTY, is_generated_script_type, safe_property_name,
+    papyrus_script_name
 )
+from script_convert.command_rows import (
+    COMMAND_ROWS, GMST_TO_ACTOR_VALUE, ACTOR_VALUE_FUNCTIONS,
+    ACTOR_VALUE_READ_FUNCTIONS, param_types
+)
+from script_convert.commands_falloutnv import FALLOUT_HANDLERS
 
 #: TES4 command name (lowercase) -> handler `(ctx, call) -> str | None`.
-REGISTRY: dict = {}
+REGISTRY: dict = dict(FALLOUT_HANDLERS)
 
 
 def command(*names: str):
@@ -114,7 +118,7 @@ def stage(ctx, call) -> str:
     quest_src = parts[0].strip() if parts else (call.ref or '')
     if not quest_src:
         return None
-    prop = _safe_property_name(quest_src)
+    prop = safe_property_name(quest_src)
     # Never DOWNGRADE: the same quest is often reached both as a stage target
     # and as a cross-script variable owner (`Arena.SetStage 10` beside
     # `Arena.ChorrolMatch`), and the specific TES4_<script> type is what makes
@@ -152,7 +156,7 @@ def quest_state(ctx, call) -> str:
     # ABORTS the fragment -- so the Shivering Isles post-quest dialogue quest
     # was never started.
     quest_src = ctx._scro_alias_for(quest_src) or quest_src
-    prop = _safe_property_name(quest_src)
+    prop = safe_property_name(quest_src)
     # Keep an existing type: a TES4_XxxScript (which extends Quest) still
     # answers Start/Stop/IsRunning, and the cross-script variable reads that
     # need that type keep working.  Quest is enough when nothing is known --
@@ -179,7 +183,7 @@ def global_value(ctx, call) -> str:
     gname = call.source(0).strip()
     if not gname:
         return None
-    safe = _safe_property_name(gname)
+    safe = safe_property_name(gname)
     ctx.sc.property_refs[safe] = 'GlobalVariable'
     if call.name == 'getglobalvalue':
         return ctx._global_read(safe)
@@ -221,7 +225,7 @@ def udf_call(ctx, call) -> str:
         return None
     fid = ctx.xref.edid_to_formid.get(target.lower(), '') if ctx.xref else ''
     canon = ctx.xref.formid_to_edid.get(fid, target) if fid else target
-    prop = _safe_property_name(canon)
+    prop = safe_property_name(canon)
     ctx.sc.property_refs[prop] = papyrus_script_name(canon)
     args = [call.arg(i) for i in range(1, len(call))]
     ctx.sc.udf_calls.append((prop, tuple(args)))
@@ -246,8 +250,9 @@ def say(ctx, call) -> str:
     parts = ctx.arg_srcs()
     # SayTo names the TARGET first and the topic second.
     n = 1 if (call.name == 'sayto' and len(parts) >= 2) else 0
-    topic = call.arg(n, 'None')
+    topic = 'None'
     if len(parts) > n:
+        topic = safe_property_name(parts[n].strip().split()[0])
         ctx._mark_topic_property(parts[n].strip().split()[0])
 
     ref = ctx._resolve_objref_ref(call.ref, call.extends)
@@ -298,13 +303,12 @@ def start_conversation(ctx, call) -> str:
 def add_topic(ctx, call) -> str:
     """AddTopic on a GATED topic opens that topic's unlock gate.
 
-    Skyrim has no AddTopic, so the visibility model is re-expressed as one
-    `TES4Unlock_<topic>` global per explicitly-added topic (see
-    tes5_import/dialog_unlocks.py).  INFO and quest-stage fragments already
-    emit the SetValue; a script AddTopic is the THIRD reveal route.
-    Load-bearing rather than cosmetic: TGReadWantedPoster and
-    TG00MysteriousNoteScript are how the player first learns of the Gray Fox.
-    An UNGATED topic is already visible, so it no-ops.
+    Skyrim has no AddTopic, so visibility is re-expressed as one
+    `TES4Unlock_<topic>` global per explicitly-added topic.  A script AddTopic
+    is the THIRD reveal route after INFO and quest-stage fragments; an
+    UNGATED topic is already visible, so it no-ops.
+
+    See: docs/commentary/tes5_import_dialogue.md#addtopic-unlock-globals
     """
     topic = call.source(0).strip().strip('"')
     gname = (ctx.topic_unlock_globals or {}).get(topic.lower())
@@ -532,7 +536,8 @@ def _as_actor(ctx, target: str) -> str:
     """Cast or register `target` so it is Actor-typed at the call site."""
     vtype = ctx.sc.var_types.get(target.lower(), '')
     ptype = ctx.sc.property_refs.get(target, '')
-    if ptype.startswith('TES4_') or 'ObjectReference' in (ptype, vtype):
+    if is_generated_script_type(ptype) \
+            or 'ObjectReference' in (ptype, vtype):
         return f'({target} as Actor)'
     if not ptype and not vtype and target.isidentifier():
         ctx.sc.property_refs[target] = 'Actor'
@@ -557,7 +562,7 @@ def magic_effect_visuals(ctx, call) -> str:
     if not shader:
         return ctx.note(f'{call.written()} (no shader found for effect code)')
     ref = ctx._resolve_objref_ref(call.ref, call.extends)
-    safe = _safe_property_name(shader)
+    safe = safe_property_name(shader)
     ctx.sc.property_refs[safe] = 'EffectShader'
     if call.name in ('sme', 'stopmagiceffectvisuals'):
         return f'{safe}.Stop({ref})'
@@ -595,7 +600,7 @@ def get_is_current_package(ctx, call) -> str:
     ref = ctx._resolve_self_ref(call.ref, call.extends, actor_func=True)
     if ref == 'Self' and call.extends != 'Actor':
         ref = '(Self as Actor)'
-    safe = _safe_property_name(arg)
+    safe = safe_property_name(arg)
     ctx.sc.property_refs[safe] = 'Package'
     return f'({ref}.GetCurrentPackage() == {safe})'
 
@@ -765,7 +770,7 @@ def is_in_faction(ctx, call) -> str:
     """IsInFaction -- Papyrus declares it on Actor, so the subject is cast."""
     if not len(call):
         return None
-    ctx.sc.property_refs[_safe_property_name(call.source(0).strip())] = 'Faction'
+    ctx.sc.property_refs[safe_property_name(call.source(0).strip())] = 'Faction'
     ref = ctx._resolve_self_ref(call.ref, call.extends, actor_func=True)
     if ref == 'Self' and call.extends != 'Actor':
         ref = '(Self as Actor)'
@@ -802,16 +807,29 @@ def faction_reaction(ctx, call) -> str:
 
     Skyrim replaced it with faction RELATIONS, which Papyrus reaches through
     the polyfill; the two factions and the amount are the payload.
+
+    A non-literal amount cannot be bucketed at conversion time, so it is
+    bucketed at RUNTIME on the same sign -- a scripted variable still lands
+    on a real enum tier instead of a dead modifier.
     """
     if len(call) < 2:
         return ctx.note(f'{call.raw_name} needs two factions')
     for n in (0, 1):
         name = call.source(n).strip()
         if name:
-            ctx.sc.property_refs[_safe_property_name(name)] = 'Faction'
-    return ctx._faction_reaction_call(
-        call.arg(0), call.arg(1), call.source(2, '0'),
+            ctx.sc.property_refs[safe_property_name(name)] = 'Faction'
+    f1, f2 = call.arg(0), call.arg(1)
+    tiered = ctx._faction_reaction_call(
+        f1, f2, call.source(2, '0'),
         is_mod=call.name.startswith('mod'), extends=call.extends)
+    if tiered is not None:
+        return tiered
+    amount = call.arg(2)
+    return (f'if ({amount}) < 0\n'
+            f'  {f1}.SetEnemy({f2}, false, false)\n'
+            f'else\n'
+            f'  {f1}.SetAlly({f2}, true, true)\n'
+            f'endif')
 
 
 @command('getincell')
@@ -840,7 +858,7 @@ def get_in_cell(ctx, call) -> str:
         return f'{helper}({ref})'
 
     # A single cell compares directly.
-    prop = _safe_property_name(interiors[0] if interiors else name)
+    prop = safe_property_name(interiors[0] if interiors else name)
     ctx.sc.property_refs[prop] = 'Cell'
     return f'({ref}.GetParentCell() == {prop})'
 
@@ -965,7 +983,7 @@ def _is_faction(ctx, call, arg: str) -> bool:
         return True
     refs = ctx.sc.property_refs
     return 'Faction' in (refs.get(arg, ''),
-                         refs.get(_safe_property_name(src), ''))
+                         refs.get(safe_property_name(src), ''))
 
 
 # ---------------------------------------------------------------------------
@@ -1072,7 +1090,7 @@ def chargen_menu(ctx, call) -> str:
     ctx.sc.chargen_menu_seq += 1
     var = f'TES4_menuPick{ctx.sc.chargen_menu_seq}'
     retry = f'TES4_menuRetry{ctx.sc.chargen_menu_seq}'
-    first = _safe_property_name(pages[0][0])
+    first = safe_property_name(pages[0][0])
     ctx.sc.property_refs[first] = 'Message'
 
     # Show() returns -1 when the box could not display (a menu/dialogue
@@ -1092,7 +1110,7 @@ def chargen_menu(ctx, call) -> str:
     # Slot PAGE_OPTIONS on a non-final page is "More ...": the global choice
     # index is 9*page + button (see message_menus._paged).
     for page, (medid, _title, _btns) in enumerate(pages[1:], start=1):
-        safe = _safe_property_name(medid)
+        safe = safe_property_name(medid)
         ctx.sc.property_refs[safe] = 'Message'
         lines += [f'If {var} == {PAGE_OPTIONS * page}',
                   f'  {var} = {PAGE_OPTIONS * page} + {safe}.Show()',
@@ -1105,7 +1123,7 @@ def chargen_menu(ctx, call) -> str:
         lines.append(f'{keyword} {var} == {idx}')
         keyword, acted = 'ElseIf', True
         for spell in spells:
-            safe = _safe_property_name(spell)
+            safe = safe_property_name(spell)
             ctx.sc.property_refs[safe] = 'Spell'
             lines.append(f'  Game.GetPlayer().AddSpell({safe}, false)')
     if acted:
@@ -1118,7 +1136,7 @@ def chargen_menu(ctx, call) -> str:
     # an ungated fallback for that case.
     gname = plan.get('choice_global')
     if gname:
-        safe = _safe_property_name(gname)
+        safe = safe_property_name(gname)
         ctx.sc.property_refs[safe] = 'GlobalVariable'
         lines += [f'If {var} >= 0', f'  {safe}.SetValue({var} + 1)', 'EndIf']
     lines.append('TES4_ChargenMenuBusy = False')
@@ -1201,7 +1219,7 @@ _AV_SET = frozenset({'setactorvalue', 'setav', 'forceactorvalue', 'forceav',
 _AV_READ = frozenset({'getactorvalue', 'getav'})
 
 
-@command(*sorted(_ACTOR_VALUE_FUNCTIONS))
+@command(*sorted(ACTOR_VALUE_FUNCTIONS))
 def actor_value(ctx, call) -> str:
     """Get/Set/Mod ActorValue -- the AV NAME is a quoted string in Papyrus.
 
@@ -1227,7 +1245,7 @@ def actor_value(ctx, call) -> str:
         return None
     raw = call.source(0).rstrip(',').strip('"\'')
     if raw.lower() in TES4_ATTRIBUTES:
-        if call.name in _ACTOR_VALUE_READ_FUNCTIONS:
+        if call.name in ACTOR_VALUE_READ_FUNCTIONS:
             return ATTRIBUTE_STUB_VALUE
         return (f';TES4 attribute {raw} has no Skyrim equivalent '
                 f'-- write dropped')
@@ -1248,7 +1266,9 @@ def actor_value(ctx, call) -> str:
                   if call.name in _AV_SET else None)
         args.append(scaled if scaled is not None else call.arg(1))
 
-    papyrus = _AV_PAPYRUS.get(call.name, 'GetActorValue')
+    papyrus = (_AV_PAPYRUS.get(call.name)
+               or getattr(COMMAND_ROWS.get(call.name), 'emit', '')
+               or 'GetActorValue')
     if call.name in _AV_PLAYER_ONLY:
         return f'Game.GetPlayer().{papyrus}({", ".join(args)})'
     ref = ctx._resolve_self_ref(call.ref, call.extends, actor_func=True)

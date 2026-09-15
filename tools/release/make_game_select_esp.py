@@ -40,13 +40,13 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from subprocess_flags import windows_cmd  # noqa: E402
+from core.subprocess_flags import windows_cmd
 
-from tes5_import.writer import (pack_record, pack_subrecord, pack_tes4_header,
+from tes5_import.base.writer import (pack_record, pack_subrecord, pack_tes4_header,
                                 pack_top_group, pack_string_subrecord,
                                 pack_formid_subrecord, pack_uint32_subrecord,
-                                _count_records_and_groups)
-from tes5_import.dialog_conditions import build_ctda
+                                count_records_and_groups)
+from tes5_import.base.conditions import build_ctda
 from script_convert.pipeline import build_vmad_object_script
 
 PLUGIN_NAME = 'TESGameSelect.esp'
@@ -65,9 +65,6 @@ FID_QUST              = 0x01000820
 
 # --- Vanilla Skyrim.esm forms we override or reference -----------------------
 # MQ101 "Unbound", the opening. We OVERRIDE this record: the only point where a
-# new game can be diverted cleanly is its stage-0 fragment, which runs before
-# the cart ride starts. A separate quest that stops MQ101 afterwards leaves the
-# player bound and mid-scene (see TESGameSelectMQ101.psc).
 FID_MQ101 = 0x0003372B
 # Skyrim's own empty interior holding cell and the XMarker inside it. Reusing
 # these means no cell authoring, and the player waits somewhere genuinely blank
@@ -361,15 +358,18 @@ def _pack_script_entry(name: str, object_props: dict) -> bytes:
 
 
 def build_plugin(skyrim_esm: str) -> bytes:
+    """The finished plugin bytes.
+
+    HEDR count is records + GRUPs, matching vanilla Skyrim.esm and the
+    main writer.  An undercount is not cosmetic: the engine walks the
+    file by this number and a wrong one silently drops records.
+    """
     groups = [
         pack_top_group('GLOB', b''.join(build_glob(f, e) for f, e in GLOBALS)),
         pack_top_group('MESG', build_mesg()),
         pack_top_group('QUST', build_qust() + build_mq101_override(skyrim_esm)),
     ]
-    # HEDR count = records + GRUPs, matching vanilla Skyrim.esm and the main
-    # writer. An undercount here is not cosmetic: the engine walks the file by
-    # this number, and a wrong one silently drops records.
-    count = sum(_count_records_and_groups(g) for g in groups)
+    count = sum(count_records_and_groups(g) for g in groups)
     header = pack_tes4_header(
         ['Skyrim.esm'],
         num_records=count,
@@ -399,12 +399,13 @@ def write_seq(outdir: str):
 def compile_scripts(outdir: str) -> bool:
     """Compile both plugin scripts against the Skyrim SE headers."""
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from convert import _find_skyrim_source_scripts, load_config
+    from convert import load_config
+    from papyrus_compile import find_skyrim_source_scripts
     try:
         cfg = load_config()
     except (FileNotFoundError, OSError):
         cfg = {}
-    headers = _find_skyrim_source_scripts(cfg)
+    headers = find_skyrim_source_scripts(cfg)
     if not headers:
         print('  ERROR: Skyrim Papyrus source headers not found '
               '(<Skyrim SE>\\Data\\Source\\Scripts)')
@@ -438,6 +439,43 @@ def compile_scripts(outdir: str) -> bool:
     return ok
 
 
+def resolve_skyrim_esm(explicit: str = None) -> str:
+    """The Skyrim.esm whose MQ101 is overridden, or '' when none is found.
+
+    Falls back to the installed game's Data folder when no path is given.
+    """
+    if not explicit:
+        from convert import load_config
+        from source_paths import find_game_path
+        try:
+            cfg = load_config()
+        except (FileNotFoundError, OSError):
+            cfg = {}
+        data_path = find_game_path('skyrimse', cfg)
+        if not data_path:
+            print('  ERROR: Skyrim SE install not found; pass --skyrim-esm')
+            return ''
+        explicit = os.path.join(data_path, 'Skyrim.esm')
+    if not os.path.isfile(explicit):
+        print(f'  ERROR: Skyrim.esm not found at {explicit}')
+        return ''
+    return explicit
+
+
+def stage_sources(root: str, outdir: str) -> None:
+    """Copy the hand-written .psc sources into the shipped Data folder.
+
+    The shipped folder is a complete, self-contained Data folder.
+    """
+    src_dir = os.path.join(outdir, 'scripts', 'source')
+    os.makedirs(src_dir, exist_ok=True)
+    for name in (SCRIPT_NAME, MQ101_SCRIPT_NAME):
+        shutil.copyfile(
+            os.path.join(root, 'TESGameSelect', 'scripts', 'source',
+                         name + '.psc'),
+            os.path.join(src_dir, name + '.psc'))
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -456,31 +494,11 @@ def main():
     outdir = args.outdir if os.path.isabs(args.outdir) else os.path.join(root, args.outdir)
     os.makedirs(outdir, exist_ok=True)
 
-    skyrim_esm = args.skyrim_esm
+    skyrim_esm = resolve_skyrim_esm(args.skyrim_esm)
     if not skyrim_esm:
-        from convert import find_game_path, load_config
-        try:
-            cfg = load_config()
-        except (FileNotFoundError, OSError):
-            cfg = {}
-        data_path = find_game_path('skyrimse', cfg)
-        if not data_path:
-            print('  ERROR: Skyrim SE install not found; pass --skyrim-esm')
-            return 1
-        skyrim_esm = os.path.join(data_path, 'Skyrim.esm')
-    if not os.path.isfile(skyrim_esm):
-        print(f'  ERROR: Skyrim.esm not found at {skyrim_esm}')
         return 1
 
-    # Stage the hand-written script sources into the output tree so the shipped
-    # folder is a complete, self-contained Data folder.
-    src_dir = os.path.join(outdir, 'scripts', 'source')
-    os.makedirs(src_dir, exist_ok=True)
-    for name in (SCRIPT_NAME, MQ101_SCRIPT_NAME):
-        shutil.copyfile(
-            os.path.join(root, 'TESGameSelect', 'scripts', 'source',
-                         name + '.psc'),
-            os.path.join(src_dir, name + '.psc'))
+    stage_sources(root, outdir)
 
     print(f'Reading MQ101 from {skyrim_esm} ...')
     data, count = build_plugin(skyrim_esm)

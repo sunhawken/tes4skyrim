@@ -1,13 +1,17 @@
 """Item/object converters: STAT, ACTI, MISC, KEYM, DOOR, FLOR, FURN, GRAS, TREE, LIGH, SLGM, ANIO, CONT."""
 
+from asset_convert.game_paths import current_namespace
+import os
 import struct
 
-from ..constants import LOD_SIZE_THRESHOLD
-from ..mesh_bounds import get_mesh_physics_flags
+from output_layout import assets_for
+
+from ..base.constants import LOD_SIZE_THRESHOLD
+from ..base.mesh_bounds import get_mesh_physics_flags
 from .common import (
     VENDOR_KYWD,
     _common_header_subs,
-    _prefix_path,
+    prefix_path,
     _resolve_obnd,
     _simple_object,
     get_float,
@@ -58,8 +62,8 @@ def convert_STAT(rec: dict) -> bytes:
     subs = _common_header_subs(rec, need_full=False, obnd_override=bounds)
     path = get_str(rec, 'Model.MODL')
     if path:
-        subs += pack_string_subrecord('MODL', _prefix_path(path))
-        key = _prefix_path(path).lower().replace('\\', '/')
+        subs += pack_string_subrecord('MODL', prefix_path(path))
+        key = prefix_path(path).lower().replace('\\', '/')
         if get_mesh_physics_flags(key) & 1:
             # MSTT layout (xEdit + Skyrim.esm): EDID OBND [FULL] MODL DATA
             # [SNAM]; DATA is a REQUIRED u8 — 0 on the swinging signs.
@@ -98,9 +102,7 @@ def convert_KEYM(rec: dict) -> bytes:
     return _simple_object(rec, 'KEYM', extra_subs=extra)
 
 
-# Normalised TES4 model path -> {'open'/'close'/'loop': TES4 SOUN FormID}, for
-# doors whose open/close sound is authored in the MESH rather than on the
-# record.  Populated by load_door_model_sounds() in import Phase 0.
+#: MESH-authored door sounds: path -> {'open'/'close'/'loop': SOUN FormID}.
 _DOOR_MODEL_SOUNDS: dict = {}
 
 
@@ -116,7 +118,7 @@ def load_door_model_sounds(meshes_dir, by_type) -> int:
     Oblivion doors take their audio from the record's SNAM/ANAM OR from
     `sound: <SOUN EditorID>` keys on the model's Open/Close sequences; Skyrim
     has only the record channel, so the mesh-authored names have to be lifted
-    onto it or those doors convert silent (see asset_convert.door_sounds).
+    onto it or those doors convert silent (see asset_convert.audio.door_sounds).
 
     The EditorID is resolved against this plugin's own SOUN records, so an
     unknown name simply yields no sound rather than a dangling reference.
@@ -128,7 +130,7 @@ def load_door_model_sounds(meshes_dir, by_type) -> int:
     if not doors:
         return 0
     try:
-        from asset_convert.door_sounds import scan_door_models
+        from asset_convert.audio.door_sounds import scan_door_models
     except ImportError as exc:
         print(f"  Door sounds: asset_convert unavailable ({exc}), skipping")
         return 0
@@ -348,24 +350,12 @@ def convert_FLOR(rec: dict) -> bytes:
     return _simple_object(rec, 'FLOR', extra_subs=extra)
 
 
-# --- FURN marker data -------------------------------------------------------
-#
-# TES5 FURN MNAM bits 0-23 enable NIF marker POSITION 0-23 (xEdit "Sit 0..23").
-# The converted NIF's positions are the clustered SEATS produced by
-# asset_convert/furniture_markers.py, NOT the original Oblivion entry markers,
-# so the TES4 MNAM bitmask (which indexed the Oblivion NIF's entry list)
-# CANNOT be passed through: dangling bits make the engine index past the
-# NIF's position list and seat NPCs at garbage positions far from the mesh.
-#
-# The seat list is computed here with the SAME shared code the NIF converter
-# uses (same clustering, same order), from the source NIF in the export dir.
-# Populated once by load_furniture_seats() (called from import_main Phase 0).
-#
-# High MNAM flags: TES4 and TES5 share bit 30 (sit-type furniture) and
-# bit 31 (bed-type) — verified against vanilla Skyrim (chairs/benches
-# 0x40000001, beds 0x88000001).  Vanilla beds additionally set bit 27
-# (0x08000000 "Must Exit to Talk").
-_FURN_SEATS: dict = {}  # normalised MODL path -> seat list (see cluster_seats)
+# ---------------------------------------------------------------------------
+# FURN marker data
+# ---------------------------------------------------------------------------
+
+#: MODL path -> seat list (cluster_seats); MNAM bits 0-23 enable NIF marker 0-23.
+_FURN_SEATS: dict = {}
 # Original TES4 base FormID (uppercase 8-hex string) -> origin shift for its
 # model.  The NIF converter re-origins marker-bearing models to the vanilla
 # floor-origin convention (the engine anchors seated actors to the REFR z),
@@ -383,41 +373,77 @@ def get_base_origin_shift(base_fid: str) -> float:
     return _BASE_ORIGIN_SHIFT.get(base_fid.upper(), 0.0)
 
 
-def load_furniture_models(meshes_dir, by_type) -> int:
+def master_mesh_dirs(ctx) -> list:
+    """Each TES4 master's source mesh tree, in _HEADER.txt order."""
+    from ..pipeline import master_export_dirs
+    return [str(assets_for(d) / 'meshes') for d in master_export_dirs(ctx)]
+
+
+def _index_origin_shifts(pairs, model_shift: dict) -> int:
+    """Register every (base FormID, record) whose model is re-origined.
+
+    `pairs` yields (fid, rec) with fid ALREADY in this plugin's index space —
+    for a master that is its `master_export` key, never `rec['FormID']`.
+    """
+    shifted = 0
+    for fid, rec in pairs:
+        modl = get_str(rec, 'Model.MODL')
+        if not modl or not fid:
+            continue
+        shift = model_shift.get(_furn_model_key(modl))
+        if shift and abs(shift) > 1e-4:
+            _BASE_ORIGIN_SHIFT[fid.upper()] = shift
+            shifted += 1
+    return shifted
+
+
+def _scan_marker_models(mesh_dirs, scan_marker_nifs) -> list:
+    """(model key, absolute NIF path) for every marker-bearing model.
+
+    Earlier directories win, so this plugin's own mesh shadows a master's
+    copy of the same path.
+    """
+    jobs, seen = [], set()
+    for mdir in mesh_dirs:
+        if not os.path.isdir(mdir):
+            continue
+        for key in sorted(scan_marker_nifs(mdir)):
+            if key in seen:
+                continue
+            seen.add(key)
+            jobs.append((key, os.path.join(mdir, key.replace('/', os.sep))))
+    return jobs
+
+
+def load_furniture_models(meshes_dir, by_type, ctx=None) -> int:
     """Compute seat lists + origin shifts for every marker-bearing model.
 
-    meshes_dir: <export_dir>/meshes (source Oblivion NIFs from BSA extraction).
-    by_type: full record dict (sig -> [records]) — every record type whose
-    model is a marker-bearing NIF gets an origin-shift entry so its REFRs
-    can be compensated.
+    meshes_dir is <export_dir>/meshes; by_type maps sig -> records.  Both the
+    meshes and the base records of `ctx`'s masters are indexed too, so a
+    plugin that only PLACES a master's furniture still compensates.  A model
+    whose NIF is unreadable is skipped, leaving its REFRs unshifted.
 
-    Returns the number of models resolved.  FURN models whose NIF is
-    missing or unreadable fall back to a conservative single-seat FURN at
-    convert time (their REFRs are left unshifted, matching the unshifted /
-    missing mesh).
+    See: docs/commentary/asset_convert_nif.md#master-owned-furniture
     """
-    import os
     _FURN_SEATS.clear()
     _BASE_ORIGIN_SHIFT.clear()
     try:
-        from asset_convert.furniture_markers import (furniture_model_info_job,
+        from asset_convert.nif.furniture_markers import (furniture_model_info_job,
                                                      scan_marker_nifs)
     except ImportError as exc:
         print(f"  Furniture seats: asset_convert unavailable ({exc}), using fallback")
         return 0
-    if not os.path.isdir(meshes_dir):
-        print(f"  Furniture seats: meshes dir not found ({meshes_dir}), using fallback")
-        return 0
 
-    marker_models = scan_marker_nifs(meshes_dir)
-    # PyFFI parsing is CPU-bound pure Python — run the per-NIF parses across
-    # a process pool (threads would serialise on the GIL).
-    jobs = [(key, os.path.join(meshes_dir, key.replace('/', os.sep)))
-            for key in sorted(marker_models)]
+    mesh_dirs = [meshes_dir] + master_mesh_dirs(ctx)
+    jobs = _scan_marker_models(mesh_dirs, scan_marker_nifs)
+    if not jobs:
+        print(f"  Furniture seats: no marker models under {meshes_dir}, using fallback")
+        return 0
     model_shift: dict = {}
     resolved = 0
 
     def _consume(results):
+        """Record each parsed model; PyFFI is CPU-bound so the caller pools."""
         nonlocal resolved
         for key, info, err in results:
             if err is not None:
@@ -431,23 +457,16 @@ def load_furniture_models(meshes_dir, by_type) -> int:
         _consume(map(furniture_model_info_job, jobs))
     else:
         from concurrent.futures import ProcessPoolExecutor
-        from worker_budget import worker_count
+        from core.worker_budget import worker_count
         workers = min(worker_count(), len(jobs))
         with ProcessPoolExecutor(max_workers=workers) as ex:
             _consume(ex.map(furniture_model_info_job, jobs))
 
-    shifted_bases = 0
-    for recs in by_type.values():
-        for rec in recs:
-            modl = get_str(rec, 'Model.MODL')
-            if not modl:
-                continue
-            shift = model_shift.get(_furn_model_key(modl))
-            if shift and abs(shift) > 1e-4:
-                fid = get_str(rec, 'FormID')
-                if fid:
-                    _BASE_ORIGIN_SHIFT[fid.upper()] = shift
-                    shifted_bases += 1
+    master_export = getattr(ctx, 'master_export', None) or {}
+    shifted_bases = _index_origin_shifts(master_export.items(), model_shift)
+    shifted_bases += _index_origin_shifts(
+        ((get_str(rec, 'FormID'), rec)
+         for recs in by_type.values() for rec in recs), model_shift)
     print(f"  Furniture seats: {resolved} marker models resolved, "
           f"{shifted_bases} base records need REFR z compensation")
     return resolved
@@ -511,63 +530,57 @@ def convert_FURN(rec: dict) -> bytes:
     return _simple_object(rec, 'FURN', extra_subs=extra)
 
 
+# ---------------------------------------------------------------------------
+# Grass
+# ---------------------------------------------------------------------------
+
+#: iMinGrassSize in Oblivion_default.ini and Fallout_default.ini; the source planters cap their grid step at it.
+TES4_MIN_GRASS_SIZE = 80.0
+
+
+def _grass_data(rec: dict) -> bytes:
+    """GRAS DATA with PositionRange/Density rewritten for placement parity.
+
+    Skyrim steps its grid at max(PositionRange, 20); the source engines step
+    at max(PositionRange, 80) and boost density by 80/PositionRange when the
+    cap bites, so both are baked into the record.
+    See: docs/commentary/asset_convert_terrain.md#grass-placement-parity
+    """
+    src_range = get_float(rec, 'DATA.PositionRange')
+    boost = TES4_MIN_GRASS_SIZE / src_range if 0 < src_range < TES4_MIN_GRASS_SIZE else 1.0
+    data = bytearray(32)
+    data[0] = min(100, round(get_int(rec, 'DATA.Density') * boost))
+    data[1] = get_int(rec, 'DATA.MinSlope')
+    data[2] = get_int(rec, 'DATA.MaxSlope', 90)
+    struct.pack_into('<H', data, 4, get_int(rec, 'DATA.UnitFromWaterAmount'))
+    struct.pack_into('<I', data, 8, get_int(rec, 'DATA.UnitFromWaterType'))
+    struct.pack_into('<f', data, 12, max(src_range, TES4_MIN_GRASS_SIZE))
+    struct.pack_into('<f', data, 16, get_float(rec, 'DATA.HeightRange'))
+    struct.pack_into('<f', data, 20, get_float(rec, 'DATA.ColorRange'))
+    struct.pack_into('<f', data, 24, get_float(rec, 'DATA.WavePeriod'))
+    data[28] = get_int(rec, 'DATA.Flags')
+    return bytes(data)
+
+
 def convert_GRAS(rec: dict) -> bytes:
     """GRAS — Grass.
 
-    Every working GRAS record (vanilla Skyrim.esm, USSEP, Beyond Skyrim's
-    BSHeartland.esm, Skyrim Extended Cut, Legacy Orsinium) shares three
-    structural invariants the generic object path violates:
-      1. OBND is all ZEROS (never computed mesh bounds);
-      2. MODT is present (BSHeartland proves a 12-byte version-2 stub
-         with no texture hashes works);
-      3. the model path lives under meshes\\landscape\\grass\\ (45/45
-         surveyed MODL paths — the asset pipeline places a copy of each
-         converted grass NIF there, see grass_profile.grass_model_dest).
-    Grass is engine-instanced from LAND texture layers, not placed, so it
-    skips the normal object treatment.
+    Built by hand to honor the invariants every working GRAS record shares:
+    OBND all zeros, a version-2 MODT stub, and the model under
+    meshes\\landscape\\grass\\ (see grass_profile.grass_model_dest).
+    See: docs/commentary/asset_convert_terrain.md#grass-conversion-record-invariants-shader
     """
-    from asset_convert.grass_profile import grass_model_dest
+    from asset_convert.nif.grass_profile import grass_model_dest
     subs = b''
     edid = get_str(rec, 'EditorID')
     if edid:
         subs += pack_string_subrecord('EDID', edid)
-    subs += pack_obnd()  # all zeros — vanilla/BSHeartland invariant
+    subs += pack_obnd()
     path = get_str(rec, 'Model.MODL')
     if path:
         subs += pack_string_subrecord('MODL', grass_model_dest(path))
-        # MODT stub (version 2, no hashes) — present on every working GRAS
         subs += pack_subrecord('MODT', struct.pack('<III', 2, 0, 0))
-
-    # TES5 GRAS DATA is the same layout, but TES4 values were tuned for
-    # Oblivion's much coarser placement grid (iMinGrassSize=80 vs Skyrim's
-    # 20 — 16x fewer placement points).  Passed through raw, Density up to
-    # 100 with PositionRange up to 90 over-instances Skyrim's grass planter
-    # and CTDs (no log) on cells where dense grass textures cover whole
-    # quadrants.  Clamp both to the proven-working envelope: vanilla uses
-    # Density 3-6 / PositionRange <=32; BSHeartland (working Oblivion-style
-    # grass fields) goes up to Density 80 / PositionRange ~32.
-    density = min(get_int(rec, 'DATA.Density'), 80)
-    min_slope = get_int(rec, 'DATA.MinSlope')
-    max_slope = get_int(rec, 'DATA.MaxSlope', 90)
-    uf_water = get_int(rec, 'DATA.UnitFromWaterAmount')
-    uf_type = get_int(rec, 'DATA.UnitFromWaterType')
-    pos_range = min(get_float(rec, 'DATA.PositionRange'), 32.0)
-    h_range = get_float(rec, 'DATA.HeightRange')
-    c_range = get_float(rec, 'DATA.ColorRange')
-    wave = get_float(rec, 'DATA.WavePeriod')
-    flags = get_int(rec, 'DATA.Flags')
-    data = bytearray(32)
-    data[0] = density
-    data[1] = min_slope
-    data[2] = max_slope
-    struct.pack_into('<H', data, 4, uf_water)
-    struct.pack_into('<I', data, 8, uf_type)
-    struct.pack_into('<f', data, 12, pos_range)
-    struct.pack_into('<f', data, 16, h_range)
-    struct.pack_into('<f', data, 20, c_range)
-    struct.pack_into('<f', data, 24, wave)
-    data[28] = flags
-    subs += pack_subrecord('DATA', bytes(data))
+    subs += pack_subrecord('DATA', _grass_data(rec))
     return pack_record('GRAS', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
 
@@ -603,11 +616,15 @@ def convert_TREE(rec: dict) -> bytes:
     subs += pack_obnd(*bounds)
     model = get_str(rec, 'Model.MODL')
     if model and edid:
-        subs += pack_string_subrecord('MODL', f'tes4\\speedtrees\\{edid.lower()}.nif')
+        subs += pack_string_subrecord(
+            'MODL',
+            f'{current_namespace()}\\speedtrees\\{edid.lower()}.nif')
     elif model:
         import os
         stem = os.path.splitext(os.path.basename(model.replace('\\', '/').lstrip('/')))[0]
-        subs += pack_string_subrecord('MODL', f'tes4\\speedtrees\\{stem.lower()}.nif')
+        subs += pack_string_subrecord(
+            'MODL',
+            f'{current_namespace()}\\speedtrees\\{stem.lower()}.nif')
     subs += pack_subrecord('PFPC', struct.pack('<I', 0))
     subs += pack_subrecord('CNAM', _TREE_CNAM)
     # Same size-derived LOD flags as STAT: trees flow through the standard
@@ -620,20 +637,24 @@ def convert_TREE(rec: dict) -> bytes:
 
 
 def convert_LIGH(rec: dict) -> bytes:
-    """LIGH — Light. TES5 order: EDID OBND MODL FULL DATA FNAM SNAM"""
+    """LIGH — Light. TES5 order: EDID VMAD OBND MODL FULL DATA FNAM SNAM
+
+    TES4 attaches quest scripts to lights, so VMAD is spliced in here;
+    without it a converted script exists but is attached to nothing.
+
+    The `object_scripts` import stays INSIDE the body.
+    See: docs/reference/tes5_import_architecture.md#object-scripts-import-is-deferred
+    """
     subs = b''
     edid = get_str(rec, 'EditorID')
     if edid:
         subs += pack_string_subrecord('EDID', edid)
-    # VMAD — LIGH supports object scripts in Skyrim, and TES4 attaches quest
-    # scripts to lights (SE06FlameOfAgnon's SetStage lives on one); without
-    # this splice the converted script existed but was attached to nothing.
-    from ..object_scripts import get_object_vmad
+    from ..base.object_scripts import get_object_vmad
     subs += get_object_vmad(get_formid(rec, 'FormID'))
     subs += pack_obnd(*_resolve_obnd(rec, 'LIGH'))
     model = get_str(rec, 'Model.MODL')
     if model:
-        subs += pack_string_subrecord('MODL', _prefix_path(model))
+        subs += pack_string_subrecord('MODL', prefix_path(model))
     full = get_str(rec, 'FULL')
     if full:
         subs += pack_string_subrecord('FULL', full)
@@ -717,7 +738,7 @@ def convert_ANIO(rec: dict) -> bytes:
         subs += pack_string_subrecord('EDID', edid)
     model = get_str(rec, 'Model.MODL')
     if model:
-        subs += pack_string_subrecord('MODL', _prefix_path(model))
+        subs += pack_string_subrecord('MODL', prefix_path(model))
     bnam = get_str(rec, 'BNAM')
     if bnam:
         subs += pack_string_subrecord('BNAM', bnam)
@@ -756,5 +777,65 @@ def convert_CONT(rec: dict) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Equipment converters
+# Leveled list converters
 # ---------------------------------------------------------------------------
+
+
+def _leveled_entries(rec: dict) -> list:
+    """(level, FormID, count) per entry, skipping the null-FormID slots.
+
+    LVLO is `Level(U16) pad(U16) FormID(U32) Count(U16) pad(U16)`, 12 bytes.
+
+    See: docs/commentary/ck_warnings.md#leveled-list-null-entries
+    """
+    entries = []
+    for i in range(get_int(rec, 'EntryCount')):
+        fid = get_formid(rec, f'Entry[{i}].FormID')
+        if not fid:
+            continue
+        level = get_int(rec, f'Entry[{i}].Level', 1)
+        count = abs(get_int(rec, f'Entry[{i}].Count', 1)) or 1
+        entries.append((max(1, level), fid, count))
+    return entries
+
+
+def _convert_leveled_list(rec: dict, tes5_sig: str) -> bytes:
+    """Pack a TES4 leveled list as `tes5_sig`, LLCT counting surviving entries."""
+    subs = b''
+    edid = get_str(rec, 'EditorID')
+    if edid:
+        subs += pack_string_subrecord('EDID', edid)
+    subs += pack_obnd()
+
+    chance = get_int(rec, 'LVLD.ChanceNone')
+    subs += pack_uint8_subrecord('LVLD', chance)
+    flags = get_int(rec, 'LVLF.Flags')
+    subs += pack_uint8_subrecord('LVLF', flags)
+
+    entries = _leveled_entries(rec)
+    if entries:
+        subs += pack_subrecord('LLCT', struct.pack('<B', min(len(entries), 255)))
+    for level, fid, count in entries:
+        subs += pack_subrecord('LVLO', struct.pack('<HxxIHxx', level, fid, count))
+
+    return pack_record(tes5_sig, get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
+
+
+def convert_LVLI(rec: dict) -> bytes:
+    """LVLI → LVLI (Leveled Item)."""
+    return _convert_leveled_list(rec, 'LVLI')
+
+
+def convert_LVLC(rec: dict) -> bytes:
+    """LVLC → LVLN (Leveled NPC)."""
+    return _convert_leveled_list(rec, 'LVLN')
+
+
+def convert_LVLN(rec: dict) -> bytes:
+    """LVLN → LVLN; FO3/FNV has the type natively and Skyrim shares it."""
+    return _convert_leveled_list(rec, 'LVLN')
+
+
+def convert_LVSP(rec: dict) -> bytes:
+    """LVSP → LVSP (Leveled Spell)."""
+    return _convert_leveled_list(rec, 'LVSP')

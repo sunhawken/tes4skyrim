@@ -13,7 +13,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from asset_convert import archive, bsa_extract, mod_ingest, source_registry  # noqa: E402
+from asset_convert.sources import archive
+from asset_convert.sources import bsa_extract
+from asset_convert.sources import mod_ingest
+from asset_convert.sources import source_registry
 
 
 # ---------------------------------------------------------------------------
@@ -62,10 +65,10 @@ def _mod_entries(prefix=''):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize('prefix,expect_root', [
-    ('', ''),                                   # Elsweyr: payload at root
-    ('MyMod/Data/', 'MyMod/Data'),              # TWMP: nested Data
-    ('A/B/Data/', 'A/B/Data'),                  # deeply nested Data
-    ('Data/', 'Data'),                          # Data at top level
+    ('', []),                                   # Elsweyr: payload at root
+    ('MyMod/Data/', ['MyMod/Data']),            # TWMP: nested Data
+    ('A/B/Data/', ['A/B/Data']),                # deeply nested Data
+    ('Data/', ['Data']),                        # Data at top level
 ])
 def test_layout_rule(tmp_path, prefix, expect_root):
     arc = _zip(tmp_path / 'mod.zip', _mod_entries(prefix))
@@ -81,8 +84,52 @@ def test_shallowest_data_folder_wins(tmp_path):
     entries['Docs/Data/notes.txt'] = b'x'
     arc = _zip(tmp_path / 'mod.zip', entries)
     man = mod_ingest.inspect(arc)
-    assert man.payload_root == 'Data'
+    assert man.payload_root == ['Data']
     assert man.ambiguous_data == []
+
+
+def test_bain_subpackages_are_all_payload_roots(tmp_path):
+    """A complex BAIN archive installs every sub-package, in name order.
+
+    Tamriel Data (HD) ships `00 Data Files` and `01 Data Files - Normal Maps`
+    and no folder named Data; treating it as archive-root put all 46,863 files
+    under `misc/` where no asset stage could see them.
+    See: docs/commentary/asset_convert_mod_ingest.md#payload-roots
+    """
+    arc = _zip(tmp_path / 'mod.zip', {
+        '00 Core/MyMod.esp': _tes4_plugin_bytes(),
+        '00 Core/Meshes/a.nif': b'N',
+        '01 Textures - 4X/Textures/b.dds': b'D',
+        'ReadMe-Quests-Guide/readme.txt': b'x',
+    })
+    man = mod_ingest.inspect(arc)
+    assert man.payload_root == ['00 Core', '01 Textures - 4X']
+    assert man.plugins == ['MyMod.esp']
+    assert man.counts.get('meshes') == 1
+    assert man.counts.get('textures') == 1
+
+
+def test_numbers_do_not_make_a_bain_subpackage(tmp_path):
+    """BAIN never parses the numeric prefix; structure alone decides.
+
+    A numbered folder holding only docs is not a sub-package, and an
+    unnumbered folder holding a data dir is.
+    """
+    arc = _zip(tmp_path / 'mod.zip', {
+        'Core Files/Meshes/a.nif': b'N',
+        '99 Documentation/manual.txt': b'x',
+    })
+    assert mod_ingest.inspect(arc).payload_root == ['Core Files']
+
+
+def test_loose_data_at_root_beats_subpackages(tmp_path):
+    """A simple package stays simple even beside a would-be sub-package."""
+    arc = _zip(tmp_path / 'mod.zip', {
+        'MyMod.esp': _tes4_plugin_bytes(),
+        'Meshes/a.nif': b'N',
+        '01 Optional/Textures/b.dds': b'D',
+    })
+    assert mod_ingest.inspect(arc).payload_root == []
 
 
 def test_equal_depth_data_folders_reported_ambiguous(tmp_path):
@@ -129,7 +176,8 @@ def test_unsafe_paths_rejected(bad):
     ('./x/./y.nif', 'x/y.nif'),
     ('a/b/../c.nif', 'a/c.nif'),
 ])
-def test_safe_paths_normalised(good, want):
+def test_safe_paths_normalized(good, want):
+    """safe_relpath returns the forward-slashed, dot-collapsed relative path."""
     assert archive.safe_relpath(good) == want
 
 
@@ -209,7 +257,7 @@ def test_registry_records_and_resolves(tmp_path):
 
     entry = source_registry.get(export, 'MyMod.esp')
     assert entry and entry['kind'] == 'archive'
-    assert entry['payload_root'] == ''
+    assert entry['payload_root'] == []
     binary = source_registry.plugin_binary(export, 'MyMod.esp')
     assert binary and binary.is_file()
     # Case-insensitive lookup: the CLI's -f and the GUI's combo differ in case.
@@ -751,7 +799,7 @@ def test_converted_plugins_finds_plugins_inside_a_group_folder(tmp_path):
     Both scanners key off `<plugin>.manifest.json` instead. Getting this wrong
     drops the plugin out of load-order resolution silently.
     """
-    from asset_convert.sibling_lod import converted_plugins
+    from asset_convert.lod.sibling_lod import converted_plugins
 
     out = tmp_path / 'output'
     # A single-plugin conversion: folder named for the plugin.
@@ -923,7 +971,7 @@ def test_a_master_inside_a_group_folder_still_resolves(tmp_path):
     silent-failure mode.
     """
     import os
-    from tes5_import.overrides import _export_root, _master_export_dir
+    from tes5_import.overrides.nested import export_root, master_export_dir
 
     # A two-plugin mod, so its members nest inside the group folder.
     entries = _mod_entries('TWMP/Data/')
@@ -941,9 +989,9 @@ def test_a_master_inside_a_group_folder_still_resolves(tmp_path):
     # must be found.
     for start in (export / 'Oblivion.esm',
                   source_registry.record_dir(export, 'MapMarkers.esp')):
-        root = _export_root(str(start))
+        root = export_root(str(start))
         assert os.path.isfile(os.path.join(root, 'sources.json')), start
-        found = _master_export_dir(root, 'MyMod.esp')
+        found = master_export_dir(root, 'MyMod.esp')
         assert os.path.isdir(found), f'{start}: master not found at {found}'
 
 

@@ -1,6 +1,6 @@
-# tes5_import/object_scripts.py - quests and quest scripts
+# tes5_import/base/object_scripts.py - quests and quest scripts
 
-**Code:** `script_convert/converter.py`, `tes5_import/dialog_converter.py`, `tes5_import/object_scripts.py`, `script_convert/constants.py`
+**Code:** `tes5_import/dialogue/quest.py`, `script_convert/converter.py`, `tes5_import/dialogue/converter.py`, `tes5_import/base/object_scripts.py`, `script_convert/constants.py`
 
 ## Contents
 
@@ -36,6 +36,61 @@
 - [Known gaps (round 6, not fixed here)](#known-gaps-2)
 - [Known gaps (round 3, not fixed here)](#known-gaps-2-2)
 - [Known gap (not fixed here)](#known-gap)
+- [Why an actor script must move to its placed reference](#actor-script-relocation)
+
+## Why an actor script must move to its placed reference
+<a id="actor-script-relocation"></a>
+
+**Code:** `tes5_import/base/object_scripts.py:_relocate_actor_scripts_to_refs`
+
+Three independent reasons an actor script MUST live on the reference, not on
+the base `NPC_`/`CREA`:
+
+1. **`GetVMScriptVariable(ref, "::var_var")` reads the property off a script
+   attached to the *reference named in param1*** (the ACHR), not off the base
+   record — verified against Skyrim.esm, where 100% of vanilla func-630 package
+   conditions name a REFR that carries its own VMAD holding the variable. A
+   base-attached script propagates to instances for property *access* (fragment
+   writes work), but the condition *read* fails, so the quest package never wins
+   its arbitration and the actor stays put (Pinarus/FGC01Rats,
+   Arielle/MG04Restore, ~142 actors).
+
+2. **Reference events never fire on a base-attached script.** `OnPackageEnd` and
+   friends are declared on `Actor`/`ObjectReference` (vanilla Scripts.zip);
+   `NPC_` is an ActorBase, so an event-driven script bound there is inert. This
+   silently killed every converted quest that sequences on package completion —
+   CharacterGen sets stage 12 from Renote's `OnPackageEnd`, so the chain stopped
+   at stage 10 and the Emperor/guards had no `GetStage ==` package to select at
+   all.
+
+3. **Self-reference calls have no target on a base record.** A bare `enable` /
+   `moveto` / `startcombat` acts on the calling REFERENCE; an ActorBase is not
+   one, so the call does nothing. Oblivion's standard scripted-entrance idiom is
+   an initially-disabled placement whose own GameMode block enables it on a cue,
+   which makes this the difference between the actor appearing and never
+   existing — Celebro, the Nehrim intro companion, was absent from the start
+   cell for exactly this reason (`MQ00CelebroScript`:
+   `if GetStage MQ00 == 5 / enable`).
+
+Vanilla does exactly this split: instance-identified logic lives on the ACHR
+(masterAmbushScript, 464 placements), while generic per-actor behaviour stays on
+the base (WIDeadBodyCleanupScript, defaultGhostScript).
+
+The script is moved (base entry removed) rather than duplicated so there is
+exactly ONE instance — both the fragment write (via the ACHR-typed self
+property) and the condition read resolve to it.
+
+### Which scripts qualify, and the single-placement rule
+
+The MASTERS' scripts are indexed alongside this plugin's (keyed on the
+`master_export` key, this plugin's space — see `_collect_scpts`): a dependent
+plugin's actor can carry one of its master's scripts, and missing it means the
+relocation never happens, so every reason above silently applies.
+
+A script may be moved OFF the base only when that base has a single placement,
+else siblings would lose it. Shared bases (rare: SI victims, Sheogorath's sheep)
+keep the base attachment and gain a per-ref one, matching Oblivion's
+per-instance variables.
 
 ## Quest conversion: bugs found and fixed
 <a id="quest-conversion-bugs"></a>
@@ -65,8 +120,8 @@ found nothing, and silently skipped the binding → `myMS14` was None at runtime
 `myMS14.SetStage(...)` in 8 dialogue fragments plus the attached scripts did nothing. **MS14 (Nothing You
 Can Possess) was uncompletable.** Fix: `resolve_property_formid()` in
 [script_convert/constants.py](../../script_convert/constants.py) reverses the `my` rename on lookup miss; used by
-both the INFO-fragment binder ([tes5_import/dialog_converter.py](../../tes5_import/dialog_converter.py)) and the
-object-script binder ([tes5_import/object_scripts.py](../../tes5_import/object_scripts.py)). Verified: TIF props
+both the INFO-fragment binder ([tes5_import/dialogue/converter.py](../../tes5_import/dialogue/converter.py)) and the
+object-script binder ([tes5_import/base/object_scripts.py](../../tes5_import/base/object_scripts.py)). Verified: TIF props
 now bind `myMS14 → 01017606`, and SE09AddItemsScript's props now include `SE09` + all activator refs.
 
 ### 3. `StartConversation target topic` discarded the topic (`Say(None)`)
@@ -87,7 +142,7 @@ was converted+compiled but attached to nothing. Fixed in
 The importer's fragment filter counted a whitespace-only (`"\r\n"`) stage result script; the psc
 generator's filter (`script.strip()`) didn't. `TES4_QF_E3` and `TES4_QF_SEObelisks` VMADs referenced a
 `Fragment_Stage_0100_Item_0` that doesn't exist. Fixed by aligning the importer filter
-([tes5_import/dialog_converter.py](../../tes5_import/dialog_converter.py) `_quest_stage_fragments`).
+([tes5_import/dialogue/converter.py](../../tes5_import/dialogue/converter.py) `_quest_stage_fragments`).
 
 ### 6. Inherited bark gate dead-ended conversation-revealed choice topics (SE36 froze)
 The bark-choice promotion stamps the revealing greeting's timing gate onto the choice topic's INFOs. SE36's
@@ -448,7 +503,7 @@ ESM that `AMBBaenlinDeath` and `AMBBaenlinMiss` bind to `01064209`/`0106420A`.
 
 Skyrim has no `AddTopic`, so the pipeline re-expresses Oblivion's dialogue
 visibility model as one `TES4Unlock_<topic>` global per explicitly-added topic
-(`tes5_import/dialog_unlocks.py`). INFO fragments and quest-stage fragments both
+(`tes5_import/dialogue/unlocks.py`). INFO fragments and quest-stage fragments both
 emit `TES4Unlock_X.SetValue(1)`. A **script** `AddTopic X` — the third reveal
 route — emitted an inert `;NE: AddTopic` comment instead.
 
@@ -493,7 +548,7 @@ already exists"*. The QUST emitter now seeds its `declared` set from
 
 The converter mints properties for records that exist only in the output —
 `TES4Fame`, `TES4Infamy`, `TES4GoldFenced`, `TES4CyrodiilCrimeFaction`, and now
-`TES4Unlock_*`. `_resolve_props` in `tes5_import/object_scripts.py` binds
+`TES4Unlock_*`. `_resolve_props` in `tes5_import/base/object_scripts.py` binds
 properties through `resolve_property_formid()`, which looks them up in
 `xref.edid_to_formid` — a map built **from the TES4 export**, which by
 definition never contains a synthesized record. So every one silently resolved
@@ -520,11 +575,10 @@ read the same global and looked clean precisely because the defect was one layer
 below the script text.
 
 **Fix.** `_resolve_props` consults the registry before falling through to the
-EditorID lookup, via a new `get_well_known_properties()` accessor in
-`import_main` (an accessor rather than a direct import, because `import_main`
-imports `object_scripts`). The registry is populated in the main process during
-phase 0 and the object-script plan is also main-process, so no worker sees an
-empty copy.
+EditorID lookup, importing `WELL_KNOWN_PROPERTIES` directly from
+`synth_records` (its defining module). The registry is populated in the main
+process during phase 0 and the object-script plan is also main-process, so no
+worker sees an empty copy.
 
 ### R5-3. An early `return` permanently killed the polling loop
 
@@ -1417,7 +1471,7 @@ be "fixed". Split out of the audit so they are not read as stale.
   (plus 2,252 ACHR and 253 ACRE). It looks unbindable, because the script is
   attached to the *base object* and the property names the *reference* — but
   Skyrim instantiates a base record's VMAD scripts on every placed reference,
-  which is why `SCRIPTABLE_TYPES` in `tes5_import/object_scripts.py` includes
+  which is why `SCRIPTABLE_TYPES` in `tes5_import/base/object_scripts.py` includes
   the base signatures in the first place. `cross_ref.get_record_script_type`
   deliberately follows the `NAME` chain for this reason. Correct as written.
 
@@ -1710,7 +1764,7 @@ stage 40).  SEFF scripts converted to `extends ActiveMagicEffect` and compiled,
 but nothing referenced them: no carrier MGEF, so the script never ran.
 Built as `build_seff_variants` in `tes5_import/record_types/magic.py` -- one
 Script-archetype MGEF per distinct SEFF script, VMAD built by
-`build_magic_effect_script_plan` in `tes5_import/object_scripts.py`, spliced
+`build_magic_effect_script_plan` in `tes5_import/base/object_scripts.py`, spliced
 into the converted SPEL/ENCH/INGR effect lists.
 
 **B. MenuMode blocks were preserved as comments** -- MS05 (Through a Nightmare,
@@ -1724,3 +1778,272 @@ conversion caused the "MQ01 starts-then-fails" bug.
 **C. MS14 stage 200 was never a regression.**  `MS14TivelaScript` is attached to
 nothing in Oblivion.esm itself, so its stage-200 edge never ran in the original
 game.  The walkthrough baseline excludes orphaned SCPTs.
+
+
+## <a id="quest-conversion"></a>QUST conversion: what the module owns
+
+**Code:** `tes5_import/dialogue/quest.py`
+
+Split out of `dialog_converter.py`, which had grown to 2,759 code lines. The
+seam was chosen by counting call-graph edges across every candidate cut, not by
+the file's own section banners -- those claim seven sections, but one connected
+component of 34 functions spans four of them. The minimum cut leaves 4 edges,
+all running one way: dialogue reads `compute_quest_priorities`,
+`_quest_state_ctdas`, `_has_quest_state_condition` and `_bark_choice_gate_bytes`
+from the quest module, and nothing in the quest module imports dialogue.
+
+### Script properties
+
+The player's ids never bind through a SCRO. `0x14` has no EditorID to name a
+property with, and `0x07` is the TES4 player `NPC_` (EditorID `Player`), which
+would bind an `Actor Property Player` to a BASE record the VM refuses. The
+declared-name pass binds whichever spelling the script uses to `PlayerRef`
+instead.
+
+### <a id="engine-globals"></a>Engine globals: dropping the record is half the contract
+
+**Code:** `tes5_import/record_types/common.py` `convert_GLOB`
+
+Skyrim already ships `gamehour`, `gamedayspassed`, `gameday`, `gamemonth`,
+`gameyear` and `timescale` at the SAME FormIDs Oblivion uses, so `convert_GLOB`
+emits no record for them -- our own copies would only be duplicate EditorIDs.
+
+That is only half of it. VMAD properties naming those globals must also be
+bound UNSHIFTED, via `constants.ENGINE_GLOBAL_FORMIDS`; they must not be
+shifted into our index. For a long time only the record-dropping half existed,
+which left every such property bound to a nonexistent form.
+
+An earlier comment credited `script_convert._GLOBAL_CANONICAL` with fixing the
+references. It does not -- it only canonicalizes the NAME.
+
+One converter runs for all stages: `convert_fragment` deliberately accumulates
+`_property_refs` across calls, which is how the QF_ generator collects the union
+of every fragment's references.
+
+### Quest-state conditions
+
+TES4 CTDA functions expressing quest TIMING (56 `GetQuestRunning`, 58
+`GetStage`, 59 `GetStageDone`, 99 `GetQuestCompleted`) are the conditions a
+choice-reached response topic must inherit from the greeting that reveals it, so
+a promoted top-level topic does not appear before its quest reaches the right
+point.
+
+Oblivion also tracks progress as the player's rank in a quest faction rather
+than a stage -- Agronak's challenge greetings are gated on
+`GetFactionRank(Arena...)` -- so those player-progress gates are carried onto
+choice targets alongside the quest-state ones.
+
+The CTDA operator is the top 3 bits of the type byte.
+
+### Quest targets become per-objective aliases
+
+Oblivion `QSTA` is QUEST-level: one entry per (target ref, condition set), where
+the conditions are `GetStage` bounds saying WHEN that target's compass marker is
+live. Skyrim `QSTA` is per-OBJECTIVE and vanilla leaves it UNCONDITIONAL -- the
+objective being Displayed is what selects the marker. Checked across
+Skyrim.esm: objectives read `QOBJ FNAM NNAM QSTA [QSTA?]`, CTDAs are the rare
+exception, and the right target simply sits on the right objective.
+
+So the faithful mapping RESOLVES Oblivion's `GetStage` gates at build time
+rather than replaying them at runtime: each objective (= stage) emits only the
+targets whose TES4 conditions hold AT THAT STAGE, with no CTDAs. Carrying every
+target on every objective -- the previous design -- makes the engine face a list
+whose leading entries are false, and it renders no marker at all: the objective
+shows in the journal while compass and map stay empty.
+
+An objective with no live target keeps its journal text and marks nothing, the
+same as vanilla's marker-less objectives ("Return when you're ready"). If
+Oblivion gated every target away at that stage, honour it rather than inventing
+a marker.
+
+The HUD objective is the SHORT line, not the long log entry `CNAM` carries (see
+`objective_text.py`). It must stay identical to `quest_objective_texts()`, which
+the override builder uses to rebuild this same run for a translation plugin.
+
+### Package aliases
+
+A Skyrim quest package must hang off a reference alias (`ALPC`): that is what
+lets it outrank the actor's standing schedule, which is exactly what Oblivion
+achieved by putting a conditioned package at the top of the actor's AI list.
+`pack_plan` (built in Phase 0) says which refs this quest's packages name;
+aliases are allocated during conversion and PACK reads back the SAME indices, so
+the two cannot drift. A ref that was already a quest target can also run
+packages.
+
+### Forced-reference alias layout
+
+`ALST, ALID, FNAM, ALFR, [ALPC...], VTCK, ALED`, following vanilla. **`VTCK` is
+present on 2,687/2,687 vanilla forced-ref aliases -- a 100% invariant** (empty
+means "no voice-type override"), and every one of the 255 vanilla
+objective+forced-ref quests carries it.
+
+Flags `0x0292` = Optional (`0x0002`, so a fill failure cannot block quest start
+and take the dialogue down with it) + Allow Dead (`0x0010`) + Allow Disabled
+(`0x0080`) + Allow Reserved (`0x0200`) -- an attested vanilla combination. The
+old `0x109A` added Allow Reuse/Allow Destroyed and appears nowhere in vanilla.
+
+### VMAD property binding
+
+Bind every property the QF_ script DECLARES, not just what the SCROs cover: the
+player is in no registry and its SCRO is skipped, and the synthesized records
+(`TES4ControlsDisabled`, `TES4Msg_*`, ...) resolve ONLY through the well-known
+registry, looked up per declared name -- merging the whole ~1,880-entry registry
+put every unlock global on every scripted quest.
+
+The engine's `PlayerRef` always wins: a SCRO-derived case variant naming the
+converted TES4 player `NPC_` would bind a BASE record the VM refuses and the
+property reads None.
+
+A reference-typed property naming an actor BASE means the placed instance
+(`CarmaloTruiand.moveto ...` on QF_MS26); the VM refuses an `NPC_`/`CREA` into
+it and the property reads None. The SCRO's base is rebound to its one placed
+ref, which also binds names the SCROs missed.
+
+### <a id="quest-priority-arbitration"></a>Quest priority is the dialogue arbitrator
+
+Oblivion picks the first passing INFO in QUEST PRIORITY order (highest first),
+NOT file order.
+
+`QUST.DNAM.Priority` is a U8, but the engine/CK band is 0-100: Skyrim.esm's
+1,811 quests span 0-100 with **nothing** above it. The byte also arbitrates a
+quest ALIAS PACKAGE against the actor's standing schedule, so an out-of-band
+value there breaks AI, not just dialogue ordering.
+
+`ZERO_STAGE_TOP = 49` is the ceiling for stage-less "conversation container"
+quests (MG00General, FGConversations, ...). Staged quests keep their AUTHORED
+TES4 priority; only a container quest that would otherwise outrank one is pulled
+down.
+
+Containers at or below the ceiling keep their authored priority untouched. Only
+those ABOVE it move, and they are ORDER-PRESERVING compressed into the headroom
+just under the ceiling rather than all clamped onto it -- a flat clamp would tie
+MQConversations (85) with Dark00General (50) and hand arbitration between them
+to file order. Distinct authored values map to distinct slots, the highest
+landing on the ceiling, so relative order is exact. Slots run out only if a
+plugin has more than `ZERO_STAGE_TOP` distinct over-ceiling values; ties at the
+floor are then unavoidable but stay in the band.
+
+The ceiling is FIXED, not `min(staged priority)`: three staged quests
+(MQDragonArmor, SE06Battle, E3) are authored at 0, so a relative ceiling would be
+0 and would flatten all 125 containers onto one value.
+
+`_QUEST_PRIORITY_OVERRIDE` carries the result to `_quest_dnam`, so the WRITTEN
+`QUST.DNAM.Priority` includes the container clamp. **DIAL `PNAM` must NOT be
+derived from it** -- see `convert_DIAL`.
+
+### <a id="conditions-a-choice-target-inherits"></a>Conditions a choice target inherits
+
+A choice-reached response topic must inherit the conditions of the greeting that
+reveals it, so a promoted top-level topic does not appear before its time.
+
+`_QUEST_STATE_FUNCS` -- TES4 CTDA functions expressing quest TIMING (when a line
+is live): 56 `GetQuestRunning`, 58 `GetStage`, 59 `GetStageDone`, 99
+`GetQuestCompleted`.
+
+`_PLAYER_PROGRESS_FUNCS` -- 71 `GetInFaction`, 73 `GetFactionRank`. Oblivion
+questlines often track progress as the player's rank in a quest faction rather
+than a stage: Agronak's challenge greetings are gated
+`GetFactionRank(ArenaCombatants) == 7` ON TARGET (the player), and without
+inheriting that, the promoted "Yes, I wish to challenge you" topic sits in his
+menu from the first conversation. Only the run-on-target form is a progress
+gate -- the subject form describes the SPEAKER, and the target topic already
+carries its own audience conditions.
+
+`_VAR_STATE_FUNCS` -- 53 `GetScriptVariable` / 79 `GetQuestVariable` are ALSO
+timing gates (`set Arena.ChallengeAgronak to 1` both advances state and retires
+the greeting). They inherit as translated `GetVMScriptVariable` /
+`GetVMQuestVariable` conditions with their CIS2 variable name riding along.
+
+`GetStageDone(quest, N)` means stage N has been completed; it is approximated as
+"we are at or past N", the only monotonic reading available from static data.
+
+The CTDA operator is the top 3 bits of the type byte. A trailing OR flag with
+nothing after it is invalid and is cleared. Revealer gates build an OR-chain of
+one condition per revealer; mixed AND-groups across revealers use the first
+revealer's group.
+
+### <a id="stage-journal-text"></a>Stage journal text: gamepad variants and control tokens
+
+Oblivion shipped TWO journal texts for a control-tutorial stage -- a gamepad
+variant and a keyboard/mouse variant -- and the engine picked by platform at
+runtime (the same `if isXbox == 0 ... else` split guarding the matching
+MessageBox calls in MQ01Script). Skyrim has no such selector: it renders every
+QSDT/CNAM pair the record carries, so emitting both left console text showing on
+PC ("Use the left stick to move around", "press A to equip") and, because the
+objective takes the FIRST non-empty text, made the gamepad line the visible
+objective. Only the PC variant is kept.
+
+Only MQ01 (the tutorial) has these pairs -- 7 stages -- so the match is
+deliberately narrow: a stage must have MULTIPLE texts and the pair must split
+cleanly into one gamepad-only and one PC-only reading, otherwise all texts are
+kept untouched.
+
+Oblivion's journal text also embeds control-name tokens (`&sUActnForward;`) that
+its UI expanded to the player's live key binding. Skyrim has no such expansion
+and prints the token verbatim, so the tutorial read "To move forward,
+&sUActnForward;". Skyrim's DEFAULT PC bindings are substituted, phrased to fit
+the surrounding sentence ("To move forward, press W"). Only MQ01 uses these --
+9 occurrences.
+
+### <a id="stage-fragments-and-property-refs"></a>Stage fragments and property refs
+
+One converter runs for all stages: `convert_fragment` deliberately preserves
+`_property_refs` across calls, which is how the QF_ generator accumulates the
+single union of every fragment's references.
+
+`.strip()` must match the PSC generator's filter exactly: E3 and SEObelisks have
+a whitespace-only `\r\n` stage-100 result script, which emitted a VMAD fragment
+for a stage the PSC did not generate a function for.
+
+An ActorBase-typed `Player` is the `NPC_` (0x7), not the reference (0x14): the VM
+refuses a reference into an ActorBase property and the whole script's binding
+fails.
+
+### <a id="declared-properties-not-the-whole-registry"></a>Declared properties, not the whole registry
+
+Running the same converter the `.psc` was generated from is what tells us WHICH
+properties the script actually declares: the synthesized records
+(`TES4ControlsDisabled`, `TES4Fame`, `TES4Msg_*`) that resolve only through the
+well-known registry, the engine-hardcoded names (`Player`) no SCRO covers, and
+the declared TYPE of each -- which decides whether an actor-base binding must be
+redirected to the placed reference. This replaced binding all ~1,880 registry
+entries to every quest. It is best-effort: a converter failure yields an empty
+dict and the property is left unbound, exactly as before the filtering existed.
+
+The record's SCROs cover ordinary records but NOT these. The player is in no
+registry and its SCRO is deliberately skipped, and the synthesized records exist
+only in the output. An unbound property is None and the first use aborts the
+WHOLE fragment -- `UrielSeptimRef.SetLookAt(Player)` killed Charactergen stage 12
+before it unlocked CGEmperor01-24, leaving the Emperor with only 'Rumors'.
+
+The player check comes FIRST so the engine's `PlayerRef` can never be displaced
+by a same-named registry entry or record. Names resolving to nothing are
+omitted, never bound to zero.
+
+### <a id="resolving-target-markers-per-stage"></a>Resolving target markers per stage
+
+Oblivion gates each `QSTA` with conditions -- overwhelmingly `GetStage <op> N` on
+the quest's own FormID, which is exactly "show this marker during this part of
+the quest". Skyrim has no equivalent, its objective targets being unconditional,
+so the gate is resolved at build time: evaluate the chain with
+`GetStage == stage_idx` and put the target only on the objectives where it holds.
+
+OR semantics follow the CTDA chain rule: bit 0 of the type byte ORs a condition
+with the NEXT one, so the chain is an AND of OR-groups. A condition that cannot
+be evaluated (any function other than `GetStage`/`GetStageDone` --
+`GetQuestVariable`, `GetDeadCount`, ...) is treated as PASSING: it is a runtime
+fact we cannot know, and dropping the target on a maybe would lose a marker
+Oblivion did show. A target with no conditions at all is always live.
+
+### <a id="timing-ctdas-a-promoted-target-inherits"></a>Timing CTDAs a promoted target inherits
+
+`_quest_state_ctdas` reads `Condition[i].Raw` and keeps only quest-state
+functions (`GetStage` etc.), run-on-target `GetInFaction`/`GetFactionRank`
+(player questline progress -- Oblivion's faction-rank-as-stage idiom), and legacy
+variable reads translated to `GetVMScriptVariable`/`GetVMQuestVariable` with
+their CIS2 variable name. It converts and remaps them, then clears any dangling
+OR flag so the returned list is a standalone AND-group.
+
+Identity and voice conditions are deliberately excluded: the response topic
+already carries its own `GetIsID`, and only the missing TIMING gate is inherited.
+An always-available greeting has no timing conditions and yields an empty list.

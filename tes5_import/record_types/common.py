@@ -4,9 +4,10 @@ Shared helper functions for TES5 record converters.
 
 import struct
 
-from ..mesh_bounds import get_mesh_obnd
-from ..text_reader import get_float, get_formid, get_int, get_str
-from ..writer import (
+from asset_convert.game_paths import current_namespace
+from ..base.mesh_bounds import get_mesh_obnd
+from ..base.text_reader import get_float, get_formid, get_int, get_str
+from ..base.writer import (
     pack_float_subrecord,
     pack_formid_subrecord,
     pack_obnd,
@@ -19,22 +20,56 @@ from ..writer import (
 )
 
 
-def _prefix_path(path: str) -> str:
-    """Prefix asset path with tes4\\ namespace.
-    Strips leading 'textures\\' if present since Skyrim auto-prefixes it."""
+# ---------------------------------------------------------------------------
+#   Shared subrecord helpers
+# ---------------------------------------------------------------------------
+
+
+def prefix_path(path: str) -> str:
+    """Prefix an asset path with the ACTIVE game namespace.
+
+    Strips a leading 'textures\\' since Skyrim auto-prefixes it. MUST agree
+    with asset_convert's rewrite_tex_path: if the record side and the asset
+    copy disagree, every record names a path no archive ships.
+    See: docs/commentary/asset_convert_texture.md#per-game-asset-namespace
+    """
     if not path:
         return path
+    ns = current_namespace()
     p = path
     if p.lower().startswith('textures\\') or p.lower().startswith('textures/'):
         p = p[9:]
-    if not p.lower().startswith('tes4\\') and not p.lower().startswith('tes4/'):
-        return 'tes4\\' + p
+    low = p.lower()
+    if not low.startswith(ns + '\\') and not low.startswith(ns + '/'):
+        return ns + '\\' + p
     return p
+
+
+def landscape_texture_path(icon_path: str) -> str:
+    """The shipped path of an LTEX ICON, whatever the source game.
+
+    Oblivion names a bare file relative to Textures\\Landscape\\, so the
+    folder is prepended. Morrowind's is already a full path under Textures\\
+    and must be left alone -- prefixing it invented a landscape\\ folder that
+    does not exist, and all 107 terrain textures resolved to nothing.
+    See: docs/commentary/tes4_export_morrowind.md#land-terrain
+    """
+    lowered = icon_path.lower().replace('/', '\\')
+    if not (lowered.startswith('textures\\')
+            or lowered.startswith('landscape\\')):
+        icon_path = 'landscape\\' + icon_path
+    return prefix_path(icon_path)
 
 
 def _common_header_subs(rec: dict, need_obnd: bool = True, need_full: bool = True,
                         obnd_sig: str = '', obnd_override: tuple = None) -> bytes:
-    """Build common leading subrecords: EDID, OBND, FULL.
+    """Build common leading subrecords: EDID, VMAD, OBND, FULL.
+
+    VMAD carries the converted TES4 object script (SCPT via SCRI) when
+    one was bound, and Skyrim orders it right after EDID.
+
+    The `object_scripts` import stays INSIDE the body.
+    See: docs/reference/tes5_import_architecture.md#object-scripts-import-is-deferred
 
     obnd_sig: record type signature for type-aware OBND defaults.
     obnd_override: explicit (x1,y1,z1,x2,y2,z2) tuple; skips mesh lookup.
@@ -43,9 +78,7 @@ def _common_header_subs(rec: dict, need_obnd: bool = True, need_full: bool = Tru
     edid = get_str(rec, 'EditorID')
     if edid:
         subs += pack_string_subrecord('EDID', edid)
-    # VMAD — converted TES4 object script (SCPT via SCRI), if one was bound.
-    # Skyrim order places VMAD right after EDID, before OBND.
-    from ..object_scripts import get_object_vmad
+    from ..base.object_scripts import get_object_vmad
     subs += get_object_vmad(get_formid(rec, 'FormID'))
     if need_obnd:
         bounds = obnd_override if obnd_override is not None else _resolve_obnd(rec, obnd_sig)
@@ -117,7 +150,7 @@ def _resolve_obnd(rec: dict, obnd_sig: str) -> tuple:
         return authored
     path = get_str(rec, 'Model.MODL')
     if path:
-        key = _prefix_path(path).lower().replace('\\', '/')
+        key = prefix_path(path).lower().replace('\\', '/')
         bounds = get_mesh_obnd(key)
         if bounds is not None:
             return bounds
@@ -172,27 +205,27 @@ def _simple_object(rec: dict, sig: str, has_full: bool = True,
     if has_model:
         path = get_str(rec, 'Model.MODL')
         if path:
-            subs += pack_string_subrecord('MODL', _prefix_path(path))
+            subs += pack_string_subrecord('MODL', prefix_path(path))
     subs += extra_subs
     return pack_record(sig, get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
 
 def _convert_biped_flags(tes4_flags: int) -> int:
-    """Convert TES4 biped flags to TES5 first person flags.
+    """Convert source biped flags to TES5 first person flags.
 
-    Returns PRIMARY equip slots plus equipment-conflict extras (e.g. helmets
-    block the Circlet slot so you can't wear both simultaneously).
-    Body-coverage extras (e.g. ForeArms on a cuirass) are NOT included here —
-    they go on the ARMA (via ARMA_BODY_COVERAGE_EXTRA) so that the ARMO only
-    occupies its own equipment slot and doesn't conflict with other equipped items.
+    Returns PRIMARY equip slots plus equipment-conflict extras; the source
+    game selects the slot table.  Both imports are function-local to break
+    the cycle equipment_falloutnv -> common -> equipment_falloutnv.
+    See: docs/commentary/asset_convert_armor.md#biped-slot-conversion
     """
-    from ..constants import BIPED_SLOT_MAP, BIPED_SLOT_EXTRA
+    from ..base.constants import BIPED_SLOT_MAP, BIPED_SLOT_EXTRA
+    from .equipment_falloutnv import biped_slot_tables
+    slot_map, slot_extra = biped_slot_tables(BIPED_SLOT_MAP, BIPED_SLOT_EXTRA)
     tes5 = 0
-    for tes4_bit, tes5_bit in BIPED_SLOT_MAP.items():
+    for tes4_bit, tes5_bit in slot_map.items():
         if tes4_flags & (1 << tes4_bit):
             tes5 |= (1 << tes5_bit)
-    # Apply equipment-conflict extras (e.g. helmet → also block Circlet slot)
-    for tes5_bit, extra_bits in BIPED_SLOT_EXTRA.items():
+    for tes5_bit, extra_bits in slot_extra.items():
         if tes5 & (1 << tes5_bit):
             for eb in extra_bits:
                 tes5 |= (1 << eb)
@@ -247,3 +280,52 @@ def note_emitted_region(fid):
 def region_was_emitted(fid) -> bool:
     """True when convert_REGN emitted `fid`."""
     return fid in _EMITTED_REGION_FIDS
+
+
+# ---------------------------------------------------------------------------
+#   Game settings and globals
+# ---------------------------------------------------------------------------
+
+#: TES4 globals Skyrim already ships at the SAME FormIDs; never re-emitted.
+_ENGINE_GLOBALS = {'gamehour', 'gamedayspassed', 'gameday', 'gamemonth',
+                   'gameyear', 'timescale'}
+
+
+def convert_GLOB(rec: dict) -> bytes:
+    """GLOB → GLOB, dropping the globals Skyrim's engine already defines.
+
+    See: docs/commentary/tes5_import_quest.md#engine-globals
+    """
+    subs = b''
+    edid = get_str(rec, 'EditorID')
+    if edid and edid.lower() in _ENGINE_GLOBALS:
+        return b''
+    if edid:
+        subs += pack_string_subrecord('EDID', edid)
+    type_char = get_str(rec, 'FNAM.Type', 'f')
+    subs += pack_uint8_subrecord('FNAM', ord(type_char[0]) if type_char else ord('f'))
+    value = get_float(rec, 'FLTV.Value')
+    subs += pack_float_subrecord('FLTV', value)
+    return pack_record('GLOB', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
+
+
+def convert_GMST(rec: dict) -> bytes:
+    """GMST → GMST; the EditorID's leading s/f/i prefix types the DATA value."""
+    subs = b''
+    edid = get_str(rec, 'EditorID')
+    if edid:
+        subs += pack_string_subrecord('EDID', edid)
+    value_str = get_str(rec, 'DATA.Value')
+    if edid and edid.startswith('s'):
+        subs += pack_string_subrecord('DATA', value_str)
+    elif edid and edid.startswith('f'):
+        try:
+            subs += pack_float_subrecord('DATA', float(value_str))
+        except ValueError:
+            subs += pack_uint32_subrecord('DATA', 0)
+    else:
+        try:
+            subs += pack_uint32_subrecord('DATA', int(value_str))
+        except ValueError:
+            subs += pack_uint32_subrecord('DATA', 0)
+    return pack_record('GMST', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)

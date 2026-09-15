@@ -1,6 +1,6 @@
 # tes5_import/record_types/magic.py - magic conversion
 
-**Code:** `tes5_import/record_types/equipment.py`, `tes5_import/record_types/magic.py`, `tes5_import/vanilla_mgef_data.py`, `asset_convert/skyrim_overrides.py`
+**Code:** `tes5_import/record_types/equipment.py`, `tes5_import/record_types/magic.py`, `tes5_import/generated/vanilla_mgef_data.py`, `asset_convert/character/skyrim_overrides.py`
 
 ## Contents
 
@@ -107,7 +107,7 @@ a name. `tools/audit/magic_audit.py` reports phantom keys.
 
 ### 3. ~~The vanilla DATA blobs are truncated — 96 bytes where 152 are required~~ — FIXED 2026-07-25
 
-`tes5_import/vanilla_mgef_data.py` claimed "152-byte DATA hex" in its
+`tes5_import/generated/vanilla_mgef_data.py` claimed "152-byte DATA hex" in its
 docstring. Every one of its 80 blobs was **96 bytes**.
 
 Cause: `tools/generators/gen_vanilla_mgef_table.py:read_dump` did
@@ -144,7 +144,7 @@ converted and unused. Since the mesh pipeline is now solid, this data is
 recoverable — it just has nowhere to land today.
 
 Note also that `EFSH` conversion itself is partial: it writes a 128-byte DATA
-populated only through offset 44 (flags, fill colour, 6 fill-alpha floats) and
+populated only through offset 44 (flags, fill color, 6 fill-alpha floats) and
 zeroes the rest.
 
 Supporting record types with **no writer at all**: `ARTO`, `RFCT`, `IPDS`,
@@ -321,6 +321,7 @@ filler; dump a converted summon MGEF and diff its DATA field-by-field against
 
 ### Phase 3 — Projectiles and delivery — DONE 2026-08-01 (projectile half)
 
+<a id="aimed-ench-null-projectile"></a>
 **An Aimed magic item with no projectile is a HARD CRASH, not a dud cast.**
 This was written up as a cosmetic problem ("the item casts NOTHING in game",
 `magic_effects.py`'s module docstring, and the CK's "is AIMED but has no Magic

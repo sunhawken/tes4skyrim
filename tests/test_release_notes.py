@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import tools.release.release_notes as rn  # noqa: E402
+import tools.release.release_notes as rn
 
 
 def steps(path):
@@ -43,10 +43,10 @@ def test_phase_map_targets_are_known_steps():
 @pytest.mark.parametrize("path,expected", [
     ("tes5_import/record_types/actors.py", "6. Import"),
     ("script_convert/converter.py",        "8. Scripts"),
-    ("asset_convert/nif_converter.py",     "3. Meshes"),
-    ("asset_convert/audio_converter.py",   "7. Sounds"),
-    ("asset_convert/lod_gen.py",           "Create LOD"),
-    ("asset_convert/bsa_extract.py",       "2. Extract"),
+    ("asset_convert/nif/nif_converter.py",     "3. Meshes"),
+    ("asset_convert/audio/audio_converter.py",   "7. Sounds"),
+    ("asset_convert/lod/lod_gen.py",           "Create LOD"),
+    ("asset_convert/sources/bsa_extract.py",       "2. Extract"),
     ("asset_convert/spt_reader.py",        "4. SpeedTrees"),
     ("asset_convert/hkx_convert.py",       "5. Creatures"),
 ])
@@ -78,20 +78,36 @@ def test_non_pipeline_paths_need_no_rerun(path):
     assert steps(path) == []
 
 
-def test_gui_change_is_reported_as_gui_only():
-    ordered, unmatched, gui_only = rn.steps_for_paths(["gui.py"])
+@pytest.mark.parametrize("path", [
+    "gui.py", "gui.pyw", "core/gui/app.py", "core/gui/panels.py",
+])
+def test_gui_change_is_reported_as_gui_only(path):
+    """The GUI lives in core/gui/; a change there re-runs no pipeline step."""
+    ordered, unmatched, gui_only = rn.steps_for_paths([path])
     assert not unmatched and ordered == [] and gui_only
+
+
+@pytest.mark.parametrize("path", ["core/run_log.py", "core/plugin_masters.py"])
+def test_core_reporting_plumbing_reruns_nothing(path):
+    """These only report -- they produce no conversion output to stale."""
+    assert steps(path) == []
+
+
+def test_new_core_module_is_never_unmatched():
+    """The bare `^core/` tail catches anything added there later."""
+    _ordered, unmatched, _gui = rn.steps_for_paths(["core/some_new_module.py"])
+    assert not unmatched
 
 
 # ── Packaging is a consequence, never a standalone reason ─────────────────
 
 def test_packaging_follows_a_producing_step():
-    assert set(rn.PACKAGING_STEPS) <= set(steps("tes5_import/import_main.py"))
+    assert set(rn.PACKAGING_STEPS) <= set(steps("tes5_import/pipeline.py"))
 
 
 def test_patch_skyrim_alone_does_not_drag_in_packaging():
     """Patch Skyrim writes a standalone ARMA patch that BSA/zip never read."""
-    assert steps("asset_convert/modify_body_meshes.py") == ["Patch Skyrim"]
+    assert steps("asset_convert/character/modify_body_meshes.py") == ["Patch Skyrim"]
 
 
 @pytest.mark.parametrize("path", [
@@ -108,7 +124,7 @@ def test_starter_mod_repackages_itself_only(path):
 # ── Shared plumbing legitimately means everything ─────────────────────────
 
 @pytest.mark.parametrize("path", [
-    "process_job.py", "worker_budget.py", "subprocess_flags.py",
+    "core/process_job.py", "core/worker_budget.py", "core/subprocess_flags.py",
 ])
 def test_pool_plumbing_implies_all_steps(path):
     assert steps(path) == rn.STEP_ORDER
@@ -140,7 +156,7 @@ def test_unmapped_path_selects_no_steps():
 
 def test_unmapped_path_does_not_widen_a_known_change():
     ordered, unmatched, _ = rn.steps_for_paths(
-        ["asset_convert/lod_gen.py", "brand_new_package/thing.py"])
+        ["asset_convert/lod/lod_gen.py", "brand_new_package/thing.py"])
     assert unmatched == ["brand_new_package/thing.py"]
     assert "Create LOD" in ordered
     assert "1. Export" not in ordered
@@ -229,5 +245,5 @@ def test_convert_py_uses_supplied_attribution():
 
 def test_steps_are_emitted_in_gui_order():
     ordered, _, _ = rn.steps_for_paths(
-        ["asset_convert/lod_gen.py", "tes4_export/x.py", "script_convert/y.py"])
+        ["asset_convert/lod/lod_gen.py", "tes4_export/x.py", "script_convert/y.py"])
     assert ordered == [s for s in rn.STEP_ORDER if s in ordered]

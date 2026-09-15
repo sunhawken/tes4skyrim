@@ -26,7 +26,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from subprocess_flags import windows_cmd  # noqa: E402
+from core.subprocess_flags import windows_cmd
 
 SSE = r'C:\Program Files (x86)\Steam\steamapps\common\Skyrim Special Edition'
 CK = os.path.join(SSE, 'Papyrus Compiler', 'PapyrusCompiler.exe')
@@ -73,8 +73,9 @@ def _ensure_vanilla_src():
         return
     sys.path.insert(0, ROOT)
     try:
-        from convert import _find_skyrim_source_scripts
-        _find_skyrim_source_scripts()
+        from convert import load_config
+        from papyrus_compile import find_skyrim_source_scripts
+        find_skyrim_source_scripts(load_config())
     except Exception as e:
         print(f'  WARNING: could not unpack vanilla headers: {e}')
 

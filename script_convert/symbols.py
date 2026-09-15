@@ -31,18 +31,13 @@ from script_convert.tes4 import nodes as N
 from dataclasses import dataclass, field
 
 from script_convert.constants import (
-    AXIS_COMMANDS, NUMERIC_RANK,
-    _ACTOR_ARG_FUNCTIONS,
-    _ACTOR_ONLY_FUNCTIONS,
-    _OBJREF_SHARED_FUNCTIONS,
-    _BASE_OBJECT_PAPYRUS,
+    AXIS_COMMANDS, KNOWN_GLOBALS, NUMERIC_RANK, RETURN_TYPES,
+    _BASE_OBJECT_PAPYRUS, is_generated_script_type,
     _FORM_RETURNING,
-    ACTOR,
-    AV,
-    COMMAND_ROWS,
-    MAP,
-    KNOWN_GLOBALS,
-    RETURN_TYPES,
+)
+from script_convert.command_rows import (
+    ACTOR, ACTOR_ARG_FUNCTIONS, ACTOR_ONLY_FUNCTIONS, AV, COMMAND_ROWS, MAP,
+    OBJREF_SHARED_FUNCTIONS,
 )
 
 # Names a generated script may use without declaring them: Papyrus globals,
@@ -193,10 +188,7 @@ def scan_var_usage(stmts, names, lookup):
                     usage[recv].ref_usage = True
                     if _needs_actor(node.name):
                         usage[recv].actor_usage = True
-            # A bare name passed as an ARGUMENT is being used as a form --
-            # and as an ACTOR when the command takes one there (TES4Polyfill
-            # .GetIsCreature, StartCombat, IsDetectedBy...).
-            actor_arg = node.name.lower() in _ACTOR_ARG_FUNCTIONS
+            actor_arg = node.name.lower() in ACTOR_ARG_FUNCTIONS
             for a in node.args:
                 if isinstance(a, N.Ident) and a.name.lower() in usage:
                     usage[a.name.lower()].ref_usage = True
@@ -291,7 +283,7 @@ def _classify_assignment(usage, value, lookup):
         # Only a type Papyrus REFUSES to store in an ObjectReference forces
         # the widening; a ref-shaped or script-typed value is already fine.
         if (vtype not in ('ObjectReference', 'Actor', 'Form')
-                and not vtype.startswith('TES4_')
+                and not is_generated_script_type(vtype)
                 and vtype not in ('Int', 'Float', 'Bool', 'String')):
             usage.form_type = 'Form'
     usage.ref_assign = True
@@ -445,30 +437,25 @@ def _needs_actor(name: str) -> bool:
     """Does calling `name` on a receiver require that receiver to be an Actor?
 
     Two authorities agree on this and both are consulted: the
-    `_ACTOR_ONLY_FUNCTIONS` census, and the command row's own `subj` -- a row
+    `ACTOR_ONLY_FUNCTIONS` census, and the command row's own `subj` -- a row
     written `Cmd(..., ACTOR)` or `Cmd(..., AV)` says so by construction, which
     keeps the answer correct for every command added since the census.
+
+    A name in `OBJREF_SHARED_FUNCTIONS` says nothing about its receiver, and an
+    ALIAS is consulted under the name it maps to as well.
+    See: docs/commentary/script_convert.md#commands-that-must-not-promote
     """
     low = name.lower()
-    # 14 of _ACTOR_ONLY_FUNCTIONS are ALSO declared on ObjectReference
-    # (PlaceAtMe, AddItem...).  Calling one says nothing about the receiver,
-    # and typing a spawn marker Actor because it calls PlaceAtMe breaks every
-    # write into it -- the same exclusion the emitter applies before casting.
-    if low in _OBJREF_SHARED_FUNCTIONS:
+    if low in OBJREF_SHARED_FUNCTIONS:
         return False
-    if low in _ACTOR_ONLY_FUNCTIONS:
+    if low in ACTOR_ONLY_FUNCTIONS:
         return True
     row = COMMAND_ROWS.get(low)
     if row is None:
         return False
     if row.subj in (ACTOR, AV):
         return True
-    # An ALIAS resolves through the name it maps to: `UnequipItemNS` is TES4's
-    # no-sound spelling of `UnequipItem` and reaches the same Papyrus method,
-    # so the census keyed by the primary spelling has to be consulted under
-    # that name too -- otherwise the receiver stays ObjectReference and the
-    # call is undefined.
-    return row.subj == MAP and row.emit.lower() in _ACTOR_ONLY_FUNCTIONS
+    return row.subj == MAP and row.emit.lower() in ACTOR_ONLY_FUNCTIONS
 
 
 def property_declarations(property_refs, declared) -> list:
@@ -483,18 +470,18 @@ def property_declarations(property_refs, declared) -> list:
     type.  Declaring the generic one instead made every cross-script variable
     read through it fail to compile.
     """
-    from script_convert.constants import _safe_property_name
+    from script_convert.constants import safe_property_name
 
     merged = {}
     for pname, ptype in sorted(property_refs.items()):
-        key = _safe_property_name(pname).lower()
+        key = safe_property_name(pname).lower()
         known = merged.get(key)
         if known is None or (known[1] == 'Quest' and ptype != 'Quest'):
             merged[key] = (pname, ptype)
 
     out = []
     for pname, ptype in sorted(merged.values(), key=lambda x: x[0].lower()):
-        safe = _safe_property_name(pname)
+        safe = safe_property_name(pname)
         if safe.lower() in declared:
             continue
         declared.add(safe.lower())

@@ -8,7 +8,7 @@ data.
 def resolve_property_formid(xref, prop_name: str) -> str:
     """EditorID lookup for a (possibly sanitized) property name.
 
-    Reverses each rename `_safe_property_name` can apply, in order: the exact
+    Reverses each rename `safe_property_name` can apply, in order: the exact
     `d<digits>` leading-digit prefix, the plain name, the legacy digit-DELETING
     scheme, the reserved-word `my` prefix, and the `<Name>Base` ActorBase
     de-collision.  An unreversed rename leaves the property None at runtime.
@@ -20,7 +20,7 @@ def resolve_property_formid(xref, prop_name: str) -> str:
     if not fid:
         fid = xref.edid_to_formid.get(low, '')
     if not fid:
-        fid = _digit_stripped_formid(xref, low)
+        fid = digit_stripped_formid(xref, low)
     if not fid and low.startswith('my'):
         fid = xref.edid_to_formid.get(low[2:], '')
     if not fid and len(low) > 4 and low.endswith('base'):
@@ -36,7 +36,7 @@ _NON_PROPERTY_SIGS = frozenset(
 )
 
 
-def _digit_stripped_formid(xref, low: str) -> str:
+def digit_stripped_formid(xref, low: str) -> str:
     """FormID for a property name whose leading digits were stripped.
 
     Legacy: the old sanitiser DELETED leading digits, and ~1,400

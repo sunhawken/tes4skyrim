@@ -26,6 +26,26 @@ Each stage has a `--<step>-only` flag. The steps are: `export`, `import`,
 `modify-body-meshes`, `pack`, `pack-zip`. Read `convert.py`'s module docstring
 for the authoritative list — it changes more often than this doc.
 
+### 🛑 LOD is NOT built with `convert.py --lod-only`
+
+**`tools/release/create_lod.py` is the entry point for all LOD generation.** A
+worldspace is baked ONCE from the plugin that owns it plus every other plugin
+as an overlay, so `-f <plugin> --lod-only` bakes the wrong content: it misses
+the overlays that supply most of the worldspace's objects.
+
+```bash
+python tools/release/create_lod.py --worldspaces WrldMorrowind --dry-run
+python tools/release/create_lod.py --worldspaces WrldMorrowind
+```
+
+**Always `--dry-run` first and read the plan** — it names the owner and every
+overlay, which is the only confirmation that the target is the one you meant.
+`WrldMorrowind` is owned by `Morrowind_ob.esm` with `Tamriel_Data.esm` and
+`TR_Mainland.esm` overlaid; baking `Morrowind_ob.esm` alone drops all Tamriel
+Rebuilt content. `--worldspaces` only ever REMOVES work, so it is a scope, not
+a filter on what is buildable. Full behaviour:
+[python_tools.md](python_tools.md#terrain--lod--world).
+
 ### Asset-only mods are pseudo-plugins — they still take `-f`
 
 A mod with no ESP/ESM (texture/mesh replacer, resource pack) is a legitimate
@@ -39,12 +59,45 @@ python convert.py --list-mods                     # names + what each ships
 python convert.py -f "Tamriel Landscape Pack" --speedtrees-only
 ```
 
-Only the record stages (`export`/`import`/`scripts`/`creatures`) are skipped —
-there is no binary to read, so they no-op rather than fail
-(`convert.py::_is_asset_only`).
+Only the record stages (`export`/`import`/`scripts`/`creatures`) are skipped.
+There is no binary for them to read, so those files are dropped from the
+plugin-only phases up front (`source_paths.is_asset_only`) rather than left to
+fail one by one on a missing source; the asset phases still run normally.
 After `--import-mod`, the tool prints the exact command with the applicable
 flags already filled in. **Never conclude that an asset has "no plugin to
 build" because no ESP references it** — check `--list-mods` first.
+
+### <a id="plugin-source-resolution"></a>Where a plugin's binary comes from
+
+**Code:** `convert.py` `resolve_plugin_path`
+
+`-f <plugin>` names a plugin, not a path. Three sources are tried in order:
+
+1. **An imported mod's retained binary** — `export/<plugin>/_source/<plugin>`,
+   written by `mod_ingest.py` when the plugin came from a mod archive.
+2. **The registered game directory that owns it** — `source_registry`
+   records each source Data folder as `kind: "directory"` (Oblivion, Nehrim,
+   Fallout New Vegas), and `directory_for()` maps a plugin name back to its
+   own folder.
+3. **The default Data directory** (`tes4_data`), for anything unregistered.
+
+Step 2 is what lets a second or third game convert at all. Without it every
+plugin resolves against the *default* Data directory, so `-f FalloutNV.esm`
+looked for `FalloutNV.esm` inside the Oblivion folder and failed with
+"Source file not found" — even though the registry held the correct path all
+along. Nehrim worked only because its export tree already existed.
+
+A registry that is missing or broken must never break a default-directory
+conversion, so every registry lookup here is inside one `try` that falls
+through to step 3.
+
+### <a id="game-data-path-detection"></a>Detecting a game's own Data path
+
+`find_game_path` checks the **config key first** (`tes4DataPath` /
+`tes5DataPath`), then the Windows registry. Config wins deliberately: a
+non-Windows host has no `winreg` at all, and a Windows user whose registry
+entry points at the wrong install needs a way to override it. Both keys are
+empty by default, so on a normal Windows box this changes nothing.
 
 ### Unreferenced textures are dropped at PACK time, never deleted
 
@@ -79,10 +132,10 @@ offset. Two copies existed:
 | Scanner | Fix | Result |
 |---|---|---|
 | `refs_from_records` (export text) | `'.dds' not in body` substring reject — `LAND.txt` is 1.47 GB with zero `.dds` | minutes → 4.2 s |
-| `refs_from_assets` + `nif_converter._harvest_texture_bytes` (binary) | `_texture_refs_in`: `bytes.find` each `.dds`, walk back over legal bytes | 13.8x, `build_refs` 87.6 s → 11.5 s |
+| `refs_from_assets` + `nif_converter._harvest_texture_bytes` (binary) | `texture_refs_in`: `bytes.find` each `.dds`, walk back over legal bytes | 13.8x, `build_refs` 87.6 s → 11.5 s |
 
 The binary case could not use a substring reject — every `.bto` really does
-contain `.dds`. Watch the bound when touching `_texture_refs_in`: the old
+contain `.dds`. Watch the bound when touching `texture_refs_in`: the old
 `{3,200}` counted the run *before* `.dds`, so a whole match reaches **204**
 bytes; capping the match at 200 silently truncates the longest paths.
 Equivalence with the original regex is pinned by `TestBinaryTextureScan`.
@@ -110,29 +163,36 @@ Linux/Mac than on Windows.
 <a id="run-logs"></a>
 ### Run logs
 
-Every run writes its console output to a rotating file in `logs/`, newest
-first, so the record of a run survives closing the GUI (whose scrollback was
-previously the only copy) and starting the next one:
+Every run writes its console output to its own file in `logs/`, so the record
+of a run survives closing the GUI (whose scrollback was previously the only
+copy) and starting the next one. Each name carries the start time and the
+plugin the run converted:
 
 ```
-logs/run-1.log   # most recent
-logs/run-2.log
-logs/run-3.log
+logs/run-20260911-143002-Oblivion.esm.log
+logs/run-20260911-101755-Nehrim.esm.log
+logs/run-20260908-224410-global.log        # a run with no plugin selected
 ```
 
-`logRunsKept` in `conversion_config.json` sets how many are kept (default 3);
-`0` disables run logging entirely. Names are fixed rather than timestamped so
-"the last run" is always `run-1.log` — the wall-clock time, version, and the
-command/steps are in the header inside the file. Tools ▸ Open Logs Folder
-opens the directory, and each run prints its own log path into the log.
+The timestamp leads so a plain lexical sort is chronological, and the plugin is
+in the name so the log for the build you just played is identifiable without
+opening every file. Two runs starting inside the same second get a `-2` suffix
+rather than one overwriting the other. `logRunsKept` in
+`conversion_config.json` sets how many are kept (default 20); `0` disables run
+logging entirely. A new run deletes only the surplus oldest, so an existing
+log's name never changes under a reader. Tools ▸ Open Logs Folder opens the
+directory, and each run prints its own log path into the log.
+`TESCONV_LOGS_DIR` overrides the directory (the test suite uses it so it never
+writes beside a live run).
 
-**The run's OWNER rotates, never each process.** A GUI run is usually several
-`convert.py` invocations (one per step), so rotating per process would leave
-the "last 3 runs" holding the last 3 *steps* of one run. The GUI rotates once,
-writes every line through its own sink, and sets `TESCONV_RUN_LOG` in the child
-environment; a child seeing that variable neither rotates nor writes, so the
-file has exactly one writer. A bare `python convert.py` sees no such variable,
-so there the process is the run and it rotates for itself.
+**The run's OWNER opens the log, never each process.** A GUI run is usually
+several `convert.py` invocations (one per step), so opening one per process
+would leave the retained set holding the last N *steps* of one run. The GUI
+opens one log, writes every line through its own sink, and sets
+`TESCONV_RUN_LOG` in the child environment; a child seeing that variable
+neither prunes nor writes, so the file has exactly one writer. A bare
+`python convert.py` sees no such variable, so there the process is the run and
+it opens one for itself.
 
 Lines are flushed as they are written — a log that only reaches disk on clean
 exit is empty exactly when it matters most. A run that is killed or hangs
@@ -155,7 +215,7 @@ either way.
    mapping needed for any of them, with ONE exception -- `hkxcmd.exe` parses
    its own argv and treats a leading `/` as a switch prefix, silently
    swallowing an absolute POSIX path as an unrecognised flag. Every call site
-   already routes through `asset_convert/hkx_xml.py`'s `_to_hkxcmd_path()`,
+   already routes through `asset_convert/havok/hkx_xml.py`'s `to_hkxcmd_path()`,
    which prefixes Wine's `Z:` drive and swaps in backslashes for that one tool
    only — nothing else needs it, and this is transparent to callers.
 
@@ -174,7 +234,7 @@ either way.
    `conversion_config.json`'s `tes4DataPath` / `tes5DataPath` are the
    equivalent everywhere else: set them to Oblivion's and Skyrim SE's `Data`
    folders and every phase that would otherwise consult the registry
-   (script compilation's header lookup, `asset_convert/skyrim_assets.py`'s
+   (script compilation's header lookup, `asset_convert/sources/skyrim_assets.py`'s
    vanilla-asset lookup, `preflight.py`'s checks, …) picks it up. This is
    checked FIRST everywhere, so it also works as a registry override on
    Windows if the registry ever points at the wrong install; left blank (the
@@ -201,8 +261,7 @@ either way.
 
 - Export text is cached per record type in `export/<filename>/` (`ACTI.txt`,
   `NPC_.txt`, …).
-- FormID mappings live in `export/mappings/<filename>.FormID_Mapping.txt`.
-- Processing `Knights.esp` reuses the cached `Oblivion.esm` export + mappings.
+- Processing `Knights.esp` reuses the cached `Oblivion.esm` export.
 - `--no-cache` forces a re-export.
 
 ### Versioned stage artifacts
@@ -213,7 +272,7 @@ outlive the PLUGIN that wrote them: a dependent plugin reads its master's
 `creature_projects.json` and never rewrites it. So a file on disk can predate
 the code reading it by any amount.
 
-Registered artifacts carry an envelope (`tes5_import/artifact_schema.py`):
+Registered artifacts carry an envelope (`tes5_import/base/artifact_schema.py`):
 
 ```json
 {"version": 1, "plugin": "Oblivion.esm", "stage": "--creatures-only",
@@ -284,7 +343,7 @@ If you see that class of symptom now, it is NOT id drift; look elsewhere.
 `phase_extract` branches on `export/sources.json`:
 
 - a plugin **imported from a mod archive** re-runs its ingest
-  (`asset_convert/mod_ingest.py::reingest`), unpacking from the archive copy
+  (`asset_convert/sources/mod_ingest.py::reingest`), unpacking from the archive copy
   retained under `export/<plugin>/_source/`;
 - **everything else** extracts the BSAs beside it in the Oblivion Data
   directory, exactly as before.
@@ -309,8 +368,8 @@ topic binding is patched in after Phase 5. Read the phase comments in
 
 Every converted script compiles against Bethesda's own `.psc` sources, passed
 to the compiler as `-h`. The CK ships them one of three ways, and
-`convert._find_skyrim_source_scripts()` is the single lookup every caller uses
-(the Scripts phase, `preflight._papyrus_headers`, `tools/script/ck_compile_check.py`,
+`papyrus_compile.find_skyrim_source_scripts()` is the single lookup every caller
+uses (the Scripts phase, `preflight._papyrus_headers`, `tools/script/ck_compile_check.py`,
 `tools/script/compile_papyrus.py`) so the dependency check can never pass while the
 phase then fails to find them:
 
@@ -334,7 +393,7 @@ the normal "headers not found" Missing rather than crashing.
 
 ## Skipped record types
 
-`SKIP_TYPES` in [tes5_import/constants.py](../../tes5_import/constants.py) is the
+`SKIP_TYPES` in [tes5_import/base/constants.py](../../tes5_import/base/constants.py) is the
 single source of truth. Currently skipped: ROAD, SCPT, SKIL, BSGN, RACE, MGEF,
 CSTY, IDLE, GMST, EYES, HAIR.
 
@@ -381,11 +440,29 @@ Model.MODL=Creatures\\Deer\\Skeleton.NIF
 ```
 TESConversion/
   convert.py              # pipeline orchestrator (all stages)
-  gui.py / gui.pyw        # GUI front-end
+  gui.py / gui.pyw        # GUI launcher only -- the window is core/gui/
   conversion_config.json  # file list and settings
-  run_log.py              # rotating per-run logs (see Run logs)
 
-  logs/                   # run-1/2/3.log, newest first (gitignored)
+  core/                   # shared plumbing every stage imports
+    run_log.py            # per-run logs (see Run logs)
+    worker_budget.py      # parallel worker count
+    subprocess_flags.py   # POPEN_FLAGS, windows_cmd, run_streamed
+    process_job.py        # Win32 Job Object containment
+    collision_options.py  # collision winding-repair toggle
+    plugin_masters.py     # master lists from binary headers
+
+    gui/                  # the converter window
+      app.py              # GuiApp carrier, palette, OS chrome, assembly order
+      config.py           # step tables, settings, scanners, run_process
+      widgets.py          # dialogs, scroller, tooltips, plugin combobox
+      menus.py            # the dark menu bar
+      selection.py        # sources, step checkboxes, Upgrade, drop zone
+      panels.py           # the five modal panels
+      runner.py           # log, run state, commands, stamps, execution
+      mods.py             # Mods menu
+      morrowind.py        # Settings > Morrowind source
+
+  logs/                   # run-<timestamp>-<plugin>.log (gitignored)
 
   tes4_export/            # TES4 binary -> KEY=VALUE text (pure dump)
     tes4_reader.py        # mmap-based binary reader
@@ -422,6 +499,7 @@ TESConversion/
     spt_parser.py spt_generator.py spt_converter.py   # SpeedTree
 
   native/                 # C++ extensions (grow.cpp -> _navgrow_native)
+  tes_runtime/            # TESRuntime.dll, the shipped SKSE plugin (animation cache + FNV guns/limbs)
   external/               # third-party binaries (see README license table)
   tests/ tools/ docs/ references/ temp/
   export/                 # cached exports (gitignored)
@@ -429,6 +507,9 @@ TESConversion/
     <Mod Label>/          #   an IMPORTED mod: one folder for the whole archive
   output/                 # WORKING area (gitignored)
     <plugin>/             #   one folder per converted plugin...
+      SKSE/Plugins/TESRuntime/           # <plugin>.bodyparts.json / .guns.json, loose (never in a BSA)
+      SKSE/Plugins/TESRuntime/animation/ #   the plugin's animation cache fragment
+      meshes/actors/character/           # FO3/FNV only: patched humanoid behaviors + animations/<game>guns/
     <Mod Label>/          #   ...or one per imported mod (mirrors export/)
     AutoConvertLOD/       #   the baked LOD mod (tools/release/create_lod.py)
     Finished Mods/        #   everything the user INSTALLS -- see below

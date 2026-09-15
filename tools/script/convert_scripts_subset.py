@@ -30,8 +30,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from tes5_import.text_reader import parse_export_file  # noqa: E402
-from script_convert import pipeline  # noqa: E402
+from asset_convert.game_paths import namespace_for, set_namespace
+from tes5_import.base.text_reader import parse_export_file
+from script_convert import pipeline
 
 
 def _quest_records(export_dir: str, quest_edid: str, by_type: dict):
@@ -70,6 +71,37 @@ def _quest_records(export_dir: str, quest_edid: str, by_type: dict):
     return sorted(s for s in scpts if s), [r['FormID'] for r in infos], [q['EditorID']]
 
 
+def _select(args, export_dir: str, scpt_work, info_work, qust_work):
+    """The records the requested EditorIDs/FormIDs name, as (scpt, info, qust).
+
+    `--quest` expands to every script, INFO and QUST the quest owns.
+    """
+    want_scpt = {s.lower() for s in args.scpt}
+    want_info = {s.upper().zfill(8) for s in args.info}
+    want_qust = {s.lower() for s in args.qust}
+    if args.quest:
+        by_type = {}
+        for sig in ('DIAL', 'INFO', 'QUST', 'SCPT'):
+            p = os.path.join(export_dir, f'{sig}.txt')
+            by_type[sig] = parse_export_file(p) if os.path.exists(p) else []
+        s, i, q = _quest_records(export_dir, args.quest, by_type)
+        want_scpt |= {x.lower() for x in s}
+        want_info |= {x.upper() for x in i}
+        want_qust |= {x.lower() for x in q}
+        print(f'  quest {args.quest}: {len(s)} scripts, {len(i)} INFOs')
+
+    scpt = [r for r in scpt_work
+            if (r.get('EditorID') or '').lower() in want_scpt]
+    info = [r for r in info_work
+            if (r.get('FormID') or '').upper() in want_info]
+    qust = [r for r in qust_work
+            if (r.get('EditorID') or '').lower() in want_qust]
+    missing = want_scpt - {(r.get('EditorID') or '').lower() for r in scpt}
+    if missing:
+        print(f'  ** SCPT not found / no body: {sorted(missing)}')
+    return scpt, info, qust
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -85,31 +117,14 @@ def main(argv=None) -> int:
     export_dir = str(ROOT / 'export' / args.plugin)
     out = args.out or str(ROOT / 'temp' / 'subset_scripts' / args.plugin)
     os.makedirs(out, exist_ok=True)
+    set_namespace(namespace_for(export_dir))
 
     ctx = pipeline.build_script_context(export_dir, out)
     scpt_work, info_work, qust_work = (ctx['scpt_work'], ctx['info_work'],
                                        ctx['qust_work'])
 
-    want_scpt = {s.lower() for s in args.scpt}
-    want_info = {s.upper().zfill(8) for s in args.info}
-    want_qust = {s.lower() for s in args.qust}
-    if args.quest:
-        by_type = {}
-        for sig in ('DIAL', 'INFO', 'QUST', 'SCPT'):
-            p = os.path.join(export_dir, f'{sig}.txt')
-            by_type[sig] = parse_export_file(p) if os.path.exists(p) else []
-        s, i, q = _quest_records(export_dir, args.quest, by_type)
-        want_scpt |= {x.lower() for x in s}
-        want_info |= {x.upper() for x in i}
-        want_qust |= {x.lower() for x in q}
-        print(f'  quest {args.quest}: {len(s)} scripts, {len(i)} INFOs')
-
-    scpt = [r for r in scpt_work if (r.get('EditorID') or '').lower() in want_scpt]
-    info = [r for r in info_work if (r.get('FormID') or '').upper() in want_info]
-    qust = [r for r in qust_work if (r.get('EditorID') or '').lower() in want_qust]
-    missing = want_scpt - {(r.get('EditorID') or '').lower() for r in scpt}
-    if missing:
-        print(f'  ** SCPT not found / no body: {sorted(missing)}')
+    scpt, info, qust = _select(args, export_dir, scpt_work, info_work,
+                               qust_work)
 
     pipeline._script_worker_init(*ctx['initargs'])
     stats = pipeline._new_stats()
@@ -129,7 +144,8 @@ def main(argv=None) -> int:
 
     if args.compile:
         import subprocess
-        cmd = [sys.executable, str(ROOT / 'tools' / 'compile_papyrus.py'),
+        cmd = [sys.executable,
+               str(ROOT / 'tools' / 'script' / 'compile_papyrus.py'),
                '--src', out, '--out', os.path.join(out, 'pex')]
         print('  ' + ' '.join(cmd))
         return subprocess.call(cmd)

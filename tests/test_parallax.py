@@ -21,15 +21,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from asset_convert import parallax                                # noqa: E402
-from asset_convert.parallax import (classify_alpha,               # noqa: E402
+from asset_convert.texture import parallax
+from asset_convert.texture.parallax import (classify_alpha,
                                     decode_alpha_plane,
                                     encode_bc4_dds, height_path)
 
 
 # ---------------------------------------------------------------------------
 # Synthetic DDS builders — the classifier reads real block data, so the tests
-# have to hand it real block data rather than a stubbed byte count.
 # ---------------------------------------------------------------------------
 
 def _dds_header(w, h, fourcc, mips=1):
@@ -264,12 +263,12 @@ class TestHeightMapEncoding:
         """
         good = bytearray(60 + (v * 145) // 255 for v in range(256))
         assert max(good) - min(good) <= 150
-        out = parallax.normalise_height(good)
+        out = parallax.normalize_height(good)
         assert bytes(out) == bytes(good), 'a well-made map was modified'
 
     def test_amplitude_cap_compresses_an_over_deep_map(self):
         deep = bytearray(range(256))                     # amplitude 255
-        out = parallax.normalise_height(deep)
+        out = parallax.normalize_height(deep)
         assert max(out) - min(out) == parallax.DEFAULT_MAX_RANGE
 
     def test_a_corrected_map_is_moved_onto_the_target_median(self):
@@ -279,16 +278,16 @@ class TestHeightMapEncoding:
         deep = bytearray([v % 61 for v in range(200)]
                          + [195 + v % 61 for v in range(56)])
         assert max(deep) - min(deep) > 150 and sorted(deep)[128] < 60
-        out = parallax.normalise_height(deep)
+        out = parallax.normalize_height(deep)
         assert abs(sorted(out)[len(out) // 2] - parallax.TARGET_MEDIAN) <= 1
 
-    def test_centring_never_clips(self):
+    def test_centering_never_clips(self):
         """A shift that would push texels past 0 or 255 is limited instead —
         clipping would flatten real relief into a plateau."""
         high = bytearray([195 + v % 61 for v in range(200)]
                          + [v % 61 for v in range(56)])
         assert max(high) - min(high) > 150 and sorted(high)[128] > 195
-        out = parallax.normalise_height(high)
+        out = parallax.normalize_height(high)
         assert min(out) >= 0 and max(out) <= 255
         # nothing piled up on a boundary
         assert list(out).count(0) <= list(high).count(0)
@@ -298,11 +297,11 @@ class TestHeightMapEncoding:
         assert len(set(out)) > 1
 
     def test_a_good_map_keeps_its_median_too(self):
-        """Centring is a CORRECTION, not a detector — it must never reach a
+        """Centering is a CORRECTION, not a detector — it must never reach a
         map the amplitude cap let through."""
         good = bytearray(20 + (v * 140) // 255 for v in range(256))
         assert max(good) - min(good) <= 150
-        out = parallax.normalise_height(good)
+        out = parallax.normalize_height(good)
         assert bytes(out) == bytes(good)
         assert sorted(out)[len(out) // 2] != parallax.TARGET_MEDIAN
 
@@ -322,9 +321,9 @@ class TestHeightMapEncoding:
         good = bytearray(20 + (v * 156) // 255 for v in range(256))
         deep = bytearray([v % 61 for v in range(200)]
                          + [195 + v % 61 for v in range(56)])
-        g = parallax.normalise_height(good, target_range=target)
+        g = parallax.normalize_height(good, target_range=target)
         assert bytes(g) == bytes(good), 'a hand-tuned map was damaged'
-        d = parallax.normalise_height(deep, target_range=target)
+        d = parallax.normalize_height(deep, target_range=target)
         assert max(d) - min(d) == (target or cap)
 
     def test_the_measure_ignores_outliers(self):
@@ -391,27 +390,26 @@ class TestHeightMapEncoding:
             restless += bytes([v]) * (4 if 60 <= v <= 190 else 1)
         before = _flat_share(restless)
         assert before < 0.35, before
-        out = parallax.normalise_height(restless, target_range=140)
+        out = parallax.normalize_height(restless, target_range=140)
         after = _flat_share(out)
         assert after > before * 1.5, f'{before:.2f} -> {after:.2f}'
 
-    def test_a_field_parked_at_the_bottom_is_recentred(self):
-        """`durchgangD`, and the reason the band measure does not cover it.
+    def test_a_field_parked_at_the_bottom_is_recentered(self):
+        """`durchgangD`, and why the band measure does not cover it.
 
-        A practically black wall — median 17, amplitude 158 — reads as 89.2%
-        FLAT on the band measure, and correctly so: it is flat, just parked at
-        the bottom of the channel. A parallax shader offsets along the view
-        vector, so a surface sitting near 0 renders not as depth but as a
-        constant view-dependent UV shift, i.e. the texture slides as the camera
-        moves. Amplitude misses it (158 < 163) and the curve has nothing to fix.
+        A black wall — median 17, amplitude 158 — reads 89.2% FLAT on the band
+        measure, correctly: it is flat, just parked at the channel bottom. A
+        parallax shader offsets along the view vector, so a surface near 0
+        renders not as depth but as a constant view-dependent UV shift: the
+        texture slides as the camera moves. Amplitude misses it (158 < 163).
         """
         wall = bytearray([(v % 40) for v in range(4000)] + [158])
         assert max(wall) - min(wall) < parallax.DEFAULT_MAX_RANGE
         assert sorted(wall)[len(wall) // 2] < parallax.MIN_MEDIAN
-        out = parallax.normalise_height(wall)
+        out = parallax.normalize_height(wall)
         assert sorted(out)[len(out) // 2] > parallax.MIN_MEDIAN, 'not lifted'
 
-    def test_recentring_alone_cannot_damage_relief(self):
+    def test_recentering_alone_cannot_damage_relief(self):
         """What a map caught ONLY by the median floor is allowed to receive.
 
         A pure translation, and nothing else: no compression, no tone curve.
@@ -419,14 +417,14 @@ class TestHeightMapEncoding:
         gradient and every gap survives a shift unchanged.
         """
         wall = bytearray([(v % 40) for v in range(4000)] + [158])
-        out = parallax.normalise_height(wall)
+        out = parallax.normalize_height(wall)
         assert max(out) - min(out) == max(wall) - min(wall), 'amplitude moved'
         assert len(set(out)) == len(set(wall)), 'levels lost'
         offs = {o - i for i, o in zip(wall, out)}
         assert len(offs) == 1, f'not a pure translation: {sorted(offs)[:5]}'
 
     def test_the_median_floor_never_reaches_the_reference_population(self):
-        """Centring was rejected once and needed new evidence to come back.
+        """Centering was rejected once and needed new evidence to come back.
 
         The old refutation tested a TOLERANCE AROUND MID-GREY on 56 pairs,
         where the medians overlap hopelessly. This is a one-sided FLOOR, and
@@ -440,7 +438,7 @@ class TestHeightMapEncoding:
         # a reference-like map: amplitude inside the cap, median well above
         good = bytearray(52 + (v * 140) // 255 for v in range(256))
         assert sorted(good)[128] >= 52
-        assert bytes(parallax.normalise_height(good)) == bytes(good)
+        assert bytes(parallax.normalize_height(good)) == bytes(good)
 
     def test_the_curve_leaves_relief_inside_the_body(self):
         """The ceiling on the exponent, and why it is derived rather than set.
@@ -454,7 +452,7 @@ class TestHeightMapEncoding:
         restless = bytearray()
         for v in range(256):
             restless += bytes([v]) * (4 if 60 <= v <= 190 else 1)
-        out = parallax.normalise_height(restless, target_range=140)
+        out = parallax.normalize_height(restless, target_range=140)
         med = sorted(out)[len(out) // 2]
         body = {v for v in out if abs(v - med) <= parallax.FLAT_BAND}
         assert len(body) >= parallax._MIN_BODY_LEVELS, \
@@ -474,7 +472,7 @@ class TestHeightMapEncoding:
         src = sorted(set(dark))
         assert min(dark) == 0
         assert max(src[i + 1] - src[i] for i in range(len(src) - 1)) == 1
-        out = parallax.normalise_height(dark, target_range=140)
+        out = parallax.normalize_height(dark, target_range=140)
         used = sorted(set(out))
         gap = max(used[i + 1] - used[i] for i in range(len(used) - 1))
         assert gap <= 12, f'curve opened a {gap}-level hole'
@@ -482,17 +480,17 @@ class TestHeightMapEncoding:
 
     def test_the_tone_curve_never_reaches_a_good_map(self):
         good = bytearray(20 + (v * 156) // 255 for v in range(256))
-        assert bytes(parallax.normalise_height(good)) == bytes(good)
+        assert bytes(parallax.normalize_height(good)) == bytes(good)
 
     def test_cap_can_be_disabled(self):
         deep = bytearray(range(256))
-        assert bytes(parallax.normalise_height(deep, max_range=0)) == \
+        assert bytes(parallax.normalize_height(deep, max_range=0)) == \
             bytes(deep)
 
     def test_strength_is_an_extra_factor_on_top(self):
         mild = bytearray(60 + (v * 100) // 255 for v in range(256))
-        assert bytes(parallax.normalise_height(mild)) == bytes(mild)
-        out = parallax.normalise_height(mild, strength=0.5)
+        assert bytes(parallax.normalize_height(mild)) == bytes(mild)
+        out = parallax.normalize_height(mild, strength=0.5)
         assert abs((max(out) - min(out)) - 50) <= 1
 
     def test_build_height_map_writes_the_file(self, tmp_path):
@@ -529,7 +527,7 @@ def nif():
 def _tree(tmp_path, dds_bytes, rel='rocks\\stone.dds'):
     """A minimal source tree: <tmp>/meshes/a.nif beside <tmp>/textures/...
 
-    _resolve_source_texture maps the rewritten path back through exactly this
+    resolve_source_texture maps the rewritten path back through exactly this
     layout, so the test has to reproduce it rather than hand over a bare file.
     """
     tex = tmp_path / 'textures' / Path(rel.replace('\\', '/'))
@@ -566,10 +564,12 @@ def _shape(NifFormat, apply_mode, tex_rel='rocks\\stone.dds',
 
 
 def _convert(shape, src_nif, parallax_on):
-    from asset_convert import nif_converter as nc
-    nc._PARALLAX_ALPHA_CACHE.clear()      # the cache is per process, not per test
+    """Convert one shape, with the per-process alpha cache cleared first."""
+    from asset_convert.nif import nif_converter as nc
+    from asset_convert.nif import shaders
+    shaders._PARALLAX_ALPHA_CACHE.clear()
     stats = {'_src_path': src_nif, '_parallax': parallax_on}
-    ts = nc._process_geometry(shape, fix_textures=True, stats=stats)
+    ts = nc.process_geometry(shape, fix_textures=True, stats=stats)
     return ts, stats
 
 
@@ -599,12 +599,13 @@ class TestParallaxIsOptIn:
         depend on whether meshes or LOD ran last. A height offset at LOD
         distance is invisible anyway.
         """
-        from asset_convert import nif_converter as nc
+        from asset_convert.nif import nif_converter as nc
+        from asset_convert.nif import shaders
         src = _tree(tmp_path, HEIGHT_DDS)
         far = str(Path(src).with_name(name))
-        nc._PARALLAX_ALPHA_CACHE.clear()
+        shaders._PARALLAX_ALPHA_CACHE.clear()
         stats = {'_src_path': far, '_parallax': True}
-        ts = nc._process_geometry(_shape(nif, parallax.APPLY_HILIGHT2),
+        ts = nc.process_geometry(_shape(nif, parallax.APPLY_HILIGHT2),
                                   fix_textures=True, stats=stats)
         shader = ts.bs_properties[0]
         assert shader.skyrim_shader_type == 0
@@ -615,11 +616,11 @@ class TestParallaxIsOptIn:
     def test_a_normal_mesh_named_like_a_farm_still_converts(self, nif,
                                                             tmp_path):
         """The suffix test must not swallow ordinary names ending in 'far'."""
-        from asset_convert import nif_converter as nc
-        assert not nc._is_lod_tier_mesh('meshes\\clutter\\farm.nif')
-        assert not nc._is_lod_tier_mesh('meshes\\x\\barnfar.nif')
-        assert nc._is_lod_tier_mesh('meshes\\x\\wall_far.nif')
-        assert nc._is_lod_tier_mesh('meshes\\x\\WALL_FAR16.NIF')
+        from asset_convert.nif import shaders
+        assert not shaders._is_lod_tier_mesh('meshes\\clutter\\farm.nif')
+        assert not shaders._is_lod_tier_mesh('meshes\\x\\barnfar.nif')
+        assert shaders._is_lod_tier_mesh('meshes\\x\\wall_far.nif')
+        assert shaders._is_lod_tier_mesh('meshes\\x\\WALL_FAR16.NIF')
 
     def test_unflagged_shape_is_untouched_with_the_switch(self, nif, tmp_path):
         """The mesh flag is the AUTHORED intent and is never guessed at: a
@@ -641,7 +642,7 @@ class TestLodMeshesNeverCarryParallax:
         flag and the slot-3 height map straight to the LOD tier — while the
         decimation rebuilds the geometry and drops the vertex colors that
         shader needs. That is what rendered unlit-black."""
-        from asset_convert.lod_far_gen import _strip_parallax
+        from asset_convert.lod.lod_far_gen import strip_parallax
 
         texset = nif.BSShaderTextureSet()
         texset.num_textures = 9
@@ -656,7 +657,7 @@ class TestLodMeshesNeverCarryParallax:
         class _Doc:
             blocks = [shader]
 
-        assert _strip_parallax(_Doc()) == 1
+        assert strip_parallax(_Doc()) == 1
         assert int(shader.skyrim_shader_type) == 0
         assert int(shader.shader_flags_1.slsf_1_parallax) == 0
         assert bytes(texset.textures[3]) == b''
@@ -665,7 +666,7 @@ class TestLodMeshesNeverCarryParallax:
             b'textures\\tes4\\lazeon\\wandb.dds'
 
     def test_a_plain_lod_mesh_is_left_alone(self, nif):
-        from asset_convert.lod_far_gen import _strip_parallax
+        from asset_convert.lod.lod_far_gen import strip_parallax
 
         texset = nif.BSShaderTextureSet()
         texset.num_textures = 9
@@ -677,7 +678,7 @@ class TestLodMeshesNeverCarryParallax:
         class _Doc:
             blocks = [shader]
 
-        assert _strip_parallax(_Doc()) == 0
+        assert strip_parallax(_Doc()) == 0
         assert bytes(texset.textures[0]) == b'textures\\tes4\\rocks\\stone.dds'
 
 
@@ -764,11 +765,6 @@ class TestParallaxShapeConstruction:
 
 # ---------------------------------------------------------------------------
 # Output conditioning: Mitchell halve -> Gaussian blur -> tone curve -> BC4.
-#
-# Skyrim's parallax sampling is coarser than Oblivion's, so every map is
-# smoothed.  What makes that safe without recalibrating is the ORDER:
-# normalise_height fits onto a MEASURED property of its input, so it still
-# lands on TARGET_FLAT_SHARE after the halving and the blur.
 # ---------------------------------------------------------------------------
 
 def _bc1_palette(c0, c1, four_color):
@@ -910,15 +906,15 @@ class TestGlobalDepthScale:
 
 class TestDiffuseAlphaStrip:
 
-    # c0 > c1 already, so DXT1 reads the block exactly as DXT5 did
-    FOUR_COLOUR = struct.pack('<HHI', 0xF800, 0x001F, 0x1B1B1B1B)
+    #: c0 > c1 already, so DXT1 reads the block exactly as DXT5 did
+    FOUR_COLOR = struct.pack('<HHI', 0xF800, 0x001F, 0x1B1B1B1B)
 
     def test_four_color_blocks_survive_texel_for_texel(self):
-        dds = _dxt5_with_color_blocks(4, 4, [self.FOUR_COLOUR])
+        dds = _dxt5_with_color_blocks(4, 4, [self.FOUR_COLOR])
         out = parallax.strip_alpha_to_bc1(dds)
         assert out[84:88] == b'DXT1'
         assert (_decode_color_block(out[128:136], False)
-                == _decode_color_block(self.FOUR_COLOUR, True))
+                == _decode_color_block(self.FOUR_COLOR, True))
 
     def test_a_swapped_block_decodes_to_the_same_texels(self):
         # c0 < c1 would mean 3-color + TRANSPARENT in DXT1; the repair swaps
@@ -942,7 +938,7 @@ class TestDiffuseAlphaStrip:
                 == _decode_color_block(blk, True))
 
     def test_the_payload_halves(self):
-        dds = _dxt5_with_color_blocks(16, 16, [self.FOUR_COLOUR])
+        dds = _dxt5_with_color_blocks(16, 16, [self.FOUR_COLOR])
         out = parallax.strip_alpha_to_bc1(dds)
         assert len(out) - 128 == (len(dds) - 128) // 2
 
@@ -950,7 +946,7 @@ class TestDiffuseAlphaStrip:
         # 8x8 -> 4x4 -> 2x2 -> 1x1 is one block each below the top's four
         dds = bytearray(_dds_header(8, 8, b'DXT5', mips=4))
         for _ in range(4 + 1 + 1 + 1):
-            dds += b'\x00' * 8 + self.FOUR_COLOUR
+            dds += b'\x00' * 8 + self.FOUR_COLOR
         out = parallax.strip_alpha_to_bc1(bytes(dds))
         assert struct.unpack_from('<I', out, 28)[0] == 4
         assert len(out) == 128 + (4 + 1 + 1 + 1) * 8
@@ -960,7 +956,7 @@ class TestDiffuseAlphaStrip:
         assert parallax.strip_alpha_to_bc1(dds) is None
 
     def test_only_diffuses_with_a_height_map_are_stripped(self, tmp_path):
-        dxt5 = _dxt5_with_color_blocks(4, 4, [self.FOUR_COLOUR])
+        dxt5 = _dxt5_with_color_blocks(4, 4, [self.FOUR_COLOR])
         (tmp_path / 'carried.dds').write_bytes(dxt5)
         (tmp_path / 'carried_p.dds').write_bytes(b'placeholder')
         (tmp_path / 'plain.dds').write_bytes(dxt5)
@@ -976,7 +972,7 @@ class TestDiffuseAlphaStrip:
 
     def test_running_it_twice_changes_nothing(self, tmp_path):
         (tmp_path / 'x.dds').write_bytes(
-            _dxt5_with_color_blocks(4, 4, [self.FOUR_COLOUR]))
+            _dxt5_with_color_blocks(4, 4, [self.FOUR_COLOR]))
         (tmp_path / 'x_p.dds').write_bytes(b'p')
         parallax.strip_diffuse_alpha(str(tmp_path))
         once = (tmp_path / 'x.dds').read_bytes()
@@ -988,9 +984,6 @@ class TestDiffuseAlphaStrip:
 
 # ---------------------------------------------------------------------------
 # --textures-only: PGPatcher patches the meshes across the player's whole load
-# order, so we ship only what it cannot derive -- the height field hidden in
-# Oblivion's diffuse alpha.  The meshes must still be READ, because the
-# APPLY_HILIGHT2 flag is the only evidence that a diffuse carries one.
 # ---------------------------------------------------------------------------
 
 def _source_nif(nif, tmp_path, apply_mode):
@@ -1015,8 +1008,9 @@ def _source_nif(nif, tmp_path, apply_mode):
 class TestTexturesOnly:
 
     def _run(self, nif, tmp_path, textures_only):
-        from asset_convert import nif_converter as nc
-        nc._PARALLAX_ALPHA_CACHE.clear()
+        from asset_convert.nif import nif_converter as nc
+        from asset_convert.nif import shaders
+        shaders._PARALLAX_ALPHA_CACHE.clear()
         src = _source_nif(nif, tmp_path, parallax.APPLY_HILIGHT2)
         dst = tmp_path / 'out' / 'meshes' / 'tes4' / 'a.nif'
         r = nc.convert_nif(str(src), str(dst), parallax=True,

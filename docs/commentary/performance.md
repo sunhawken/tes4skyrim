@@ -1,6 +1,6 @@
 # the whole pipeline - performance and parallelism
 
-**Code:** `asset_convert/pyffi_monkey_patch.py`, `tes5_import/writer.py`, `asset_convert/book_inam.py`, `asset_convert/nif_geom_array.py`
+**Code:** `asset_convert/nif/pyffi_monkey_patch.py`, `tes5_import/base/writer.py`, `asset_convert/ui/book_inam.py`, `asset_convert/nif/nif_geom_array.py`
 
 ## Contents
 
@@ -186,7 +186,7 @@ generic XML-driven object model — `struct_.__init__`, `get_basic_attribute`,
 `getattr`, `_get_filtered_attribute_list` — **not** our conversion code. The
 stage already runs one process per core, so the only lever is per-mesh CPU.
 
-**Patch 9** (`asset_convert/pyffi_monkey_patch.py`): `StructBase._log_struct`
+**Patch 9** (`asset_convert/nif/pyffi_monkey_patch.py`): `StructBase._log_struct`
 -> no-op. PyFFI calls it for every attribute of every struct on **both** read
 and write, doing a `getattr`, an `isinstance`, a `get_value()` and a six-operand
 `str.format()` before the logger discards the record. Nothing consumes it — the
@@ -200,7 +200,7 @@ cumulative of ~11 s across 12 meshes, in only **57 calls**) because it runs a
 per-**triangle** Python loop allocating several `Vector3` objects each, then a
 per-**vertex** Gram-Schmidt loop. The numpy version reproduces the algorithm
 exactly — the same quantised `(vertex, normal)` merge hash (so uv seams still
-share a frame), degenerate-triangle skipping, per-triangle normalisation
+share a frame), degenerate-triangle skipping, per-triangle normalization
 *before* accumulation, the `r_sign` factor, the Gram-Schmidt order, and the
 `x cross n` / `y cross n` fallback basis. Anything it cannot handle (no uvs, no
 normals, no triangles, length mismatch) falls through to the original.
@@ -225,7 +225,7 @@ shapedata = NiTriShapeData().deepcopy(NiTriBasedGeomData().deepcopy(self.data))
 
 The intermediate exists only because `NiTriShapeData` and `NiTriStripsData` are
 **siblings** — `deepcopy` refuses unrelated classes, so a strips→shape copy has
-no legal direct form. But it copies every vertex, normal, uv and colour TWICE,
+no legal direct form. But it copies every vertex, normal, uv and color TWICE,
 and both hops select the *same* attribute list (measured: 19 names for the data
 blocks, 29 for the shape blocks — the base-class attributes). The triangle /
 strip fields are never among them; `set_triangles`/`set_strips` supplies those
@@ -237,7 +237,7 @@ Two changes, both in `pyffi_monkey_patch.py`:
    attribute list is taken from the **SOURCE**, never the freshly-constructed
    target — `_get_filtered_attribute_list` is condition-dependent, and
    `has_normals` / `has_vertex_colors` / the uv flags are all False on a new
-   object, so filtering on the target silently drops every normal and colour.
+   object, so filtering on the target silently drops every normal and color.
 2. **Bulk element copy** for flat scalar element types (`Vector3`, `Color4`,
    `TexCoord`). `update_size()` builds each element through
    `StructBase.__init__` — a `set()`, an `_items` list and one holder per
@@ -247,7 +247,7 @@ Two changes, both in `pyffi_monkey_patch.py`:
    element once and assigns the holders' `_value` fields across. Handles the
    2-D `uv_sets` array; anything else falls back.
 
-Elements are always NEW objects, never shared with the source — `_process_geometry`
+Elements are always NEW objects, never shared with the source — `process_geometry`
 mutates the copy in place (`_set_tangents`, `_clamp_uv_sets`,
 `fix_missing_triangles`) while still reading the original's `extra_data_list`
 and `data.num_vertices`.
@@ -324,7 +324,7 @@ object per item and calls `elem.read()`, which runs a `struct.unpack` per
 `native/src/nifgeom/geom.cpp` (`_nifgeom_native`) adds `fill_floats` /
 `pack_floats`: the Python side constructs the elements and hands the extension
 the flat list of value holders, which fills or drains them in one call.
-`asset_convert/nif_geom_native.py` patches `Array.read`/`Array.write` for
+`asset_convert/nif/nif_geom_native.py` patches `Array.read`/`Array.write` for
 element types that are exactly N unconditional float components; everything
 else falls through to PyFFI untouched.
 
@@ -358,7 +358,7 @@ that work again from the read/write share of the profile.**
 
 ### 3c. Patch 14 -- numpy-backed geometry arrays (the 2.4x)
 
-`asset_convert/nif_geom_array.py`.  Patch 13 sped up array I/O and left the
+`asset_convert/nif/nif_geom_array.py`.  Patch 13 sped up array I/O and left the
 real cost untouched: PyFFI materialises one element OBJECT per item, and
 constructing 225,591 `Vector3` objects alone costs **0.80 s** per 60 meshes.
 This backs `Vector3`/`Color4`/`TexCoord`/`Vector4` arrays with ONE numpy array
@@ -501,7 +501,7 @@ properly parallel. Two findings:
   compute is wrong here.
 
   Fixed by publishing ONE copy through `multiprocessing.shared_memory`; each
-  worker maps it and rebuilds numpy **views** (`_SharedLands`). After: **4.8-6.7
+  worker maps it and rebuilds numpy **views** (`SharedLands`). After: **4.8-6.7
   GB peak with all 29 workers and 15 GB free.** Do NOT "fix" this by cutting
   `worker_count()` — the workers were never the problem, the per-worker copy was.
 
@@ -510,7 +510,7 @@ properly parallel. Two findings:
     `(layer, fid, grid)`. It sorts by layer and DROPS the index, so **list order
     is the only thing carrying blend order** — a packer that rebuilt from a dict
     would silently reorder terrain texture blending.
-  - **Size the block, then fill it in place** (`_lands_layout` + `_write_lands`).
+  - **Size the block, then fill it in place** (`lands_layout` + `write_lands`).
     Packing into a `bytearray` first holds a second full copy in the parent —
     1.2 GB — exactly while 29 workers spawn.
   - **Drop the parent's `lands` after packing** and keep the `SharedMemory`
@@ -557,7 +557,7 @@ properly parallel. Two findings:
   613 MB read is **0.10 s** (OS page cache) against a ~2.9 s scan. Tried and
   reverted.
 - **The remaining per-worldspace fixed cost is the record walk itself**, not the
-  read — `_scan_land_file` walks every record in the file to find one
+  read — `scan_land_file` walks every record in the file to find one
   worldspace's LANDs, 18 times over. Caching the *parsed* result per worldspace
   (or bucketing all worldspaces in a single pass) is the next real LOD win and
   is NOT done.
@@ -577,7 +577,7 @@ properly parallel. Two findings:
 - **Worker state replay pattern**: converter functions depend on module globals
   set in Phase 0 (formid offset, cell locations, WORLD_NAMES, furniture origin
   shifts, mesh bounds). Process pools must replay them via an initializer — see
-  `tes5_import/navm_worker.py` and `tes5_import/convert_worker.py`.
+  `tes5_import/navmesh/worker.py` and `tes5_import/base/convert_worker.py`.
 - **Determinism contract**: the output ESM must be byte-reproducible. Process
   results in submission order (`ex.map`, not `as_completed`) and keep record
   EMISSION serial — derived ids no longer depend on call order, but group order
@@ -617,7 +617,7 @@ is what lets converted mods interoperate: a patch written against Oblivion's
 `0001A2B3` still resolves.
 
 **Generated records derive their id from their source**, via
-`PluginWriter.derive_formid(site, key)` (`tes5_import/writer.py`). `site` names
+`PluginWriter.derive_formid(site, key)` (`tes5_import/base/writer.py`). `site` names
 the kind of record ('OTFT', 'ARMA', 'NAVM'), `key` identifies what it was
 generated FROM — normally the source TES4 FormID. The id is
 `md5(site, key)` mapped into `DERIVED_ID_BASE`.. and is therefore a pure
@@ -777,7 +777,7 @@ here, in the order worth checking:
 2. **An initializer that raises.** An exception inside `initializer=` cannot be
    returned to the parent, so it surfaces as an opaque `BrokenProcessPool` with
    no traceback — and the worker's stderr is invisible when multiprocessing runs
-   `pythonw.exe`. `asset_convert/book_inam.py` and
+   `pythonw.exe`. `asset_convert/ui/book_inam.py` and
    `import_main._precompute_navmeshes` both guard this by running the
    initializer once in the parent first.
 3. **A C++ exception escaping a native extension** (verified 2026-07-29, this is

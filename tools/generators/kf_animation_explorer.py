@@ -22,8 +22,37 @@ from pathlib import Path
 from pyffi.formats.nif import NifFormat
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+#: Source plugin whose skeleton and .kf corpus this run reads; set from --plugin.
+PLUGIN = ['Oblivion.esm']
+
+
+def _plugin_slug():
+    """The source plugin's lowercase stem, used to name generated files."""
+    return PLUGIN[0].rsplit('.', 1)[0].lower()
+
+
+def _source_skeleton_json():
+    """Generated skeleton JSON for the source plugin."""
+    gen = PROJECT_ROOT / 'asset_convert' / 'generated'
+    return gen / ('skeleton_bones_%s.json' % _plugin_slug())
+
+
+def _character_dir():
+    """Exported human character folder holding the skeleton and .kf clips."""
+    return (PROJECT_ROOT / 'export' / PLUGIN[0] / 'meshes'
+            / 'characters' / '_male')
+
+
+def _pose_out_path():
+    """Where this run's best-pose cache is written."""
+    gen = PROJECT_ROOT / 'asset_convert' / 'generated'
+    if _plugin_slug() == 'oblivion':
+        return gen / 'best_animation_pose.json'
+    return gen / ('best_animation_pose_%s.json' % _plugin_slug())
 sys.path.insert(0, str(PROJECT_ROOT))
-from asset_convert.skyrim_overrides import OBLIVION_TO_SKYRIM_BONE_MAP
+from asset_convert.character.skyrim_overrides import OBLIVION_TO_SKYRIM_BONE_MAP
+from asset_convert.character.skyrim_overrides_falloutnv import bone_map_for
 
 
 def _m33_to_np(r):
@@ -283,12 +312,11 @@ def get_skyrim_targets_in_ob_space():
     system (only 1.8° difference). So let's just load them directly and see.
     """
     sk_json = PROJECT_ROOT / 'asset_convert' / 'generated' / 'skeleton_bones_skyrim_male.json'
-    ob_json = PROJECT_ROOT / 'asset_convert' / 'generated' / 'skeleton_bones_oblivion.json'
-    
-    if not sk_json.exists() or not ob_json.exists():
-        # Try non-generated paths
-        sk_json = PROJECT_ROOT / 'asset_convert' / 'skeleton_bones_skyrim_male.json'
-        ob_json = PROJECT_ROOT / 'asset_convert' / 'skeleton_bones_oblivion.json'
+    ob_json = _source_skeleton_json()
+    for path in (sk_json, ob_json):
+        if not path.exists():
+            raise SystemExit(
+                'missing %s -- run extract_skeleton_bones first' % path)
     
     with open(sk_json) as f:
         sk_raw = json.load(f)
@@ -319,7 +347,7 @@ def find_best_pose(skeleton_bones, kf_dir, ob_positions, sk_positions):
     
     # Build OB->SK name mapping for bones we care about
     mapped_bones = {}
-    for ob_name, sk_name in OBLIVION_TO_SKYRIM_BONE_MAP.items():
+    for ob_name, sk_name in bone_map_for(skeleton_bones).items():
         if ob_name in skeleton_bones and sk_name in sk_positions:
             mapped_bones[ob_name] = sk_name
     
@@ -400,7 +428,7 @@ def find_best_pose(skeleton_bones, kf_dir, ob_positions, sk_positions):
 
 
 def dump_skeleton(args):
-    skel_path = PROJECT_ROOT / 'export' / 'Oblivion.esm' / 'meshes' / 'characters' / '_male' / 'skeleton.nif'
+    skel_path = _character_dir() / 'skeleton.nif'
     bones = load_skeleton_hierarchy(skel_path)
     
     print(f"Oblivion skeleton: {len(bones)} bones")
@@ -421,7 +449,7 @@ def dump_skeleton(args):
 
 
 def scan_kf(args):
-    kf_dir = PROJECT_ROOT / 'export' / 'Oblivion.esm' / 'meshes' / 'characters' / '_male'
+    kf_dir = _character_dir()
     kf_files = sorted(kf_dir.glob('*.kf'))
     print(f"Found {len(kf_files)} .kf files in _male/")
     
@@ -450,8 +478,8 @@ def scan_kf(args):
 
 
 def find_pose(args):
-    skel_path = PROJECT_ROOT / 'export' / 'Oblivion.esm' / 'meshes' / 'characters' / '_male' / 'skeleton.nif'
-    kf_dir = PROJECT_ROOT / 'export' / 'Oblivion.esm' / 'meshes' / 'characters' / '_male'
+    skel_path = _character_dir() / 'skeleton.nif'
+    kf_dir = _character_dir()
     
     print("Loading OB skeleton...")
     skeleton_bones = load_skeleton_hierarchy(skel_path)
@@ -463,7 +491,7 @@ def find_pose(args):
     print("\nRest-pose (T-pose) distances OB->SK:")
     total = 0
     n = 0
-    for ob_name, sk_name in sorted(OBLIVION_TO_SKYRIM_BONE_MAP.items()):
+    for ob_name, sk_name in sorted(bone_map_for(skeleton_bones).items()):
         if ob_name in skeleton_bones and sk_name in sk_positions:
             ob_pos = skeleton_bones[ob_name]['world'][3, :3]
             sk_pos = sk_positions[sk_name]
@@ -522,62 +550,6 @@ def _mat3_to_quat_rv(R):
 
 # ---------------------------------------------------------------------------
 # BRAINSTORM: Better use of the animation corpus in the cache builder
-# ---------------------------------------------------------------------------
-#
-# Current approach: greedy per-chain argmin — for each chain (arm/leg), scan
-# every keyframe in every .kf, evaluate the chain's total bone-position error,
-# keep the frame with the lowest cost. This gives one delta matrix per bone.
-#
-# Why this leaves 10% on the table:
-#   1. Greedy chain-by-chain: spine is never optimised, so all downstream
-#      bones (arm, shoulder) start from a sub-optimal root world transform.
-#   2. Best-frame selection discards all pose variation — hundreds of frames
-#      collapse to one. The optimal delta for a bone may not exist in any
-#      single frame; it lives in the convex hull of all frames.
-#   3. The delta is applied as LBS; see skin_retarget.py brainstorm for why
-#      LBS causes joint collapse compared to DQS.
-#
-# Better approaches to implement here:
-#
-# APPROACH A — Least-squares optimal delta (replaces argmin frame search)
-#   For each bone b, collect all N frames: pairs (R_ob_i, t_ob_i) and target
-#   (R_sk, t_sk) in world space. The delta D = inv(world_ob_rest) @ world_ob_anim
-#   only changes per frame; the target is constant (SK rest pose).
-#   Frame selection is equivalent to picking the D_i that minimises
-#       || W_sk - W_ob_rest @ D_i ||_F
-#   Rather than argmin over discrete frames, compute the least-squares D*
-#   across ALL frames (or a weighted average favoring frames that have low
-#   cost for ALL bones in the chain simultaneously). This gives a delta that
-#   is not constrained to a single keyframe and may be significantly better.
-#   Implementation: compute D_weighted = Σ alpha_i * D_i where alpha_i is
-#   softmax(-cost_i / temperature). Recover the nearest rotation via SVD.
-#
-# APPROACH B — Full-body joint-angle optimisation (IK over the corpus)
-#   Treat the Skyrim rest pose as a target configuration. Use the animation
-#   corpus to define the feasible joint-angle space (convex hull or Gaussian
-#   model per joint). Run L-BFGS-B minimising total bone-position error with
-#   joint angles as the free variables, constrained to the feasible space.
-#   The result is a physically plausible pose that gets as close as possible
-#   to the Skyrim rest pose within Oblivion's skeletal degrees of freedom.
-#   compute_fk_world_positions() is the forward pass; gradients can be
-#   approximated by finite differences since the skeleton is small (~50 bones).
-#
-# APPROACH C — Per-bone transform distribution → confidence-weighted blend
-#   Instead of a single best delta, store the mean and variance of all deltas
-#   observed for each bone across the corpus. Bones with low variance (e.g.
-#   foot — always near the same pose) get their mean delta used with high
-#   confidence. Bones with high variance (e.g. arm — many different poses)
-#   get their delta blended toward the target-minimising direction. This
-#   naturally handles the fact that some bones are over-determined by
-#   animation data while others are under-determined.
-#
-# APPROACH D — Body chain optimisation (currently excluded, see comment below)
-#   The spine chain is excluded because it's asymmetric across L/R. This
-#   causes the entire upper body to inherit a sub-optimal root transform.
-#   Fix: include the spine in optimisation but use a bilateral symmetry
-#   constraint — force L and R deltas to be mirror images of each other.
-#   This is implementable as a joint optimisation over the spine + both arms
-#   simultaneously with a symmetry regularisation term.
 
 def _parse_kf_safe(kf_path):
     """Thread/process-safe wrapper around parse_kf_file."""
@@ -596,8 +568,8 @@ def build_cache(args):
     Rotation is blended from the corpus (weighted toward candidates that also
     position descendants well) then SVD-projected to nearest proper rotation.
     """
-    skel_path = PROJECT_ROOT / 'export' / 'Oblivion.esm' / 'meshes' / 'characters' / '_male' / 'skeleton.nif'
-    kf_dir = PROJECT_ROOT / 'export' / 'Oblivion.esm' / 'meshes' / 'characters' / '_male'
+    skel_path = _character_dir() / 'skeleton.nif'
+    kf_dir = _character_dir()
 
     print("Loading OB skeleton...")
     skeleton_bones = load_skeleton_hierarchy(skel_path)
@@ -607,7 +579,7 @@ def build_cache(args):
 
     # Build OB→SK name mapping
     mapped_bones = {}
-    for ob_name, sk_name in OBLIVION_TO_SKYRIM_BONE_MAP.items():
+    for ob_name, sk_name in bone_map_for(skeleton_bones).items():
         if ob_name in skeleton_bones and sk_name in sk_positions:
             mapped_bones[ob_name] = sk_name
 
@@ -845,7 +817,7 @@ def build_cache(args):
                        [-k[1], k[0], 0]])
         return np.eye(3) + np.sin(theta) * K + (1 - np.cos(theta)) * (K @ K)
 
-    print(f"\n  Multi-start L-BFGS-B refinement (K={MULTI_START_K}, θ_max={THETA_MAX:.2f} rad)")
+    print(f"\n  Multi-start L-BFGS-B refinement (K={MULTI_START_K}, theta_max={THETA_MAX:.2f} rad)")
 
     for chain_name in chain_order_list:
         chain_bones_list = CHAINS[chain_name]
@@ -927,10 +899,10 @@ def build_cache(args):
             max_angle = max(np.linalg.norm(best_overall_result.x[i*3:(i+1)*3])
                            for i in range(len(active_bones)))
             start_label = f"start#{best_start_idx}" if best_start_idx > 0 else "best_frame"
-            print(f"  {chain_name:12s}: {pre_rmsd:.3f} → {post_rmsd:.3f}  "
+            print(f"  {chain_name:12s}: {pre_rmsd:.3f} -> {post_rmsd:.3f}  "
                   f"(max_rot={math.degrees(max_angle):.1f}°, {start_label})")
         else:
-            print(f"  {chain_name:12s}: {pre_rmsd:.3f} → no improvement")
+            print(f"  {chain_name:12s}: {pre_rmsd:.3f} -> no improvement")
 
     # Overall RMSD before mirroring
     total_sq = 0
@@ -1059,7 +1031,7 @@ def build_cache(args):
     cache['info'] = f'Approach A softmax T={TEMPERATURE}, RMSD={mirror_rmsd:.4f}'
     print(f"  Post-mirror RMSD:  {mirror_rmsd:.4f}")
 
-    out_path = PROJECT_ROOT / 'asset_convert' / 'generated' / 'best_animation_pose.json'
+    out_path = _pose_out_path()
     out_path.parent.mkdir(exist_ok=True)
     with open(out_path, 'w') as f:
         json.dump(cache, f, indent=2)
@@ -1076,7 +1048,11 @@ if __name__ == '__main__':
     group.add_argument('--find-pose', action='store_true', help='Find best animation pose matching Skyrim')
     group.add_argument('--build-cache', action='store_true', help='Build animation pose cache')
     
+    parser.add_argument('--plugin', default='Oblivion.esm',
+                        help='Source plugin whose skeleton and .kf clips to read')
+
     args = parser.parse_args()
+    PLUGIN[0] = args.plugin
     
     if args.skeleton:
         dump_skeleton(args)

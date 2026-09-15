@@ -10,10 +10,16 @@ A phase reads the `ScriptContext` and returns lines; it never reaches into a
 later phase's state.
 """
 
+from script_convert.blocks_morrowind import (TES3_BLOCK_TYPE,
+                                             is_implicit_block)
+from script_convert.blocks import (BLOCK_MAP, COMBAT_STATE_GUARDS,
+                                   block_filter_guard)
 from script_convert.constants import (
-    BLOCK_MAP, COMMAND_ROWS, COMBAT_STATE_GUARDS, POLL_BLOCKS,
-    REF_SPECIFICITY, _ACTOR_ONLY_FUNCTIONS,
-    _OBJREF_SHARED_FUNCTIONS, TYPE_MAP, _safe_property_name, papyrus_script_name,
+    POLL_BLOCKS, REF_SPECIFICITY, TYPE_MAP, is_generated_script_type,
+    safe_property_name, papyrus_script_name
+)
+from script_convert.command_rows import (
+    COMMAND_ROWS, ACTOR_ONLY_FUNCTIONS, OBJREF_SHARED_FUNCTIONS
 )
 from script_convert import symbols as _symbols
 from script_convert.emit import script as _script
@@ -60,6 +66,7 @@ def _prepare(conv, name: str, source: str, extends: str, editor_id: str):
 
     conv._parse_source(source)
     tree = conv._tree
+    _retype_implicit_blocks(tree, editor_id or name)
     _load_symbols(conv, tree, editor_id)
     _load_facts(conv, tree)
     _promote_actor_locals(conv, tree)
@@ -116,19 +123,14 @@ def _promote_actor_locals(conv, tree) -> None:
             # `gate01.playgroup` is a command on a DOOR, and declaring
             # `Actor Property gate01` then cannot hold the door it is assigned.
             row = COMMAND_ROWS.get(called)
-            actorish = (called in _ACTOR_ONLY_FUNCTIONS
+            actorish = (called in ACTOR_ONLY_FUNCTIONS
                         or (row is not None and row.subj in ('ACTOR', 'AV')))
-            # ...but a method ObjectReference ALSO declares proves nothing:
-            # 14 of `_ACTOR_ONLY_FUNCTIONS` are shared, and `mySelf.PlaceAtMe`
-            # on a spawner marker is the ObjectReference form.  Promoting on
-            # one declared `Actor Property mySelf`, which cannot hold the
-            # marker the script assigns to it.
-            if not actorish or called in _OBJREF_SHARED_FUNCTIONS:
+            if not actorish or called in OBJREF_SHARED_FUNCTIONS:
                 continue
             low = name.lower()
             if sc.var_types.get(low) == 'ObjectReference':
                 sc.var_types[low] = 'Actor'
-                sc.var_types[_safe_property_name(name).lower()] = 'Actor'
+                sc.var_types[safe_property_name(name).lower()] = 'Actor'
 
 
 def _load_symbols(conv, tree, editor_id: str) -> None:
@@ -137,7 +139,7 @@ def _load_symbols(conv, tree, editor_id: str) -> None:
     edid_low = (editor_id or '').lower()
     for var in (tree.variables if tree else ()):
         vname, vtype = var.name, var.vtype
-        safe = _safe_property_name(vname)
+        safe = safe_property_name(vname)
         # BOTH spellings: the body still writes the variable the TES4 way, and
         # a name that collides with a TES4 command (DiveRockScript's `short
         # message`) is only recognised as a variable -- rather than compiled as
@@ -201,9 +203,9 @@ def _narrow_ref_types(conv, tree) -> None:
     narrowed = _symbols.resolve_ref_types(
         stmts, refs, conv.type_of, conv._base_record_type)
     for low, ptype in narrowed.items():
-        for spelling in (low, _safe_property_name(low).lower()):
+        for spelling in (low, safe_property_name(low).lower()):
             sc.var_types[spelling] = ptype
-        safe = _safe_property_name(low)
+        safe = safe_property_name(low)
         if safe in sc.property_refs:
             sc.property_refs[safe] = ptype
 
@@ -304,11 +306,11 @@ def properties(conv, tree) -> list:
         if block.btype.lower() == 'function':
             for name in _udf_params(block.filter):
                 params.add(name.lower())
-                params.add(_safe_property_name(name).lower())
+                params.add(safe_property_name(name).lower())
 
     out, seen = [], set()
     for var in (tree.variables if tree else ()):
-        safe = _safe_property_name(var.name)
+        safe = safe_property_name(var.name)
         low = safe.lower()
         if low in seen or low in params:
             continue
@@ -383,10 +385,10 @@ def udf(conv, tree, extends: str) -> list:
     # ObjectReference skipped the downcast the wider handle needs.
     types = [_param_type(conv, p) for p in params]
     for name, ptype in zip(params, types):
-        for spelling in (name.lower(), _safe_property_name(name).lower()):
+        for spelling in (name.lower(), safe_property_name(name).lower()):
             conv.sc.var_types[spelling] = ptype
     lines = _script.emit_body(conv, block.body, extends, 1)
-    sig = ', '.join('%s %s' % (ptype, _safe_property_name(name))
+    sig = ', '.join('%s %s' % (ptype, safe_property_name(name))
                     for name, ptype in zip(params, types))
     conv.sc.udf_signature = types
     rtype = 'Int ' if conv.sc.udf_returns else ''
@@ -405,7 +407,7 @@ def _param_type(conv, name: str) -> str:
     behind, and returning it unchanged typed `mwGetFactionWitnessesFunc`'s
     parameter Form while the body passed it to IsInFaction.
     """
-    safe = _safe_property_name(name)
+    safe = safe_property_name(name)
     declared = conv.sc.var_types.get(name.lower(), 'Int')
     if declared not in ('ObjectReference', 'Form'):
         return declared
@@ -713,6 +715,20 @@ def lifecycle(conv, tree, extends: str) -> list:
 # Synthesised events
 # ---------------------------------------------------------------------------
 
+def _retype_implicit_blocks(tree, script_name: str) -> None:
+    """Give a TES3 script's one implicit block the type it behaves as.
+
+    TES3 names no event -- `begin <script name>` -- so the block matches no
+    entry in BLOCK_MAP and every phase downstream dropped it body and all.
+    The body runs every frame while loaded, which is `gamemode`.
+    See: docs/commentary/script_convert_morrowind.md#implicit-blocks
+    """
+    for block in (tree.blocks if tree else ()):
+        if is_implicit_block(block.btype, block.filter, script_name):
+            block.btype = TES3_BLOCK_TYPE
+            block.filter = ''
+
+
 def trap_hit(conv, tree, extends: str) -> list:
     """The contact-damage event TES4's ENGINE used to raise.
 
@@ -757,7 +773,7 @@ def _declared(tree, name_low: str):
     """The Papyrus-safe name of a variable this script declares, or None."""
     for var in (tree.variables if tree else ()):
         if var.name.lower() == name_low:
-            return _safe_property_name(var.name)
+            return safe_property_name(var.name)
     return None
 
 
@@ -893,7 +909,7 @@ def _guarded(conv, block, body: list) -> list:
     the moment they loaded in.
     """
     btype = block.btype.lower()
-    guard = conv._block_filter_guard(btype, block.filter or '')
+    guard = block_filter_guard(conv, btype, block.filter or '')
     state = COMBAT_STATE_GUARDS.get(btype)
     if state and guard is not None:
         guard = f'{state} && {guard}' if guard else state
@@ -1009,7 +1025,7 @@ def menu_blocks(conv, tree, extends: str) -> list:
 
 
 def stage_latches(conv) -> list:
-    """Declare the stage-arrival latches `_guard_stage_timer` reads.
+    """Declare the stage-arrival latches `stage_latch.guard_stage_timer` reads.
 
     Initialised to -1 so the FIRST pass at a stage never satisfies
     `latch == N`: the guard then waits one pass, which is what lets that
@@ -1040,16 +1056,21 @@ def chargen_latch(conv) -> list:
 
 
 def _specific(a: str, b: str) -> str:
-    """The more specific of two candidate types for one variable."""
+    """The more specific of two candidate types for one variable.
+
+    A generated script type outranks everything: it is what cross-script
+    variable reads through the property need.
+    See: docs/commentary/script_convert.md#generated-script-types
+    """
     if not a:
         return b
     if not b or a == b:
         return a
     if a in REF_SPECIFICITY and b in REF_SPECIFICITY:
         return max(a, b, key=REF_SPECIFICITY.index)
-    # A script type (`TES4_Foo`) is the most specific thing there is: it is
-    # what cross-script variable reads through the property need.
-    return a if a.startswith('TES4_') else (b if b.startswith('TES4_') else a)
+    if is_generated_script_type(a):
+        return a
+    return b if is_generated_script_type(b) else a
 
 
 def _promote_assigned_actors(conv, tree) -> None:
@@ -1077,4 +1098,4 @@ def _promote_assigned_actors(conv, tree) -> None:
             low = name.lower()
             if sc.var_types.get(low) == 'ObjectReference':
                 sc.var_types[low] = 'Actor'
-                sc.var_types[_safe_property_name(name).lower()] = 'Actor'
+                sc.var_types[safe_property_name(name).lower()] = 'Actor'

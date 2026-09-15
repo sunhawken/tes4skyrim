@@ -20,12 +20,14 @@ the graph.
 import re
 
 from script_convert.constants import (
-    FAME_GLOBALS, KNOWN_GLOBALS, COMMAND_ROWS, HANDLED_COMMANDS,
-    TES4_MURDER_BOUNTY,
-    _ACTOR_VALUE_MAP_LOW, _BARE_NO_EQUIV_COMMANDS, _FORM_TYPE_TESTS,
-    _canonical_global, _safe_property_name,
+    FAME_GLOBALS, KNOWN_GLOBALS, TES4_MURDER_BOUNTY, _FORM_TYPE_TESTS,
+    _canonical_global, safe_property_name
 )
-from script_convert.resolve import _digit_stripped_formid
+from script_convert.command_rows import (
+    COMMAND_ROWS, HANDLED_COMMANDS, ACTOR_VALUE_MAP_LOW,
+    BARE_NO_EQUIV_COMMANDS
+)
+from script_convert.resolve import digit_stripped_formid
 
 #: A raw FormID operand: TES4 scripts name a form by id as readily as by
 #: EditorID (`additem 0000000f 500` is how Morrowind_ob hands out gold).  The
@@ -140,8 +142,8 @@ def resolve(conv, expr: str, extends: str) -> str:
         canonical = _canonical_global(expr)
         conv.sc.property_refs[canonical] = 'GlobalVariable'
         return f'{canonical}.GetValue()'
-    if low in _ACTOR_VALUE_MAP_LOW:
-        return _ACTOR_VALUE_MAP_LOW[low]
+    if low in ACTOR_VALUE_MAP_LOW:
+        return ACTOR_VALUE_MAP_LOW[low]
     return sc.var_renames.get(low, expr)
 
 
@@ -250,7 +252,7 @@ def _is_bare_command(low: str) -> bool:
         return True
     if low in COMMAND_ROWS:
         return True
-    if low in HANDLED_COMMANDS and low in _BARE_NO_EQUIV_COMMANDS:
+    if low in HANDLED_COMMANDS and low in BARE_NO_EQUIV_COMMANDS:
         return True
     # Prefix-matched no-equivalent families (OBSE menu/UI, console commands,
     # array/string helpers).  One row per variant would have to be added by
@@ -294,9 +296,7 @@ def _record(conv, expr: str, low: str):
 
     fid = xref.edid_to_formid.get(low, '')
     if not fid:
-        # A Papyrus identifier cannot start with a digit, so a Morroblivion
-        # record named `0<name>` arrives here already stripped.
-        fid = _digit_stripped_formid(xref, low)
+        fid = digit_stripped_formid(xref, low)
     if not fid:
         # Stale source spelling -- recover it from this record's SCRO table.
         alias = conv._scro_alias_for(expr)
@@ -319,6 +319,6 @@ def _record(conv, expr: str, low: str):
     # Papyrus is also case-insensitive the two declarations collided, the
     # caller's type lost, and the call became "undefined function".
     canon = xref.formid_to_edid.get(fid, expr)
-    safe = _safe_property_name(canon)
+    safe = safe_property_name(canon)
     conv.sc.property_refs[safe] = ptype
     return conv._global_read(safe) if ptype == 'GlobalVariable' else safe

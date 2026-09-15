@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/banner.svg" alt="TES4 AutoConvert — Oblivion to Skyrim Conversion" width="720">
+  <img src="docs/assets/banner.svg" alt="TES Auto-Convert — Gamebryo to Skyrim Conversion" width="720">
 </p>
 
 <p align="center">
@@ -206,6 +206,32 @@ If you'd like to use any modded Oblivion assets such as models or textures, firs
 
 **IMPORTANT NOTE** This project is still under rapid development and it's possible that Formids can change from underneath you. Updates WILL likely break your save file and you'll have to start anew
 
+
+### TESRuntime (SKSE plugin)
+
+`TESRuntime.dll` is the converter's own required SKSE plugin. It currently composes the animation cache singleton for converted creatures, so that multiple mods can edit it and add creatures as well as runs the fallout gun handling that Skyrim has no equivalent for. Its log is
+`Documents\My Games\Skyrim Special Edition\SKSE\TESRuntime.log`.
+See [tes_runtime/README.md](tes_runtime/README.md) for the details and for
+building it yourself.
+
+#### Changing the gun reload key
+
+The reload key defaults to **mouse button 4** and the iron-sight (zoom) key to
+**right mouse**. To change either, create
+`Data\SKSE\Plugins\TESRuntime\TESRuntime.ini` and give it a `[Guns]`
+section with the [virtual-key code](https://learn.microsoft.com/windows/win32/inputdev/virtual-key-codes)
+of the key you want, in decimal:
+
+```ini
+[Guns]
+ReloadKey=82
+ZoomKey=2
+```
+
+`82` is 0x52, so that example moves reload onto the **R** key and
+leaves zoom on right mouse. The file is read once at startup, so restart the
+game after editing it. Omit a key, or the file entirely, to keep the default.
+
 ---
 
 ## Command line
@@ -256,10 +282,10 @@ python convert.py -f Oblivion.esm --mesh-bounds-only   # Rescan mesh bounds → 
 
 ```bash
 # Mesh conversion only
-python -m asset_convert.nif_converter path/to/meshes/ path/to/output/
+python -m asset_convert.nif.nif_converter path/to/meshes/ path/to/output/
 
 # BSA extraction only
-python -m asset_convert.bsa_extract Oblivion.esm --data-path "C:/path/to/Oblivion/Data"
+python -m asset_convert.sources.bsa_extract Oblivion.esm --data-path "C:/path/to/Oblivion/Data"
 
 # Tests
 python -m pytest tests/ -v
@@ -365,12 +391,13 @@ covered by this project's MIT license.
 | [LvxMagick — DovahNifWorkbench](https://www.nexusmods.com/skyrimspecialedition/mods/183399) | Mopp Bridge, `external/mopp_bridge/dovah_hkp_mesh_mopp_bridge.exe` | No stated license (Nexus-only, no public source). **Statically links Havok** — see the Havok note below |
 | [Bad Dog — PyNifly](https://github.com/BadDogSkyrim/PyNifly) | Pure-Python Havok hk_2010 packfile reader + hkaSplineCompressedAnimation codec (vendored in `external/pynifly_hkx/`) — the heart of creature animation conversion | **GPL-3.0** (vendored from PyNifly 27.4.0; local changes marked `# TESConversion:`) — see the GPL note below |
 | [figment — hkxcmd](https://github.com/figment/hkxcmd) | Havok packfile XML↔binary compiler, `external/hkxcmd/hkxcmd.exe`, used to build skeleton/behavior/animation `.hkx` | **BSD-3-Clause** for hkxcmd's own sources (© 2011; text in `external/hkxcmd/LICENSE.TXT`). **Statically links Havok** — see the Havok note below |
+| [Monitor221hz — HKX2-Enhanced-Library](https://github.com/Monitor221hz/HKX2-Enhanced-Library) | Skyrim SE 64-bit Havok packfile ↔ XML, `external/hkxconv/hkxconv.exe`, used to patch the vanilla humanoid behavior graphs (`hkxcmd` cannot read 64-bit files). Forked from [ret2end](https://github.com/ret2end/HKX2Library), in turn from [katalash](https://github.com/katalash/DSMapStudio) / [krenyy](https://gitlab.com/HKX2/HKX2Library); bundles `BinaryReaderEx` from [JKAnderson — SoulsFormats](https://github.com/JKAnderson/SoulsFormats) | **No stated license** anywhere in that chain (no LICENSE file upstream) — community project, publicly distributed and freely forked; redistributed here on that basis. Full chain and rebuild steps in `external/hkxconv/README.md` |
 | [Microsoft DirectX SDK (June 2010)](https://www.microsoft.com/en-us/download/details.aspx?id=6812) | `external/xwmaencode/xWMAEncode.exe`, xWMA voice compression | Microsoft — **not redistributed**; obtain from the SDK (see [Requirements](#requirements)) |
 | [FFmpeg](https://ffmpeg.org/) | `external/ffmpeg/ffmpeg.exe`, decoding Oblivion MP3/WAV voice and sound files | **LGPL v2.1 or later** — redistributed; license text in `external/ffmpeg/COPYING.LGPLv2.1`. See the LGPL note below |
 | Oblivion banner font ([dafont](https://www.dafont.com/oblivion.font)) | Project banner | *Free for personal use only*, based on Bethesda's trademarked logo. **Not** bundled in this repo; the banner ships as pre-rendered vector outlines. |
 
 > **Note on GPL-3.0:** `external/pynifly_hkx/` is GPL-3.0. It is used by the creature
-> animation conversion path (`asset_convert/hkx_anim.py`). If you redistribute a build
+> animation conversion path (`asset_convert/havok/hkx_anim.py`). If you redistribute a build
 > that includes it, the GPL's terms apply to that distribution.
 
 > **Note on LGPL (FFmpeg):** `external/ffmpeg/ffmpeg.exe` is built from **unmodified**

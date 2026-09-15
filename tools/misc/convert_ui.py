@@ -41,10 +41,10 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from asset_convert import ui_cursor                      # noqa: E402
-from asset_convert import ui_menus                       # noqa: E402
-from asset_convert.bsa_extract import read_bsa_files     # noqa: E402
-from output_layout import finished_dir                   # noqa: E402
+from asset_convert.ui import ui_cursor
+from asset_convert.ui import ui_menus
+from asset_convert.sources.bsa_extract import read_bsa_files
+from output_layout import finished_dir
 
 MOD_NAME = "Oblivion UI"
 MESSAGE_BOX_SWF = r'interface\messagebox.swf'
@@ -98,7 +98,7 @@ def find_data_dirs(oblivion=None, skyrim=None):
             config = json.loads(config_path.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             config = {}
-    from convert import find_game_path
+    from source_paths import find_game_path
     ob = oblivion or find_game_path('oblivion', config)
     sk = skyrim or find_game_path('skyrimse', config)
     return (Path(ob) if ob else None), (Path(sk) if sk else None)

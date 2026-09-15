@@ -108,7 +108,7 @@ from .tes4_reader import (
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from worker_budget import worker_count  # noqa: E402
+from core.worker_budget import worker_count
 
 EXPORT_DISPATCH = {
     # Items / Objects
@@ -181,8 +181,10 @@ def format_record(rec: Record, hdr_size: int = RECORD_HEADER_SIZE) -> str:
         export_fn = export_falloutnv.base_exporter(rec.type)
     if export_fn:
         type_lines = export_fn(rec)
-        # Remove duplicate EditorID if present
-        type_lines = [l for l in type_lines if not l.startswith("EditorID=")]
+        drop = ("EditorID=",)
+        if hdr_size != RECORD_HEADER_SIZE:
+            drop += export_falloutnv.superseded_keys(rec)
+        type_lines = [l for l in type_lines if not l.startswith(drop)]
         lines.extend(type_lines)
         if hdr_size != RECORD_HEADER_SIZE:
             lines.extend(export_falloutnv.export_lines(rec))
@@ -291,12 +293,7 @@ def _export_per_type_serial(by_type: dict, output_dir: str,
 
 
 # --- Parallel formatting -----------------------------------------------------
-#
 # Formatting is pure-Python CPU work that holds the GIL, so threads pin one
-# core; a *process* pool gives real scaling. To avoid pickling every Record
-# (with all its subrecord bytes) across the process boundary, workers re-read
-# records straight from their own mmap of the source file: a job is just a
-# list of (offset, hierarchy) tuples.
 
 # Target uncompressed bytes of source data per format job. Small enough that
 # LAND/REFR spread over every core, big enough to amortise IPC.

@@ -2,7 +2,7 @@
 
 WHY THIS EXISTS (and why the other navmesh tools don't cover it)
 
-`tes5_import.navm_worker.run_job` deliberately catches per-cell errors so one bad
+`tes5_import.navmesh.worker.run_job` deliberately catches per-cell errors so one bad
 cell cannot abort the 2,900-job pool, and the pool's workers run under
 `pythonw.exe` where stdout goes nowhere. So when the import reports
 
@@ -41,16 +41,25 @@ import time
 import traceback
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
-from output_layout import assets_for  # noqa: E402
+from output_layout import assets_for
+from tes5_import.navmesh import pool as navm_pool
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 
 def _load(export_dir, offset):
-    from tes5_import.text_reader import (parse_export_directory,
+    """(text_reader, by_type, door_fids, base_model_by_fid, jobs) for a plugin.
+
+    The masters' export is loaded and passed to both index builders, exactly as
+    `pipeline_records` does: a DOOR or base object owned by a master otherwise
+    resolves to nothing, so every such door loses its panel measurement and the
+    geometry rebuilt here silently differs from the pipeline's.
+    """
+    from tes5_import.base import text_reader as im
+    from tes5_import.base.text_reader import (parse_export_directory,
                                          group_records_by_type,
                                          set_formid_index_offset)
-    from tes5_import import import_main as im
+    from tes5_import.overrides.nested import load_master_export
 
     set_formid_index_offset(offset)
     print(f'parsing {export_dir} ...', flush=True)
@@ -58,9 +67,13 @@ def _load(export_dir, offset):
     by_type = group_records_by_type(parse_export_directory(export_dir))
     print(f'  parsed in {time.time() - t0:.1f}s', flush=True)
 
-    door_fids = im._build_door_fid_set(by_type)
-    base_model_by_fid = im._build_base_model_index(by_type)
-    jobs = im._gather_navm_jobs(by_type, door_fids)
+    master_export = load_master_export(export_dir)
+    if master_export:
+        print(f'  {len(master_export)} master records', flush=True)
+    door_fids = navm_pool.build_door_fid_set(by_type, master_export)
+    base_model_by_fid = navm_pool.build_base_model_index(by_type,
+                                                         master_export)
+    jobs = navm_pool.gather_navm_jobs(by_type, door_fids)
     # FormIDs are pre-assigned in the parent in the real run; any stable value
     # works here since we are not writing a plugin.
     for i, job in enumerate(jobs):
@@ -111,11 +124,11 @@ def main():
     print(f'  {len(jobs)} navmesh jobs', flush=True)
 
     collision_cache = str(assets_for(export_dir) / 'collision_cache.bin')
-    geom_cache = im._navmesh_geom_cache(collision_cache)
+    geom_cache = navm_pool.navmesh_geom_cache(collision_cache)
     dcc = str(assets_for(export_dir) / 'door_centers_cache.json')
 
-    from tes5_import import navm_worker
-    from tes5_import.pgrd_to_navm import convert_PGRD
+    from tes5_import.navmesh import worker as navm_worker
+    from tes5_import.navmesh.from_pgrd import convert_PGRD
 
     navm_worker.init_worker(
         base_model_by_fid, door_fids, collision_cache, args.offset, geom_cache,

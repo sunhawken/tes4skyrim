@@ -1,6 +1,6 @@
-# tes5_import/pack_converter.py - AI packages
+# tes5_import/packages/converter.py - AI packages
 
-**Code:** `tes5_import/pack_converter.py`, `tes5_import/packages.py`, `tes5_import/dialog_converter.py`, `tes5_import/dialog_conditions.py`
+**Code:** `tes5_import/packages/converter.py`, `tes5_import/packages/actor_wiring.py`, `tes5_import/dialogue/converter.py`, `tes5_import/base/conditions.py`
 
 ## Contents
 
@@ -36,8 +36,8 @@ follow, escort, flee, and ambush the way they did in Oblivion.
 >
 > Current reality:
 > - `PACK` is **NOT** in `SKIP_TYPES` — it is converted.
-> - `convert_PACK` lives in [tes5_import/pack_converter.py](../../tes5_import/pack_converter.py)
->   (with templates in [pack_templates.py](../../tes5_import/pack_templates.py)), not
+> - `convert_PACK` lives in [tes5_import/packages/converter.py](../../tes5_import/packages/converter.py)
+>   (with templates in [pack_templates.py](../../tes5_import/packages/templates.py)), not
 >   in `record_types/dialog_misc.py`, and is live code.
 > - PACK is written in its **own phase (import_main Phase 3b2), after QUST**,
 >   because quest packages need the aliases to exist first — it is deliberately
@@ -184,7 +184,7 @@ Two routes, and vanilla uses both:
   quest is running, which is precisely how Oblivion's "quest package with a
   `GetStage` condition sitting at the top of the NPC's list" behaves.
 
-Our `convert_QUST` ([tes5_import/dialog_converter.py:379](../../tes5_import/dialog_converter.py#L379))
+Our `convert_QUST` ([tes5_import/dialogue/converter.py:379](../../tes5_import/dialogue/converter.py#L379))
 currently emits **no aliases at all**. That is a hard prerequisite for quest
 packages.
 
@@ -277,7 +277,7 @@ The rest degrade to travel-and-sandbox, which is strictly better than today's
 ## 3. Design
 <a id="3-design"></a>
 
-### 3.1 New module: `tes5_import/pack_converter.py`
+### 3.1 New module: `tes5_import/packages/converter.py`
 
 Own file (CLAUDE.md: keep files < ~1000 lines; `dialog_misc.py` is already large).
 Delete `convert_PACK` from `dialog_misc.py`.
@@ -394,13 +394,13 @@ Aliases must be **stable and idempotent** (index by EditorID) because the Papyru
 ### 3.5 Conditions
 
 TES4 `Condition[N].Raw` → TES5 `CTDA` via the **existing** translator in
-[tes5_import/dialog_conditions.py](../../tes5_import/dialog_conditions.py) — do not
+[tes5_import/base/conditions.py](../../tes5_import/base/conditions.py) — do not
 write a second one. Quest packages' `GetStage FGC01Rats == 50` conditions are the
 entire activation mechanism, so this must be reused, not approximated.
 
 ### 3.6 Actor wiring — retire the substitution shim
 
-[tes5_import/packages.py](../../tes5_import/packages.py) currently *drops* types
+[tes5_import/packages/actor_wiring.py](../../tes5_import/packages/actor_wiring.py) currently *drops* types
 {1,2,7,8,9,10} and collapses everything else to one sandbox. Once real packages
 exist:
 
@@ -523,6 +523,24 @@ reference. Regression: `test_actor_script_relocated_to_placed_ref`,
 `test_shared_base_keeps_script_and_adds_ref`.
 
 ## 8. `PLDT` alias locations must be type 8, not type 9 (2026-07-20)
+<a id="player-target-is-the-reference"></a>
+### A player package target is the REFERENCE, never the base NPC_
+
+"The player", however TES4 spelled it, is the specific reference `PlayerRef`.
+Oblivion routinely writes it as Object-ID plus the player's base `NPC_`
+(0x07), but Skyrim's escort/follow procedures need a *reference* to act on,
+and vanilla is emphatic about which one: **Skyrim.esm names the player as a
+package target 543x as (type 0, 0x14) against just 6x as (type 1, 0x07)**.
+Left as an Object-ID the engine holds a base form rather than an actor to
+follow, so the package is SELECTED but its procedure never engages —
+**Morroblivion's chargen guard said "follow me" and stood still**.
+
+`resolve_target` normalizes to the reference FIRST, before the alias lookup,
+so the lookup sees 0x14 and a quest package still routes the player through
+its quest reference alias (`PTDA` type 4). That aliasing is what lets the
+package outrank the actor's standing schedule, so it must not be
+short-circuited.
+
 <a id="8-pldt-alias-locations-must"></a>
 
 The fix in §7 was necessary but not sufficient — after it, `sv` on Pinarus showed

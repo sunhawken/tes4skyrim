@@ -28,17 +28,17 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from asset_convert import collision_extract as ce  # noqa: E402
-from tes5_import.navmesh import build, params  # noqa: E402
-from tes5_import.pgrd_to_navm import (_collect_doors,  # noqa: E402
+from asset_convert.collision import collision_extract as ce
+from tes5_import.navmesh import build, params
+from tes5_import.navmesh.from_pgrd import (collect_doors,
                                       load_door_centroids)
-from tes5_import.text_reader import (  # noqa: E402
+from tes5_import.base.text_reader import (
     parse_export_directory, group_records_by_type, get_float, get_int, get_str,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
-from output_layout import assets_for  # noqa: E402
+from output_layout import assets_for
 
 _TYPES = {'CELL', 'REFR', 'PGRD', 'LAND', 'STAT', 'CONT', 'FURN', 'ACTI',
           'TREE', 'DOOR', 'WRLD'}
@@ -259,6 +259,24 @@ def _run_cell(job):
             sliv, micro, dt)
 
 
+def _door_model_map(by_type):
+    """Return a MAP of low-24 DOOR FormID -> model key, never a bare set.
+
+    Matches import_main._build_door_fid_set.  A bare set makes _collect_doors
+    take its legacy membership-only path, which skips panel centering AND the
+    per-model threshold axis/width -- so every debug tool measured doors with
+    width 0 and the default orientation while the real pipeline used the
+    measured ones.
+    """
+    out = {}
+    for d in by_type.get('DOOR', []):
+        f = d.get('FormID')
+        m = get_str(d, 'Model.MODL') or get_str(d, 'MODL')
+        if f and m:
+            out[int(f, 16) & 0xFFFFFF] = _model_key(m)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--export', default='export/Oblivion.esm')
@@ -306,18 +324,7 @@ def main():
                         for p in by_type.get('PGRD', [])}
         land_by_cell = {(ld.get('ParentCELL') or '').upper(): ld
                         for ld in by_type.get('LAND', [])}
-        # MAP (not a set): fid -> model key, matching
-        # import_main._build_door_fid_set.  A bare set makes _collect_doors take
-        # its legacy membership-only path, which skips panel centring AND the
-        # per-model threshold axis/width — so every debug tool measured doors
-        # with width 0 and the default orientation while the real pipeline used
-        # the measured ones.
-        door_fids = {}
-        for d in by_type.get('DOOR', []):
-            f = d.get('FormID')
-            m = get_str(d, 'Model.MODL') or get_str(d, 'MODL')
-            if f and m:
-                door_fids[int(f, 16) & 0xFFFFFF] = _model_key(m)
+        door_fids = _door_model_map(by_type)
         cells = by_type.get('CELL', [])
 
         with open(cache, 'wb') as fh:
@@ -361,7 +368,7 @@ def main():
             name = 'ext_%d_%d' % (gx, gy)
         refrs = refr_by_cell.get(fid, [])
         doors = [(x, y, z, r, tp, w)
-                 for (x, y, z, r, _f, tp, w) in _collect_doors(refrs, door_fids)]
+                 for (x, y, z, r, _f, tp, w) in collect_doors(refrs, door_fids)]
         jobs.append(((name or fid)[:34],
                      refrs, nodes, edges, land, gx, gy, doors))
 

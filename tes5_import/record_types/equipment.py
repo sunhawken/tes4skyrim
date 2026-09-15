@@ -1,11 +1,12 @@
 """Equipment converters: WEAP, ARMO, CLOT, AMMO, BOOK, ENCH, SPEL, ALCH, INGR, SGST, APPA."""
 
+from asset_convert.game_paths import current_namespace
 import re
 import struct
 
-from ..constants import ENCH_CAST_TYPE_MAP, ENCH_TYPE_MAP, WEAPON_TYPE_MAP, ARMA_BODY_COVERAGE_EXTRA
-from ..magic_effects import aimed_variant, has_projectile
-from ..skyrim_overrides import (
+from ..base.constants import ENCH_CAST_TYPE_MAP, ENCH_TYPE_MAP, WEAPON_TYPE_MAP, ARMA_BODY_COVERAGE_EXTRA
+from ..actors.magic_effects import aimed_variant, has_projectile
+from ..base.equivalents import (
     ARMA_ADDITIONAL_RACES,
     ARMA_ADDITIONAL_RACES_NONBEAST,
     ARMA_BEAST_RACES,
@@ -30,12 +31,15 @@ from ..skyrim_overrides import (
     WEAPON_ANIM_STAGGER,
     WEAPON_ANIM_VNAM,
 )
+from .equipment_falloutnv import ammo_flags, gun_speed
 from .equipment_falloutnv import refine_anim_type as refine_fallout_anim_type
+from .projectile_falloutnv import (ammo_projectile, gun_sheathe_sounds,
+                                   gun_sound_subs)
 from .common import (
     VENDOR_KYWD,
     _common_header_subs,
     _convert_biped_flags,
-    _prefix_path,
+    prefix_path,
     get_float,
     get_formid,
     get_int,
@@ -50,7 +54,7 @@ from .common import (
 )
 
 
-from output_layout import assets_for  # noqa: E402
+from output_layout import assets_for
 
 def _resolve_mgef(code: str, actor_value: int = -1, script_fid: str = '',
                   effect_type: str = '') -> int:
@@ -223,7 +227,7 @@ def _pack_effects(rec: dict, count_key: str = 'EffectCount', pad_to: int = 0,
 def _book_source_mesh_missing(writer, model: str) -> bool:
     """True when the plugin's BOOK MODL has no source mesh in the export.
 
-    asset_convert/book_inam.py skips those models ("source mesh missing"), so
+    asset_convert/ui/book_inam.py skips those models ("source mesh missing"), so
     the INAM STAT must not point at a mesh that will never be generated.
     Cached per writer; unknown export dir → assume present (old behaviour).
     """
@@ -276,7 +280,7 @@ def _weapon_anim_type(rec: dict, tes4_type: int, model: str) -> int:
     Skyrim's behaviour graph drives equip/draw from the animation type, and it
     must agree with the NIF's Prn node or the weapon is invisible when drawn:
     Mace looks at WeaponMace, WarAxe at WeaponAxe, Dagger at WeaponDagger. The
-    mesh-name tests here mirror _remap_prn() in asset_convert/nif_converter.py.
+    mesh-name tests here mirror _remap_prn() in asset_convert/nif/nif_converter.py.
 
     See: docs/commentary/tes4_export_falloutnv.md#weapons-guns-become-crossbows
     """
@@ -291,15 +295,46 @@ def _weapon_anim_type(rec: dict, tes4_type: int, model: str) -> int:
     return refine_fallout_anim_type(rec, anim_type)
 
 
+def _weapon_model_and_sounds(rec: dict, writer, anim_type: int,
+                             model: str) -> bytes:
+    """WNAM and the sound links, in TES5 order, before DATA.
+
+    WNAM is the record's own 1st-person STAT (FO3/FNV) or a companion STAT
+    holding the world model (Oblivion has no 1st-person weapon meshes).
+    SNAM..UNAM are a FO3/FNV gun's shoot/dry-fire/idle sounds; NAM9/NAM8
+    (draw/sheathe) prefer the record's own, else the per-type vanilla ones.
+    See: docs/commentary/tes4_export_falloutnv.md#projectiles
+    """
+    subs = b''
+    wnam_fid = get_formid(rec, 'WNAM')
+    if not wnam_fid and model and writer is not None:
+        edid = get_str(rec, 'EditorID', '')
+        wnam_fid = writer.derive_formid('WEAP_STAT', get_formid(rec, 'FormID'))
+        writer.add_record('STAT', _build_weapon_1stperson_stat(
+            edid, prefix_path(model), wnam_fid))
+    if wnam_fid:
+        subs += pack_formid_subrecord('WNAM', wnam_fid)
+    draw, sheathe = 0, 0
+    if writer is not None:
+        subs += gun_sound_subs(rec, writer)
+        draw, sheathe = gun_sheathe_sounds(rec, writer)
+    subs += pack_formid_subrecord(
+        'NAM9', draw or WEAPON_ANIM_NAM9.get(anim_type, 0x0003C72E))
+    subs += pack_formid_subrecord(
+        'NAM8', sheathe or WEAPON_ANIM_NAM8.get(anim_type, 0x0003C72F))
+    return subs
+
+
 def convert_WEAP(rec: dict, writer=None) -> bytes:
     """Convert WEAP.
 
-    TES5 order: EDID OBND FULL MODL EITM ETYP BIDS BAMT INAM WNAM NAM9 NAM8 DATA DNAM CRDT VNAM
+    TES5 order: EDID OBND FULL MODL EITM ETYP BIDS BAMT INAM WNAM SNAM XNAM
+    NAM7 TNAM UNAM NAM9 NAM8 DATA DNAM CRDT VNAM
     """
     subs = _common_header_subs(rec, obnd_sig='WEAP')
     model = get_str(rec, 'Model.MODL')
     if model:
-        subs += pack_string_subrecord('MODL', _prefix_path(model))
+        subs += pack_string_subrecord('MODL', prefix_path(model))
 
     # EITM — Object Effect (enchantment)
     enam = get_formid(rec, 'ENAM')
@@ -321,29 +356,13 @@ def convert_WEAP(rec: dict, writer=None) -> bytes:
     # KSIZ/KWDA — vendor keyword (TES4 type 4 = Staff)
     subs += pack_keywords([VENDOR_KYWD['Staff' if tes4_type == 4 else 'Weapon']])
 
-    # INAM — Impact Data Set (hit effects/particles)
-    subs += pack_formid_subrecord('INAM', WEAPON_ANIM_INAM.get(anim_type, 0x00013CAC))
+    subs += pack_formid_subrecord(
+        'INAM', get_formid(rec, 'INAM')
+        or WEAPON_ANIM_INAM.get(anim_type, 0x00013CAC))
 
-    # WNAM — 1st-person model STAT reference.
-    # We create a companion STAT record containing the same mesh as the world model.
-    # Oblivion has no separate hi-poly 1st-person weapon meshes.
-    wnam_fid = 0
-    if model and writer is not None:
-        edid = get_str(rec, 'EditorID', '')
-        wnam_fid = writer.derive_formid('WEAP_STAT', get_formid(rec, 'FormID'))
-        stat_bytes = _build_weapon_1stperson_stat(edid, _prefix_path(model), wnam_fid)
-        writer.add_record('STAT', stat_bytes)
-    if wnam_fid:
-        subs += pack_formid_subrecord('WNAM', wnam_fid)
+    subs += _weapon_model_and_sounds(rec, writer, anim_type, model)
 
-    # NAM9 — Draw sound descriptor FormID (must come BEFORE DATA)
-    subs += pack_formid_subrecord('NAM9', WEAPON_ANIM_NAM9.get(anim_type, 0x0003C72E))
-
-    # NAM8 — Sheathe sound descriptor FormID (must come BEFORE DATA)
-    subs += pack_formid_subrecord('NAM8', WEAPON_ANIM_NAM8.get(anim_type, 0x0003C72F))
-
-    # TES5 WEAP DATA: Value(4) + Weight(4) + Damage(2) = 10 bytes
-    speed = get_float(rec, 'DATA.Speed', 1.0)
+    speed = gun_speed(rec, get_float(rec, 'DATA.Speed', 1.0))
     reach = get_float(rec, 'DATA.Reach', 1.0)
     value = get_int(rec, 'DATA.Value')
     weight = get_float(rec, 'DATA.Weight')
@@ -353,10 +372,11 @@ def convert_WEAP(rec: dict, writer=None) -> bytes:
     # DNAM — weapon parameters (100 bytes)
     dnam = bytearray(100)
     struct.pack_into('<B', dnam, 0, anim_type)
-    struct.pack_into('<f', dnam, 4, WEAPON_ANIM_MULT.get(anim_type, 1.0))   # animationMultiplier
-    struct.pack_into('<f', dnam, 8, reach if reach > 0.0 else 1.0)             # Reach (0.0 is invalid; default to 1.0)
-    struct.pack_into('<I', dnam, 12, WEAPON_ANIM_FLAGS.get(anim_type, 0))   # Flags
-    struct.pack_into('<f', dnam, 44, speed)                                  # Speed (animationAttackMult slot)
+    struct.pack_into('<f', dnam, 4, gun_speed(rec, WEAPON_ANIM_MULT.get(anim_type, 1.0)))
+    struct.pack_into('<f', dnam, 8, reach if reach > 0.0 else 1.0)
+    struct.pack_into('<I', dnam, 12, WEAPON_ANIM_FLAGS.get(anim_type, 0))
+    struct.pack_into('<B', dnam, 26, max(1, get_int(rec, 'DNAM.ProjectileCount', 1)))
+    struct.pack_into('<f', dnam, 44, speed)
     struct.pack_into('<B', dnam, 76, WEAPON_ANIM_STAGGER.get(anim_type, 0)) # Stagger
     subs += pack_subrecord('DNAM', bytes(dnam))
 
@@ -417,12 +437,12 @@ def convert_ARMO(rec: dict, is_clothing: bool = False, writer=None) -> bytes:
     ground_model = (male_world or male_model
                     or get_str(rec, 'Female.WorldModel.MODL') or female_model)
     if ground_model:
-        subs += pack_string_subrecord('MOD2', _prefix_path(ground_model))
+        subs += pack_string_subrecord('MOD2', prefix_path(ground_model))
 
     # MOD4 — Female world model (if different)
     female_world = get_str(rec, 'Female.WorldModel.MODL')
     if female_world:
-        subs += pack_string_subrecord('MOD4', _prefix_path(female_world))
+        subs += pack_string_subrecord('MOD4', prefix_path(female_world))
 
     # BOD2 (Biped Object Data) replaces BMDT — shared with the override path
     tes4_biped = get_int(rec, 'BMDT.BipedFlags')
@@ -594,7 +614,7 @@ def _build_arma(rec: dict, arma_fid: int, tes5_biped: int, armor_type: int,
     subs += pack_subrecord('DNAM', dnam)
 
     def _weighted(path: str) -> str:
-        p = _prefix_path(path)
+        p = prefix_path(path)
         if not p.lower().endswith('.nif'):
             return p
         if beast_race:
@@ -652,27 +672,15 @@ def convert_CLOT(rec: dict, writer=None) -> bytes:
 def _build_arrow_proj(edid: str, model_path: str, speed: float, proj_fid: int) -> bytes:
     """Build a minimal PROJ record for a converted arrow.
 
-    TES5 PROJ order: EDID OBND FULL MODL DATA NAM1 VNAM
-    DATA (92 bytes) layout per wbDefinitionsTES5.pas, values matched to
-    vanilla ArrowIronProjectile (0003BE11):
-      {00} Flags(U16) {02} Type(U16) {04} Gravity(f) {08} Speed(f) {12} Range(f)
-      {16} Light {20} MuzzleFlashLight {24} TracerChance(f)
-      {28} ExplAltTrigProximity(f) {32} ExplAltTrigTimer(f) {36} Explosion
-      {40} Sound {44} MuzzleFlashDuration(f) {48} FadeDuration(f)
-      {52} ImpactForce(f) {56} SoundCountdown {60} SoundDisable
-      {64} DefaultWeaponSource {68} ConeSpread(f) {72} CollisionRadius(f)
-      {76} Lifetime(f) {80} RelaunchInterval(f) {84} DecalData {88} CollisionLayer
-    Type is a bit value: Arrow = 0x40 (NOT an ordinal — 7 would be
-    Missile|Lobber|Beam and the engine spawns no usable projectile).
-    Flags 0x00C0 = Can Be Picked Up + Supersonic (as ArrowIronProjectile).
+    Order EDID OBND FULL MODL DATA NAM1 VNAM; DATA is 92 bytes whose offsets,
+    Arrow's BIT type 0x40 and the speed scaling are all in the offset map.
+    See: docs/reference/record_mapping.md#proj-data-layout
     """
     subs = b''
     subs += pack_string_subrecord('EDID', edid + 'Projectile')
     subs += pack_obnd()
     subs += pack_string_subrecord('MODL', model_path)
 
-    # Scale TES4 normalised speed (0-1) to TES5 units/sec (~3600 for iron arrow)
-    # TES4 speed 1.0 → TES5 3600; apply proportionally with a minimum of 500
     tes5_speed = max(500.0, speed * 3600.0)
 
     data = bytearray(92)
@@ -698,7 +706,7 @@ def convert_AMMO(rec: dict, writer=None) -> bytes:
     subs = _common_header_subs(rec, obnd_sig='AMMO')
     model = get_str(rec, 'Model.MODL')
     if model:
-        subs += pack_string_subrecord('MODL', _prefix_path(model))
+        subs += pack_string_subrecord('MODL', prefix_path(model))
 
     damage = get_int(rec, 'DATA.Damage')
     value = get_int(rec, 'DATA.Value')
@@ -706,16 +714,13 @@ def convert_AMMO(rec: dict, writer=None) -> bytes:
     weight = get_float(rec, 'DATA.Weight')
     speed = get_float(rec, 'DATA.Speed', 1.0)
 
-    # Build a companion PROJ record so this arrow has its own projectile.
-    # TES4 has no separate PROJ records; we synthesise one per AMMO.
-    if writer is not None:
+    proj_fid = ammo_projectile(rec) or DEFAULT_ARROW_PROJECTILE
+    if proj_fid == DEFAULT_ARROW_PROJECTILE and writer is not None:
         edid = get_str(rec, 'EditorID', '')
         proj_fid = writer.derive_formid('PROJ', get_formid(rec, 'FormID'))
-        proj_model = _prefix_path(model) if model else _prefix_path('Weapons\\Iron\\Arrow.NIF')
+        proj_model = prefix_path(model) if model else prefix_path('Weapons\\Iron\\Arrow.NIF')
         proj_bytes = _build_arrow_proj(edid, proj_model, speed, proj_fid)
         writer.add_record('PROJ', proj_bytes)
-    else:
-        proj_fid = DEFAULT_ARROW_PROJECTILE
 
     # YNAM/ZNAM — pickup/putdown sounds (as vanilla arrows: ITMGenericWeaponUp/Down)
     subs += pack_formid_subrecord('YNAM', 0x0003E7B7)
@@ -724,12 +729,8 @@ def convert_AMMO(rec: dict, writer=None) -> bytes:
     # KSIZ/KWDA — vendor keyword (weapon vendors' list includes Arrow)
     subs += pack_keywords([VENDOR_KYWD['Arrow']])
 
-    # TES5 AMMO DATA (SSE, 20 bytes): Projectile(FormID) Flags(U32) Damage(float) Value(U32) Weight(float)
-    # Flags: bit 0 = Ignores Normal Weapon Resistance (carried over from TES4),
-    # bit 2 = Non-Bolt — REQUIRED or the engine classifies the ammo as a
-    # crossbow bolt (TES4 has no bolts; everything converts as an arrow).
-    tes5_flags = (flags & 0x01) | 0x04
-    data = struct.pack('<IIfIf', proj_fid, tes5_flags, float(damage), value, weight)
+    data = struct.pack('<IIfIf', proj_fid, ammo_flags(flags), float(damage),
+                       value, weight)
     subs += pack_subrecord('DATA', data)
     subs += pack_string_subrecord('ONAM', '')  # Short name
 
@@ -774,7 +775,8 @@ def _fix_book_html(text: str) -> str:
     def _prefix_img(m):
         path = m.group(2).replace('\\', '/')
         if not path.lower().startswith('img://'):
-            path = 'img://textures/tes4/menus/' + path.lstrip('/')
+            path = ('img://textures/' + current_namespace()
+                    + '/menus/' + path.lstrip('/'))
         return f"<img src='{path}'"
     # Match opening quote, path, and consume the matching closing quote.
     text = re.sub(r'<IMG\s+src=(["\']?)([^"\'>\s]+)\1', _prefix_img, text, flags=re.IGNORECASE)
@@ -823,7 +825,7 @@ def convert_BOOK(rec: dict, writer=None) -> bytes:
     subs = _common_header_subs(rec, obnd_sig='BOOK')
     model = get_str(rec, 'Model.MODL')
     if model:
-        subs += pack_string_subrecord('MODL', _prefix_path(model))
+        subs += pack_string_subrecord('MODL', prefix_path(model))
     desc = get_str(rec, 'DESC')
     if desc:
         desc = _fix_book_html(desc)
@@ -859,7 +861,7 @@ def convert_BOOK(rec: dict, writer=None) -> bytes:
     # point at one of the rigged Skyrim reading meshes: the open animation and
     # page text come from the template's behavior graph + skinned page bones +
     # PageText quad, so a static mesh here opens invisible with no text.
-    # asset_convert/book_inam.py bakes each distinct TES4 book model's cover
+    # asset_convert/ui/book_inam.py bakes each distinct TES4 book model's cover
     # textures onto the vanilla book/note rig and writes it to
     # meshes\tes4\clutter\books\inv\<inv_basename(model)>.nif; one STAT per
     # model is synthesised here (cached on the writer — BOOKs convert
@@ -871,7 +873,7 @@ def convert_BOOK(rec: dict, writer=None) -> bytes:
         # asset side does: two BOOK models can share a leaf filename across
         # different directories, and only the map knows which one keeps the
         # bare name.  Built once per writer (BOOKs convert serially).
-        from asset_convert.book_inam import inv_basename, inv_basename_map
+        from asset_convert.ui.book_inam import inv_basename, inv_basename_map
         bmap = getattr(writer, '_book_inam_names', None)
         if bmap is None:
             models = sorted(getattr(writer, 'book_models', None) or [],
@@ -898,7 +900,7 @@ def convert_BOOK(rec: dict, writer=None) -> bytes:
                 inam_fid = writer.derive_formid('BOOK_INVART', model.lower())
                 inv_model = 'clutter\\books\\inv\\' + base + '.nif'
                 stat_bytes = _build_model_stat('InvArt_' + base,
-                                               _prefix_path(inv_model), inam_fid)
+                                               prefix_path(inv_model), inam_fid)
                 writer.add_record('STAT', stat_bytes)
                 cache[base] = inam_fid
     subs += pack_formid_subrecord('INAM', inam_fid)
@@ -1043,7 +1045,7 @@ def convert_ALCH(rec: dict) -> bytes:
 
     model = get_str(rec, 'Model.MODL')
     if model:
-        subs += pack_string_subrecord('MODL', _prefix_path(model))
+        subs += pack_string_subrecord('MODL', prefix_path(model))
 
     weight = get_float(rec, 'DATA.Weight')
     subs += pack_float_subrecord('DATA', weight)
@@ -1075,7 +1077,7 @@ def convert_INGR(rec: dict) -> bytes:
 
     model = get_str(rec, 'Model.MODL')
     if model:
-        subs += pack_string_subrecord('MODL', _prefix_path(model))
+        subs += pack_string_subrecord('MODL', prefix_path(model))
 
     value = get_int(rec, 'DATA.Value')
     weight = get_float(rec, 'DATA.Weight')
@@ -1120,7 +1122,7 @@ def _build_scrl(rec: dict, effect_src: dict, cost: int = 0,
 
     model = get_str(rec, 'Model.MODL')
     if model:
-        subs += pack_string_subrecord('MODL', _prefix_path(model))
+        subs += pack_string_subrecord('MODL', prefix_path(model))
 
     value = get_int(rec, 'DATA.Value')
     weight = get_float(rec, 'DATA.Weight')
@@ -1161,7 +1163,7 @@ def convert_APPA(rec: dict) -> bytes:
     subs = _common_header_subs(rec, obnd_sig='MISC')
     model = get_str(rec, 'Model.MODL')
     if model:
-        subs += pack_string_subrecord('MODL', _prefix_path(model))
+        subs += pack_string_subrecord('MODL', prefix_path(model))
     subs += pack_keywords([VENDOR_KYWD['Clutter']])
     value = get_int(rec, 'DATA.Value')
     weight = get_float(rec, 'DATA.Weight')

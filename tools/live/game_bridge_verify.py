@@ -30,8 +30,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from tools.live.game_bridge import Bridge, BridgeError  # noqa: E402
-from tools.script import papyrus_tail  # noqa: E402
+from tools.live.game_bridge import Bridge, BridgeError
+from tools.script import papyrus_tail
 
 
 class Check:
@@ -49,7 +49,7 @@ def run(results: list[Check], name: str, fn, critical: bool = True) -> Check:
         c.ok, c.detail = ok, detail
     except BridgeError as exc:
         c.ok, c.detail = False, f"[{exc.code}] {exc}"
-    except Exception as exc:  # noqa: BLE001 - a verifier must not itself crash
+    except Exception as exc:
         c.ok, c.detail = False, f"{type(exc).__name__}: {exc}"
     results.append(c)
     return c

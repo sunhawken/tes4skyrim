@@ -6,7 +6,7 @@ Produces the input the voxelizer rasterizes:
     blocking  (M,3,3) float32   walls, pillars, railings, crate sides
 
 Each placed REFR contributes its base mesh's cached collision soup
-(asset_convert.collision_extract), transformed by the ref's full rotation,
+(asset_convert.collision.collision_extract), transformed by the ref's full rotation,
 scale and position.  The old converter applied only RotZ, which silently
 mis-oriented every tilted/ramped static; we apply the full X*Y*Z rotation.
 
@@ -18,7 +18,8 @@ import math
 
 import numpy as np
 
-from ..text_reader import get_float, get_str
+from ..base.text_reader import get_float, get_str
+from ..record_types.world import shifted_position
 from . import params
 
 _CELL_SIZE = 4096.0
@@ -26,33 +27,18 @@ _LAND_VERTS = 33
 _LAND_SPACING = _CELL_SIZE / (_LAND_VERTS - 1)   # 128.0
 _VHGT_UNIT = 8.0
 
-# Largest plausible magnitude for a placement coordinate, in game units.
-#
-# Oblivion's worldspaces span roughly +-2e5 units (a 4096-unit cell grid at
-# +-32 blocks), so 1e7 is ~50x the whole map and cannot be a real placement.
-#
-# This is NOT defensive padding -- Nehrim genuinely ships refs with garbage
-# floats where the CS never initialised the position: 17 REFRs across 10 base
-# objects carry PosY = 8.936455989415117e+17 (and PosX = 1.68e-36), e.g. REFR
-# 001E57C4 in cell 001E4FEC. Placing one stretches the cell's triangle soup to
-# 8.9e17 units wide, which blew the native TriGrid's dense bucket grid to 5.4e14
-# buckets -- a 4-billion-GB allocation whose std::bad_alloc aborted the pool
-# worker and failed the whole Nehrim import with a bare BrokenProcessPool.
-#
-# A ref this far out contributes nothing a navmesh could use (it is nowhere near
-# the pathgrid), so dropping its collision is exactly right; the ref itself is
-# still converted and written normally by the record path.
-_MAX_PLACEMENT = 1e7
+#: Placement bound in game units. See: docs/commentary/tes5_import_navmesh.md#wild-placements-are-dropped
+MAX_PLACEMENT = 1e7
 
 
 def _finite_placement(pos, scale):
     """True if a REFR's placement can contribute usable collision geometry."""
     if not np.all(np.isfinite(pos)) or not math.isfinite(scale):
         return False
-    return bool(np.all(np.abs(pos) <= _MAX_PLACEMENT))
+    return bool(np.all(np.abs(pos) <= MAX_PLACEMENT))
 
 
-def _rot_matrix(rx, ry, rz):
+def rot_matrix(rx, ry, rz):
     """REFR placement rotation matrix (local mesh coords -> cell coords).
 
     The transpose of the Rz@Ry@Rx product, never the product itself.
@@ -70,7 +56,7 @@ def _rot_matrix(rx, ry, rz):
     return m.T
 
 
-def _place(flat, rot, scale, pos):
+def place(flat, rot, scale, pos):
     """Transform a flat [9N] game-unit soup into an (N,3,3) world array.
 
     `flat` may be a python list or (from the cache) a float32 numpy array; use
@@ -151,7 +137,11 @@ def _placed_soup(refr, base_model_by_fid, get_collision):
     """Return (walkable, blocking) placed arrays for one REFR, or (None, None).
 
     Either element is None when that class is absent or the ref is unusable.
+    Placement uses `shifted_position`, the SAME position the ESM writes, so
+    furniture collision does not float above where the engine puts the object.
+
     See: docs/commentary/tes5_import_navmesh.md#wild-placements-are-dropped
+    See: docs/commentary/asset_convert_nif.md#furniture-shift-third-consumer
     """
     name = refr.get('NAME')
     if not name:
@@ -165,18 +155,16 @@ def _placed_soup(refr, base_model_by_fid, get_collision):
     if not soup:
         return None, None
     scale = get_float(refr, 'XSCL.Scale', 1.0) or 1.0
-    pos = np.array([get_float(refr, 'PosX'),
-                    get_float(refr, 'PosY'),
-                    get_float(refr, 'PosZ')], dtype=np.float64)
+    pos = np.array(shifted_position(refr, scale), dtype=np.float64)
     if not _finite_placement(pos, scale):
         return None, None
-    rot = _rot_matrix(get_float(refr, 'RotX'),
+    rot = rot_matrix(get_float(refr, 'RotX'),
                       get_float(refr, 'RotY'),
                       get_float(refr, 'RotZ'))
     if not np.all(np.isfinite(rot)):
         return None, None
-    return (_place(soup.get('w'), rot, scale, pos),
-            _place(soup.get('b'), rot, scale, pos))
+    return (place(soup.get('w'), rot, scale, pos),
+            place(soup.get('b'), rot, scale, pos))
 
 
 def _sort_refr_parts(refr_recs, base_model_by_fid, get_collision, skip_bases):

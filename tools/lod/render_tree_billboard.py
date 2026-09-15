@@ -1,6 +1,6 @@
 """CLI for rendering Oblivion-style tree billboards in bulk.
 
-The rendering itself lives in `asset_convert/tree_billboard.py`, because the
+The rendering itself lives in `asset_convert/lod/tree_billboard.py`, because the
 LOD pipeline calls it directly: `lod_far_gen._far_nif_worker` renders a missing
 billboard on the spot so no tree ever reaches the geometry simplifier.  This
 wrapper exists for ad-hoc runs — filling in a whole load order up front, or
@@ -15,32 +15,39 @@ Usage:
 import argparse
 import multiprocessing as mp
 import os
+import struct
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from subprocess_flags import configure_multiprocessing
-from worker_budget import worker_count
+from core.subprocess_flags import configure_multiprocessing
+from core.worker_budget import worker_count
 from asset_convert.game_paths import win_join
-from asset_convert.tree_billboard import (BILLBOARD_DIR, BS, render_billboard,
+from asset_convert.lod.esm_scan import parse_esm
+from asset_convert.lod.lod_far_gen import is_tree_model
+from asset_convert.lod.tree_billboard import (billboard_dir, BS, render_billboard,
                                           write_dds_rgba)
 
 configure_multiprocessing()
 
 
 def tree_models(plugin_dirs):
-    """{model_rel: owning output dir} for every placed TREE-type base."""
-    from asset_convert import lod_gen as G
-    from asset_convert.lod_far_gen import is_tree_model
+    """{model_rel: owning output dir} for every placed TREE-type base.
+
+    Every plugin in a directory is read, not just the first: a directory can
+    hold several and the TREE bases are spread across them.  An unreadable
+    plugin is reported on stderr rather than swallowed -- skipping in silence
+    renders nothing and still exits 0.
+    """
     found = {}
     for base in plugin_dirs:
-        # Every plugin in the tree, not just the first: a directory can hold
-        # several, and the TREE bases we need are spread across them.
         for esm in sorted(list(base.glob('*.esm')) + list(base.glob('*.esp'))):
             try:
-                _ws, _cells, stats, _refs = G._parse_esm(esm)
-            except Exception:
+                _ws, _cells, stats, _refs = parse_esm(esm)
+            except (OSError, ValueError, KeyError, struct.error) as exc:
+                print('  SKIP %s: %s: %s' % (esm.name, type(exc).__name__, exc),
+                      file=sys.stderr)
                 continue
             for _fid, st in stats.items():
                 if not is_tree_model(st):
@@ -55,7 +62,7 @@ def has_billboard(stem, tex_roots):
     bare = stem.lstrip('0123456789') or stem
     for cand in {stem, bare}:
         for t in tex_roots:
-            if win_join(t, BILLBOARD_DIR + BS + cand + '.dds').exists():
+            if win_join(t, billboard_dir() + BS + cand + '.dds').exists():
                 return True
     return False
 
@@ -131,7 +138,7 @@ def main():
         if not src.exists():
             nomesh += 1
             continue
-        dst = win_join(base / 'textures', BILLBOARD_DIR + BS + stem + '.dds')
+        dst = win_join(base / 'textures', billboard_dir() + BS + stem + '.dds')
         tasks.append((str(src), str(dst), [str(t) for t in tex_roots], a.size))
 
     print('to render: %d   already had: %d   no mesh shipped: %d'

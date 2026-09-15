@@ -16,10 +16,10 @@ import pytest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-from asset_convert.kf_decode import (decode_kf, eval_bspline,  # noqa: E402
-                                     split_root_motion, _knots,
-                                     _basis_weights)
-from asset_convert.hkx_xml import HKXCMD  # noqa: E402
+from asset_convert.havok.kf_decode import (decode_kf, eval_bspline,
+                                     split_root_motion, knots,
+                                     basis_weights)
+from asset_convert.havok.hkx_xml import HKXCMD
 
 DOG_DIR = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
                        'creatures', 'dog')
@@ -47,9 +47,9 @@ class TestBSplineEval:
 
     def test_partition_of_unity(self):
         n = 9
-        u = _knots(n)
+        u = knots(n)
         for v in np.linspace(0.0, n - 3 - 1e-6, 20):
-            w = _basis_weights(n, v, u)
+            w = basis_weights(n, v, u)
             assert abs(w.sum() - 1.0) < 1e-9
 
     def test_curve_stays_in_convex_hull(self):
@@ -123,7 +123,7 @@ class TestDecodeKf:
 @needs_assets
 class TestSkeletonHkx:
     def test_bone_collection(self):
-        from asset_convert.hkx_skeleton import load_skeleton_bones
+        from asset_convert.havok.hkx_skeleton import load_skeleton_bones
         bones = load_skeleton_bones(DOG_SKEL)
         # engine contract: rig root renamed to the name SSE binds by
         # (all 30 vanilla creature rigs use exactly this root bone name)
@@ -134,8 +134,9 @@ class TestSkeletonHkx:
             assert b.parent < i
 
     def test_quat_matrix_roundtrip(self):
-        from asset_convert import pyffi_monkey_patch  # noqa: F401
-        from asset_convert.hkx_skeleton import (_mat33_to_quat_xyzw,
+        from asset_convert.nif.pyffi_monkey_patch import apply_patches
+        apply_patches()
+        from asset_convert.havok.hkx_skeleton import (mat33_to_quat_xyzw,
                                                 find_skeleton_root,
                                                 quat_xyzw_to_mat33)
         from pyffi.formats.nif import NifFormat
@@ -151,13 +152,13 @@ class TestSkeletonHkx:
             m = nd.rotation
             orig = [[m.m_11, m.m_12, m.m_13], [m.m_21, m.m_22, m.m_23],
                     [m.m_31, m.m_32, m.m_33]]
-            rec = quat_xyzw_to_mat33(_mat33_to_quat_xyzw(m))
+            rec = quat_xyzw_to_mat33(mat33_to_quat_xyzw(m))
             assert np.abs(np.array(rec) - np.array(orig)).max() < 1e-5
 
     @needs_hkxcmd
     def test_generate_and_roundtrip(self, tmp_path):
-        from asset_convert.hkx_skeleton import generate_skeleton_hkx
-        from asset_convert.hkx_xml import decompile_hkx
+        from asset_convert.havok.hkx_skeleton import generate_skeleton_hkx
+        from asset_convert.havok.hkx_xml import decompile_hkx
         out = str(tmp_path / 'skeleton.hkx')
         bones = generate_skeleton_hkx(DOG_SKEL, out)
         assert os.path.getsize(out) > 1000
@@ -177,8 +178,8 @@ class TestSkeletonHkx:
 @needs_hkxcmd
 class TestAnimHkx:
     def test_convert_and_verify(self, tmp_path):
-        from asset_convert.hkx_anim import convert_clip_hkx, verify_hkx
-        from asset_convert.hkx_skeleton import load_skeleton_bones
+        from asset_convert.havok.hkx_anim import convert_clip_hkx, verify_hkx
+        from asset_convert.havok.hkx_skeleton import load_skeleton_bones
         bones = load_skeleton_bones(DOG_SKEL)
         out = str(tmp_path / 'forward.hkx')
         clip, motion = convert_clip_hkx(DOG_FORWARD, bones, out)
@@ -191,8 +192,8 @@ class TestAnimHkx:
 
     def test_hkxcmd_can_deserialize(self, tmp_path):
         # the real Havok deserializer (what the engine uses) must accept it
-        from asset_convert.hkx_anim import convert_clip_hkx
-        from asset_convert.hkx_skeleton import load_skeleton_bones
+        from asset_convert.havok.hkx_anim import convert_clip_hkx
+        from asset_convert.havok.hkx_skeleton import load_skeleton_bones
         bones = load_skeleton_bones(DOG_SKEL)
         out = str(tmp_path / 'forward.hkx')
         convert_clip_hkx(DOG_FORWARD, bones, out)
@@ -206,8 +207,8 @@ class TestAnimHkx:
         """Annotations must be TRANSLATED Skyrim events, never Oblivion's raw
         text keys — raw `Sound: X`/`Enum: Y` embedded verbatim was the
         confirmed root cause of totally silent creatures (2026-08-07)."""
-        from asset_convert.hkx_anim import convert_clip_hkx
-        from asset_convert.hkx_skeleton import load_skeleton_bones
+        from asset_convert.havok.hkx_anim import convert_clip_hkx
+        from asset_convert.havok.hkx_skeleton import load_skeleton_bones
         from external.pynifly_hkx.anim_skyrim import load_skyrim_animation
         bones = load_skeleton_bones(DOG_SKEL)
         kf = os.path.join(DOG_DIR, 'handtohandattackleft.kf')
@@ -224,8 +225,8 @@ class TestAnimHkx:
     def test_foot_enums_translated(self, tmp_path):
         """`Enum: Left/BackLeft/...` gait keys become engine footstep events
         at their AUTHORED times (FSTP.ANAM matches these names verbatim)."""
-        from asset_convert.hkx_anim import convert_clip_hkx
-        from asset_convert.hkx_skeleton import load_skeleton_bones
+        from asset_convert.havok.hkx_anim import convert_clip_hkx
+        from asset_convert.havok.hkx_skeleton import load_skeleton_bones
         from external.pynifly_hkx.anim_skyrim import load_skyrim_animation
         bones = load_skeleton_bones(DOG_SKEL)
         out = str(tmp_path / 'forward.hkx')
@@ -248,22 +249,38 @@ class TestPerPluginProjectNamespace:
     """
 
     def test_layout_is_namespaced_everywhere(self):
-        from asset_convert.hkx_behavior import project_layout
+        from asset_convert.game_paths import set_namespace
+        from asset_convert.havok.hkx_behavior import project_layout
+        set_namespace('tes4')
         a = project_layout('scamp', 'oblivion')
         b = project_layout('scamp', 'morrowind_ob')
         for key in ('project_hkx', 'project_txt', 'behavior_hkx', 'anim_dir',
                     'skeleton_nif', 'body_dir', 'fs_dir'):
             assert a[key] != b[key], key
         assert a['project_hkx'] == \
-            'Actors\\TES4\\oblivion\\scamp\\tes4oblivion_scampproject.hkx'
-        assert a['behavior_hkx'] == ('Actors\\TES4\\oblivion\\scamp\\'
+            'Actors\\tes4\\oblivion\\scamp\\tes4oblivion_scampproject.hkx'
+        assert a['behavior_hkx'] == ('Actors\\tes4\\oblivion\\scamp\\'
                                      'Behaviors\\tes4oblivion_scampbehavior.hkx')
         assert a['project_txt'] == 'tes4oblivion_scampproject.txt'
         assert a['fs_dir'] == os.path.join('actors', 'tes4', 'oblivion',
                                            'scamp')
 
+    def test_layout_is_namespaced_per_GAME(self):
+        """A second game's creature of the same name is a distinct project."""
+        from asset_convert.game_paths import set_namespace
+        from asset_convert.havok.hkx_behavior import project_layout
+        set_namespace('tes4')
+        obl = project_layout('scamp', 'oblivion')
+        set_namespace('falloutnv')
+        fnv = project_layout('scamp', 'oblivion')
+        set_namespace('tes4')
+        for key in ('project_hkx', 'project_txt', 'behavior_hkx', 'anim_dir',
+                    'skeleton_nif', 'body_dir', 'fs_dir'):
+            assert obl[key] != fnv[key], key
+        assert fnv['project_txt'] == 'falloutnvoblivion_scampproject.txt'
+
     def test_namespace_is_the_plugin_stem(self):
-        from asset_convert.creature_pipeline import plugin_namespace
+        from asset_convert.havok.creature_pipeline import plugin_namespace
         assert plugin_namespace('Oblivion.esm') == 'oblivion'
         assert plugin_namespace('Morrowind_ob.esm') == 'morrowind_ob'
         assert plugin_namespace('DLCShiveringIsles.esp') == 'dlcshiveringisles'
@@ -272,10 +289,10 @@ class TestPerPluginProjectNamespace:
             'morrowind_ob_chargen_and_transport_mod'
 
     def test_sibling_union_keeps_both_plugins_projects(self, tmp_path):
-        """The shared singlefile registers every plugin's block; same folder
-        name in two plugins = two distinct projects, no winner picked."""
+        """Same folder name in two plugins = two distinct projects, so each
+        plugin's fragment is built from its own tree alone."""
         import json
-        from asset_convert.creature_pipeline import _manifests_under
+        from asset_convert.havok.creature_pipeline import manifests_under
         for plug, ns in (('Oblivion.esm', 'oblivion'),
                          ('Morrowind_ob.esm', 'morrowind_ob')):
             d = tmp_path / plug / 'meshes' / 'actors' / 'tes4' / ns / 'scamp'
@@ -283,21 +300,170 @@ class TestPerPluginProjectNamespace:
             (d / 'project_manifest.json').write_text(json.dumps(
                 {'name': 'scamp', 'namespace': ns,
                  'project_txt': f'tes4{ns}_scampproject.txt'}))
-        a = _manifests_under(str(tmp_path / 'Oblivion.esm' / 'meshes'))
-        b = _manifests_under(str(tmp_path / 'Morrowind_ob.esm' / 'meshes'))
+        a = manifests_under(str(tmp_path / 'Oblivion.esm' / 'meshes'))
+        b = manifests_under(str(tmp_path / 'Morrowind_ob.esm' / 'meshes'))
         assert set(a) == {'tes4oblivion_scampproject.txt'}
         assert set(b) == {'tes4morrowind_ob_scampproject.txt'}
         assert not (set(a) & set(b))
 
     def test_every_clip_index_is_in_range(self):
         """No clip may index past the character file list."""
-        from asset_convert.animation_data import _anim_file_index
+        from asset_convert.havok.animation_data import anim_file_index
         m = {'project_txt': 'tes4xproject.txt',
              'clips': [{'anim': 'Animations\\a%d.hkx' % i}
                        for i in range(17)]}
-        idx = _anim_file_index(m)
+        idx = anim_file_index(m)
         n_files = len(dict.fromkeys(c['anim'] for c in m['clips']))
         assert all(0 <= i < n_files for i in idx.values())
+
+
+def _manifest(ns, folder, n_clips=2):
+    """A minimal project manifest the block emitters accept."""
+    return {'name': folder, 'namespace': ns,
+            'project_txt': f'tes4{ns}_{folder}project.txt',
+            'project_files': ['Behaviors\\x.hkx', 'Characters\\x.hkx',
+                              'Character Assets\\skeleton.HKX'],
+            'anim_dir': f'meshes\\actors\\tes4\\{ns}\\{folder}\\animations',
+            'clips': [{'name': f'Clip{i}', 'stem': f'clip{i}',
+                       'anim': f'Animations\\clip{i}.hkx', 'duration': 1.0,
+                       'looping': True, 'end_event': None, 'sounds': [],
+                       'feet': [], 'hits': []} for i in range(n_clips)],
+            'motions': {}, 'attacks': []}
+
+
+def _base_ad():
+    """A one-project vanilla animationdata file (wolf: one clip, motion)."""
+    return ['1', 'wolfproject.txt', '11', '1', '1', 'Behaviors\\w.hkx',
+            '1', 'Idle', '0', '1', '0', '0', '0', '', '7', '0', '1', '1',
+            '1 0 0 0', '1', '1 0 0 0 1', '']
+
+
+def _base_asd():
+    """The matching one-project animationsetdata file."""
+    return ['1', 'WolfProjectData\\WolfProject.txt', '1',
+            'FullCharacter.txt', 'V3', '0', '0', '0', '0']
+
+
+class TestAnimCacheFragments:
+    """The converter writes fragments; TESRuntime.dll composes them onto
+    the vanilla singlefiles at load. compose_* here is the DLL's reference:
+    the same rule (append, dedupe by name) the old build-time merge used.
+    See docs/reference/tes_runtime_fragments.md."""
+
+    def test_fragment_holds_only_own_projects(self, tmp_path):
+        """A plugin's fragment lists its own projects, sorted, and no
+        singlefile is written beside it."""
+        import json
+        from asset_convert.havok.animation_data import write_fragment
+        path = write_fragment([_manifest('oblivion', 'scamp'),
+                               _manifest('oblivion', 'dog')],
+                              str(tmp_path / 'meshes'), 'Oblivion.esm')
+        assert path == str(tmp_path / 'SKSE' / 'Plugins' / 'TESRuntime'
+                           / 'animation' / 'Oblivion.json')
+        frag = json.load(open(path, encoding='utf-8'))
+        assert frag['version'] == 1 and frag['source'] == 'Oblivion.esm'
+        assert [e['project'] for e in frag['animdata']] == \
+            ['tes4oblivion_dogproject.txt', 'tes4oblivion_scampproject.txt']
+        assert frag['animsetdata'][0]['entry'] == \
+            'tes4oblivion_dogprojectData\\tes4oblivion_dogproject.txt'
+        assert (tmp_path / 'meshes' / 'animationdata'
+                / 'tes4oblivion_dogproject.txt').is_file()
+        assert not (tmp_path / 'meshes'
+                    / 'animationdatasinglefile.txt').exists()
+
+    def test_compose_registers_every_fragment_once(self):
+        """Distinct project names all register; a duplicate is skipped and
+        every registered block is wrapped by its own line count."""
+        from asset_convert.havok.animation_data import (
+            compose_animationdata, compose_animationsetdata,
+            manifest_fragment)
+        base_ad = _base_ad()
+        frags = []
+        for ns in ('oblivion', 'morrowind_ob', 'oblivion'):
+            ad, asd = manifest_fragment(_manifest(ns, 'scamp'))
+            frags.append({'animdata': [ad], 'animsetdata': [asd]})
+        ad = compose_animationdata(base_ad, frags)
+        asd = compose_animationsetdata(_base_asd(), frags)
+        assert ad[0] == '3' and ad[1:4] == [
+            'wolfproject.txt', 'tes4oblivion_scampproject.txt',
+            'tes4morrowind_ob_scampproject.txt']
+        assert asd[0] == '3'
+        body = ad[4:]
+        assert body[:len(base_ad) - 2] == base_ad[2:]
+        n = int(body[len(base_ad) - 2])
+        assert n == len(frags[0]['animdata'][0]['clip_block'])
+
+    def test_compose_is_a_no_op_without_fragments(self):
+        """No fragments: the base comes back untouched."""
+        from asset_convert.havok.animation_data import compose_animationdata
+        assert compose_animationdata(_base_ad(), []) == _base_ad()
+
+    def test_append_splices_into_an_existing_project(self):
+        """Append ops land inside the named project and rewrite its counts."""
+        from asset_convert.havok.animation_data import (
+            compose_animationdata, compose_animationsetdata)
+        frag = {'animdata_append': [
+                    {'project': 'wolfproject.txt',
+                     'clips': ['Gun', '0', '1', '0', '0', '0', ''],
+                     'motions': ['0', '2', '1', '2 0 0 0', '1',
+                                 '2 0 0 0 1', '']}],
+                'animsetdata_append': [
+                    {'entry': 'WolfProjectData\\WolfProject.txt',
+                     'set_file': '_gun.txt',
+                     'block': ['V3', '0', '1', 'iRightHandType', '10', '10',
+                               '0', '0']}]}
+        ad = compose_animationdata(_base_ad(), [frag])
+        assert ad[0] == '1'
+        assert ad[2] == str(11 + 7) and ad[3 + 11:3 + 18] == \
+            ['Gun', '0', '1', '0', '0', '0', '']
+        assert ad[3 + 18] == str(7 + 7) and ad[-7:] == \
+            frag['animdata_append'][0]['motions']
+        asd = compose_animationsetdata(_base_asd(), [frag])
+        assert asd[2] == '2' and asd[3:5] == ['FullCharacter.txt', '_gun.txt']
+        assert asd[-8:] == frag['animsetdata_append'][0]['block']
+
+    def test_cpp_composer_matches_python(self, tmp_path):
+        """tes_runtime/compose_test.exe (the DLL's composer, built by
+        tes_runtime/build.bat) must produce byte-identical files to the
+        Python reference over the same base and fragments."""
+        import json
+        import subprocess
+        from asset_convert.havok.animation_data import (
+            compose_singlefiles, read_fragments, write_composed,
+            write_fragment)
+        exe = os.path.join(REPO, 'tes_runtime', 'compose_test.exe')
+        if not os.path.isfile(exe):
+            pytest.skip('tes_runtime/compose_test.exe not built')
+        base_dir = tmp_path / 'base'
+        base_dir.mkdir()
+        base = {'animationdatasinglefile.txt': _base_ad(),
+                'animationsetdatasinglefile.txt': _base_asd()}
+        write_composed(base, str(base_dir))
+        frag_dir = tmp_path / 'SKSE' / 'Plugins' / 'TESRuntime' / 'animation'
+        write_fragment([_manifest('oblivion', 'scamp', 3),
+                        _manifest('oblivion', 'dog')],
+                       str(tmp_path / 'meshes'), 'Oblivion.esm')
+        (frag_dir / 'zz_append.json').write_text(json.dumps({
+            'version': 1, 'source': 't', 'animdata': [], 'animsetdata': [],
+            'animdata_append': [{'project': 'wolfproject.txt',
+                                 'clips': ['Gun', '0', '1', '0', '0', '0',
+                                           ''],
+                                 'motions': ['0', '2', '1', '2 0 0 0', '1',
+                                             '2 0 0 0 1', '']}],
+            'animsetdata_append': [{
+                'entry': 'WolfProjectData\\WolfProject.txt',
+                'set_file': '_gun.txt',
+                'block': ['V3', '0', '1', 'iRightHandType', '10', '10',
+                          '0', '0']}]}))
+        py_dir, cpp_dir = tmp_path / 'py', tmp_path / 'cpp'
+        py_dir.mkdir()
+        cpp_dir.mkdir()
+        write_composed(compose_singlefiles(base, read_fragments(str(frag_dir))),
+                       str(py_dir))
+        assert subprocess.run([exe, str(base_dir), str(frag_dir),
+                               str(cpp_dir)]).returncode == 0
+        for fn in base:
+            assert (py_dir / fn).read_bytes() == (cpp_dir / fn).read_bytes()
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +487,7 @@ class TestCastLane:
     MLh_SpellFire_Event trigger is what actually fires the spell."""
 
     def _clips(self):
-        from asset_convert.hkx_behavior import classify_clips
+        from asset_convert.havok.hkx_behavior import classify_clips
         return classify_clips(SCAMP_DIR)
 
     def test_cast_clips_are_claimed_not_dropped(self):
@@ -336,19 +502,19 @@ class TestCastLane:
         _Out), ONE chain per graph — vanilla creature casters route
         everything through the left hand (the atronach's RH states are dead
         code and even its RH Out fires MLh_SpellFire_Event)."""
-        from asset_convert.hkx_behavior import cast_phase_defs
+        from asset_convert.havok.hkx_behavior import cast_phase_defs
         names = [s for s, _kf, _p, _st in cast_phase_defs(self._clips())]
         assert names == ['Mag_FF_In', 'Mag_FF_Loop', 'Mag_FF_Out']
 
     def test_cast_plays_the_aimed_clip_first(self):
         """The engine's entry event carries no delivery, so the chain plays
         the most cast-like gesture available: casttarget over castself."""
-        from asset_convert.behavior_clips import cast_clip
+        from asset_convert.havok.behavior_clips import cast_clip
         assert os.path.basename(cast_clip(self._clips())).lower() \
             == 'casttarget.kf'
 
     def test_only_the_loop_repeats(self):
-        from asset_convert.hkx_behavior import state_defs
+        from asset_convert.havok.hkx_behavior import state_defs
         loops = {n: l for n, _k, l, _e, _x in state_defs(self._clips())
                  if n.startswith('Mag_FF_')}
         assert loops == {'Mag_FF_In': False, 'Mag_FF_Loop': True,
@@ -357,7 +523,7 @@ class TestCastLane:
     def test_each_phase_gets_its_own_animation(self):
         """The phases are CUT from one source clip, so they cannot share
         one animation file."""
-        from asset_convert.hkx_behavior import cast_anim_stems
+        from asset_convert.havok.hkx_behavior import cast_anim_stems
         stems = cast_anim_stems(self._clips())
         assert stems == {'Mag_FF_In': 'casttarget_In',
                          'Mag_FF_Loop': 'casttarget_Loop',
@@ -368,7 +534,7 @@ class TestCastLane:
         opens CAST_PRE_RELEASE before it (vanilla's Out carries ~0.23s of
         wind-up before its SpellFire trigger) and the returned offset points
         the trigger back at the authored moment exactly."""
-        from asset_convert.hkx_anim import (decode_clip, split_cast_clip,
+        from asset_convert.havok.hkx_anim import (decode_clip, split_cast_clip,
                                             CAST_LOOP_SECONDS,
                                             CAST_PRE_RELEASE)
         clip, _m = decode_clip(self._clips()['cast']['Target'], 30.0)
@@ -386,7 +552,7 @@ class TestCastLane:
     def test_graph_declares_the_engine_magic_interface(self):
         """Without these variables the engine cannot ask for a cast, and
         without the entry/release vocabulary it can never drive one."""
-        from asset_convert.hkx_behavior import build_behavior_xml
+        from asset_convert.havok.hkx_behavior import build_behavior_xml
         xml = build_behavior_xml('TES4ScampBehavior', self._clips())
         for var in ('bWantCastRight', 'bWantCastLeft', 'bMRh_Ready',
                     'bMLh_Ready', 'IsCasting'):
@@ -410,7 +576,7 @@ class TestCastLane:
         the ENGINE's to grant. (A working caster, the atronach, ships all
         five at 0 in its wordVariableValues.)"""
         import re
-        from asset_convert.hkx_behavior import build_behavior_xml
+        from asset_convert.havok.hkx_behavior import build_behavior_xml
         xml = build_behavior_xml('TES4ScampBehavior', self._clips())
         names = re.search(r'name="variableNames"[^>]*>(.*?)</hkparam>',
                           xml, re.S).group(1)
@@ -427,7 +593,7 @@ class TestCastLane:
         it is what actually fires the spell — plus Spell_Stop at clip end;
         vanilla's Mag_FF_RH_Out block is exactly that pair."""
         import re
-        from asset_convert.hkx_behavior import build_behavior_xml
+        from asset_convert.havok.hkx_behavior import build_behavior_xml
         xml = build_behavior_xml('TES4ScampBehavior', self._clips())
         names = re.search(r'name="eventNames"[^>]*>(.*?)</hkparam>',
                           xml, re.S).group(1)
@@ -440,7 +606,6 @@ class TestCastLane:
 
 # ---------------------------------------------------------------------------
 # Ghost/wraith dissolve: NiVisController -> bone scale (docs/creature_conversion
-# .md "Ghosts hovered in the air instead of dissolving")
 # ---------------------------------------------------------------------------
 
 GHOST_DIR = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
@@ -519,9 +684,9 @@ class TestTrackMerge:
     dropped the visibility scale on exactly the two ectoplasm bones."""
 
     def test_duplicate_bone_tracks_merge_not_overwrite(self):
-        from asset_convert.hkx_anim import (clip_to_animation_data,
+        from asset_convert.havok.hkx_anim import (clip_to_animation_data,
                                             reference_pose_from_bones)
-        from asset_convert.hkx_skeleton import load_skeleton_bones
+        from asset_convert.havok.hkx_skeleton import load_skeleton_bones
 
         skel = os.path.join(REPO, 'output', 'Oblivion.esm', 'meshes',
                             'actors', 'tes4', 'oblivion', 'ghost',
@@ -529,7 +694,7 @@ class TestTrackMerge:
         if not os.path.exists(skel):
             pytest.skip('converted ghost skeleton missing')
 
-        from asset_convert.kf_decode import BoneTrack
+        from asset_convert.havok.kf_decode import BoneTrack
 
         bones = load_skeleton_bones(skel)
         order = [b.name for b in bones]
@@ -559,9 +724,9 @@ class TestTrackMerge:
 
     def test_merge_does_not_mutate_the_source_clip(self):
         # a clip can be written more than once (cast splits reuse one decode)
-        from asset_convert.hkx_anim import (clip_to_animation_data,
+        from asset_convert.havok.hkx_anim import (clip_to_animation_data,
                                             reference_pose_from_bones)
-        from asset_convert.hkx_skeleton import load_skeleton_bones
+        from asset_convert.havok.hkx_skeleton import load_skeleton_bones
 
         skel = os.path.join(REPO, 'output', 'Oblivion.esm', 'meshes',
                             'actors', 'tes4', 'oblivion', 'ghost',
@@ -580,7 +745,6 @@ class TestTrackMerge:
 
 # ---------------------------------------------------------------------------
 # Ghost dissolve: authored detection + the two-script VMAD
-# (docs/commentary/asset_convert_creature.md "Ghosts hover on death")
 # ---------------------------------------------------------------------------
 
 class TestDissolveDetection:
@@ -588,7 +752,7 @@ class TestDissolveDetection:
     actor's own skin holder instead of dropping the body -- never a name."""
 
     def _detect(self, path):
-        from asset_convert.hkx_behavior import detect_dissolve
+        from asset_convert.havok.hkx_behavior import detect_dissolve
         clip = decode_kf(path)[0]
         return detect_dissolve({'death': (clip, None)})
 
@@ -622,7 +786,7 @@ class TestDissolveDetection:
         assert self._detect(p)['dissolves'] is False
 
     def test_missing_death_clip_is_not_a_dissolve(self):
-        from asset_convert.hkx_behavior import detect_dissolve
+        from asset_convert.havok.hkx_behavior import detect_dissolve
         assert detect_dissolve({})['dissolves'] is False
         assert detect_dissolve(None)['dissolves'] is False
 
@@ -697,8 +861,8 @@ class TestDeathPileExtraction:
 
     def _extract(self, folder, tmp_path):
         import numpy as np
-        from asset_convert.nif_converter import extract_death_pile
-        from asset_convert.hkx_behavior import detect_dissolve
+        from asset_convert.havok.creature_mesh import extract_death_pile
+        from asset_convert.havok.hkx_behavior import detect_dissolve
         from pyffi.formats.nif import NifFormat
 
         skel = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
@@ -761,7 +925,7 @@ class TestDeathPileExtraction:
         assert len(names) == len(set(names)), names
 
     def test_no_pile_when_nothing_is_revealed(self, tmp_path):
-        from asset_convert.nif_converter import extract_death_pile
+        from asset_convert.havok.creature_mesh import extract_death_pile
         skel = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
                             'creatures', 'ghost', 'skeleton.nif')
         if not os.path.exists(skel):
@@ -771,16 +935,16 @@ class TestDeathPileExtraction:
         assert not os.path.exists(dst)
 
 
-class TestParticleColour:
-    """A converted particle system must keep its AUTHORED colour, and its
-    shader tint must stay neutral when the particles carry their own colour
+class TestParticleColor:
+    """A converted particle system must keep its AUTHORED color, and its
+    shader tint must stay neutral when the particles carry their own color
     (docs/commentary/asset_convert_creature.md -- the ghost's smoke rendered black)."""
 
     GHOST_SKEL = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
                               'creatures', 'ghost', 'skeleton.nif')
 
     def _convert(self, tmp_path):
-        from asset_convert.nif_converter import convert_nif
+        from asset_convert.nif.nif_converter import convert_nif
         from pyffi.formats.nif import NifFormat
         if not os.path.exists(self.GHOST_SKEL):
             pytest.skip('ghost assets missing')
@@ -791,9 +955,11 @@ class TestParticleColour:
             d.read(f)
         return d
 
-    def test_authored_colour_survives(self, tmp_path):
-        # source NiColorData starts at a pale green (0.70, 0.83, 0.75); the
-        # converter used to overwrite every system with a fire palette
+    def test_authored_color_survives(self, tmp_path):
+        """The source NiColorData pale green (0.70, 0.83, 0.75) must survive.
+
+        The converter used to overwrite every system with a fire palette.
+        """
         d = self._convert(tmp_path)
         checked = 0
         for b in d.roots[0].tree():
@@ -809,12 +975,15 @@ class TestParticleColour:
                 checked += 1
             if checked:
                 break
-        assert checked, 'no colour modifier found'
+        assert checked, 'no color modifier found'
 
-    def test_shader_tint_is_neutral_when_particles_are_coloured(self,
+    def test_shader_tint_is_neutral_when_particles_are_colored(self,
                                                                 tmp_path):
-        # BSEffectShaderProperty.emissive_color MULTIPLIES the texture, so the
-        # source's near-black (0.04) NiMaterialProperty made the smoke black
+        """Emissive color must stay bright when the particles carry the color.
+
+        BSEffectShaderProperty.emissive_color MULTIPLIES the texture, so the
+        source's near-black (0.04) NiMaterialProperty made the smoke black.
+        """
         d = self._convert(tmp_path)
         checked = 0
         for b in d.roots[0].tree():
@@ -842,9 +1011,9 @@ class TestPileCollision:
     bhkSimpleShapePhantom(layer 15) -> bhkTransformShape -> bhkBoxShape."""
 
     def _pile(self, folder, tmp_path):
-        from asset_convert.nif_converter import (extract_death_pile,
-                                                 convert_nif)
-        from asset_convert.hkx_behavior import detect_dissolve
+        from asset_convert.havok.creature_mesh import extract_death_pile
+        from asset_convert.nif.nif_converter import convert_nif
+        from asset_convert.havok.hkx_behavior import detect_dissolve
         from pyffi.formats.nif import NifFormat
         skel = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
                             'creatures', folder, 'skeleton.nif')
@@ -873,6 +1042,8 @@ class TestPileCollision:
         assert any(n.startswith('bhk') for n in names), sorted(names)
 
     def test_pile_collision_is_the_vanilla_phantom(self, tmp_path):
+        """Pile collision is a phantom whose transform centers the box on the
+        geometry (z ~10 game units)."""
         d = self._pile('ghost', tmp_path)
         assert d is not None
         names = [b.__class__.__name__ for b in d.blocks]
@@ -893,7 +1064,6 @@ class TestPileCollision:
         assert 0.10 < float(box.dimensions.x) < 0.25, box.dimensions.x
         assert 0.10 < float(box.dimensions.y) < 0.25, box.dimensions.y
         assert 0.08 < float(box.dimensions.z) < 0.25, box.dimensions.z
-        # ...and the transform shape centres it on the geometry (z ~10 gu)
         assert 0.05 < float(xf.transform.m_34) < 0.30, xf.transform.m_34
         spco = [b for b in d.blocks
                 if b.__class__.__name__ == 'bhkSPCollisionObject']
@@ -909,7 +1079,6 @@ class TestPileCollision:
 
 # ---------------------------------------------------------------------------
 # Swim-prefixed equip clips, the water-native promotion, and pinning a
-# caster with bAnimationDriven so it stops sliding
 # ---------------------------------------------------------------------------
 
 FISH_DIR = os.path.join(REPO, 'export', 'Oblivion.esm', 'meshes',
@@ -933,7 +1102,7 @@ class TestSwimEquipClips:
     """
 
     def _clips(self):
-        from asset_convert.hkx_behavior import classify_clips
+        from asset_convert.havok.hkx_behavior import classify_clips
         return classify_clips(FISH_DIR)
 
     def test_equip_stance_is_claimed(self):
@@ -979,8 +1148,8 @@ class TestCastPin:
     def _cast_bindings(self, xml):
         # variable indices as the emitted graph numbers them
         import re
-        from asset_convert.hkx_behavior import (ENGINE_VARIABLES,
-                                                MAGIC_VARIABLES)
+        from asset_convert.havok.behavior_vocabulary import (
+            ENGINE_VARIABLES, MAGIC_VARIABLES)
         names = [n for n, _t, _iv in ENGINE_VARIABLES]
         names += [n for n, _t, _iv in MAGIC_VARIABLES]   # scamp: no block/swim
         binding = ('memberPath">bIsActive{slot}</hkparam>\\s*'
@@ -995,7 +1164,7 @@ class TestCastPin:
 
     @needs_scamp
     def test_cast_chain_holds_banimationdriven(self):
-        from asset_convert.hkx_behavior import (build_behavior_xml,
+        from asset_convert.havok.hkx_behavior import (build_behavior_xml,
                                                 classify_clips,
                                                 movement_type_names)
         clips = classify_clips(SCAMP_DIR)
@@ -1010,10 +1179,10 @@ class TestCastPin:
     def test_cast_chain_allows_rotation(self):
         # pinned caster must still turn to face (falmer ranged guard)
         import re
-        from asset_convert.hkx_behavior import (build_behavior_xml,
+        from asset_convert.havok.behavior_vocabulary import ENGINE_VARIABLES
+        from asset_convert.havok.hkx_behavior import (build_behavior_xml,
                                                 classify_clips,
-                                                movement_type_names,
-                                                ENGINE_VARIABLES)
+                                                movement_type_names)
         clips = classify_clips(SCAMP_DIR)
         xml = build_behavior_xml('tes4oblivion_scampbehavior', clips,
                                  movement_types=movement_type_names('scamp'))
@@ -1027,7 +1196,7 @@ class TestCastPin:
         # BeginCastLeft -> LeftHandSpellCastHandler is idempotent (acts only
         # in caster state 1); an edge-triggered expression parked a live
         # scamp in state 1 for minutes with the condition already true
-        from asset_convert.hkx_behavior import (build_behavior_xml,
+        from asset_convert.havok.hkx_behavior import (build_behavior_xml,
                                                 classify_clips,
                                                 movement_type_names)
         clips = classify_clips(SCAMP_DIR)
@@ -1040,7 +1209,7 @@ class TestCastPin:
 
     @needs_scamp
     def test_rooted_movt_stays_dead(self):
-        from asset_convert.hkx_behavior import (build_behavior_xml,
+        from asset_convert.havok.hkx_behavior import (build_behavior_xml,
                                                 classify_clips,
                                                 movement_type_names)
         mts = movement_type_names('scamp')
@@ -1064,7 +1233,7 @@ class TestDirectionBlend:
     """
 
     def _xml(self):
-        from asset_convert.hkx_behavior import (build_behavior_xml,
+        from asset_convert.havok.hkx_behavior import (build_behavior_xml,
                                                 classify_clips,
                                                 movement_type_names)
         clips = classify_clips(SCAMP_DIR)
@@ -1084,7 +1253,7 @@ class TestDirectionBlend:
 
     def test_direction_blend_anchors(self):
         import re
-        from asset_convert.hkx_behavior import ENGINE_VARIABLES
+        from asset_convert.havok.behavior_vocabulary import ENGINE_VARIABLES
         xml = self._xml()
         # one direction blend per gait family (scamp has walk + run)
         for fam in ('Walk', 'Run'):
@@ -1121,7 +1290,7 @@ class TestWaterNativePromotion:
     """
 
     def _clips(self):
-        from asset_convert.hkx_behavior import classify_clips
+        from asset_convert.havok.hkx_behavior import classify_clips
         return classify_clips(FISH_DIR)
 
     def test_swim_clips_are_the_base_locomotion(self):
@@ -1137,7 +1306,7 @@ class TestWaterNativePromotion:
 
     def test_amphibians_keep_the_split(self):
         # the mudcrab walks AND swims -- it must keep the land graph
-        from asset_convert.hkx_behavior import classify_clips
+        from asset_convert.havok.hkx_behavior import classify_clips
         crab = os.path.join(os.path.dirname(FISH_DIR), 'mudcrab')
         if not os.path.isdir(crab):
             pytest.skip('mudcrab export assets missing')
@@ -1149,7 +1318,7 @@ class TestWaterNativePromotion:
     def test_attacks_reachable_from_default_state(self):
         # the promoted fish keeps DefaultState active (no SwimState), so
         # the DefaultState-local attackStart transitions can actually fire
-        from asset_convert.hkx_behavior import (build_behavior_xml,
+        from asset_convert.havok.hkx_behavior import (build_behavior_xml,
                                                 movement_type_names)
         c = self._clips()
         xml = build_behavior_xml('tes4oblivion_slaughterfishbehavior', c,
@@ -1185,7 +1354,7 @@ class TestAnimGroupFallback:
     """
 
     def test_read_animgroup_is_the_sequence_name(self):
-        from asset_convert.behavior_clips import read_animgroup
+        from asset_convert.havok.behavior_clips import read_animgroup
         if not os.path.isdir(NIXHOUND_DIR):
             pytest.skip('Morrowind_ob export assets missing')
         assert read_animgroup(
@@ -1194,14 +1363,14 @@ class TestAnimGroupFallback:
             os.path.join(NIXHOUND_DIR, 'walkfastforward.kf')) == 'FastForward'
 
     def test_read_animgroup_rejects_non_nif(self):
-        from asset_convert.behavior_clips import read_animgroup
+        from asset_convert.havok.behavior_clips import read_animgroup
         assert read_animgroup(__file__) is None
         assert read_animgroup(
             os.path.join(REPO, 'no', 'such', 'file.kf')) is None
 
     @needs_mw
     def test_nixhound_gets_a_forward_state(self):
-        from asset_convert.hkx_behavior import classify_clips
+        from asset_convert.havok.hkx_behavior import classify_clips
         c = classify_clips(NIXHOUND_DIR)
         fwd = c['locomotion'].get('MoveForward')
         assert fwd, 'nix hound has no MoveForward state - it will slide'
@@ -1213,7 +1382,7 @@ class TestAnimGroupFallback:
     @needs_mw
     def test_ash_slave_gets_a_forward_state(self):
         # same defect, different folder tree (meshes/morroblivion/**)
-        from asset_convert.hkx_behavior import classify_clips
+        from asset_convert.havok.hkx_behavior import classify_clips
         if not os.path.isdir(ASHSLAVE_DIR):
             pytest.skip('Morroblivion sixthhouse assets missing')
         c = classify_clips(ASHSLAVE_DIR)
@@ -1223,7 +1392,7 @@ class TestAnimGroupFallback:
         # swimhandtohandfastforward.kf declares AnimGroup 'FastForward' too;
         # the murkdweller ships a full land set AND a full swim set, so the
         # land slots must not be filled from swim-prefixed clips.
-        from asset_convert.hkx_behavior import classify_clips
+        from asset_convert.havok.hkx_behavior import classify_clips
         if not os.path.isdir(MURK_DIR):
             pytest.skip('murkdweller export assets missing')
         c = classify_clips(MURK_DIR)
@@ -1240,7 +1409,7 @@ class TestAnimGroupFallback:
     def test_stem_claims_still_win(self):
         # the fallback is additive only: a folder the stem tables already
         # cover must classify exactly as before (dog ships forward.kf)
-        from asset_convert.hkx_behavior import classify_clips
+        from asset_convert.havok.hkx_behavior import classify_clips
         c = classify_clips(DOG_DIR)
         assert os.path.basename(
             c['locomotion']['MoveForward']) == 'forward.kf'
@@ -1248,18 +1417,6 @@ class TestAnimGroupFallback:
 
 # ---------------------------------------------------------------------------
 # Ragdoll bone <-> rigid body bijection, and the engine's ORDERING contract
-#
-# hkaRagdollInstance writes boneToRigidBodyMap as range(len(parts)) and the
-# hkaSkeletonMapper keys PARTS by NAME, so ragdoll parts must map 1:1 onto
-# anim bones and carry unique part names.  On top of that, SkyrimSE's attach
-# (Address Library id 63792) walks the skeleton.NIF in pre-order DFS, collects
-# EVERY constraint of every body into one list, and overwrites hkx
-# constraint[i-1] with NIF constraint[j-1] where i is the hkx part index and
-# j the NIF body index -- no bounds check.  So the hkx part order must BE the
-# NIF DFS order with the first body as root, and every later NIF body must
-# carry exactly one constraint (see hkx_ragdoll.plan_ragdoll_tree).  The
-# 2026-08-27/28 Morroblivion alit crash was an hkx root (Spine) that was the
-# NIF's SECOND body: constraint[-1] is uninitialized stack.
 # ---------------------------------------------------------------------------
 
 ALIT_SKEL = os.path.join(REPO, 'export', 'Morrowind_ob.esm', 'meshes',
@@ -1274,13 +1431,17 @@ needs_landdreugh = pytest.mark.skipif(not os.path.exists(LANDDREUGH_SKEL),
                                       reason='Oblivion export assets missing')
 needs_mudcrab = pytest.mark.skipif(not os.path.exists(MUDCRAB_SKEL),
                                    reason='Oblivion export assets missing')
+TURRET_SKEL = os.path.join(REPO, 'export', 'FalloutNV.esm', 'meshes',
+                           'creatures', 'sentryturret', 'skeleton.nif')
+needs_turret = pytest.mark.skipif(not os.path.exists(TURRET_SKEL),
+                                  reason='FalloutNV export assets missing')
 
 
 class TestRagdollBijection:
 
     def _parts(self, skel):
-        from asset_convert.hkx_skeleton import load_skeleton_bones
-        from asset_convert.hkx_ragdoll import extract_ragdoll
+        from asset_convert.havok.hkx_skeleton import load_skeleton_bones
+        from asset_convert.havok.hkx_ragdoll import extract_ragdoll
         bones = load_skeleton_bones(skel)
         return bones, extract_ragdoll(skel, bones)
 
@@ -1319,24 +1480,24 @@ class TestRagdollBijection:
             ['Ragdoll_' + bones[p.anim_index].name for p in parts]
 
     def test_invariant_assert_catches_aliasing(self):
-        from asset_convert.hkx_ragdoll import (RagdollPart,
-                                               _assert_ragdoll_invariants)
+        from asset_convert.havok.hkx_ragdoll import (RagdollPart,
+                                               assert_ragdoll_invariants)
 
         def _part(name, idx, parent, con=('ragdoll', {})):
             p = RagdollPart()
             p.name, p.anim_index, p.parent, p.constraint = name, idx, parent, con
             return p
 
-        _assert_ragdoll_invariants([_part('A', 0, -1, None), _part('B', 1, 0)])
+        assert_ragdoll_invariants([_part('A', 0, -1, None), _part('B', 1, 0)])
 
         with pytest.raises(ValueError, match='anim bone'):
-            _assert_ragdoll_invariants([_part('A', 0, -1, None),
+            assert_ragdoll_invariants([_part('A', 0, -1, None),
                                         _part('B', 0, 0)])
         with pytest.raises(ValueError, match='not unique'):
-            _assert_ragdoll_invariants([_part('A', 0, -1, None),
+            assert_ragdoll_invariants([_part('A', 0, -1, None),
                                         _part('A', 1, 0)])
         with pytest.raises(ValueError, match='no constraint'):
-            _assert_ragdoll_invariants([_part('A', 0, -1, None),
+            assert_ragdoll_invariants([_part('A', 0, -1, None),
                                         _part('B', 1, 0, None)])
 
     @needs_alit
@@ -1352,14 +1513,14 @@ class TestRagdollBijection:
     # -- the engine's ordering contract ------------------------------------
 
     def _dfs_bodies(self, skel):
-        from asset_convert.hkx_ragdoll import plan_ragdoll_tree, _decode_name
-        from asset_convert.hkx_skeleton import BONE_RENAMES
+        from asset_convert.havok.hkx_ragdoll import plan_ragdoll_tree, decode_name
+        from asset_convert.havok.hkx_skeleton import BONE_RENAMES
         from pyffi.formats.nif import NifFormat
         d = NifFormat.Data()
         with open(skel, 'rb') as f:
             d.read(f)
         plan = plan_ragdoll_tree(d)
-        names = [_decode_name(n) for n in plan['body_nodes']]
+        names = [decode_name(n) for n in plan['body_nodes']]
         return plan, ['Ragdoll_' + BONE_RENAMES.get(n, n) for n in names]
 
     @needs_alit
@@ -1405,30 +1566,33 @@ class TestRagdollBijection:
             assert p.parent < i
 
     def test_swap_joint_ends_negates_limits_and_swaps_frames(self):
-        from asset_convert.hkx_ragdoll import _swap_joint_ends
+        from asset_convert.havok.hkx_ragdoll import swap_joint_ends
         info = {'rows_a': 'A', 'rows_b': 'B', 'piv_a': 'pa', 'piv_b': 'pb',
                 'cone': 0.5, 'plane_min': -0.2, 'plane_max': 0.7,
                 'twist_min': -0.1, 'twist_max': 0.3, 'friction': 0.0}
-        out = _swap_joint_ends('ragdoll', info)
+        out = swap_joint_ends('ragdoll', info)
         assert (out['rows_a'], out['rows_b']) == ('B', 'A')
         assert (out['piv_a'], out['piv_b']) == ('pb', 'pa')
         assert (out['plane_min'], out['plane_max']) == (-0.7, 0.2)
         assert (out['twist_min'], out['twist_max']) == (-0.3, 0.1)
         assert out['cone'] == 0.5
-        h = _swap_joint_ends('hinge', {'rows_a': 'A', 'rows_b': 'B',
+        h = swap_joint_ends('hinge', {'rows_a': 'A', 'rows_b': 'B',
                                        'piv_a': 1, 'piv_b': 2,
                                        'min': -0.8, 'max': 0.1, 'friction': 0})
         assert (h['min'], h['max']) == (-0.1, 0.8)
         # involution: swapping twice is the identity
-        assert _swap_joint_ends('ragdoll', out) == info
+        assert swap_joint_ends('ragdoll', out) == info
 
     @needs_alit
     def test_nif_side_lists_match_the_plan(self):
-        # collision.enforce_ragdoll_tree rebuilds every body's constraint
-        # list to exactly its planned joint: first body bare, every other
-        # body ONE joint to an earlier body -- the list the engine indexes.
-        from asset_convert.collision import enforce_ragdoll_tree
-        from asset_convert.hkx_ragdoll import plan_ragdoll_tree, _decode_name
+        """Every body's list is exactly its planned joint.
+
+        First body bare, every other body ONE joint to an earlier body --
+        the list the engine indexes.
+        """
+        from asset_convert.collision.collision_constraints import (
+            enforce_ragdoll_tree)
+        from asset_convert.havok.hkx_ragdoll import plan_ragdoll_tree, decode_name
         from pyffi.formats.nif import NifFormat
         d = NifFormat.Data()
         with open(ALIT_SKEL, 'rb') as f:
@@ -1440,25 +1604,28 @@ class TestRagdollBijection:
         assert len(bodies[0].collision_object.body.constraints) == 0
         for n in bodies[1:]:
             cons = list(n.collision_object.body.constraints)
-            assert len(cons) == 1, _decode_name(n)
+            assert len(cons) == 1, decode_name(n)
             ents = list(cons[0].entities)
             assert ents[0] is n.collision_object.body
             parent = next(b for b in bodies if b.collision_object.body is ents[1])
             assert bodies.index(parent) < bodies.index(n)
-        spine = next(n for n in bodies if _decode_name(n) == 'BBip01 Spine')
+        spine = next(n for n in bodies if decode_name(n) == 'BBip01 Spine')
         con = spine.collision_object.body.constraints[0]
         assert con.__class__.__name__ == 'bhkRagdollConstraint'
-        assert _decode_name(bodies[0]) == 'Bip01 NonAccum'
+        assert decode_name(bodies[0]) == 'Bip01 NonAccum'
         assert con.entities[1] is bodies[0].collision_object.body
         # idempotent: a second pass changes nothing
         assert enforce_ragdoll_tree(d, root) == 0
 
     @needs_mudcrab
     def test_nif_side_drops_second_constraints(self):
-        # mudcrab authors three bodies with TWO constraints each, which
-        # shifts every later slot the engine indexes by body order
-        from asset_convert.collision import enforce_ragdoll_tree
-        from asset_convert.hkx_ragdoll import plan_ragdoll_tree
+        """The mudcrab's three bodies with TWO constraints each are trimmed.
+
+        An extra constraint shifts every later slot the engine indexes.
+        """
+        from asset_convert.collision.collision_constraints import (
+            enforce_ragdoll_tree)
+        from asset_convert.havok.hkx_ragdoll import plan_ragdoll_tree
         from pyffi.formats.nif import NifFormat
         d = NifFormat.Data()
         with open(MUDCRAB_SKEL, 'rb') as f:
@@ -1472,21 +1639,57 @@ class TestRagdollBijection:
                   for n in plan['body_nodes']]
         assert counts == [0] + [1] * (len(counts) - 1)
 
+    @needs_turret
+    def test_plain_hinge_is_promoted_to_limited_hinge(self):
+        """No bhkHingeConstraint may survive in a ragdoll tree.
+
+        hkpConstraintUtils::convertToPowered accepts only limited hinge and
+        ragdoll data and returns NULL for anything else, which the engine's
+        ragdoll attach then dereferences (the FalloutNV sentry turret CTD).
+        The promoted joint must span the full circle a free hinge means.
+        """
+        from asset_convert.collision.collision_constraints import (
+            enforce_ragdoll_tree)
+        from asset_convert.havok.hkx_ragdoll import plan_ragdoll_tree
+        from pyffi.formats.nif import NifFormat
+        d = NifFormat.Data()
+        with open(TURRET_SKEL, 'rb') as f:
+            d.read(f)
+        plan = plan_ragdoll_tree(d)
+        authored = [n for n in plan['body_nodes']
+                    for c in n.collision_object.body.constraints
+                    if c.__class__.__name__ == 'bhkHingeConstraint']
+        assert authored, 'fixture changed: turret no longer authors a plain hinge'
+
+        enforce_ragdoll_tree(d, d.roots[0])
+
+        kinds = [c.__class__.__name__ for n in plan['body_nodes']
+                 for c in n.collision_object.body.constraints]
+        assert 'bhkHingeConstraint' not in kinds
+        assert set(kinds) <= {'bhkLimitedHingeConstraint',
+                              'bhkRagdollConstraint'}
+        promoted = [c for n in plan['body_nodes']
+                    for c in n.collision_object.body.constraints
+                    if c.__class__.__name__ == 'bhkLimitedHingeConstraint']
+        spans = [(c.limited_hinge.min_angle, c.limited_hinge.max_angle)
+                 for c in promoted]
+        assert any(lo <= -np.pi + 1e-4 and hi >= np.pi - 1e-4
+                   for lo, hi in spans)
+
     @needs_landdreugh
     def test_nif_side_reverses_a_forward_joint_in_place(self):
-        from asset_convert.collision import (enforce_ragdoll_tree,
-                                             _joint_descriptor,
-                                             _reverse_constraint_ends)
-        from asset_convert.hkx_ragdoll import plan_ragdoll_tree, _decode_name
+        from asset_convert.collision.collision_constraints import (
+            enforce_ragdoll_tree, joint_descriptor, reverse_constraint_ends)
+        from asset_convert.havok.hkx_ragdoll import plan_ragdoll_tree, decode_name
         from pyffi.formats.nif import NifFormat
         d = NifFormat.Data()
         with open(LANDDREUGH_SKEL, 'rb') as f:
             d.read(f)
         plan = plan_ragdoll_tree(d)
         pelvis, spine = plan['body_nodes'][0], next(
-            n for n in plan['body_nodes'] if _decode_name(n) == 'Bip01 Spine01')
+            n for n in plan['body_nodes'] if decode_name(n) == 'Bip01 Spine01')
         con = pelvis.collision_object.body.constraints[0]
-        kind, rd = _joint_descriptor(con)       # the source wraps it malleable
+        kind, rd = joint_descriptor(con)       # the source wraps it malleable
         lo, hi = (('twist_min_angle', 'twist_max_angle') if kind == 'ragdoll'
                   else ('min_angle', 'max_angle'))
         before = [(v.x, v.y, v.z) for v in (rd.pivot_a, rd.pivot_b)]
@@ -1501,22 +1704,22 @@ class TestRagdollBijection:
         assert (float(getattr(rd, lo)),
                 float(getattr(rd, hi))) == (-limits[1], -limits[0])
         # involution
-        _reverse_constraint_ends(con)
+        reverse_constraint_ends(con)
         assert [(v.x, v.y, v.z) for v in (rd.pivot_a, rd.pivot_b)] == before
 
     @needs_assets
     def test_marker_exclusion_leaves_normal_rigs_alone(self):
         # the predicate keys on physical content, so a rig with only real
         # capsules must keep every body
-        import asset_convert.hkx_ragdoll as R
-        from asset_convert.hkx_skeleton import load_skeleton_bones
+        import asset_convert.havok.hkx_ragdoll as R
+        from asset_convert.havok.hkx_skeleton import load_skeleton_bones
         bones = load_skeleton_bones(DOG_SKEL)
-        real = R._is_marker_body
+        real = R.is_marker_body
         try:
-            R._is_marker_body = lambda n, b: False
+            R.is_marker_body = lambda n, b: False
             before = R.extract_ragdoll(DOG_SKEL, bones)
         finally:
-            R._is_marker_body = real
+            R.is_marker_body = real
         after = R.extract_ragdoll(DOG_SKEL, bones)
         assert len(before) == len(after)
 
@@ -1528,17 +1731,17 @@ ASHVAMP_DIR = os.path.join(REPO, 'export', 'Morrowind_ob.esm', 'meshes',
 
 @needs_assets
 class TestAccumBindPoseLeak:
-    """The accum bone must flatten to IDENTITY, never to its frame-0 pose.
+    """The accum bone flattens to its authored frame-0 pose, never identity.
 
-    See: docs/commentary/asset_convert_animation.md#accum-bind-pose-leak
+    See: docs/commentary/asset_convert_falloutnv.md#accum-root-identity
     """
 
     @pytest.mark.parametrize('kf,yaw', [('turnleft.kf', 54.18),
                                         ('stagger.kf', 67.11),
                                         ('idle.kf', 54.18)])
-    def test_accum_rotation_flattens_to_identity(self, kf, yaw):
-        """The accum track ends identity, though the source carries `yaw`."""
-        from asset_convert.kf_decode import split_root_motion
+    def test_accum_rotation_flattens_to_first_sample(self, kf, yaw):
+        """The accum track ends static at the source's authored `yaw`."""
+        from asset_convert.havok.kf_decode import split_root_motion
         path = os.path.join(ASHVAMP_DIR, kf)
         if not os.path.exists(path):
             pytest.skip('ash vampire not exported')
@@ -1554,11 +1757,11 @@ class TestAccumBindPoseLeak:
         for t in clip.tracks:
             if t.bone == motion['bone']:
                 assert t.rotations == pytest.approx(
-                    np.tile((1.0, 0.0, 0.0, 0.0), (len(clip.times), 1)))
+                    np.tile(pre[t.bone], (len(clip.times), 1)))
 
     def test_accum_translation_is_preserved(self):
         """Flattening the rotation must not disturb the accum height."""
-        from asset_convert.kf_decode import split_root_motion
+        from asset_convert.havok.kf_decode import split_root_motion
         path = os.path.join(ASHVAMP_DIR, 'turnleft.kf')
         if not os.path.exists(path):
             pytest.skip('ash vampire not exported')
@@ -1581,7 +1784,7 @@ class TestSpeedBakeFrameFloor:
     def test_ash_vampire_walk_reaches_its_formula_speed(self):
         """Baked walk speed matches the GMST formula; the old cap clipped
         it to 21.9 u/s of 46.3."""
-        from asset_convert.hkx_anim import (MIN_BAKED_FRAMES, decode_clip,
+        from asset_convert.havok.hkx_anim import (MIN_BAKED_FRAMES, decode_clip,
                                             speed_bake_factor)
         path = os.path.join(ASHVAMP_DIR, 'walkforward.kf')
         if not os.path.exists(path):
@@ -1598,7 +1801,7 @@ class TestSpeedBakeFrameFloor:
 
     def test_floor_never_lowers_the_old_cap(self):
         """A clip too short to keep the floor must still get the old cap."""
-        from asset_convert.hkx_anim import speed_bake_factor
+        from asset_convert.havok.hkx_anim import speed_bake_factor
 
         class _Clip:
             duration = 0.4

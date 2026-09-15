@@ -128,7 +128,7 @@ def _has_imported_mods() -> bool:
     Data-directory plugins never needs it, so its absence must not abort them.
     """
     try:
-        from asset_convert import source_registry
+        from asset_convert.sources import source_registry
         return bool(source_registry.plugins(SCRIPT_DIR / 'export'))
     except Exception:
         return False
@@ -203,7 +203,7 @@ def _ffmpeg() -> 'Missing | None':
     checkout rather than a missing user install -- same as the other bundled
     exes.  PATH is still searched as a fallback, so a user who deleted the
     bundled copy but has their own ffmpeg keeps working."""
-    from asset_convert.audio_converter import find_ffmpeg
+    from asset_convert.audio.audio_converter import find_ffmpeg
     if find_ffmpeg():
         return None
     return Missing(
@@ -219,7 +219,7 @@ def _ffmpeg() -> 'Missing | None':
 
 
 def _xwmaencode() -> 'Missing | None':
-    from asset_convert.audio_converter import find_xwmaencode
+    from asset_convert.audio.audio_converter import find_xwmaencode
     if find_xwmaencode():
         return None
     return Missing(
@@ -233,7 +233,7 @@ def _xwmaencode() -> 'Missing | None':
 
 
 def _lipgenerator() -> 'Missing | None':
-    from asset_convert.audio_converter import find_lipgenerator
+    from asset_convert.audio.audio_converter import find_lipgenerator
     if find_lipgenerator():
         return None
     return Missing(
@@ -251,7 +251,7 @@ def _load_config() -> dict:
     winreg is Windows-only, so registry-based game-path detection returns
     nothing off Windows; conversion_config.json's tes4DataPath/tes5DataPath
     are the Linux/Mac equivalent. Reading it here lets these preflight checks
-    match what convert.py's own find_game_path() would resolve, instead of
+    match what source_paths.find_game_path() would resolve, instead of
     reporting Skyrim SE as missing when the user has simply pointed the config
     at it.
     """
@@ -271,9 +271,10 @@ def _papyrus_headers() -> 'Missing | None':
     means the (one-time) extraction happens during preflight rather than in the
     middle of the Scripts phase.
     """
-    from convert import _find_skyrim_source_scripts, find_game_path
+    from source_paths import find_game_path
+    from papyrus_compile import find_skyrim_source_scripts
     config = _load_config()
-    if _find_skyrim_source_scripts(config):
+    if find_skyrim_source_scripts(config):
         return None
     data = find_game_path('skyrimse', config)
     return Missing(
@@ -288,11 +289,6 @@ def _papyrus_headers() -> 'Missing | None':
 
 # ---------------------------------------------------------------------------
 #  Phase requirements
-# ---------------------------------------------------------------------------
-#
-# Keyed by the `do_*` phase name convert.py uses. Each value is a list of
-# zero-argument callables returning a Missing (or None when satisfied); they
-# run lazily so a phase that is not selected costs nothing.
 
 _REQUIREMENTS = {
     'export': [],

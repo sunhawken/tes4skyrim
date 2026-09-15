@@ -22,8 +22,8 @@ import pytest
 pytest.importorskip("numpy")
 pytest.importorskip("scipy")
 
-from tes5_import import pgrd_to_navm as p2n  # noqa: E402
-from tes5_import.navi_builder import build_navi_record  # noqa: E402
+from tes5_import.navmesh import from_pgrd as p2n
+from tes5_import.navmesh.navi import build_navi_record
 
 
 class FakeWriter:
@@ -115,16 +115,16 @@ def _decode_nvnm(nvnm):
 
 def test_nvnm_header_constants():
     """Version and CRC constants must not drift from Skyrim.esm."""
-    assert p2n._NVNM_VERSION == 12
-    assert p2n._PATHING_CELL_CRC == 0xA5E9A03C
-    assert p2n._PATHING_DOOR_CRC == 0xE48B73F3
+    assert p2n.NVNM_VERSION == 12
+    assert p2n.PATHING_CELL_CRC == 0xA5E9A03C
+    assert p2n.PATHING_DOOR_CRC == 0xE48B73F3
 
 
 def test_nvnm_roundtrip_and_adjacency_symmetry():
     verts = [(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0),
              (0.0, 100.0, 0.0)]
     tris = [(0, 1, 2), (0, 2, 3)]
-    adj = p2n._compute_adjacency(tris)
+    adj = p2n.compute_adjacency(tris)
     nvnm = p2n.pack_nvnm(verts, tris, adj, [0] * len(tris),
                           wrld_fid=0, cell_fid=0x00001234,
                           grid_x=0, grid_y=0, is_exterior=False)
@@ -143,7 +143,7 @@ def test_nvnm_roundtrip_and_adjacency_symmetry():
 def test_nvnm_exterior_writes_grid_y_then_x():
     verts = [(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0)]
     tris = [(0, 1, 2)]
-    nvnm = p2n.pack_nvnm(verts, tris, p2n._compute_adjacency(tris), [0],
+    nvnm = p2n.pack_nvnm(verts, tris, p2n.compute_adjacency(tris), [0],
                           wrld_fid=0x0000003C, cell_fid=0,
                           grid_x=7, grid_y=-3, is_exterior=True)
     d = _decode_nvnm(nvnm)
@@ -154,7 +154,7 @@ def test_nvnm_exterior_writes_grid_y_then_x():
 def test_all_triangles_carry_found_flag():
     verts = [(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0)]
     tris = [(0, 1, 2)]
-    nvnm = p2n.pack_nvnm(verts, tris, p2n._compute_adjacency(tris), [0],
+    nvnm = p2n.pack_nvnm(verts, tris, p2n.compute_adjacency(tris), [0],
                           wrld_fid=0, cell_fid=1, grid_x=0, grid_y=0,
                           is_exterior=False)
     d = _decode_nvnm(nvnm)
@@ -173,10 +173,10 @@ def test_water_flag_set_below_water_height():
 def test_navm_record_is_compressed():
     verts = [(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0)]
     tris = [(0, 1, 2)]
-    nvnm = p2n.pack_nvnm(verts, tris, p2n._compute_adjacency(tris), [0],
+    nvnm = p2n.pack_nvnm(verts, tris, p2n.compute_adjacency(tris), [0],
                           wrld_fid=0, cell_fid=1, grid_x=0, grid_y=0,
                           is_exterior=False)
-    from tes5_import.writer import pack_subrecord
+    from tes5_import.base.writer import pack_subrecord
     rec = p2n.pack_navm_record(0x01000801, pack_subrecord('NVNM', nvnm))
     sig, size, flags, formid = struct.unpack_from('<4sIII', rec, 0)
     assert sig == b'NAVM'
@@ -200,24 +200,13 @@ def test_navi_record_layout():
 
 # ---------------------------------------------------------------------------
 # Edge Links — cross-cell navmesh stitching
-# ---------------------------------------------------------------------------
-# Without Edge Links every cell navmesh is an ISLAND: an actor paths fine inside
-# its own cell and can never cross a cell boundary, so any AI package with an
-# out-of-cell destination starts (the actor stands up) and never moves.  Vanilla
-# links 12,145 of 14,440 exterior navmeshes (84%), 194,744 links in total.
-#
-# Binary contract (verified against Skyrim.esm, which parses 15,949/15,949 clean):
-#   Edge Link = Type(U32) + Navmesh(FormID U32) + Triangle(S16) = 10 bytes
-#   Triangle flag bits 0/1/2 = 'Edge 0-1 / 1-2 / 2-0 Link'; when set that edge
-#   field is an INDEX into the Edge Links array, not a neighbour triangle.
-#   Type 0 = Portal (the cell-seam link).
 
 _CELL = 4096.0
 
 
 def _edge_link_cell(gx, gy, fid, hug_west):
     """A 2-triangle quad hugging one vertical edge of an exterior cell."""
-    from tes5_import.writer import pack_subrecord
+    from tes5_import.base.writer import pack_subrecord
     x0, x1 = gx * _CELL, (gx + 1) * _CELL
     y0, y1 = gy * _CELL, gy * _CELL + 512
     if hug_west:
@@ -243,14 +232,14 @@ def _two_cell_cache():
 
 
 def _decode_view(navm_bytes, fid):
-    from tes5_import import navm_edge_links as el
-    blob, _pre, _post = el._extract_nvnm(navm_bytes)
+    from tes5_import.navmesh import edge_links as el
+    blob, _pre, _post = el.extract_nvnm(navm_bytes)
     return el.NavMeshView(fid, blob)
 
 
 def test_adjacent_cells_get_reciprocal_portal_links():
     """Two cells meeting at a seam must link to each other, both ways."""
-    from tes5_import.navm_edge_links import build_edge_links, LINK_TYPE_PORTAL
+    from tes5_import.navmesh.edge_links import build_edge_links, LINK_TYPE_PORTAL
     cache = _two_cell_cache()
     made = build_edge_links(cache, verbose=False)
     assert made == 2, 'one link per side of the seam'
@@ -269,7 +258,7 @@ def test_adjacent_cells_get_reciprocal_portal_links():
 
 def test_linked_edge_field_is_an_index_not_a_neighbour():
     """The flagged edge field must become an index into Edge Links."""
-    from tes5_import.navm_edge_links import build_edge_links
+    from tes5_import.navmesh.edge_links import build_edge_links
     cache = _two_cell_cache()
     build_edge_links(cache, verbose=False)
     a = _decode_view(cache[('a', 1)][0], 0x1000)
@@ -285,7 +274,7 @@ def test_linked_edge_field_is_an_index_not_a_neighbour():
 
 def test_non_adjacent_cells_are_not_linked():
     """Cells that share no seam must not be stitched."""
-    from tes5_import.navm_edge_links import build_edge_links
+    from tes5_import.navmesh.edge_links import build_edge_links
     cache = {
         ('a', 1): _edge_link_cell(0, 0, 0x1000, hug_west=False),
         ('far', 2): _edge_link_cell(5, 5, 0x3000, hug_west=True),
@@ -295,7 +284,7 @@ def test_non_adjacent_cells_are_not_linked():
 
 def test_edge_linked_navm_round_trips_to_exact_length():
     """A re-packed NAVM must still consume exactly its blob (no drift)."""
-    from tes5_import.navm_edge_links import build_edge_links
+    from tes5_import.navmesh.edge_links import build_edge_links
     cache = _two_cell_cache()
     build_edge_links(cache, verbose=False)
     for key, (rec, meta) in cache.items():
@@ -308,7 +297,7 @@ def test_edge_linked_navm_round_trips_to_exact_length():
 
 def test_edge_links_are_deterministic():
     """Same input must give byte-identical output (the ESM is reproducible)."""
-    from tes5_import.navm_edge_links import build_edge_links
+    from tes5_import.navmesh.edge_links import build_edge_links
     c1, c2 = _two_cell_cache(), _two_cell_cache()
     build_edge_links(c1, verbose=False)
     build_edge_links(c2, verbose=False)
@@ -318,16 +307,6 @@ def test_edge_links_are_deterministic():
 
 # ---------------------------------------------------------------------------
 # NAVI connectivity mirror — the engine's navmesh info map
-# ---------------------------------------------------------------------------
-# The runtime plans cross-navmesh paths on NAVI's NVMI entries, not on the NVNM
-# blobs: an NVMI with empty Edge/Door Link arrays declares its navmesh an
-# unreachable island even when the NVNM carries portal links and door
-# triangles.  Contract verified against all 15,462 Skyrim.esm NVMI entries:
-#   Edge Links == distinct NVNM edge-link neighbours, self excluded;
-#   Door Links == the mesh's own NVNM door-triangle refs, CRC "PathingDoor".
-# And the NAVI record itself must OVERRIDE Skyrim.esm's singleton 0x00012FB4
-# (as all four DLC ESMs do) — under a fresh FormID the engine never consults
-# it and no navmesh is registered at all.
 
 def _parse_nvmi_entries(navi_rec):
     entries = {}
@@ -356,7 +335,7 @@ def _parse_nvmi_entries(navi_rec):
 
 def test_nvmi_mirrors_edge_links_after_stitching():
     """Stitched meshes must advertise their neighbours in their NVMI entry."""
-    from tes5_import.navm_edge_links import build_edge_links
+    from tes5_import.navmesh.edge_links import build_edge_links
     cache = _two_cell_cache()
     build_edge_links(cache, verbose=False)
     metas = [meta for (_rec, meta) in cache.values()]
@@ -383,7 +362,7 @@ def test_nvmi_mirrors_door_links():
 
 
 def test_navi_is_override_of_vanilla_singleton():
-    from tes5_import.navi_builder import NAVI_SINGLETON_FID
+    from tes5_import.navmesh.navi import NAVI_SINGLETON_FID
     assert NAVI_SINGLETON_FID == 0x00012FB4
 
 
@@ -464,7 +443,7 @@ class TestPlacementSanity:
     def test_absurd_and_non_finite_placements_rejected(self):
         np = pytest.importorskip("numpy")
         from tes5_import.navmesh.world import (_finite_placement,
-                                              _MAX_PLACEMENT)
+                                              MAX_PLACEMENT)
 
         ok = np.array([100.0, -200.0, 30.0])
         assert _finite_placement(ok, 1.0)
@@ -477,7 +456,7 @@ class TestPlacementSanity:
             np.array([0.0, float('inf'), 0.0]), 1.0)
         assert not _finite_placement(ok, float('nan'))
         assert not _finite_placement(
-            np.array([_MAX_PLACEMENT * 2, 0.0, 0.0]), 1.0)
+            np.array([MAX_PLACEMENT * 2, 0.0, 0.0]), 1.0)
 
 
 class TestStoreyGroupsDoorGrouping:

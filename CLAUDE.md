@@ -118,6 +118,8 @@ caching, skipped record types, the export text format, and the directory layout.
 - Deletion and Simplification is an IMPORTANT part of the process. A change that removes or only adds a few total lines of code is FAR SUPERIOR to one that adds many lines. More does not equal better. Strive to have as low of a cyclomatic complexity as possible
 - If the hook triggers for old debt, don't try to get around it as fast as possible or line golf. Take the time to examine the entire surrounding file and fix it properly. You have the time. If you need to separate out a file, pull out the RIGHT thing, not necessaryily the thing you are working on.
 - Docstrings should contain real and important function information. Story content only and always belongs in a see: tag. See tags should ALWAYS have an anchor.
+- Duplicated code is a big no-no. Check if something has been built first and if it has either point to that code instead or pull it out into a shared function
+- Avoid the chicken and egg problem when updating files. For example, adding an import without also adding its call in the same write will trigger the hook and prevent the write
 
 ### <a id="regression-read-the-commits"></a>🛑 IF IT IS A REGRESSION, READ THE COMMITS
 
@@ -194,6 +196,15 @@ real data, or a failing-then-passing test.
 - 🛑 **NEVER RUN A BARE SHELL COMMAND.** Every one goes through
   `python tools/validate/safe_run.py <command>`, which gates the `.py` files
   the command wrote. The hook refuses anything else. See [the wrapper](#safe-run).
+- 🛑 **UNLINK EVERY JUNCTION BEFORE REMOVING A WORKTREE.** Linking live
+  `export/`/`output/` into one is fine; the TEARDOWN is what kills — both
+  `git worktree remove --force` and `rmtree` FOLLOW junctions and delete the
+  real tree. Order: `os.rmdir()` each link, verify each target still has its
+  files, then remove. `is_junction()` misses them — track links as you create
+  them. Both dirs are gitignored, so nothing restores them.
+- 🛑 **NEVER OVERWRITE AN ARTIFACT TO SET UP AN A/B OR COMPARISON.** Work on
+  scratchpad copies and point the tool at them. Regenerating wastes the user's
+  time, and it destroys the baseline the comparison needed.
 - **NEVER `git stash` / `git stash pop`** in this repository.
 - **NEVER `git commit` or `git push`.** The user commits after in-game testing.
 - **NEVER `git add` / `git rm`** (staging, including staged deletions). Use plain
@@ -270,10 +281,10 @@ real data, or a failing-then-passing test.
   | `tes4_export/` | `python convert.py -f <plugin> --export-only` |
   | `tes5_import/` (records, navmesh, packages, dialogue) | `--import-only` |
   | `script_convert/` | `--scripts-only` (compiles .psc → .pex) |
-  | `asset_convert/nif_converter.py`, collision, skin | `--meshes-only` |
+  | `asset_convert/nif/nif_converter.py`, collision, skin | `--meshes-only` |
   | `spt_*` | `--speedtrees-only` |
   | sound conversion | `--sounds-only` |
-  | LOD | `--lod-only` |
+  | LOD | `tools/release/create_lod.py --worldspaces <EDID>`, NEVER `--lod-only` |
   | BSA packing | `--pack-only` |
 
   Touching several areas means running several stages — import *and* scripts if
@@ -294,6 +305,12 @@ real data, or a failing-then-passing test.
   change affects. Reserve the full stage for changes that genuinely touch every
   mesh, and say so when you run one.
 - **Build the mesh the user named, in the PLUGIN the user named** If they say a mesh is a Nehrim issue, rebuild it under `Nehrim.esm` even if there is a same-named mesh under `Oblivion.esm`
+- 🛑 **A `--*-only` FLAG IS A STAGE, NOT A SCOPE** — `--lod-only` bakes every
+  qualifying worldspace, masters' included. Confirm the target from the first
+  output lines before calling a build running; a banner is not progress.
+- 🛑 **LOD BUILDS ONLY VIA `tools/release/create_lod.py --worldspaces <EDID>`,
+  NEVER `--lod-only`** — a worldspace bakes once from its owner plus every
+  plugin as an overlay. `--dry-run` first; the plan names owner and overlays.
 - **Never run two CPU-saturating jobs at once.** The order is **targeted tests
   first, then builds, one at a time.** While one runs, do not start pytest, a
   mesh sweep, or a second build — wait for the completion notification, then
@@ -314,12 +331,13 @@ real data, or a failing-then-passing test.
   working.
 - We aren't British. No "colour", "centre" or the like
 - No allowlist or blocklist, it's whitelist and blacklist
+- Never tell the user you can't look another session's transcript. They are files on disc. Yes you can.
 
 ### Assets and references
 
 - **`references/` is for comparison/analysis ONLY — the pipeline must NEVER
   resolve runtime assets through it.** Vanilla Skyrim files are fetched via
-  `asset_convert/skyrim_assets.py` (cache in `export/skyrim_assets/`, else
+  `asset_convert/sources/skyrim_assets.py` (cache in `export/skyrim_assets/`, else
   auto-extracted from the SSE BSAs via registry-detected install).
 - `references/` subfolders (`NIFConverter/`, `xEdit/`, `UESP/`, `nifskope`) are
   other projects — reference only. Note that these are not the ONLY references in that folder. Check before guessing
@@ -327,7 +345,7 @@ real data, or a failing-then-passing test.
   Grep it before describing one — never invent semantics.** Oblivion:
   `references/cs_wiki/` (.txt).
 - **LE assets are SSE-compatible.** Never dig through SSE-format assets/BSAs.
-  BSA meshes are SSE-format; read them with `asset_convert/sse_nif.py`
+  BSA meshes are SSE-format; read them with `asset_convert/nif/sse_nif.py`
   (`read_nif` converts BSTriShape graphs to LE NiTriShape graphs in-memory;
   pyffi Patch 8 supplies the SSE read layouts). Output is always written LE
   (uv2=83), which SSE loads natively.
@@ -346,6 +364,11 @@ real data, or a failing-then-passing test.
 - Use multiprocessing, not threads, for pure-Python work; **ThreadPoolExecutor is
   only for I/O and subprocesses.** The output ESM must stay byte-reproducible.
   Rules and measured results: [docs/commentary/performance.md](docs/commentary/performance.md).
+- 🛑 **EVERY `subprocess` CALL IN THE PIPELINE PASSES `**POPEN_FLAGS`**
+  (`subprocess_flags.py`). Without it a per-file stage opens one console window
+  per file under `pythonw`. Loose assets in a shared Data folder belong to the
+  MASTERLESS plugin only — gate on `_is_masterless`, or every expansion
+  re-copies and re-transcodes its master's tree.
 - **Never exhaust memory**: some pool tools load the ~2.1 GB export index per
   worker. Cap `--workers` or run single-process.
 - **<a id="formid-drift"></a>FORMIDS ARE HASHED, NOT COUNTED.**
@@ -383,11 +406,13 @@ python tools/navmesh/navmesh_cache_hook.py --run                      # publish 
   keyed by asset path. Only our own `navmesh_geom_cache` pickles go in.
 - **Never put mtime, absolute paths, or worker counts in a cache key** — they
   are machine-local, so every downloader misses.
-- **NEVER add a function directly below — or edit the tail of — one of the six
-  gated functions in `import_main.py`** (`NAVMESH_FUNCS` in
-  `navmesh_cache_hook.py`). Git's `-U0` hunk header names the function ABOVE an
-  insertion, so unrelated code reads as a navmesh change and the next push
-  republishes the whole cache. Check with `navmesh_cache_hook.py --check`.
+- **The cache tag is a SHA-1 over the BYTES of every `tes5_import/navmesh/*.py`**
+  (`navmesh/pool.py:navmesh_geom_cache`). Any edit there — whitespace included —
+  invalidates every downloader's cache, so republish when you touch it.
+  `NAVMESH_PATHS`/`NAVMESH_FUNCS` in `navmesh_cache_hook.py` gate the push; a
+  function added directly below a gated one reads as a navmesh change because
+  git's `-U0` hunk header names the function ABOVE an insertion. Check with
+  `navmesh_cache_hook.py --check`.
 
 Why, and the invalidation/tag contracts:
 [world_land_navmesh_notes.md](docs/commentary/tes5_import_navmesh.md#the-shared-navmesh-cache--design-rationale).
@@ -417,6 +442,11 @@ WROTE. A bare command is refused: a heredoc writes a `.py` no gate ever sees.
 **`grep "a\|b"` silently finds NOTHING** — bash eats the backslash, so grep
 gets a literal `|` and still exits 0. Use `grep -E "a|b"` or `-e a -e b`. Zero
 matches is a broken query, never evidence about the tree.
+
+🛑 **A BASH HEREDOC EATS BACKSLASHES** — `\a`, `\1`, `\_` become bell, byte 1,
+`_`. Never write a Windows path, regex or doc text through `cat <<'EOF'` /
+`python - <<'EOF'`. Use the Write tool for the file, and build paths with
+`chr(92)` or forward slashes. Applies to the doc-gate hook too.
 
 🛑 <a id="doc-rules"></a>**THE CODE RULES ARE A REQUIREMENT, NOT A GUIDELINE.**
 `.claude/hooks/doc_rules_gate.py` runs `--gate-diff` BEFORE an Edit lands and

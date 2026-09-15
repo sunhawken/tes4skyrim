@@ -46,7 +46,7 @@ def test_record_dir_does_not_move_when_a_sibling_is_imported(tmp_path):
     record directory. Its already-exported .txt dump was left behind, and
     every later stage then reported "No export directory" and skipped.
     """
-    from asset_convert import source_registry
+    from asset_convert.sources import source_registry
 
     full = _fake_group(tmp_path / 'full', ['A.esp', 'B.esp'])
     # The same archive with only A.esp registered so far. `group_plugins`
@@ -62,7 +62,7 @@ def test_record_dir_does_not_move_when_a_sibling_is_imported(tmp_path):
 
 def test_a_one_plugin_mod_keeps_its_records_in_the_group_root(tmp_path):
     """Nesting a lone plugin would move every single-plugin mod on disk."""
-    from asset_convert import source_registry
+    from asset_convert.sources import source_registry
     exp = _fake_group(tmp_path, ['Solo.esp'], label='Black Marsh')
     assert source_registry.record_dir(exp, 'Solo.esp').name == 'Black Marsh'
 
@@ -79,7 +79,7 @@ def test_asset_only_mod_is_not_reimported_every_run(tmp_path):
     there could never be satisfied and every run re-unpacked the archive.
     """
     import zipfile
-    from asset_convert import mod_ingest
+    from asset_convert.sources import mod_ingest
 
     arc = tmp_path / 'MyAssetPack.zip'
     with zipfile.ZipFile(arc, 'w') as z:
@@ -96,7 +96,7 @@ def test_adding_a_plugin_member_still_reimports(tmp_path):
     """Caching must not swallow a run that would ADD a plugin to the group."""
     import struct
     import zipfile
-    from asset_convert import mod_ingest
+    from asset_convert.sources import mod_ingest
 
     def _esp():
         return b'TES4' + struct.pack('<IIIII', 0, 0, 0, 0, 0) + b'\x00' * 4
@@ -130,7 +130,7 @@ def test_pack_bsas_resolves_the_output_folder_from_the_export_root(tmp_path):
     and abort the pack with "output directory not found" for every plugin of
     a multi-plugin mod -- the very failure the resolver was added to prevent.
     """
-    from asset_convert.bsa_pack import _out_root
+    from asset_convert.sources.bsa_pack import _out_root
 
     exp = _fake_group(tmp_path, ['A.esm', 'B.esp'])
     out = tmp_path / 'output'
@@ -152,14 +152,14 @@ def test_book_ownership_is_decided_on_the_asset_root(tmp_path):
     compared). Every book a grouped mod ships was deferred to a master that
     never bakes it, reported only as "N model(s) left to the master".
     """
-    from asset_convert.book_inam import _split_master_owned
+    from asset_convert.ui.book_inam import split_master_owned
 
     mod = tmp_path / 'export' / 'My Pack'
     (mod / 'meshes' / 'clutter' / 'books').mkdir(parents=True)
     (mod / 'meshes' / 'clutter' / 'books' / 'mine.nif').write_bytes(b'x')
     mine = BS.join(['clutter', 'books', 'mine.nif'])
 
-    own, deferred = _split_master_owned([mine], str(mod), [str(mod)])
+    own, deferred = split_master_owned([mine], str(mod), [str(mod)])
     assert deferred == 0 and len(own) == 1
 
     # A master's book is still correctly deferred to that master.
@@ -167,7 +167,7 @@ def test_book_ownership_is_decided_on_the_asset_root(tmp_path):
     (master / 'meshes' / 'clutter' / 'books').mkdir(parents=True)
     (master / 'meshes' / 'clutter' / 'books' / 'theirs.nif').write_bytes(b'x')
     theirs = BS.join(['clutter', 'books', 'theirs.nif'])
-    own2, deferred2 = _split_master_owned([theirs], str(mod),
+    own2, deferred2 = split_master_owned([theirs], str(mod),
                                           [str(mod), str(master)])
     assert deferred2 == 1 and own2 == []
 
@@ -209,32 +209,32 @@ def test_master_lookups_all_agree_on_the_export_root(tmp_path):
     silently: dropped manifest entries, no voice-type adoption, no inherited
     creature projects -- each with at most a warning.
     """
-    from tes5_import.overrides import _export_root, _master_export_dir
+    from tes5_import.overrides.nested import export_root, master_export_dir
 
     exp = _fake_group(tmp_path, ['A.esm', 'B.esp'])
     rec = exp / 'My Pack' / 'A.esm'
     rec.mkdir(parents=True)
     (exp / 'Oblivion.esm').mkdir()
 
-    assert _export_root(str(rec)) == str(exp)
-    assert _master_export_dir(_export_root(str(rec)),
+    assert export_root(str(rec)) == str(exp)
+    assert master_export_dir(export_root(str(rec)),
                               'Oblivion.esm') == str(exp / 'Oblivion.esm')
 
     # A plain (non-grouped) plugin is unchanged.
     plain = exp / 'Nehrim.esm'
     plain.mkdir()
-    assert _export_root(str(plain)) == str(exp)
+    assert export_root(str(plain)) == str(exp)
 
 
 def test_import_main_master_dirs_match_load_master_export(tmp_path):
-    """`_master_export_dirs` exists to mirror `load_master_export` exactly.
+    """`master_export_dirs` exists to mirror `load_master_export` exactly.
 
     Its own docstring says so, and it stopped being true: it returned [] for
     every grouped plugin, so the voice-type adoption loop never ran and every
     actor fell through to the Imperial default.
     """
-    from tes5_import.import_main import _master_export_dirs
-    from tes5_import.overrides import _export_root, _master_export_dir
+    from tes5_import.pipeline import master_export_dirs
+    from tes5_import.overrides.nested import export_root, master_export_dir
 
     exp = _fake_group(tmp_path, ['A.esm', 'B.esp'])
     rec = exp / 'My Pack' / 'A.esm'
@@ -246,8 +246,8 @@ def test_import_main_master_dirs_match_load_master_export(tmp_path):
     class _Ctx:
         export_dir = str(rec)
 
-    got = _master_export_dirs(_Ctx())
-    assert got == [_master_export_dir(_export_root(str(rec)), 'Oblivion.esm')]
+    got = master_export_dirs(_Ctx())
+    assert got == [master_export_dir(export_root(str(rec)), 'Oblivion.esm')]
     assert got != []
 
 
@@ -257,7 +257,7 @@ def test_creature_projects_are_inherited_from_a_master(tmp_path):
     Without them the CREA records reusing a master's creature folders fall
     through to `resolve_creature_race` and ship as BASE SKYRIM creatures.
     """
-    from tes5_import.creature_races import _load_projects
+    from tes5_import.actors.creature_races import _load_projects
 
     exp = _fake_group(tmp_path, ['A.esm', 'B.esp'])
     rec = exp / 'My Pack' / 'A.esm'
@@ -266,10 +266,7 @@ def test_creature_projects_are_inherited_from_a_master(tmp_path):
                                      encoding='utf-8')
     master = exp / 'Oblivion.esm'
     master.mkdir()
-    # Written through the real producer: the file carries a versioned
-    # envelope, and a stub entry missing a required key is now rejected as
-    # stale (tes5_import/artifact_schema.py).
-    from tes5_import.artifact_schema import write_artifact
+    from tes5_import.base.artifact_schema import write_artifact
     write_artifact(str(master / 'creature_projects.json'), 'Oblivion.esm',
                    {'rat': {'project_hkx': 'Actors\TES4\rat\p.hkx',
                             'behavior_hkx': 'Actors\TES4\rat\b.hkx',
@@ -283,11 +280,6 @@ def test_creature_projects_are_inherited_from_a_master(tmp_path):
 
 # ---------------------------------------------------------------------------
 #  CALL SITES, not just helpers
-#
-#  Every fix above is a helper doing the right thing. Three of these bugs
-#  were a correct helper handed the wrong argument, so a test that exercises
-#  only the helper passes in both directions and pins nothing. These read the
-#  call site itself.
 # ---------------------------------------------------------------------------
 
 def test_pack_bsas_is_called_with_the_export_root_not_a_record_dir():
@@ -307,10 +299,10 @@ def test_pack_bsas_is_called_with_the_export_root_not_a_record_dir():
 def test_book_inam_passes_the_asset_root_to_the_ownership_split():
     """`generate_book_inams` holds both; ownership needs the ASSET root."""
     import inspect
-    from asset_convert import book_inam
+    from asset_convert.ui import book_inam
 
     src = inspect.getsource(book_inam.generate_book_inams)
-    assert '_split_master_owned(models, asset_subdir' in src, (
+    assert 'split_master_owned(models, asset_subdir' in src, (
         'book ownership is being decided on the record dir again -- it '
         'holds no meshes, so every book defers to a master that never '
         'bakes it')
@@ -319,9 +311,9 @@ def test_book_inam_passes_the_asset_root_to_the_ownership_split():
 def test_import_main_points_the_soun_converter_at_the_asset_root():
     """The SOUN directory expansion reads `sound/`, which is asset-side."""
     import inspect
-    from tes5_import import import_main
+    from tes5_import import pipeline as import_main
 
-    src = inspect.getsource(import_main.import_plugin)
+    src = inspect.getsource(import_main)
     assert 'set_sound_source_dir(str(assets_for(export_dir)))' in src, (
         'set_sound_source_dir is being handed a record dir again -- every '
         'directory-valued SOUN ANAM becomes an unplayable bare path')

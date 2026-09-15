@@ -40,15 +40,172 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from subprocess_flags import configure_multiprocessing
-from process_job import create_pool_job
-from output_layout import assets_for  # noqa: E402
+from core.subprocess_flags import configure_multiprocessing
+from core.process_job import create_pool_job
+from output_layout import assets_for
 
 configure_multiprocessing()
 create_pool_job()
 
 
-def main() -> int:
+def _supplier_asset_dirs(names, out_root, export_root, _out_root) -> list:
+    """Converted output roots holding meshes/textures a tile may need."""
+    return [_out_root(out_root, n, export_root) for n in names
+            if _out_root(out_root, n, export_root).is_dir()]
+
+
+def _all_plugin_dirs(out_root: Path, lod_dir: Path) -> list:
+    """Every converted output tree that ships textures, the LOD mod excluded.
+
+    Texture lookup must not follow the dependency chain: a masterless patch
+    ships the land textures another plugin's terrain names, and the owner's
+    own MASTER ships the shared flat normal.
+    See: docs/commentary/asset_convert_terrain.md#terrain-lod-texture-lookup
+    """
+    return sorted(
+        d for d in Path(out_root).iterdir()
+        if d.is_dir() and d != lod_dir
+        and any((d / n).is_dir() for n in ('textures', 'Textures')))
+
+
+def _supplier_overlay_dirs(names, out_root, export_root, _out_root,
+                           record_dir) -> list:
+    """Overlay-manifest dirs, index-aligned with `_supplier_asset_dirs`."""
+    return [assets_for(record_dir(export_root, n)) for n in names
+            if _out_root(out_root, n, export_root).is_dir()]
+
+
+def _plan_jobs(wanted, owners, plugins, touched, out_root, export_root,
+               _out_root, master_chain, _worldspace_fid) -> list:
+    """One (edid, owner, esm, overlays, contributors, suppliers) job per world.
+
+    `contributors` are overlaid as RECORDS and are scoped to plugins that
+    actually place something here; `suppliers` is every dependency-legal
+    plugin, because one that places nothing can still define the base objects
+    another plugin's references point at.
+    See: docs/commentary/asset_convert_terrain.md#lod-suppliers-vs-contributors
+    """
+    jobs = []
+    for edid in wanted:
+        owner = owners.get(edid)
+        if owner is None:
+            print(f"  '{edid}': no selected plugin supplies terrain for it; "
+                  f"skipping")
+            continue
+        owner_esm = _out_root(out_root, owner, export_root) / owner
+        if not owner_esm.is_file():
+            print(f"  '{edid}': {owner} has no converted ESM; skipping")
+            continue
+
+        contributors = [n for n in plugins if n != owner
+                        and owner in master_chain(n, export_root, plugins)]
+        suppliers = list(contributors)
+
+        wrld_fid = _worldspace_fid(owner_esm, edid)
+        if wrld_fid is not None:
+            scoped = [n for n in contributors
+                      if touched.get(n) is None or wrld_fid in touched[n]]
+            if len(scoped) != len(contributors):
+                skipped = [n for n in contributors if n not in scoped]
+                print(f"  '{edid}': {len(skipped)} dependent(s) place nothing "
+                      f"here, not overlaid ({', '.join(skipped)})")
+            contributors = scoped
+
+        overlays = [_out_root(out_root, n, export_root) / n
+                    for n in contributors
+                    if (_out_root(out_root, n, export_root) / n).is_file()]
+        jobs.append((edid, owner, owner_esm, overlays, contributors,
+                     suppliers))
+    return jobs
+
+
+def _use_owner_namespace(export_root: str, owner: str) -> None:
+    """Install `owner`'s asset namespace for the job about to bake."""
+    from asset_convert.game_paths import namespace_for, set_namespace
+    from output_layout import record_dir
+    set_namespace(namespace_for(record_dir(export_root, owner)))
+
+
+def _clear_stale_tiles(lod_dir, edid: str) -> int:
+    """Delete this worldspace's tiles from a previous run.
+
+    The bake writes only the tiles it produces THIS time, so a tile an earlier
+    run emitted -- at coordinates this selection no longer covers, or from a
+    plugin since deselected -- would otherwise survive as an orphan and still
+    ship. Scoped to this worldspace's own tile names, so a run covering several
+    never deletes a sibling's fresh output and the shared, coordinate-free
+    object .nifs are untouched.
+    """
+    stale = 0
+    for sub in ("meshes/terrain", "textures/terrain"):
+        d = lod_dir / sub / edid
+        if not d.is_dir():
+            continue
+        for f in d.rglob(f"{edid}.*"):
+            if f.is_file():
+                f.unlink()
+                stale += 1
+    return stale
+
+
+def _bake_worldspace(job, ctx) -> bool:
+    """Generate one worldspace's object and terrain LOD.
+
+    `ctx` holds what every job shares: the output roots and the two
+    generators. The namespace is installed here because ONE process bakes
+    every plugin's worldspaces.
+    See: docs/commentary/asset_convert_terrain.md#write-lodgen-input-master-modes
+    """
+    edid, owner, owner_esm, overlays, contributors, suppliers = job
+    lod_dir, out_root, export_root = ctx['lod_dir'], ctx['out_root'], ctx['export_root']
+    print("-" * 54)
+    print(f"  {edid}  (records: {owner})")
+    print("-" * 54)
+    _use_owner_namespace(export_root, owner)
+
+    stale = _clear_stale_tiles(lod_dir, edid)
+    if stale:
+        print(f"  Cleared {stale} tile(s) from a previous run")
+
+    asset_dirs = ctx['supplier_asset_dirs']([owner] + suppliers)
+    overlay_dirs = ctx['supplier_overlay_dirs']([owner] + suppliers)
+    texture_dirs = _all_plugin_dirs(out_root, lod_dir)
+
+    cloud_rel = ctx['merge_cloud_bank'](out_root, lod_dir, edid, owner,
+                                        contributors, export_root)
+    if cloud_rel:
+        print(f"  World-map cloud bank -> {cloud_rel}")
+
+    print("  Generating object LOD...")
+    ok = ctx['generate_lod'](
+        esm_path=owner_esm,
+        output_dir=lod_dir,
+        worldspace_edid=edid,
+        master_dirs=None,
+        master_mesh_dirs=asset_dirs,
+        master_texture_dirs=texture_dirs,
+        overlay_paths=overlays,
+        only_cells=None,
+        far_nif_dirs=asset_dirs,
+        overlay_manifest_dirs=overlay_dirs,
+    )
+
+    print("  Generating terrain LOD...")
+    ok_terrain = ctx['generate_terrain_lod'](
+        esm_path=owner_esm,
+        output_dir=lod_dir,
+        worldspace_edid=edid,
+        overlay_paths=overlays,
+        only_cells=None,
+        extra_texture_roots=[ctx['lod_textures_root'](Path(d))
+                             for d in texture_dirs],
+    )
+    print()
+    return bool(ok and ok_terrain)
+
+
+def _parse_args():
+    """Parse the command line for a create-LOD run."""
     ap = argparse.ArgumentParser(
         description="Generate every plugin's distant LOD once, into a "
                     "standalone AutoConvertLOD mod.")
@@ -64,20 +221,96 @@ def main() -> int:
                          "worldspace the source shipped LOD for)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print the plan and generate nothing")
-    args = ap.parse_args()
+    return ap.parse_args()
 
-    from asset_convert.lod_gen import (generate_lod,
-                                       _textures_root as _lod_textures_root)
-    from asset_convert.terrain_lod import generate_terrain_lod
-    from asset_convert.sibling_lod import (_out_root, _record_dir,
+
+def _select_plugins(args, available, export_root, create_lod_order) -> list:
+    """Return the selected plugins for this run, lowest priority first.
+
+    An explicit `--plugins` order is honoured verbatim: it IS the conflict
+    resolution, and the GUI dialog lets the user arrange it by hand. Names with
+    no converted output are dropped rather than failing the run, so a stale
+    saved selection never blocks the plugins that ARE built.
+    """
+    if not args.plugins:
+        return create_lod_order(available, export_root)
+    plugins = [p for p in args.plugins if p in available]
+    missing = [p for p in args.plugins if p not in available]
+    if missing:
+        print(f"  Not converted, skipping: {', '.join(missing)}")
+    return plugins
+
+
+def _touched_worldspaces(plugins, out_root, export_root, _out_root,
+                         touched_worldspace_fids) -> dict:
+    """Map each plugin to the worldspace FormIDs it places records in.
+
+    None means "unreadable, so never filter this plugin out". Owning a
+    worldspace is not the same as editing it, and an overlay contributing
+    nothing still costs a full ESM parse per worldspace in BOTH generators, so
+    this is scanned once per plugin and reused for every job.
+    """
+    touched = {}
+    for name in plugins:
+        esm = _out_root(out_root, name, export_root) / name
+        touched[name] = None
+        if esm.is_file():
+            try:
+                touched[name] = touched_worldspace_fids(esm)
+            except OSError:
+                pass
+    return touched
+
+
+def _worldspace_fid_resolver(wanted, find_worldspace_fid, formid_remap_table):
+    """Return a memoised (esm, edid) -> NORMALIZED WRLD FormID lookup.
+
+    One owner's read resolves every worldspace in `wanted` while its bytes are
+    in hand. See: docs/commentary/asset_convert_terrain.md#create-lod-run-planning
+    """
+    cache: dict = {}
+
+    def _worldspace_fid(esm: Path, edid: str):
+        key = (str(esm).lower(), edid.lower())
+        if key in cache:
+            return cache[key]
+        gmap = formid_remap_table(esm)
+        raw = esm.read_bytes()
+        try:
+            for w in wanted:
+                k = (str(esm).lower(), w.lower())
+                if k not in cache:
+                    f = find_worldspace_fid(raw, len(raw), w)
+                    cache[k] = (None if f is None
+                                else gmap[f >> 24] | (f & 0x00FFFFFF))
+        finally:
+            del raw
+        return cache.get(key)
+
+    return _worldspace_fid
+
+
+def main() -> int:
+    """Bake every selected worldspace's LOD into the AutoConvertLOD mod.
+
+    Returns 0 when every job succeeded or there was nothing to do, 1 when any
+    bake reported an error.
+    See: docs/commentary/asset_convert_terrain.md#create-lod-run-planning
+    """
+    args = _parse_args()
+
+    from asset_convert.lod.lod_gen import (generate_lod,
+                                       textures_root as _lod_textures_root)
+    from asset_convert.lod.terrain_lod import generate_terrain_lod
+    from asset_convert.lod.sibling_lod import (_out_root, record_dir,
                                            converted_plugins, create_lod_order,
                                            lod_worldspaces, owner_map,
-                                           merge_cloud_bank, _master_chain,
+                                           merge_cloud_bank, master_chain,
                                            touched_worldspace_fids,
                                            drop_staged_meshes,
                                            LOD_DIR_NAME)
-    from asset_convert.terrain_lod import _find_worldspace_fid
-    from asset_convert.lod_gen import _formid_remap_table
+    from asset_convert.lod.terrain_lod import find_worldspace_fid
+    from asset_convert.lod.esm_scan import formid_remap_table
 
     out_root = (Path(args.output_dir) if args.output_dir
                 else SCRIPT_DIR / "output")
@@ -90,28 +323,12 @@ def main() -> int:
     print(f"  Output dir: {out_root}")
     print(f"  LOD mod:    {lod_dir}")
 
-    # The LOD mod ships tiles; any mesh here is scratch a previous bake staged
-    # for LODGen and failed to remove. Sweeping up front rather than trusting
-    # the post-bake cleanup keeps a killed run from pinning meshes forever --
-    # and since this mod installs LAST to win the tile overwrite, a stale mesh
-    # here silently overrides every plugin's current copy.
     swept = drop_staged_meshes(lod_dir)
     if swept:
         print(f"  Swept {swept} stale staged mesh file(s) from the LOD mod")
 
-    available = converted_plugins(out_root)
-    if args.plugins:
-        # Honour the caller's order verbatim — it IS the conflict resolution
-        # and the GUI dialog let the user arrange it by hand. Names with no
-        # converted output are dropped rather than failing the run, so a stale
-        # saved selection never blocks the plugins that ARE built.
-        plugins = [p for p in args.plugins if p in available]
-        missing = [p for p in args.plugins if p not in available]
-        if missing:
-            print(f"  Not converted, skipping: {', '.join(missing)}")
-    else:
-        plugins = create_lod_order(available, export_root)
-
+    plugins = _select_plugins(args, converted_plugins(out_root), export_root,
+                              create_lod_order)
     if not plugins:
         print("  No converted plugin to generate LOD for.")
         return 0
@@ -126,111 +343,21 @@ def main() -> int:
     print(f"  Worldspaces ({len(wanted)}): {', '.join(wanted) or '(none)'}")
     print()
 
-    # Resolve every worldspace to its owner and overlay stack before generating
-    # anything, so a bad selection is reported as a plan rather than discovered
-    # halfway through an hour of baking.
-    # WRLD-FormID lookups, memoised per (owner, edid). Several worldspaces share
-    # an owner — Oblivion.esm owns 18 — and resolving each one independently
-    # meant re-reading its 613 MB. The jobs below are built in worldspace order,
-    # not owner order, so the file's bytes are held only for the duration of one
-    # owner's lookups and the resolved FormIDs are what persist.
-    _fid_cache: dict = {}
-
-    def _worldspace_fid(esm: Path, edid: str):
-        key = (str(esm).lower(), edid.lower())
-        if key in _fid_cache:
-            return _fid_cache[key]
-        # NORMALISED, because it is compared against ids from OTHER plugins
-        # (`touched_worldspace_fids`), and a raw id is only meaningful inside
-        # the file it came from.
-        gmap = _formid_remap_table(esm)
-        raw = esm.read_bytes()
-        try:
-            # Resolve every worldspace this owner is responsible for while its
-            # bytes are in hand, so one read serves all of them.
-            for w in wanted:
-                k = (str(esm).lower(), w.lower())
-                if k not in _fid_cache:
-                    f = _find_worldspace_fid(raw, len(raw), w)
-                    _fid_cache[k] = (None if f is None
-                                     else gmap[f >> 24] | (f & 0x00FFFFFF))
-        finally:
-            del raw
-        return _fid_cache.get(key)
-
-    # Which worldspaces does each plugin actually put records in? Depending on a
-    # worldspace's owner is not the same as editing that worldspace, and an
-    # overlay contributing nothing still costs a full ESM parse per worldspace
-    # in BOTH generators. Scanned once per plugin here, then reused below.
-    touched = {}
-    for name in plugins:
-        esm = _out_root(out_root, name, export_root) / name
-        if esm.is_file():
-            try:
-                touched[name] = touched_worldspace_fids(esm)
-            except OSError:
-                touched[name] = None      # unreadable -> never filter it out
-        else:
-            touched[name] = None
-
-    # Every worldspace's owner in ONE pass over the load order, rather than
-    # `worldspace_owner` per worldspace re-listing every plugin each time.
+    touched = _touched_worldspaces(plugins, out_root, export_root, _out_root,
+                                   touched_worldspace_fids)
     owners = owner_map(wanted, plugins, export_root, out_root)
 
-    jobs = []
-    for edid in wanted:
-        owner = owners.get(edid)
-        if owner is None:
-            print(f"  '{edid}': no selected plugin supplies terrain for it; "
-                  f"skipping")
-            continue
-        owner_esm = _out_root(out_root, owner, export_root) / owner
-        if not owner_esm.is_file():
-            print(f"  '{edid}': {owner} has no converted ESM; skipping")
-            continue
-        # Overlays: every OTHER plugin that actually depends on the owner,
-        # in load order. Records merge by FormID, so a REFR one plugin moved
-        # and another left alone resolves exactly as the engine would.
-        #
-        # The dependency gate is not optional. A plugin that does not rest on
-        # the owner cannot legally touch its worldspace, and overlaying one
-        # anyway merges two unrelated games: Nehrim.esm is standalone with its
-        # own worldspace, and stacking it onto Oblivion's TES4Tamriel would
-        # pull its FormIDs into Cyrodiil's tiles.
-        contributors = [n for n in plugins if n != owner
-                        and owner in _master_chain(n, export_root, plugins)]
-
-        # ...and of those, only the ones that actually have records in THIS
-        # worldspace. The dependency gate above is about what a plugin is
-        # ALLOWED to touch; this is about what it DOES touch. Morrowind_ob.esm
-        # rests on Oblivion.esm and so passes the gate for all 18 of its
-        # worldspaces, while placing nothing in any of them — 18 parses of a
-        # 206 MB file to merge zero records.
-        #
-        # A plugin whose ESM could not be read is kept rather than dropped: the
-        # cost of an unnecessary overlay is time, the cost of a missing one is
-        # lost LOD.
-        wrld_fid = _worldspace_fid(owner_esm, edid)
-        if wrld_fid is not None:
-            scoped = [n for n in contributors
-                      if touched.get(n) is None or wrld_fid in touched[n]]
-            if len(scoped) != len(contributors):
-                skipped = [n for n in contributors if n not in scoped]
-                print(f"  '{edid}': {len(skipped)} dependent(s) place nothing "
-                      f"here, not overlaid ({', '.join(skipped)})")
-            contributors = scoped
-
-        overlays = [_out_root(out_root, n, export_root) / n
-                    for n in contributors
-                    if (_out_root(out_root, n, export_root) / n).is_file()]
-        jobs.append((edid, owner, owner_esm, overlays, contributors))
+    jobs = _plan_jobs(wanted, owners, plugins, touched, out_root, export_root,
+                      _out_root, master_chain,
+                      _worldspace_fid_resolver(wanted, find_worldspace_fid,
+                                               formid_remap_table))
 
     if not jobs:
         print("Nothing to generate.")
         return 0
 
     print("  Plan:")
-    for edid, owner, _esm, overlays, contributors in jobs:
+    for edid, owner, _esm, overlays, contributors, _suppliers in jobs:
         print(f"    {edid}: records from {owner}, "
               f"{len(overlays)} overlay(s) on top"
               + (f" ({', '.join(contributors)})" if contributors else ""))
@@ -240,87 +367,20 @@ def main() -> int:
         print("Dry run - nothing generated.")
         return 0
 
+    ctx = {
+        'lod_dir': lod_dir, 'out_root': out_root, 'export_root': export_root,
+        'generate_lod': generate_lod,
+        'generate_terrain_lod': generate_terrain_lod,
+        'merge_cloud_bank': merge_cloud_bank,
+        'lod_textures_root': _lod_textures_root,
+        'supplier_asset_dirs': lambda names: _supplier_asset_dirs(
+            names, out_root, export_root, _out_root),
+        'supplier_overlay_dirs': lambda names: _supplier_overlay_dirs(
+            names, out_root, export_root, _out_root, record_dir),
+    }
     ok_all = True
-    for edid, owner, owner_esm, overlays, contributors in jobs:
-        print("-" * 54)
-        print(f"  {edid}  (records: {owner})")
-        print("-" * 54)
-
-        # Clear this worldspace's tiles from a previous run before rebaking.
-        # The bake writes only the tiles it produces THIS time, so a tile an
-        # earlier run emitted — at coordinates this selection no longer covers,
-        # or from a plugin since deselected — would otherwise survive as an
-        # orphan and still ship. Scoped to this worldspace's own tile names so a
-        # run covering several worldspaces never deletes a sibling's fresh
-        # output, and so the shared, coordinate-free object .nifs are untouched.
-        stale = 0
-        for sub in ("meshes/terrain", "textures/terrain"):
-            d = lod_dir / sub / edid
-            if not d.is_dir():
-                continue
-            for f in d.rglob(f"{edid}.*"):
-                if f.is_file():
-                    f.unlink()
-                    stale += 1
-        if stale:
-            print(f"  Cleared {stale} tile(s) from a previous run")
-
-        # Assets come from the owner AND every contributor: one tile draws
-        # objects from all of them, so a model converted into only one plugin's
-        # output still has to be findable. Scoped to this worldspace's
-        # contributors rather than every selected plugin, for the same reason
-        # the overlays are — an unrelated plugin's meshes are not in this world.
-        asset_dirs = [_out_root(out_root, n, export_root)
-                      for n in [owner] + contributors
-                      if _out_root(out_root, n, export_root).is_dir()]
-        # Where each contributor's mesh conversion left its detail-overlay
-        # diffuse manifest (build bookkeeping, so export/ not output/).
-        # The overlay manifest sits beside the SHARED meshes it describes,
-        # which for an imported mod is one level above the record dir.
-        overlay_dirs = [assets_for(_record_dir(export_root, n))
-                        for n in [owner] + contributors
-                        if _record_dir(export_root, n).is_dir()]
-
-        cloud_rel = merge_cloud_bank(out_root, lod_dir, edid, owner,
-                                     contributors, export_root)
-        if cloud_rel:
-            print(f"  World-map cloud bank -> {cloud_rel}")
-
-        print(f"  Generating object LOD...")
-        ok = generate_lod(
-            esm_path=owner_esm,
-            output_dir=lod_dir,
-            worldspace_edid=edid,
-            # No tile-ownership skip: this mod is the ONLY place these tiles
-            # are generated now, so there is no master output already shipping
-            # them and nothing may be skipped. Passing any plugin dir here
-            # would skip every tile it once built and leave holes.
-            master_dirs=None,
-            master_mesh_dirs=asset_dirs,
-            master_texture_dirs=asset_dirs,
-            overlay_paths=overlays,
-            # The WHOLE worldspace, every time. `only_cells` existed to rebake
-            # just the tiles an override touched, on top of a master's own LOD
-            # run. There is no separate master run to sit on top of any more.
-            only_cells=None,
-            # Derived _far.nif meshes stay with the plugin that ships the full
-            # model; only tiles and LODSettings land in the LOD mod.
-            far_nif_dirs=asset_dirs,
-            overlay_manifest_dirs=overlay_dirs,
-        )
-
-        print(f"  Generating terrain LOD...")
-        ok_terrain = generate_terrain_lod(
-            esm_path=owner_esm,
-            output_dir=lod_dir,
-            worldspace_edid=edid,
-            overlay_paths=overlays,
-            only_cells=None,
-            extra_texture_roots=[_lod_textures_root(Path(d))
-                                 for d in asset_dirs],
-        )
-        ok_all = ok_all and ok and ok_terrain
-        print()
+    for job in jobs:
+        ok_all = _bake_worldspace(job, ctx) and ok_all
 
     print("-" * 54)
     if ok_all:

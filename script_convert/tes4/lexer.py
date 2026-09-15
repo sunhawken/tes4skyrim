@@ -60,17 +60,16 @@ class Token:
         return f'{self.kind.name}({self.text!r})@{self.line}:{self.col}'
 
 
-# Longest-first: `==` must beat `=`, `<=` must beat `<`.  `:=` is not TES4 but
-# costs nothing to recognise and keeps a mis-typed script from lexing as two
-# tokens that silently reparse.
+#: Operators, LONGEST FIRST. See: docs/commentary/script_convert.md#operator-table
 _OPERATORS = (
-    # `<>` is TES4's inequality; it MUST be matched before `<` or it lexes as
-    # two comparisons and `x <> 5` comes out `x < >` -- not an expression.
-    '==', '!=', '<>', '<=', '>=', '&&', '||', ':=',
+    '==', '!=', '<>', '<=', '>=', '&&', '||', ':=', '->',
     '+=', '-=', '*=', '/=',
     '<', '>', '=', '+', '-', '*', '/', '%', '$',
     '(', ')', '[', ']', ',', '.', ':',
 )
+
+#: One game's operator spelling -> the TES4 form the tree speaks.
+_OPERATOR_ALIASES = {'->': '.'}
 
 #: Binary precedence, loosest tier first; parser binds and emitter parens by it.
 PRECEDENCE = (
@@ -104,15 +103,39 @@ _IDENT_RE = re.compile(r'[^\W\d][\w]*', re.UNICODE)
 _NUMBER_RE = re.compile(r'(?:\d+\.\d*|\.\d+|\d+)')
 
 
+
+def _number_or_ident(out: list, text: str, i: int, n: int,
+                     line: int, col: int) -> int:
+    """Lex a NUMBER, or the digit-leading IDENT a digit run turns into.
+
+    Returns the index to resume at; a preceding `.` is emitted as the member
+    OPERATOR rather than absorbed into the name.
+    See: docs/commentary/script_convert.md#digit-leading-member-names
+    """
+    m = _NUMBER_RE.match(text, i)
+    j = m.end()
+    if j < n and (text[j].isalpha() or text[j] == '_'):
+        word = _IDENT_RE.match(text, j)
+        start = i
+        if text[i] == '.':
+            out.append(Token(T.OP, '.', line, col))
+            start = i + 1
+        out.append(Token(T.IDENT, text[start:word.end()], line, col))
+        return word.end()
+    out.append(Token(T.NUMBER, m.group(), line, col))
+    return j
+
 def tokenize(source: str) -> list[Token]:
     """Tokenise one script body into a flat token list ending in EOF.
 
     Newlines are significant (a statement is a line), and comments are KEPT --
     they are round-tripped into the output, and dropping them here would lose
     the authored intent the converted Papyrus preserves.
+
+    Both CRLF and a lone CR appear in sources; line endings are normalized to
+    LF first so the column arithmetic on every emitted Token is honest.
     """
     out: list[Token] = []
-    # `\r\n` and a lone `\r` both appear; normalise so column maths is honest.
     text = source.replace('\r\n', '\n').replace('\r', '\n')
     line = 1
     line_start = 0
@@ -165,29 +188,14 @@ def tokenize(source: str) -> list[Token]:
             i = m.end()
             continue
 
-        # A `.` is only the start of a number when a digit follows; otherwise
-        # it is the member operator (`BaurusRef.getdisposition`), which the
-        # corpus uses 8,843 times in Nehrim alone.
         if ch.isdigit() or (ch == '.' and i + 1 < n and text[i + 1].isdigit()):
-            m = _NUMBER_RE.match(text, i)
-            # An EditorID MAY START WITH A DIGIT -- `01FlayerBladeScript`,
-            # `001EffectCreatureGraywar`, `1TrapFireMineWorldRef`.  A digit run
-            # that continues into letters or `_` is one identifier, not a
-            # number followed by a name: splitting it turned a single argument
-            # into two on 709 argument tails in Nehrim alone.
-            j = m.end()
-            if j < n and (text[j].isalpha() or text[j] == '_'):
-                word = _IDENT_RE.match(text, j)
-                out.append(Token(T.IDENT, text[i:word.end()], line, col))
-                i = word.end()
-                continue
-            out.append(Token(T.NUMBER, m.group(), line, col))
-            i = j
+            i = _number_or_ident(out, text, i, n, line, col)
             continue
 
         for op in _OPERATORS:
             if text.startswith(op, i):
-                out.append(Token(T.OP, op, line, col))
+                out.append(Token(T.OP, _OPERATOR_ALIASES.get(op, op),
+                                 line, col))
                 i += len(op)
                 break
         else:

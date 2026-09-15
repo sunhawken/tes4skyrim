@@ -12,22 +12,24 @@ import glob
 import json
 import os
 import pickle
+import struct
 import sys
 import zipfile
+import zlib
 
 import numpy as np
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import asset_convert.collision_extract as ce  # noqa: E402
-from tes5_import import import_main as im  # noqa: E402
-from tes5_import.pgrd_to_navm import _geom_hash  # noqa: E402
-from tools.navmesh import navmesh_cache as nc  # noqa: E402
-from tools.navmesh import navmesh_cache_hook as hook  # noqa: E402
+import asset_convert.collision.collision_extract as ce
+from tes5_import.navmesh import pool as navm_pool
+from tes5_import.navmesh.from_pgrd import geom_hash
+from tools.navmesh import navmesh_cache as nc
+from tools.navmesh import navmesh_cache_hook as hook
 from tools.navmesh import navmesh_adopt as adopt
-from tes5_import import navm_verify
-from tes5_import.pgrd_to_navm import geom_equal, geom_quantize
+from tes5_import.navmesh import cache_audit as navm_verify
+from tes5_import.navmesh.from_pgrd import geom_equal, geom_quantize
 
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -65,28 +67,28 @@ def test_tag_ignores_collision_mtime(tmp_path, monkeypatch):
     """
     col = tmp_path / 'collision_cache.bin'
     col.write_bytes(b'collision-payload')
-    first = im._navmesh_geom_cache(str(col))
+    first = navm_pool.navmesh_geom_cache(str(col))
     assert first is not None
     st = os.stat(col)
     os.utime(col, (st.st_atime, st.st_mtime + 3600))
-    assert im._navmesh_geom_cache(str(col))[1] == first[1]
+    assert navm_pool.navmesh_geom_cache(str(col))[1] == first[1]
 
 
 def test_tag_tracks_navmesh_sources(tmp_path):
     """Editing a navmesh source must change the tag (self-invalidation)."""
     col = tmp_path / 'collision_cache.bin'
     col.write_bytes(b'x')
-    before = im._navmesh_geom_cache(str(col))[1]
+    before = navm_pool.navmesh_geom_cache(str(col))[1]
     src = os.path.join(REPO, 'tes5_import', 'navmesh', 'params.py')
     original = open(src, 'rb').read()
     try:
         with open(src, 'ab') as fh:
             fh.write(b'\n# cache-tag probe\n')
-        assert im._navmesh_geom_cache(str(col))[1] != before
+        assert navm_pool.navmesh_geom_cache(str(col))[1] != before
     finally:
         with open(src, 'wb') as fh:
             fh.write(original)
-    assert im._navmesh_geom_cache(str(col))[1] == before
+    assert navm_pool.navmesh_geom_cache(str(col))[1] == before
 
 
 # ---------------------------------------------------------------------------
@@ -104,12 +106,12 @@ def test_one_changed_mesh_spares_other_cells(monkeypatch):
     cell_a = [_refr(0x111111)]
     cell_b = [_refr(0x222222)]
 
-    a1 = _geom_hash(refr_recs=cell_a, base_model_by_fid=models, **HASH_ARGS)
-    b1 = _geom_hash(refr_recs=cell_b, base_model_by_fid=models, **HASH_ARGS)
+    a1 = geom_hash(refr_recs=cell_a, base_model_by_fid=models, **HASH_ARGS)
+    b1 = geom_hash(refr_recs=cell_b, base_model_by_fid=models, **HASH_ARGS)
 
     _fake_collision(monkeypatch, {'a.nif': _soup(99), 'b.nif': _soup(2)})
-    a2 = _geom_hash(refr_recs=cell_a, base_model_by_fid=models, **HASH_ARGS)
-    b2 = _geom_hash(refr_recs=cell_b, base_model_by_fid=models, **HASH_ARGS)
+    a2 = geom_hash(refr_recs=cell_a, base_model_by_fid=models, **HASH_ARGS)
+    b2 = geom_hash(refr_recs=cell_b, base_model_by_fid=models, **HASH_ARGS)
 
     assert a1 != a2, 'cell placing the changed mesh must miss'
     assert b1 == b2, 'cell placing only unchanged meshes must still hit'
@@ -124,9 +126,9 @@ def test_geom_hash_is_refr_order_independent_for_collision(monkeypatch):
     _fake_collision(monkeypatch, {'a.nif': _soup(1), 'b.nif': _soup(2)})
     models = {0x111111: 'a.nif', 0x222222: 'b.nif'}
     refrs = [_refr(0x111111), _refr(0x222222)]
-    h1 = _geom_hash(refr_recs=refrs, base_model_by_fid=models, **HASH_ARGS)
+    h1 = geom_hash(refr_recs=refrs, base_model_by_fid=models, **HASH_ARGS)
     _fake_collision(monkeypatch, {'b.nif': _soup(2), 'a.nif': _soup(1)})
-    h2 = _geom_hash(refr_recs=refrs, base_model_by_fid=models, **HASH_ARGS)
+    h2 = geom_hash(refr_recs=refrs, base_model_by_fid=models, **HASH_ARGS)
     assert h1 == h2
 
 
@@ -162,6 +164,42 @@ def test_digests_cleared_on_reload(tmp_path, monkeypatch):
     assert ce.collision_digest('a.nif') != first
 
 
+def test_legacy_header_is_not_current(tmp_path):
+    """Current magic + an unreadable entry table must read as STALE.
+
+    A blob carrying a second count before the table (entries at offset 16, not
+    12) passed the magic-only gate, then failed in _deserialize -- which
+    load_collision swallows, so every cell voxelized an empty world.
+    """
+    blob = zlib.decompress(ce._serialize({'a.nif': {'w': list(_soup(1)['w']),
+                                                    'b': list(_soup(1)['b'])}}))
+    legacy = blob[:12] + struct.pack('<I', 1) + blob[12:]
+    path = tmp_path / 'c.bin'
+    path.write_bytes(zlib.compress(legacy, 6))
+    assert legacy[:8] == ce._MAGIC, 'fixture must keep the CURRENT magic'
+    assert ce.collision_cache_is_current(str(path)) is False
+    assert ce.load_collision(str(path), quiet=True) == 0
+
+
+def test_current_cache_round_trips(tmp_path):
+    """A cache this build wrote must read back as current and load."""
+    path = tmp_path / 'c.bin'
+    path.write_bytes(ce._serialize({'a.nif': {'w': list(_soup(1)['w']),
+                                              'b': list(_soup(1)['b'])},
+                                    'b.nif': {'w': [], 'b': []}}))
+    assert ce.collision_cache_is_current(str(path)) is True
+    assert ce.load_collision(str(path), quiet=True) == 2
+
+
+def test_truncated_cache_is_not_current(tmp_path):
+    """A short blob must be rescanned, never partially trusted."""
+    blob = zlib.decompress(ce._serialize({'a.nif': {'w': list(_soup(1)['w']),
+                                                    'b': list(_soup(1)['b'])}}))
+    path = tmp_path / 'c.bin'
+    path.write_bytes(zlib.compress(blob[:-4], 6))
+    assert ce.collision_cache_is_current(str(path)) is False
+
+
 def test_content_hash_ignores_key_order(monkeypatch):
     """collision_content_hash certifies CONTENT, not dict/file layout."""
     _fake_collision(monkeypatch, {'a.nif': _soup(1), 'b.nif': _soup(2)})
@@ -177,52 +215,83 @@ def test_content_hash_ignores_key_order(monkeypatch):
 def test_gate_watches_every_tag_source():
     """Every file feeding the tag must be gated, or a push ships a dead cache.
 
-    import_main._navmesh_geom_cache hashes tes5_import/navmesh/*.py plus
-    pgrd_to_navm.py; the hook's NAVMESH_PATHS must cover exactly those.
+    navmesh.pool.navmesh_geom_cache hashes tes5_import/navmesh/*.py minus
+    pool._TAG_EXCLUDE; the hook must gate exactly that set.
     """
     watched = set(hook.NAVMESH_PATHS)
-    assert 'tes5_import/pgrd_to_navm.py' in watched
     assert 'tes5_import/navmesh/' in watched
-    # Anything new in the navmesh package is covered by the directory prefix.
     for src in glob.glob(os.path.join(REPO, 'tes5_import', 'navmesh', '*.py')):
         rel = os.path.relpath(src, REPO).replace('\\', '/')
+        if os.path.basename(src) in navm_pool._TAG_EXCLUDE:
+            assert hook.touches_navmesh([rel]) == [], rel
+            continue
         assert any(rel.startswith(w) for w in watched), rel
+        assert hook.touches_navmesh([rel]), rel
 
 
 def test_gate_covers_cache_defining_modules():
-    """import_main and collision_extract change caching without feeding the tag."""
-    assert '_navmesh_geom_cache' in hook.NAVMESH_FUNCS['tes5_import/import_main.py']
-    assert '_gather_navm_jobs' in hook.NAVMESH_FUNCS['tes5_import/import_main.py']
+    """collision_extract changes what gets cached without feeding the tag.
+
+    The navmesh package feeds the tag directly, so it is gated by path; only
+    collision_extract needs per-function gating.
+    """
+    assert 'tes5_import/navmesh/' in hook.NAVMESH_PATHS
     assert 'collision_digest' in \
-        hook.NAVMESH_FUNCS['asset_convert/collision_extract.py']
+        hook.NAVMESH_FUNCS['asset_convert/collision/collision_extract.py']
+    assert 'tes5_import/pipeline.py' not in hook.NAVMESH_FUNCS
 
 
 def test_gate_ignores_post_cache_stitching():
     """navm_edge_links runs AFTER the cache, so it must not gate a push."""
-    assert hook.touches_navmesh(['tes5_import/navm_edge_links.py']) == []
+    assert hook.touches_navmesh(['tes5_import/navmesh/edge_links.py']) == []
 
 
 def test_gate_matches_expected_paths():
     assert hook.touches_navmesh(['tes5_import/navmesh/corridor.py'])
-    assert hook.touches_navmesh(['tes5_import/pgrd_to_navm.py'])
+    assert hook.touches_navmesh(['tes5_import/navmesh/from_pgrd.py'])
     assert hook.touches_navmesh(['docs/x.md', 'tools/y.py']) == []
 
 
 def test_stamp_written_only_by_a_real_build(tmp_path):
     """Computing the tag must NOT certify the cache.
 
-    _navmesh_geom_cache is called by tools that merely want to know the tag; if
+    navmesh_geom_cache is called by tools that merely want to know the tag; if
     it stamped CACHE_TAG, reading the tag would make a stale cache look freshly
     built and the gate would wave it through.
     """
     col = tmp_path / 'collision_cache.bin'
     col.write_bytes(b'payload')
-    geom = im._navmesh_geom_cache(str(col))
+    geom = navm_pool.navmesh_geom_cache(str(col))
     stamp = os.path.join(geom[0], 'CACHE_TAG')
     assert not os.path.exists(stamp), 'reading the tag must not stamp'
 
-    im._stamp_navmesh_cache_tag(geom)
+    navm_pool.stamp_navmesh_cache_tag(geom)
     assert open(stamp).read().strip() == geom[1]
+
+
+def test_tag_ignores_line_endings(tmp_path, monkeypatch):
+    """CRLF and LF copies of one source tree must tag identically.
+
+    core.autocrlf rewrites line endings per file, so a checkout, a branch
+    switch or an editor save flips individual files without changing content.
+    Hashing raw bytes made the tag a property of the checkout: caches missed
+    after edits that never touched navmesh logic.
+    """
+    def tag_for(newline, name):
+        """Tag of a copy of the navmesh package written with *newline*."""
+        pkg = tmp_path / name
+        pkg.mkdir()
+        for src in glob.glob(os.path.join(
+                os.path.dirname(navm_pool.__file__), '*.py')):
+            body = open(src, 'rb').read().replace(b'\r\n', b'\n')
+            (pkg / os.path.basename(src)).write_bytes(
+                body.replace(b'\n', newline))
+        col = pkg / 'collision_cache.bin'
+        col.write_bytes(b'payload')
+        monkeypatch.setattr(navm_pool, '__file__', str(pkg / 'pool.py'))
+        return navm_pool.navmesh_geom_cache(str(col))[1]
+
+    assert tag_for(b'\n', 'lf') == tag_for(b'\r\n', 'crlf')
 
 
 def test_cache_matches_tag_is_exact(tmp_path, monkeypatch):
@@ -955,7 +1024,7 @@ def test_auto_install_skips_a_cache_below_its_range(tmp_path, monkeypatch):
 
 
 def test_no_download_env_var_is_shared_not_duplicated():
-    """The GUI menu item and convert.py must read the SAME variable name.
+    """The GUI checkbox and convert.py must read the SAME variable name.
 
     Both used to spell 'TESCONV_NO_CACHE_DOWNLOAD' as a literal; a typo in
     either would silently disable the opt-out (the checkbox would appear to do
@@ -963,7 +1032,7 @@ def test_no_download_env_var_is_shared_not_duplicated():
     """
     assert nc.NO_DOWNLOAD_ENV_VAR == 'TESCONV_NO_CACHE_DOWNLOAD'
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for name in ('gui.py', 'convert.py'):
+    for name in ('core/gui/runner.py', 'convert.py'):
         with open(os.path.join(root, name), encoding='utf-8') as fh:
             src = fh.read()
         assert 'NO_DOWNLOAD_ENV_VAR' in src, name
@@ -1177,3 +1246,38 @@ def test_prepare_is_a_noop_without_a_cache():
     jobs = [_job('interior', 0)]
     navm_verify.prepare(jobs, None)
     assert not any(j.get('verify') for j in jobs)
+
+
+class _StubWriter:
+    """Hands out one fixed NAVM FormID."""
+
+    def derive_formid(self, *_a):
+        """A stable id; nothing here writes a plugin."""
+        return 0x01000800
+
+
+def test_worker_context_is_initialized_before_any_rebuild(monkeypatch):
+    """precompute_navmeshes must init the worker BEFORE navm_verify.prepare.
+
+    prepare() rebuilds sampled cells in the PARENT, and run_job reads globals
+    only init_worker sets.  Initializing after it (as the import did) left
+    _BASE_MODEL_BY_FID empty, so every REFR resolved to no mesh, the cell
+    voxelized bare terrain, and a good cache reported MISMATCH.
+    """
+    calls = []
+    monkeypatch.setattr(navm_pool, 'precompute_fallout_navmeshes',
+                        lambda *a, **k: None)
+    monkeypatch.setattr(navm_pool, 'gather_navm_jobs',
+                        lambda *a, **k: [_job('interior', 0)])
+    monkeypatch.setattr(navm_pool, 'navmesh_geom_cache', lambda *a: None)
+    monkeypatch.setattr(navm_pool, 'navm_worker_count', lambda n: 1)
+    monkeypatch.setattr(navm_verify, 'init_context',
+                        lambda *a, **k: calls.append('init'))
+    monkeypatch.setattr(navm_verify, 'prepare',
+                        lambda *a, **k: calls.append('prepare'))
+    monkeypatch.setattr(navm_pool, '_run_inline', lambda jobs: {})
+    monkeypatch.setattr(navm_pool, 'get_formid_index_offset', lambda: 0)
+    monkeypatch.setattr(navm_pool, 'get_injected_formids', lambda: {})
+
+    navm_pool.precompute_navmeshes({}, _StubWriter(), {}, set())
+    assert calls == ['init', 'prepare']

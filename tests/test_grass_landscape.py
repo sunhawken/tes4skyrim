@@ -4,14 +4,18 @@ from pathlib import Path
 
 import pytest
 
-from asset_convert import grass_profile, landscape_normals
-from asset_convert.flipbook import _decode_dxt
-from asset_convert.nif_converter import NifFormat, convert_nif
+from asset_convert.nif import grass_profile
+from asset_convert.texture import landscape_normals
+from asset_convert.nif.flipbook import decode_dxt
+from asset_convert.nif.nif_converter import NifFormat, convert_nif
 
 EXPORT_MESHES = Path('export/Oblivion.esm/meshes')
 
 # A known Oblivion grass model (GRAS record TES4GCLongGrass01)
 _GRASS_SAMPLE = 'plants/gclonggrass01.nif'
+
+#: An FNV grass model whose diffuse lives on TallGrassShaderProperty.file_name.
+_FNV_GRASS = Path('export/FalloutNV.esm/meshes/landscape/grass/nvgreengrass01.nif')
 
 
 def _grass_world_bounds(data):
@@ -76,6 +80,56 @@ class TestGrassProfile:
         assert b'landscape\\grass\\tes4_dementiagrass03.nif\x00' in data
         modt_at = data.index(b'MODT')
         assert data[modt_at + 6:modt_at + 18] == struct.pack('<III', 2, 0, 0)
+
+    def test_convert_gras_placement_parity(self):
+        """Source planters step at max(PositionRange, 80) and boost density by
+        80/PositionRange, so Density 40 at PositionRange 40 ships as 80 at 80."""
+        from tes5_import.record_types.items import convert_GRAS
+        rec = {'Signature': 'GRAS', 'FormID': '00050AA0', 'RecordFlags': '0',
+               'DATA.Density': '40', 'DATA.PositionRange': '40.0',
+               'DATA.HeightRange': '0.3', 'DATA.ColorRange': '0.3',
+               'DATA.WavePeriod': '10.0', 'DATA.Flags': '6'}
+        dat = convert_GRAS(rec)
+        dat = dat[dat.index(b'DATA') + 6:]
+        assert dat[0] == 80
+        assert struct.unpack_from('<f', dat, 12)[0] == 80.0
+
+    def test_convert_gras_density_saturates(self):
+        """FNV NVGreenGrass02: 35% at PositionRange 17 boosts to 100%, not 165%."""
+        from tes5_import.record_types.items import convert_GRAS
+        rec = {'Signature': 'GRAS', 'FormID': '0016ACCB', 'RecordFlags': '0',
+               'DATA.Density': '35', 'DATA.PositionRange': '17.0',
+               'DATA.HeightRange': '0.3', 'DATA.ColorRange': '0.25',
+               'DATA.WavePeriod': '30.0', 'DATA.Flags': '6'}
+        dat = convert_GRAS(rec)
+        dat = dat[dat.index(b'DATA') + 6:]
+        assert dat[0] == 100
+        assert struct.unpack_from('<f', dat, 12)[0] == 80.0
+
+    def test_convert_gras_wide_range_untouched(self):
+        """PositionRange above 80 and its density pass through unchanged."""
+        from tes5_import.record_types.items import convert_GRAS
+        rec = {'Signature': 'GRAS', 'FormID': '00000001', 'RecordFlags': '0',
+               'DATA.Density': '30', 'DATA.PositionRange': '90.0',
+               'DATA.HeightRange': '0.3', 'DATA.ColorRange': '0.3',
+               'DATA.WavePeriod': '10.0', 'DATA.Flags': '6'}
+        dat = convert_GRAS(rec)
+        dat = dat[dat.index(b'DATA') + 6:]
+        assert dat[0] == 30
+        assert struct.unpack_from('<f', dat, 12)[0] == 90.0
+
+    @pytest.mark.skipif(not _FNV_GRASS.exists(), reason='FNV export not available')
+    def test_tallgrass_shader_diffuse(self, tmp_path):
+        """FNV grass carries its diffuse on TallGrassShaderProperty.file_name."""
+        dst = tmp_path / 'fnvgrass.nif'
+        result = convert_nif(str(_FNV_GRASS), str(dst))
+        assert result['converted'], f"Conversion failed: {result.get('error')}"
+        data = NifFormat.Data()
+        with open(dst, 'rb') as f:
+            data.read(f)
+        sets = [b for b in data.blocks if isinstance(b, NifFormat.BSShaderTextureSet)]
+        assert sets
+        assert sets[0].textures[0].lower() == b'textures\\tes4\\landscape\\grass\\nvgreengrass.dds'
 
     @pytest.mark.skipif(not (EXPORT_MESHES / _GRASS_SAMPLE).exists(),
                         reason='Export meshes not available')
@@ -251,12 +305,12 @@ class TestLandscapeNormals:
         path = tmp_path / 'test_n.dds'
         path.write_bytes(_make_dxt1_dds(8, 8, 2, [top, mip1]))
 
-        before = _decode_dxt(path.read_bytes()[128:128 + 32], 8, 8, 'DXT1')
-        assert landscape_normals.fix_normal_specular(path) is True
+        before = decode_dxt(path.read_bytes()[128:128 + 32], 8, 8, 'DXT1')
+        assert landscape_normals.run(tmp_path) == (1, 1)
 
         data = path.read_bytes()
         assert data[84:88] == b'DXT5'
-        after = _decode_dxt(data[128:128 + 64], 8, 8, 'DXT5')
+        after = decode_dxt(data[128:128 + 64], 8, 8, 'DXT5')
         for i in range(0, len(before), 4):
             assert before[i:i + 3] == after[i:i + 3], f'RGB mismatch at texel {i // 4}'
             assert after[i + 3] == landscape_normals.SPECULAR_ALPHA
@@ -264,20 +318,52 @@ class TestLandscapeNormals:
         # Mip chain length: 4 DXT5 blocks (top) + 1 (mip1) = 80 bytes
         assert len(data) == 128 + 5 * 16
 
-    def test_dxt5_left_untouched(self, tmp_path):
-        hdr = bytearray(128)
-        hdr[0:4] = b'DDS '
-        hdr[84:88] = b'DXT5'
-        path = tmp_path / 'already_n.dds'
-        path.write_bytes(bytes(hdr) + b'\x00' * 16)
-        assert landscape_normals.fix_normal_specular(path) is False
+    def test_bright_dxt5_mask_is_dimmed(self, tmp_path):
+        """A DXT5 landscape normal with a bright mask gets the constant too.
+
+        Morroblivion's terrain normals carry a generated height field in
+        alpha (median 102/255 against Oblivion's 16); TES4 never read it, so
+        it is not a specular mask.
+        """
+        blk = bytes([200, 200]) + b'\x00' * 6 + _opaque_block(0xF800, 0x001F, 0)
+        path = tmp_path / 'bright_n.dds'
+        path.write_bytes(_make_dds(b'DXT5', 4, 4, 1, [[blk]]))
+        assert landscape_normals.run(tmp_path) == (1, 1)
+        data = path.read_bytes()
+        assert data[128] == landscape_normals.SPECULAR_ALPHA
+        assert data[128 + 8:128 + 16] == blk[8:]
 
     def test_idempotent(self, tmp_path):
         top = [_opaque_block(0xF800, 0x001F, 0)]
         path = tmp_path / 'idem_n.dds'
         path.write_bytes(_make_dxt1_dds(4, 4, 1, [top]))
-        assert landscape_normals.fix_normal_specular(path) is True
-        assert landscape_normals.fix_normal_specular(path) is False
+        assert landscape_normals.run(tmp_path) == (1, 1)
+        assert landscape_normals.run(tmp_path) == (1, 0)
+
+    def test_ensure_ltex_normals_writes_only_missing(self, tmp_path):
+        """A land texture whose normal any plugin ships is left alone; one
+        shipping none gets a flat normal under this plugin's tree."""
+        from asset_convert.game_paths import set_namespace
+        set_namespace('tes4')
+        export = tmp_path / 'export'
+        export.mkdir()
+        (export / 'LTEX.txt').write_text(
+            '---RECORD_BEGIN---\nICON=textures\\\\Tx_has.dds\n---RECORD_END---\n'
+            '---RECORD_BEGIN---\nICON=textures\\\\Tx_none.dds\n---RECORD_END---\n'
+            '---RECORD_BEGIN---\nICON=dirt02.dds\n---RECORD_END---\n')
+        out = tmp_path / 'output'
+        master = out / 'Master.esm' / 'textures' / 'tes4'
+        master.mkdir(parents=True)
+        (master / 'tx_has_n.dds').write_bytes(b'DDS ')
+        mine = out / 'Plugin.esp' / 'textures'
+        checked, written = landscape_normals.ensure_ltex_normals(
+            export, mine, out)
+        assert (checked, written) == (3, 2)
+        assert (mine / 'tes4' / 'Tx_none_n.dds').is_file()
+        flat = (mine / 'tes4' / 'landscape' / 'dirt02_n.dds').read_bytes()
+        assert flat[84:88] == b'DXT5' and flat[128] == landscape_normals.SPECULAR_ALPHA
+        assert not (mine / 'tes4' / 'Tx_has_n.dds').exists()
+        assert landscape_normals.ensure_ltex_normals(export, mine, out) == (3, 0)
 
 
 def _make_dds(fourcc, width, height, mip_count, blocks_per_mip):
@@ -305,7 +391,7 @@ class TestConstantSpecularAlpha:
     RED, BLUE = 0xF800, 0x001F
 
     def _dxt3(self, alpha_nibbles=0xFF):
-        """One DXT3 block: 8 bytes of 4-bit alpha, then the colour block."""
+        """One DXT3 block: 8 bytes of 4-bit alpha, then the color block."""
         return bytes([alpha_nibbles] * 8) + _opaque_block(
             self.RED, self.BLUE, 0x1B1B1B1B)
 
@@ -322,25 +408,26 @@ class TestConstantSpecularAlpha:
         """
         path = tmp_path / 'poster_n.dds'
         path.write_bytes(_make_dds(b'DXT3', 4, 4, 1, [[self._dxt3(0xFF)]]))
-        colour_before = path.read_bytes()[128 + 8:128 + 16]
+        color_before = path.read_bytes()[128 + 8:128 + 16]
 
         assert landscape_normals.set_constant_alpha(path, 64) is True
         data = path.read_bytes()
         assert data[84:88] == b'DXT5'
         assert data[128] == 64 and data[129] == 64
         assert data[130:136] == b'\x00' * 6, 'alpha indices must select alpha0'
-        assert data[128 + 8:128 + 16] == colour_before, 'RGB was modified'
+        assert data[128 + 8:128 + 16] == color_before, 'RGB was modified'
         assert len(data) == 128 + 16, 'DXT3 and DXT5 are both 16 bytes/block'
 
-    def test_dxt5_alpha_replaced_colour_kept(self, tmp_path):
+    def test_dxt5_alpha_replaced_color_kept(self, tmp_path):
+        """A DXT5 block gets the constant alpha while its RGB is untouched."""
         path = tmp_path / 'flat_n.dds'
         path.write_bytes(_make_dds(b'DXT5', 4, 4, 1, [[self._dxt5(25, 25)]]))
-        colour_before = path.read_bytes()[128 + 8:128 + 16]
+        color_before = path.read_bytes()[128 + 8:128 + 16]
 
         assert landscape_normals.set_constant_alpha(path, 64) is True
         data = path.read_bytes()
         assert data[128] == 64 and data[129] == 64
-        assert data[128 + 8:128 + 16] == colour_before
+        assert data[128 + 8:128 + 16] == color_before
 
     def test_mip_chain_is_walked(self, tmp_path):
         """Every mip must be rewritten, not just the top one.
@@ -378,7 +465,7 @@ class TestConstantSpecularAlpha:
 
     def test_default_normal_is_flat_and_masked(self, tmp_path):
         """The shared stand-in must classify as a real DXT5 with our alpha."""
-        from asset_convert import parallax
+        from asset_convert.texture import parallax
         landscape_normals.write_default_normal(tmp_path)
         dest = tmp_path / 'tes4' / 'default_n.dds'
         assert dest.is_file()

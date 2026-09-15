@@ -1,7 +1,7 @@
 """Shared loader for the audit-index navmesh tools (render/sweep/compare).
 
 Every diagnostic that regenerates a cell's navmesh in-process needs the same
-four things: the collision cache, the door-centre cache, the audit index
+four things: the collision cache, the door-center cache, the audit index
 (`export/<plugin>/audit_index3.pkl`, built by tools/navmesh/audit.py), and a
 way to turn a cell EditorID into the exact argument tuple `build_navmesh`
 receives from the real pipeline.  Keeping that in ONE place is what stops a
@@ -15,6 +15,7 @@ number the tool prints a lie.
     verts, tris = cell.build()
 """
 
+import contextlib
 import math
 import os
 import pickle
@@ -22,13 +23,36 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from asset_convert import collision_extract as ce  # noqa: E402
-from tes5_import.navmesh import build  # noqa: E402
-from tes5_import.pgrd_to_navm import (  # noqa: E402
-    _collect_doors, load_door_centroids,
+from asset_convert.collision import collision_extract as ce
+from tes5_import.navmesh import build
+from tes5_import.navmesh.from_pgrd import (
+    collect_doors, load_door_centroids,
 )
+from tes5_import.base.text_reader import parse_export_file
+from tes5_import.record_types.items import load_furniture_models
 
 DEFAULT_EXPORT = 'export/Oblivion.esm'
+
+
+def load_origin_shifts(export, quiet=True):
+    """Build the furniture origin-shift table the pipeline builds.
+
+    Without it a diagnostic gathers collision at the RAW PosZ while the real
+    pipeline lowers those refs, so the tool shows furniture floating by up to
+    61 units and disagrees with the navmesh it is meant to explain.
+
+    See: docs/commentary/asset_convert_nif.md#furniture-shift-third-consumer
+    """
+    by_type = {}
+    for sig in ('FURN', 'STAT'):
+        path = os.path.join(export, sig + '.txt')
+        by_type[sig] = parse_export_file(path) if os.path.isfile(path) else []
+    if quiet:
+        with open(os.devnull, 'w') as null:
+            with contextlib.redirect_stdout(null):
+                return load_furniture_models(os.path.join(export, 'meshes'),
+                                             by_type)
+    return load_furniture_models(os.path.join(export, 'meshes'), by_type)
 
 
 class CellCtx(object):
@@ -43,7 +67,7 @@ class CellCtx(object):
         import tools.navmesh.audit as na
         self.nodes, self.edges = na._pgrd_nodes(pg) if pg is not None else ([], [])
         self.refrs = index.refr_by_cell.get(self.fid, [])
-        self.doors = _collect_doors(self.refrs, index.door_fids)
+        self.doors = collect_doors(self.refrs, index.door_fids)
         self.land = index.land_by_cell.get(self.fid)
 
     @property
@@ -94,6 +118,7 @@ class NavIndex(object):
         ce.load_collision(os.path.join(export, 'collision_cache.bin'), quiet=quiet)
         load_door_centroids(os.path.join(export, 'door_centers_cache.json'),
                             quiet=quiet)
+        load_origin_shifts(export, quiet=quiet)
         with open(os.path.join(export, 'audit_index3.pkl'), 'rb') as fh:
             (self.base_model, self.refr_by_cell, self.pgrd_by_cell,
              self.land_by_cell, self.door_fids, self.cells) = pickle.load(fh)

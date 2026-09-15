@@ -16,10 +16,11 @@ import pytest
 
 pyffi = pytest.importorskip('pyffi')
 
-from asset_convert import pyffi_monkey_patch  # noqa: E402,F401
-from pyffi.formats.nif import NifFormat  # noqa: E402
+from asset_convert.nif.pyffi_monkey_patch import apply_patches
+apply_patches()
+from pyffi.formats.nif import NifFormat
 
-from asset_convert.lava_surface import build_lava_nif  # noqa: E402
+from asset_convert.lava_surface import build_lava_nif
 
 TEX = r'textures\tes4\water\oblivionlava06.dds'
 
@@ -94,7 +95,7 @@ def test_shader_is_emissive_and_tiling():
 
 
 def test_no_greyscale_palette_without_a_palette():
-    """Oblivion's lava texture is full colour, so the greyscale-to-palette bit
+    """Oblivion's lava texture is full color, so the greyscale-to-palette bit
     must stay OFF — setting it would sample a gradient texture we never bind.
     """
     shader = _blocks(_load(), NifFormat.BSEffectShaderProperty)[0]

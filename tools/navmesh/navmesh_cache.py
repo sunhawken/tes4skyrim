@@ -77,6 +77,8 @@ import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+from core.subprocess_flags import POPEN_FLAGS
+
 MANIFEST_NAME = 'navmesh_cache_manifest.json'
 CACHE_DIRNAME = 'navmesh_geom_cache'
 
@@ -115,14 +117,14 @@ def asset_name(plugin: str) -> str:
 
 def source_tag(plugin: str) -> str | None:
     """The navmesh source tag the CURRENT code would use for this plugin."""
-    from tes5_import import import_main as im
-    got = im._navmesh_geom_cache(collision_path(plugin))
+    from tes5_import.navmesh import pool as navm_pool
+    got = navm_pool.navmesh_geom_cache(collision_path(plugin))
     return got[1] if got else None
 
 
 def collision_hash(plugin: str) -> str | None:
     """Content hash of the plugin's collision cache, or None if absent."""
-    import asset_convert.collision_extract as ce
+    import asset_convert.collision.collision_extract as ce
     path = collision_path(plugin)
     if not os.path.exists(path):
         return None
@@ -131,21 +133,7 @@ def collision_hash(plugin: str) -> str | None:
     return ce.collision_content_hash()
 
 
-# The only plugins we publish a shared cache for.  Everything else under
-# export/ is a local experiment: a DLC, a landmass mod, a half-converted ESP
-# somebody ran once.  Those caches are worthless to a downloader (nobody else
-# has that plugin) but they are NOT harmless -- discover_plugins() is what the
-# pre-push gate iterates, so a 0-entry or partially-generated cache from a
-# throwaway run fails verify() and BLOCKS the push, and a large one gets zipped
-# and uploaded as a release asset nobody wants.
-#
-# Deliberately an allowlist, not a size/entry-count heuristic: "big enough to
-# publish" would silently start shipping the next landmass mod that happens to
-# cross the threshold.  Adding a plugin here is a decision to host its cache.
-#
-# Matched case-insensitively -- export/ folder names come from whatever the
-# user typed after -f, and 'Nehrim.esm' vs 'nehrim.esm' must not change what
-# gets published.
+#: Hosted caches, case-insensitive. See: docs/commentary/tes5_import_navmesh.md#publishable-plugins
 PUBLISHABLE_PLUGINS = ('Oblivion.esm', 'Nehrim.esm', 'Morrowind_ob.esm')
 
 
@@ -381,7 +369,8 @@ def gh_repo() -> list:
     loudly -- which is exactly how a working publish looked broken.
     """
     out = subprocess.run(['git', 'remote', 'get-url', 'origin'],
-                         capture_output=True, text=True, cwd=repo_root())
+                         capture_output=True, text=True, cwd=repo_root(),
+                         **POPEN_FLAGS)
     url = out.stdout.strip() if out.returncode == 0 else ''
     if not url:
         return []
@@ -433,7 +422,7 @@ def parse_cache_release_tag(name: str) -> tuple | None:
 
 
 def _version_key(tag: str) -> tuple | None:
-    """Comparable key for a MAJOR.MINOR tag, NORMALISED TO THOUSANDTHS.
+    """Comparable key for a MAJOR.MINOR tag, NORMALIZED TO THOUSANDTHS.
 
     The minor field's WIDTH sets its scale -- the same trap previous_tag() and
     the hook's next_tag() each document.  Tags through 0.58 are MAJOR.MM
@@ -482,6 +471,15 @@ def _version_key(tag: str) -> tuple | None:
 _SCHEME_SWITCH_MILS = 580
 
 
+def _raw_minor_field(tag: str) -> tuple:
+    """(major, minor, minor_width) from *tag*'s RAW digits, not _version_key.
+
+    See: docs/commentary/tes5_import_navmesh.md#cache-tag-steps-in-its-own-scheme
+    """
+    parts = tag.split('.')
+    return int(parts[0]), int(parts[1]), len(parts[1])
+
+
 def previous_tag(tag: str) -> str:
     """The code tag one step below *tag* ('0.582' -> '0.581', '0.73' -> '0.72').
 
@@ -505,15 +503,7 @@ def previous_tag(tag: str) -> str:
     """
     if _version_key(tag) is None:
         return tag
-    # Use the RAW digits, not _version_key: that key is normalised to
-    # thousandths for comparison, whereas the arithmetic below steps in the
-    # tag's own scheme and must see the field exactly as it was written.  The
-    # WIDTH is the scheme here, not the value -- '0.73' is a hundredths name
-    # even though 730 sits above the switch, so it must step to '0.72', never
-    # to '0.729'.
-    parts = tag.split('.')
-    major, minor = int(parts[0]), int(parts[1])
-    minor_width = len(parts[1])
+    major, minor, minor_width = _raw_minor_field(tag)
     # A 1-digit field is a legacy name too ('0.9'), and it decrements in tenths
     # in its own spelling.  Widths beyond 3 have never been published, but must
     # still step rather than return the input unchanged -- see the docstring:

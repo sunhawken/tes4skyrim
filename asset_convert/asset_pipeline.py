@@ -19,9 +19,19 @@ import os
 import shutil
 from pathlib import Path
 
-from . import (bsa_extract, grass_profile, hair_pipeline, landscape_normals,
-               luminance_textures, nif_converter, spt_converter, texture_prune,
-               wearable_plan)
+from asset_convert.game_paths import (namespace_for, owns_namespace,
+                                       set_namespace)
+from asset_convert.sources import bsa_extract
+from asset_convert.nif import grass_profile
+from asset_convert.character import hair_pipeline
+from asset_convert.texture import landscape_normals
+from asset_convert.texture import luminance_textures
+from asset_convert.collision import mesh_scan_fragments
+from asset_convert.nif import nif_batch
+from asset_convert.speedtree import spt_converter
+from asset_convert.texture import texture_prune
+from asset_convert.character.morrowind_armor import assemble_armor
+from asset_convert.character import wearable_plan
 
 
 # Shared-folder resolution lives in output_layout (one module, three
@@ -30,7 +40,7 @@ from . import (bsa_extract, grass_profile, hair_pipeline, landscape_normals,
 # an imported mod both collapse to `export/<plugin>/`, the layout this module
 # has always used.
 from output_layout import (asset_root as _asset_root,
-                           record_dir as _record_dir,
+                           record_dir as record_dir,
                            plugin_out_root as _plugin_out_root)
 
 
@@ -103,6 +113,70 @@ def _write_parallax_notice(plugin_dir):
     print('  Wrote PARALLAX-READ-ME.txt (Community Shaders / ENB required)')
 
 
+# ---------------------------------------------------------------------------
+# Asset namespace
+# ---------------------------------------------------------------------------
+
+def _activate_namespace(rec_dir) -> str:
+    """Install this plugin's asset namespace before any path is rewritten.
+
+    See: docs/commentary/asset_convert_texture.md#per-game-asset-namespace
+    """
+    ns = namespace_for(rec_dir)
+    set_namespace(ns)
+    return ns
+
+
+# ---------------------------------------------------------------------------
+# Mesh and texture conversion
+# ---------------------------------------------------------------------------
+
+def _persist_mesh_manifests(mesh_stats, manifest_dir, partial: bool) -> None:
+    """Persist the texture sets mesh conversion harvested, for later phases.
+
+    The prune and the texture pass both run after this, possibly in a separate
+    invocation. `partial` (a --mesh-subdirs run) MERGES rather than replaces:
+    that run saw only part of the tree, and overwriting would tell the prune
+    nothing outside those folders uses a texture, so it would delete the rest.
+
+    See: docs/commentary/asset_convert_shader.md#detail-overlay-diffuses
+    """
+    for key, name in (('textures_used', texture_prune.MANIFEST_NAME),
+                      ('overlay_diffuses',
+                       texture_prune.OVERLAY_MANIFEST_NAME)):
+        refs = set(mesh_stats.pop(key, set()))
+        if partial:
+            refs |= texture_prune.read_manifest(manifest_dir, name)
+        texture_prune.write_manifest(manifest_dir, refs, name)
+
+
+def _convert_mesh_tree(mesh_src, mesh_dst, asset_dir, rec_dir, mesh_subdirs,
+                       parallax, textures_only):
+    """Run the NIF batch over `mesh_src`; return its stats dict.
+
+    The wearable plan names which _0/_1/plain variants each mesh is actually
+    referenced as -- without it the converter writes all three for every armor
+    and clothing mesh and the plugin loads one or two.  `scan_dir` collects the
+    bounds/collision entries the workers compute from the graphs they write;
+    a previous run's fragments describe meshes this one replaces, so they are
+    cleared first.
+    See: docs/commentary/tes5_import_pipeline.md#producer-emitted-mesh-entries
+    """
+    plan = wearable_plan.build_plan(rec_dir)
+    print(f"  Wearable variant plan: {len(plan)} meshes referenced by "
+          f"ARMO/CLOT")
+    mesh_scan_fragments.clear_fragments(asset_dir)
+    return nif_batch.batch_convert(
+        str(mesh_src), output_dir=str(mesh_dst),
+        fix_textures=True, remap_skeleton=None,
+        subdir_filter=mesh_subdirs,
+        wearable_plan=plan,
+        parallax=parallax,
+        textures_only=textures_only,
+        scan_dir=None if textures_only else str(asset_dir),
+    )
+
+
 def convert_meshes(source_file, extract_dir='export', output_dir='output',
                    mesh_subdirs=None, parallax=False, textures_only=False):
     """Convert extracted NIFs and copy textures into `output_dir/<source_name>/`.
@@ -115,12 +189,12 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
         mesh_subdirs: Optional list of root mesh subfolders to include (e.g.
                       ['architecture', 'clutter']). None means all subfolders.
         parallax:     Carry Oblivion's parallax across as Skyrim height maps.
-                      Off by default — see asset_convert/parallax.py; the
+                      Off by default — see asset_convert/texture/parallax.py; the
                       output needs Community Shaders or ENB.
         textures_only: Read and analyse the meshes, ship none of them; only the
                       textures (with their `_p` height maps) go to output.  For
                       PGPatcher, which patches meshes across the player's whole
-                      load order — see nif_converter.batch_convert.
+                      load order — see nif_batch.batch_convert.
 
     Returns a dict with keys: 'mesh_conversion', 'textures_copied', 'other_copied'.
     """
@@ -131,7 +205,9 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
     # meshes/textures come from the group folder while the record dump stays
     # per plugin (source_registry.asset_root / record_dir).
     asset_dir = _asset_root(extract_dir, source_name)
-    rec_dir = _record_dir(extract_dir, source_name)
+    rec_dir = record_dir(extract_dir, source_name)
+    plugin_dir = _out_root(output_dir, source_name, extract_dir)
+    ns = _activate_namespace(rec_dir)
 
     stats = {
         'mesh_conversion': {},
@@ -139,7 +215,6 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
         'other_copied': 0,
     }
 
-    plugin_dir = _out_root(output_dir, source_name, extract_dir)
     # Build bookkeeping, not a shipped asset -- see texture_prune.MANIFEST_NAME.
     # Tracks the SHARED asset tree, so it belongs beside the assets.
     mesh_manifest_dir = asset_dir
@@ -151,72 +226,21 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
     print("NIF Mesh Conversion")
     print("=" * 60)
     mesh_src = asset_dir / 'meshes'
+    assemble_armor(rec_dir, mesh_src)
     if mesh_src.exists():
-        mesh_dst = plugin_dir / 'meshes' / 'tes4'
-        # Which _0/_1/plain variants each wearable is actually referenced as —
-        # without this the converter writes all three for every armor and
-        # clothing mesh and the plugin only ever loads one or two of them.
-        plan = wearable_plan.build_plan(rec_dir)
-        print(f"  Wearable variant plan: {len(plan)} meshes referenced by "
-              f"ARMO/CLOT")
-        stats['mesh_conversion'] = nif_converter.batch_convert(
-            str(mesh_src), output_dir=str(mesh_dst),
-            fix_textures=True, remap_skeleton=None,
-            subdir_filter=mesh_subdirs,
-            wearable_plan=plan,
-            parallax=parallax,
-            textures_only=textures_only,
-        )
+        stats['mesh_conversion'] = _convert_mesh_tree(
+            mesh_src, plugin_dir / 'meshes' / ns, asset_dir, rec_dir,
+            mesh_subdirs, parallax, textures_only)
         if parallax:
             _write_parallax_notice(plugin_dir)
-        # The textures the converted meshes reference, harvested as they were
-        # written.  Persisted because the prune runs in a later phase (after LOD
-        # and speedtrees add their own meshes), possibly a separate invocation.
-        #
-        # A --mesh-subdirs run only saw part of the tree, so it must ADD to the
-        # manifest rather than replace it: overwriting leaves the prune believing
-        # nothing outside those folders uses a texture, and it deletes the rest.
-        _used = stats['mesh_conversion'].pop('textures_used', set())
-        if mesh_subdirs:
-            _used = set(_used) | texture_prune.read_manifest(mesh_manifest_dir)
-        texture_prune.write_manifest(mesh_manifest_dir, _used)
-
-        # Which of those the source authored as detail overlays (alpha = blend
-        # weight).  Object LOD reads diffuse alpha as opacity, so the LOD stage
-        # ships opaque copies of exactly these; see
-        # texture_prune.OVERLAY_MANIFEST_NAME.
-        _overlays = stats['mesh_conversion'].pop('overlay_diffuses', set())
-        if mesh_subdirs:
-            _overlays = set(_overlays) | texture_prune.read_manifest(
-                mesh_manifest_dir, texture_prune.OVERLAY_MANIFEST_NAME)
-        texture_prune.write_manifest(mesh_manifest_dir, _overlays,
-                                     texture_prune.OVERLAY_MANIFEST_NAME)
+        _persist_mesh_manifests(stats['mesh_conversion'], mesh_manifest_dir,
+                                bool(mesh_subdirs))
     else:
         print(f"  No meshes found at {mesh_src}")
         stats['mesh_conversion'] = {'converted': 0, 'skipped': 0, 'errors': 0}
 
-    # -----------------------------------------------------------------------
-    # Grass models — GRAS NIFs (from the export's GRAS.txt) get the vanilla
-    # grass shader profile and a copy under meshes\landscape\grass\, the
-    # location every working GRAS record uses (see grass_profile module doc).
-    # -----------------------------------------------------------------------
-    # -----------------------------------------------------------------------
-    # Hair — meshes\characters\ is in nif_converter.SKIP_PATHS, and hair could
-    # not be un-skipped into the batch anyway: one Oblivion HAIR record becomes
-    # several Skyrim meshes, because the per-NPC hair length (NPC_.LNAM) has no
-    # Skyrim equivalent and is baked in per variant.  See hair_pipeline.
-    # -----------------------------------------------------------------------
     if mesh_src.exists() and not textures_only:
-        stats['hair'] = hair_pipeline.run(rec_dir, plugin_dir / 'meshes')
-
-    if mesh_src.exists() and not textures_only:
-        processed, modified, missing = grass_profile.run(
-            rec_dir, plugin_dir / 'meshes')
-        stats['grass_profile'] = {
-            'processed': processed, 'modified': modified, 'missing': missing}
-        print(f"  Grass models: {processed} placed under landscape\\grass, "
-              f"{modified} profiled"
-              + (f", {missing} missing" if missing else ""))
+        _profile_hair_and_grass(rec_dir, plugin_dir, stats)
 
     # -----------------------------------------------------------------------
     # Copy Textures
@@ -225,67 +249,76 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
     print("Copy Textures to Output")
     print("=" * 60)
 
-    tex_src = asset_dir / 'textures'
-    if tex_src.exists():
-        tex_dst = plugin_dir / 'textures' / 'tes4'
-        stats['textures_copied'] = _copy_tree(tex_src, tex_dst)
-        print(f"  Textures: {stats['textures_copied']} files -> {tex_dst}")
-
-        # Oblivion ships its GLOW maps as 8-bit DDPF_LUMINANCE, whose single
-        # channel sits under the RED mask (R 0xFF, G 0, B 0).  Skyrim's glow
-        # shader samples slot 2 as ordinary RGB and does not replicate that
-        # channel, so the glow renders PURE RED -- the "candles glow red"
-        # report (clutter\candle_g.dds on uppersilverplatecandles01).  Expand
-        # L into R=G=B.  Runs after the copy so re-copies can't resurrect the
-        # L8 originals; re-running is a no-op once converted.
-        lum_checked, lum_fixed = luminance_textures.run(tex_dst)
-        stats['luminance_textures_fixed'] = lum_fixed
-        print(f"  Luminance textures: {lum_checked} L8 found, "
-              f"{lum_fixed} expanded to BGRA")
-
-        # Landscape normal maps: DXT1 has no alpha channel, which Skyrim's
-        # landscape shader reads as a full-strength specular mask (shiny
-        # ground).  Re-container as DXT5 with a dark alpha.  Runs after the
-        # copy so re-copies don't resurrect the DXT1 versions.
-        checked, fixed = landscape_normals.run(tex_dst / 'landscape')
-        stats['landscape_normals_fixed'] = fixed
-        print(f"  Landscape normals: {checked} checked, {fixed} DXT1->DXT5 fixed")
-
-        # Every REMAINING normal map without a usable specular mask gets a
-        # constant one, and the shared stand-in normal is written for shapes
-        # whose own normal does not exist.  The mesh stage now writes a
-        # UNIFORM specular_strength of 1.0, so the modulation has to live here
-        # -- see nif_converter._SPEC_STRENGTH for why that trade is worth
-        # making.  Landscape is excluded: just handled, with a dimmer value.
-        n_checked, n_fixed, n_kinds = landscape_normals.normalize_specular_alpha(
-            tex_dst, skip=(os.sep + 'landscape' + os.sep,))
-        # AFTER the sweep: the stand-in is a constant alpha by design, so a
-        # sweep that saw it would count it as one more file it "fixed".
-        landscape_normals.write_default_normal(tex_dst)
-        stats['spec_alpha_fixed'] = n_fixed
-        print(f"  Specular masks: {n_checked} normal maps checked, {n_fixed} "
-              f"given a constant mask "
-              f"(alpha {landscape_normals.DEFAULT_MASK_ALPHA}/255)")
-        if n_kinds:
-            print('    ' + ', '.join(f'{k}={v}'
-                                     for k, v in sorted(n_kinds.items())))
-
-        # A diffuse whose alpha was carried out to a `_p` height map has no
-        # use for that channel any more, and DXT1 is half the size.  Keyed on
-        # the `_p` file the mesh stage wrote, so this is a no-op unless
-        # --parallax ran.  After the copy, for the same reason as above.
-        from . import parallax as _parallax
-        _n, _skip, _kept, _saved = _parallax.strip_diffuse_alpha(
-            tex_dst, keep=stats.get('mesh_conversion', {}).get(
-                'alpha_opacity_diffuse', ()))
-        if _n or _skip or _kept:
-            stats['parallax_diffuse_bc1'] = _n
-            print(f"  Parallax diffuse: {_n} DXT5->DXT1 "
-                  f"({_saved / (1024 * 1024):.1f} MB saved)"
-                  + (f", {_kept} kept (read as opacity)" if _kept else "")
-                  + (f", {_skip} already stripped" if _skip else ""))
-
+    _copy_and_fix_textures(asset_dir, plugin_dir, ns, stats, rec_dir)
+    checked, written = landscape_normals.ensure_ltex_normals(
+        rec_dir, plugin_dir / 'textures', output_dir)
+    stats['ltex_normals_written'] = written
+    print(f"  LTEX normals: {checked} land textures, {written} flat normals "
+          f"written for textures shipping none")
     return stats
+
+
+def _profile_hair_and_grass(rec_dir, plugin_dir, stats):
+    """Run the hair and grass post-passes over the converted mesh tree."""
+    stats['hair'] = hair_pipeline.run(rec_dir, plugin_dir / 'meshes')
+    processed, modified, missing = grass_profile.run(
+        rec_dir, plugin_dir / 'meshes')
+    stats['grass_profile'] = {
+        'processed': processed, 'modified': modified, 'missing': missing}
+    print(f"  Grass models: {processed} placed under landscape\\grass"
+          + (f", {missing} missing" if missing else ""))
+
+
+def _copy_and_fix_textures(asset_dir, plugin_dir, ns, stats, rec_dir):
+    """Copy the texture tree, then repair what Skyrim reads differently.
+
+    L8 glow maps become BGRA (Skyrim samples slot 2 as plain RGB, so an L8
+    glow renders pure red), DXT1 landscape normals gain a real alpha mask,
+    and a diffuse whose alpha became a `_p` height map drops to DXT1. Only the
+    namespace's ROOT plugin writes the shared `default_n.dds`. Every pass runs
+    AFTER the copy, so a re-copy cannot resurrect the originals and re-running
+    is a no-op.
+    See: docs/commentary/asset_convert_texture.md#landscape-normal-maps-dxt1-shiny
+    """
+    from asset_convert.texture import parallax as _parallax
+    tex_src = asset_dir / 'textures'
+    if not tex_src.exists():
+        return
+    tex_dst = plugin_dir / 'textures' / ns
+    stats['textures_copied'] = _copy_tree(tex_src, tex_dst)
+    print(f"  Textures: {stats['textures_copied']} files -> {tex_dst}")
+
+    lum_checked, lum_fixed = luminance_textures.run(tex_dst)
+    stats['luminance_textures_fixed'] = lum_fixed
+    print(f"  Luminance textures: {lum_checked} L8 found, "
+          f"{lum_fixed} expanded to BGRA")
+
+    checked, fixed = landscape_normals.run(tex_dst / 'landscape')
+    stats['landscape_normals_fixed'] = fixed
+    print(f"  Landscape normals: {checked} checked, {fixed} given the mask")
+
+    n_checked, n_fixed, n_kinds = landscape_normals.normalize_specular_alpha(
+        tex_dst, skip=(os.sep + 'landscape' + os.sep,))
+    if owns_namespace(rec_dir):
+        landscape_normals.write_default_normal(tex_dst.parent)
+    stats['spec_alpha_fixed'] = n_fixed
+    print(f"  Specular masks: {n_checked} normal maps checked, {n_fixed} "
+          f"given a constant mask "
+          f"(alpha {landscape_normals.DEFAULT_MASK_ALPHA}/255)")
+    if n_kinds:
+        print('    ' + ', '.join(f'{k}={v}'
+                                 for k, v in sorted(n_kinds.items())))
+
+    _n, _skip, _kept, _saved = _parallax.strip_diffuse_alpha(
+        tex_dst, keep=stats.get('mesh_conversion', {}).get(
+            'alpha_opacity_diffuse', ()))
+    if _n or _skip or _kept:
+        stats['parallax_diffuse_bc1'] = _n
+        print(f"  Parallax diffuse: {_n} DXT5->DXT1 "
+              f"({_saved / (1024 * 1024):.1f} MB saved)"
+              + (f", {_kept} kept (read as opacity)" if _kept else "")
+              + (f", {_skip} already stripped" if _skip else ""))
+
 
 def convert_speedtrees(source_file, extract_dir='export', output_dir='output',
                        use_engine=True):
@@ -295,7 +328,7 @@ def convert_speedtrees(source_file, extract_dir='export', output_dir='output',
     `use_engine` (ON by default) takes branches from Oblivion's own SpeedTree
     code via the committed native harness; the Python generator is the
     per-tree FALLBACK when no Oblivion.exe is configured, the harness is
-    missing, or a dump fails.  See asset_convert/spt_engine_geom.py.
+    missing, or a dump fails.  See asset_convert/speedtree/spt_engine_geom.py.
     """
     extract_dir = Path(extract_dir)
     output_dir = Path(output_dir)
@@ -310,7 +343,7 @@ def convert_speedtrees(source_file, extract_dir='export', output_dir='output',
     # from the export header rather than a fixed list -- the chain differs per
     # plugin (Valenwood: Oblivion, Tamriel, Anequina).
     master_tree_dirs = []
-    header = _record_dir(extract_dir, source_name) / '_HEADER.txt'
+    header = record_dir(extract_dir, source_name) / '_HEADER.txt'
     if header.is_file():
         for line in open(header, encoding='utf-8', errors='replace'):
             if line.startswith('Master['):
@@ -319,11 +352,11 @@ def convert_speedtrees(source_file, extract_dir='export', output_dir='output',
                 if d.is_dir():
                     master_tree_dirs.append(d)
     if spt_src.exists():
-        spt_dst = plugin_dir / 'meshes' / 'tes4' / 'speedtrees'
-        # tree textures ship via the generic texture copy (textures/tes4/trees/)
+        ns = _activate_namespace(record_dir(extract_dir, source_name))
+        spt_dst = plugin_dir / 'meshes' / ns / 'speedtrees'
         spt_stats['spt_conversion'] = spt_converter.convert_spt_directory(
             spt_src, spt_dst,
-            export_dir=_record_dir(extract_dir, source_name),
+            export_dir=record_dir(extract_dir, source_name),
             master_tree_dirs=master_tree_dirs, use_engine=use_engine)
     else:
         print(f"  No trees/ directory found at {spt_src}")
@@ -344,7 +377,7 @@ def convert_sounds(source_file, extract_dir='export', output_dir='output',
     Returns:
         dict with keys: converted, copied, failed, total.
     """
-    from .audio_converter import convert_sounds as _ac_convert
+    from asset_convert.audio.audio_converter import convert_sounds as _ac_convert
     return _ac_convert(source_file, extract_dir=extract_dir,
                        output_dir=output_dir, ffmpeg_path=ffmpeg_path)
 
