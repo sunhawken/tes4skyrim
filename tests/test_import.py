@@ -285,6 +285,36 @@ class TestConverters:
         obnd = self._get_subrecord_data(result, 'OBND')
         assert struct.unpack_from('<6h', obnd, 0) == (-5, -5, 0, 5, 5, 30)
 
+    def test_weap_enchantment_charge(self):
+        """A staff's TES4 ANAM charge pool becomes TES5 EAMT (u16).
+
+        Also asserts the two edges: a value above 65535 saturates rather than
+        wrapping (the field is 2 bytes on disk, so folding would yield a tiny
+        pool), and an unenchanted weapon gets neither EITM nor EAMT.
+
+        See: docs/commentary/tes5_import_magic.md#enchantment-charge-eamt
+        """
+        rec = {'Signature': 'WEAP', 'FormID': '00000301', 'RecordFlags': '0',
+               'EditorID': 'StaffOfFire', 'DATA.Type': '4',
+               'DATA.Speed': '1.0', 'DATA.Reach': '1.0', 'DATA.Value': '500',
+               'DATA.Health': '100', 'DATA.Weight': '9.0', 'DATA.Damage': '10',
+               'Model.MODL': 'Weapons\\Staff\\Staff.nif',
+               'ENAM': '0009535C', 'ANAM': '3600'}
+        result = convert_WEAP(rec)
+        assert self._has_subrecord(result, 'EITM')
+        eamt = self._get_subrecord_data(result, 'EAMT')
+        assert len(eamt) == 2
+        assert struct.unpack('<H', eamt)[0] == 3600
+
+        rec['ANAM'] = '100000'
+        eamt = self._get_subrecord_data(convert_WEAP(rec), 'EAMT')
+        assert struct.unpack('<H', eamt)[0] == 0xFFFF
+
+        del rec['ENAM']
+        plain = convert_WEAP(rec)
+        assert not self._has_subrecord(plain, 'EAMT')
+        assert not self._has_subrecord(plain, 'EITM')
+
     def test_armo(self):
         rec = {'Signature': 'ARMO', 'FormID': '00000300', 'RecordFlags': '0',
                'EditorID': 'IronArmor', 'FULL': 'Iron Armor',
@@ -802,6 +832,19 @@ class TestConverters:
         assert self._has_subrecord(result, 'DATA')
         data = self._get_subrecord_data(result, 'DATA')
         assert len(data) == 24  # 6 floats
+
+    def test_refr_trigger_primitive_round_trips(self):
+        """An FO3/FNV XPRM (trigger volume) is copied verbatim after NAME: the
+        layout is TES5's own, and without it OnTriggerEnter never fires."""
+        raw = ('80A69A4288A5A4430000E0420000803F0000803F8180003F9A99193E'
+               '01000000')
+        rec = {'Signature': 'REFR', 'FormID': '00001000', 'RecordFlags': '0',
+               'NAME': '00012345', 'XPRM.Raw': raw,
+               'PosX': '0.0', 'PosY': '0.0', 'PosZ': '0.0',
+               'RotX': '0.0', 'RotY': '0.0', 'RotZ': '0.0'}
+        result = convert_REFR(rec)
+        assert self._get_subrecord_data(result, 'XPRM') == bytes.fromhex(raw)
+        assert result.index(b'NAME') < result.index(b'XPRM') < result.index(b'DATA')
 
     def test_land(self):
         # Minimal LAND record
@@ -1453,7 +1496,8 @@ class TestSkyrimRecordFormat:
 # Voice file naming tests
 # ---------------------------------------------------------------------------
 
-from asset_convert.audio.audio_converter import VOICE_FILENAME_RE, TES4_VOICE_TYPE_MAP
+from asset_convert.audio.audio_converter import VOICE_FILENAME_RE
+from asset_convert.audio.voice_races import voice_key, vtyp_edid
 
 
 class TestVoiceFileNaming:
@@ -1498,27 +1542,16 @@ class TestVoiceFileNaming:
         m = VOICE_FILENAME_RE.match('00012345_1.mp3')
         assert m is None
 
-    def test_voice_type_map_coverage(self):
-        """Voice type map covers all 10 playable races Ã— 2 genders."""
-        playable_races = [
-            'Argonian', 'Breton', 'DarkElf', 'HighElf', 'Imperial',
-            'Khajiit', 'Nord', 'Orc', 'Redguard', 'WoodElf',
-        ]
-        for race in playable_races:
-            for gender in ('M', 'F'):
-                assert (race, gender) in TES4_VOICE_TYPE_MAP, \
-                    f"Missing voice type for ({race}, {gender})"
-
-    def test_voice_type_map_sheogorath(self):
-        """Sheogorath has Male voice type only."""
-        assert ('Sheogorath', 'M') in TES4_VOICE_TYPE_MAP
-
     def test_voice_type_naming_convention(self):
-        """All voice types follow TES4{Male|Female}Race naming."""
-        for (race, gender), vtype in TES4_VOICE_TYPE_MAP.items():
-            sex = 'Male' if gender == 'M' else 'Female'
-            assert vtype.startswith(f'TES4{sex}'), \
-                f"Voice type {vtype} for ({race}, {gender}) has wrong prefix"
+        """Voice types follow TES4{Male|Female}<RaceKey> naming."""
+        for key in ('HighElf', 'Nord', 'GoldenSaint'):
+            assert vtyp_edid(key, 'M') == f'TES4Male{key}'
+            assert vtyp_edid(key, 'F') == f'TES4Female{key}'
+
+    def test_voice_key_strips_display_name_punctuation(self):
+        """The folder name is the display name; the key is its alphanumerics."""
+        assert voice_key('High Elf') == 'HighElf'
+        assert voice_key('Halb-Aeterna') == 'HalbAeterna'
 
 
 # ---------------------------------------------------------------------------
@@ -6913,14 +6946,19 @@ class TestFalloutReferenceOnlyRecords:
     """See docs/commentary/tes4_export_falloutnv.md#reference-only-types."""
 
     def test_formlist_members_pass_through_in_order(self):
-        """FLST is byte-identical between the games, so order is preserved."""
+        """FLST is byte-identical between the games, so order is preserved.
+
+        Member ids stay clear of `TES4_ITEM_FORMID_TO_SKYRIM`: an
+        engine-substituted id (0x0A/0x0B/0x0F) is deliberately rewritten, so
+        using one here would test the substitution rather than the ordering.
+        """
         from tes5_import.record_types.reference_falloutnv import convert_FLST
         rec = {'FormID': '00100000', 'RecordFlags': '0', 'EditorID': 'AmmoList',
-               'LNAM[0]': '0000000A', 'LNAM[1]': '0000000B',
-               'LNAM[2]': '0000000C'}
+               'LNAM[0]': '0010000A', 'LNAM[1]': '0010000B',
+               'LNAM[2]': '0010000C'}
         members = _find_all_subrecords(convert_FLST(rec), b'LNAM')
         assert [struct.unpack('<I', m)[0] & 0xFFFFFF for m in members] == \
-            [0xA, 0xB, 0xC]
+            [0x10000A, 0x10000B, 0x10000C]
 
     def test_texture_set_keeps_only_the_six_fnv_slots(self):
         """TES5 defines TX06/TX07, which no FO3/FNV record authors."""
@@ -7038,12 +7076,11 @@ class TestFalloutCellPointers:
         rec.update(over)
         return rec
 
-    def test_an_authored_lighting_template_is_carried(self):
-        """TES4 has no LTMP source, but an FO3/FNV cell names a real LGTM."""
+    def test_an_authored_lighting_template_is_never_carried(self):
+        """Pointing LTMP at a converted FNV LGTM made interiors pitch black."""
         from tes5_import.record_types.world import convert_CELL
         out = convert_CELL(self._cell(**{'LTMP.LightingTemplate': '0000ABCD'}))
-        assert struct.unpack('<I', _find_subrecord(out, b'LTMP'))[0] \
-            & 0xFFFFFF == 0xABCD
+        assert struct.unpack('<I', _find_subrecord(out, b'LTMP'))[0] == 0
 
     def test_a_cell_with_no_template_still_writes_null_ltmp(self):
         """LTMP is required by TES5, so a TES4 cell writes it as NULL."""
@@ -7051,13 +7088,12 @@ class TestFalloutCellPointers:
         out = convert_CELL(self._cell())
         assert struct.unpack('<I', _find_subrecord(out, b'LTMP'))[0] == 0
 
-    def test_imagespace_and_encounter_zone_carry(self):
-        """XCIM and XEZN exist only in FO3/FNV sources."""
+    def test_encounter_zone_carries_but_imagespace_does_not(self):
+        """XCIM darkened every interior: its TES5 HDR block has no FNV source."""
         from tes5_import.record_types.world import convert_CELL
         out = convert_CELL(self._cell(**{'XCIM.Imagespace': '0000BEEF',
                                          'XEZN.EncounterZone': '0000CAFE'}))
-        assert struct.unpack('<I', _find_subrecord(out, b'XCIM'))[0] \
-            & 0xFFFFFF == 0xBEEF
+        assert _find_subrecord(out, b'XCIM') is None
         assert struct.unpack('<I', _find_subrecord(out, b'XEZN'))[0] \
             & 0xFFFFFF == 0xCAFE
 

@@ -19,6 +19,7 @@ from output_layout import record_dir
 from source_paths import resolve_plugin_path
 from tes5_import.base.text_reader import parse_export_file
 
+from .morroblivion_axis import pitch_for_model
 from .tes3_reader import get_string, get_subrecord, read_file
 
 #: Prefix of the converted Morroblivion plugins whose records supply the models.
@@ -181,16 +182,21 @@ class MorroblivionModels:
         return self.creatures.get(editor_id.lower()) if editor_id else None
 
 
-def remap_vanilla_models(out: dict, ctx) -> int:
-    """Rewrite every non-creature model line to Morroblivion's model; how many changed.
+def remap_vanilla_models(out: dict, ctx) -> tuple:
+    """Rewrite every non-creature model line to Morroblivion's model.
 
-    A mesh the plugin ships itself is left alone, and so is one Morroblivion
-    does not replace: the compatibility patch converts those.
+    Returns (models changed, records re-seated, references pitched). A mesh the
+    plugin ships itself is left alone, and so is one Morroblivion does not
+    replace: the compatibility patch converts those.
+
     See: docs/commentary/tes4_export_morrowind.md#morroblivion-meshes
+    See: docs/commentary/tes4_export_morrowind.md#morroblivion-origin-shift
+    See: docs/audits/morroblivion_mesh_axis_rotation.md#the-correction
     """
     if ctx.morroblivion is None:
-        return 0
-    changed = 0
+        return 0, 0, 0
+    shifts = ctx.origin_shifts
+    changed = shifted = 0
     for sig, records in out.items():
         if sig == _CREATURE:
             continue
@@ -203,7 +209,39 @@ def remap_vanilla_models(out: dict, ctx) -> int:
                 if ctx.morroblivion.owns(path):
                     continue
                 model = ctx.morroblivion.replacement(path, ctx.index)
-                if model:
-                    lines[i] = f'{key}={model.replace(chr(92), chr(92) * 2)}'
-                    changed += 1
-    return changed
+                if not model:
+                    continue
+                lines[i] = f'{key}={model.replace(chr(92), chr(92) * 2)}'
+                changed += 1
+                shift = shifts.shift_for(path, model) if shifts else 0.0
+                if shift:
+                    lines.append(f'Model.OriginShift={shift!r}')
+                    shifted += 1
+    return changed, shifted, _pitch_placements(out, ctx.morroblivion.models)
+
+
+def _pitch_placements(out: dict, models: dict) -> int:
+    """Add the axis pitch to every placed reference naming a wrong-axis mesh.
+
+    `models` maps a master record's low-24-bit FormID to its model, so a
+    reference resolves even though the base it names belongs to Morroblivion
+    and its MODL line is never in this plugin's own output.  Rewrites RotX in
+    place, keeping the importer generic.
+
+    See: docs/audits/morroblivion_mesh_axis_rotation.md#the-correction
+    """
+    pitched = 0
+    for sig in ('REFR', 'ACHR', 'ACRE'):
+        for _form_id, lines in out.get(sig, []):
+            base = next((l[len('NAME='):] for l in lines
+                         if l.startswith('NAME=')), '')
+            pitch = pitch_for_model(models.get(base.lower()[2:], '')) \
+                if base else 0.0
+            if not pitch:
+                continue
+            for i, line in enumerate(lines):
+                if line.startswith('RotX='):
+                    lines[i] = f'RotX={float(line[len("RotX="):]) + pitch!r}'
+                    pitched += 1
+                    break
+    return pitched

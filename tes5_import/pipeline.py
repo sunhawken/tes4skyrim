@@ -37,6 +37,7 @@ import time
 from core.plugin_masters import masters_from_export_header
 from asset_convert.game_paths import namespace_for, set_namespace
 from .registry import IMPORT_DISPATCH, SKIP_TYPES
+from .navmesh.pool import collision_cache_chain
 from .overrides.nested import (DELETED_FLAG as OVERRIDE_DELETED_FLAG,
                         OverrideContext, detect_injected_records)
 from .actors.magic_effects import set_tes4_effect_names
@@ -66,7 +67,7 @@ from .base.text_reader import (
 from .base.writer import PluginWriter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from output_layout import assets_for
+from output_layout import asset_cache_chain, assets_for
 
 
 
@@ -410,7 +411,8 @@ def _prescan_menu_records(by_type: dict, writer, _SC, _step_done):
     See: docs/commentary/tes5_import_pipeline.md#phase-0-chargen-menu-ids
     """
     from script_convert.message_menus import build_message_plan
-    message_plan = build_message_plan(by_type.get('SCPT', []))
+    message_plan = build_message_plan(by_type.get('SCPT', []),
+                                      by_type.get('MESG', []))
     message_mesgs = create_message_menu_records(writer, message_plan)
     _SC.message_menus = message_plan
     WELL_KNOWN_PROPERTIES.update(message_mesgs)
@@ -502,16 +504,53 @@ def _index_xref_record(xref, fid_str: str, rec: dict, rekey) -> None:
         if packs:
             xref.actor_packages[fid_str] = packs
     if sig == 'PACK':
-        pkdt = rec.get('PKDT.Type')
-        if pkdt is not None:
-            try:
-                xref.pack_type[fid_str] = int(pkdt)
-            except ValueError:
-                pass
+        _index_xref_pack(xref, fid_str, rec)
+    if sig == 'CELL':
+        _index_xref_cell(xref, fid_str, rec,
+                         rekey(rec.get('ParentWRLD', ''), own_raw, own_key))
     if sig in ('ACHR', 'ACRE', 'REFR'):
         name_fid = rekey(rec.get('NAME', ''), own_raw, own_key)
         if name_fid:
             xref.record_base[fid_str] = name_fid
+
+
+def _index_xref_pack(xref, fid_str: str, rec: dict) -> None:
+    """Record a PACK's procedure type for GetCurrentAIPackage conversion."""
+    pkdt = rec.get('PKDT.Type')
+    if pkdt is None:
+        return
+    try:
+        xref.pack_type[fid_str] = int(pkdt)
+    except ValueError:
+        pass
+
+
+def _xclc(rec: dict, key: str):
+    """One XCLC grid coordinate as an int, or None when absent."""
+    try:
+        return int(rec.get(key))
+    except (TypeError, ValueError):
+        return None
+
+
+def _index_xref_cell(xref, fid_str: str, rec: dict, wrld: str) -> None:
+    """Record a CELL's interior flag, worldspace and grid square.
+
+    Without this `split_cell_family` sees no geometry and calls every member of
+    a GetInCell family interior, so an exterior is bound as a Cell property --
+    which cannot bind -- and no WorldSpace property is emitted at all.
+
+    See: docs/commentary/script_convert.md#worldspace-property-rename
+    """
+    flags = rec.get('DATA.Flags')
+    if flags is None:
+        return
+    try:
+        is_interior = bool(int(str(flags).split()[0], 0) & 1)
+    except ValueError:
+        return
+    xref.cell_geom[fid_str] = (is_interior, wrld or '',
+                               _xclc(rec, 'XCLC.X'), _xclc(rec, 'XCLC.Y'))
 
 
 def _index_xref_script(xref, fid_str: str, rec: dict, edid_str: str) -> None:
@@ -691,8 +730,9 @@ def _prescan_mesh_caches(export_dir: str, plugin_out_dir: str, _step_done):
         print("  Door threshold cache missing or stale, measuring door "
               "panels...")
         scan_door_axes(export_dir, axis_path)
-    load_mesh_bounds(cache_path)
-    load_collision(col_path)
+    load_mesh_bounds(asset_cache_chain(export_dir,
+                                       'mesh_bounds_cache.json'))
+    load_collision(collision_cache_chain(export_dir))
     _step_done('mesh bounds + collision caches')
 
 
@@ -727,12 +767,16 @@ def _prescan_package_plan(by_type: dict, ctx, writer, fid_to_edid: dict, _step_d
     """
     from .packages.aliases import (PackagePlan, build_script_var_map,
                                build_scriptvar_owner_map,
+                               build_assigned_var_names,
                                build_script_assigned_packages)
+    from .dialogue.quest import set_assigned_var_names
     from .packages.actor_wiring import load_package_types
     _master_export = ctx.master_export if ctx else None
     load_package_types(by_type, _master_export)
 
     _script_vars = build_script_var_map(by_type, _master_export)
+    set_assigned_var_names(
+        build_assigned_var_names(by_type, _master_export))
     _sv_owner = build_scriptvar_owner_map(by_type, fid_to_edid)
     pack_plan = PackagePlan()
     _script_assigned = build_script_assigned_packages(by_type, fid_to_edid,
@@ -839,16 +883,20 @@ def _prescan_outfits_hair_skin(by_type: dict, ctx, export_dir: str):
 
 
 def _apply_dobj_battle_override(battle, writer) -> None:
-    """Override the master's DOBJ so its BTMS names our Battle music.
+    """Override the master's DOBJ for our Battle music and the lockpick slots.
 
-    The engine reaches combat music ONLY through that default object, so a
-    Battle MUSC nothing points at can never play.  Every other entry is copied
-    unchanged -- the same full-array override each official DLC ships.
+    The engine reaches combat music and the lockpicking minigame ONLY through
+    these default objects, so a Battle MUSC nothing points at never plays and a
+    converted lockpick nothing names is inert clutter.  LKPK/SKLK keep the
+    master's own forms, which the item substitutions already redirect
+    references to.  Every other entry is copied unchanged -- the same
+    full-array override each official DLC ships.
 
     See: docs/commentary/tes5_import_pipeline.md#phase-0c-dobj-btms
     """
     try:
-        from .record_types.music import build_DOBJ_override
+        from .base.equivalents import (
+            build_DOBJ_override, DOBJ_BATTLE_MUSIC_TAG, DOBJ_ITEM_TAGS)
         from asset_convert.sources.skyrim_assets import find_skyrim_data
         _sk = find_skyrim_data()
         _esm = os.path.join(_sk, 'Skyrim.esm') if _sk else None
@@ -856,12 +904,16 @@ def _apply_dobj_battle_override(battle, writer) -> None:
             print('  WARNING: Skyrim.esm not found; combat music '
                   'stays vanilla.')
             return
-        _dobj = build_DOBJ_override(battle, _esm)
+        _tags = dict(DOBJ_ITEM_TAGS)
+        if battle:
+            _tags[DOBJ_BATTLE_MUSIC_TAG] = battle
+        _dobj = build_DOBJ_override(_tags, _esm)
         if _dobj:
             writer.add_record('DOBJ', _dobj[1])
             print('  Music: combat music bound to the converted Battle track')
+            print('  Items: lockpick/skeleton key bound to the vanilla forms')
         else:
-            print('  WARNING: master DOBJ has no BTMS entry; '
+            print('  WARNING: master DOBJ has no overridable entry; '
                   'combat music stays vanilla.')
     except Exception as _de:
         print(f'  WARNING: DOBJ override failed: {_de}')

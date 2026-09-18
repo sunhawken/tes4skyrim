@@ -13,11 +13,29 @@ import struct
 from ..tes4_reader import (Record, get_all_subrecords,
                            get_formid_str, get_string,
                            get_subrecord)
+from .quest_falloutnv import emit_quest_deltas
 from .common import (emit_float, emit_formid, emit_model, emit_raw_hex,
                      emit_script, emit_string, emit_u8, emit_u16, emit_u32)
 
 #: HEDR.Version reported by FO3/FNV plugins; Oblivion reports 0.8 or 1.0.
 FALLOUT_HEDR_MIN = 1.2
+
+
+def info_result_scripts(rec: Record) -> tuple:
+    """(Begin, End) result-script text of an INFO.
+
+    FO3/FNV embed TWO scripts in an INFO, Begin then End, split by the NEXT
+    marker; TES4 embeds one, which counts as Begin.
+    See: docs/commentary/tes4_export_falloutnv.md#info-end-script
+    """
+    texts = ['', '']
+    slot = 0
+    for sub in rec.subrecords:
+        if sub.type == 'NEXT':
+            slot = 1
+        elif sub.type == 'SCTX':
+            texts[slot] = get_string(sub)
+    return tuple(texts)
 
 
 def is_fallout(hedr_version: float) -> bool:
@@ -72,6 +90,7 @@ def _emit_refr_deltas(lines: list, rec: Record):
         lines.append(f"XPRM.BoundX={bx}")
         lines.append(f"XPRM.BoundY={by}")
         lines.append(f"XPRM.BoundZ={bz}")
+        emit_raw_hex(lines, "XPRM.Raw", xprm)
 
     xrds = get_subrecord(rec, "XRDS")
     if xrds and len(xrds.data) >= 4:
@@ -462,6 +481,7 @@ _DELTA_DISPATCH = {
     "ALCH": _emit_effect_deltas,
     "ENCH": _emit_effect_deltas,
     "INGR": _emit_effect_deltas,
+    "QUST": emit_quest_deltas,
 }
 
 #: Types carrying an OBND that TES4 has no field for; Skyrim reads it natively.

@@ -9,6 +9,7 @@ See: docs/commentary/tes5_import_navmesh.md#pool-orchestration
 """
 
 from asset_convert.game_paths import current_namespace
+from output_layout import asset_cache_chain
 import glob
 import hashlib
 import os
@@ -20,6 +21,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 from core.worker_budget import worker_count
 from . import cache_audit as navm_verify, worker as navm_worker
+from ..overrides.nested import DELETED_FLAG
 from ..record_types.navm_falloutnv import precompute_fallout_navmeshes
 from ..base.text_reader import (get_float, get_formid, get_formid_index_offset,
                            get_injected_formids, get_int, get_str)
@@ -191,6 +193,28 @@ def _by_parent_cell(recs) -> dict:
     return out
 
 
+def _merge_master_cell_records(by_type: dict, master_export: dict,
+                               sig: str) -> list:
+    """`sig` records the plugin navmeshes with: the masters' plus its own.
+
+    A child plugin re-states only the references it edits, so navmeshing from
+    `by_type` alone carves a cell the masters furnished as if it were bare.
+    The masters' records are the baseline; the plugin's own override them by
+    FormID, and one the plugin flags deleted drops out entirely.
+
+    See: docs/commentary/tes5_import_navmesh.md#master-owned-cells
+    """
+    own = by_type.get(sig, [])
+    if not master_export:
+        return own
+    own_fids = {get_formid(rec, 'FormID') for rec in own}
+    merged = [rec for key, rec in master_export.items()
+              if rec.get('Signature') == sig and int(key, 16) not in own_fids]
+    merged.extend(rec for rec in own
+                  if not (get_int(rec, 'RecordFlags') & DELETED_FLAG))
+    return merged
+
+
 def _is_door_ref(rec: dict, door_fids) -> bool:
     """Is this REFR a teleport door, or a placement of a DOOR base?"""
     if rec.get('XTEL.Door'):
@@ -297,19 +321,22 @@ def _gather_exteriors(jobs, by_type, cells, indexes, pers_doors) -> None:
                                     get_int(cell_rec, 'XCLC.Y')), []))
 
 
-def gather_navm_jobs(by_type: dict, door_fids: set = None) -> list:
+def gather_navm_jobs(by_type: dict, door_fids: set = None,
+                     master_export: dict = None) -> list:
     """Enumerate PGRD->NAVM jobs in the order the group builders visit them.
 
-    Interiors first (block/sub-block), then exteriors per worldspace.  Keeping
-    this identical to the builders means the FormIDs handed out match the
-    single-threaded allocation exactly.  Each job carries everything
-    convert_PGRD needs plus a (cell_fid, pgrd_fid) key the builders look up.
+    Interiors first (block/sub-block), then exteriors per worldspace, matching
+    the builders so allocated FormIDs match the serial path.  Geometry inputs
+    merge the masters in; the jobs themselves stay driven by the plugin's OWN
+    pathgrids, so no id moves.
 
     See: docs/commentary/tes5_import_navmesh.md#pool-orchestration
     """
     cells = by_type.get('CELL', [])
-    refr_by_cell = _by_parent_cell(by_type.get('REFR', []))
-    land_by_cell = _by_parent_cell(by_type.get('LAND', []))
+    refr_by_cell = _by_parent_cell(
+        _merge_master_cell_records(by_type, master_export, 'REFR'))
+    land_by_cell = _by_parent_cell(
+        _merge_master_cell_records(by_type, master_export, 'LAND'))
     pgrd_by_cell = _by_parent_cell(by_type.get('PGRD', []))
     indexes = (refr_by_cell, land_by_cell, pgrd_by_cell)
     pers_doors = _persistent_doors_by_grid(cells, refr_by_cell,
@@ -332,6 +359,46 @@ def gather_navm_jobs(by_type: dict, door_fids: set = None) -> list:
 
 #: Runs AFTER geometry leaves the cache, so it cannot invalidate an entry.
 _TAG_EXCLUDE = frozenset({'edge_links.py'})
+
+
+def master_navm_grid(master_export: dict, master_index) -> dict:
+    """{(wrld_fid, grid_x, grid_y): navm_fid} for the MASTERS' exterior cells.
+
+    Edge links are matched by grid position, but the master index keys its
+    navmeshes by CELL FormID, so the masters' own CELL records supply XCLC.
+    A split cell contributes its FIRST navmesh, matching the id an override
+    of that cell adopts.
+
+    See: docs/commentary/tes5_import_navmesh.md#cross-plugin-edge-links
+    """
+    if not master_export or master_index is None:
+        return {}
+    out = {}
+    ext = no_navm = 0
+    for rec in master_export.values():
+        if rec.get('Signature') != 'CELL':
+            continue
+        wrld = get_formid(rec, 'ParentWRLD')
+        if not wrld or get_int(rec, 'RecordFlags') & _PERSISTENT_FLAG:
+            continue
+        ext += 1
+        fids = master_index.navms(get_formid(rec, 'FormID'))
+        if fids:
+            out[(wrld, get_int(rec, 'XCLC.X'),
+                 get_int(rec, 'XCLC.Y'))] = fids[0]
+        else:
+            no_navm += 1
+    print(f"    Master navmesh grid: {len(out)} cells mapped, {no_navm} of "
+          f"{ext} exterior cells have no NAVM in the master index")
+    return out
+
+
+def collision_cache_chain(export_dir: str) -> tuple:
+    """Every collision cache this plugin needs, MASTERS FIRST.
+
+    See: docs/commentary/tes5_import_navmesh.md#master-owned-cells
+    """
+    return asset_cache_chain(export_dir, 'collision_cache.bin')
 
 
 def navmesh_geom_cache(collision_cache: str):
@@ -385,43 +452,122 @@ def stamp_navmesh_cache_tag(geom_cache) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _progress(done, total, t0):
+    """Print one `done/total` line with the rate so far."""
+    rate = done / max(time.time() - t0, 1e-6)
+    print(f"    {done}/{total} navmeshes ({rate:.1f}/s)", flush=True)
+
+
+def _progress_every(total) -> int:
+    """Jobs between progress lines: about 40 lines, whatever the plugin size."""
+    return max(1, total // 40)
+
+
 def _run_inline(jobs) -> dict:
     """Convert every job in this process; one tiny job is not worth a pool."""
     cache = {}
-    for job in jobs:
+    total, every, t0 = len(jobs), _progress_every(len(jobs)), time.time()
+    for done, job in enumerate(jobs, 1):
         key, result = navm_worker.run_job(job)
         cache[key] = result
+        if done % every == 0 or done == total:
+            _progress(done, total, t0)
     return cache
 
 
-def _run_pooled(jobs, initargs, n_workers) -> dict:
-    """Convert every job across a process pool.
+def _map_kwargs(n_jobs, n_workers) -> dict:
+    """chunksize/buffersize for a run_job map.
 
     `buffersize` bounds how many jobs are pickled and queued at once; it only
     exists from Python 3.14, and omitting it is the pre-3.14 behaviour.
     """
-    chunksize = max(1, len(jobs) // (n_workers * 8))
-    map_kwargs = {'chunksize': chunksize}
+    chunksize = max(1, n_jobs // (n_workers * 8))
+    kwargs = {'chunksize': chunksize}
     if sys.version_info >= (3, 14):
-        map_kwargs['buffersize'] = n_workers * chunksize * _BUFFER_FACTOR
+        kwargs['buffersize'] = n_workers * chunksize * _BUFFER_FACTOR
+    return kwargs
+
+
+def _pool(initargs, n_workers) -> ProcessPoolExecutor:
+    """A run_job pool whose workers carry this plugin's context."""
+    return ProcessPoolExecutor(max_workers=n_workers,
+                               initializer=navm_worker.init_worker,
+                               initargs=initargs,
+                               max_tasks_per_child=_TASKS_PER_CHILD)
+
+
+def _run_pooled(jobs, initargs, n_workers) -> dict:
+    """Convert every job across a process pool."""
     cache = {}
-    with ProcessPoolExecutor(max_workers=n_workers,
-                             initializer=navm_worker.init_worker,
-                             initargs=initargs,
-                             max_tasks_per_child=_TASKS_PER_CHILD) as ex:
-        for key, result in ex.map(navm_worker.run_job, jobs, **map_kwargs):
+    total, every, t0 = len(jobs), _progress_every(len(jobs)), time.time()
+    with _pool(initargs, n_workers) as ex:
+        for done, (key, result) in enumerate(
+                ex.map(navm_worker.run_job, jobs,
+                       **_map_kwargs(len(jobs), n_workers)), 1):
             cache[key] = result
+            if done % every == 0 or done == total:
+                _progress(done, total, t0)
     return cache
 
 
+def pooled_prover(initargs, n_workers):
+    """A `rebuild` callable for cache_audit.prove_cache, backed by the pool.
+
+    Yields `(key, meta)` in SUBMISSION order, so the first mismatch a caller
+    sees does not depend on which worker finished first.
+
+    See: docs/commentary/tes5_import_navmesh.md#proving-runs-on-the-pool
+    """
+    def _rebuild(jobs):
+        """Rebuild `jobs` across the pool, yielding results in order."""
+        if len(jobs) == 1 or n_workers == 1:
+            for job in jobs:
+                yield navm_worker.run_job(job)
+            return
+        workers = min(n_workers, len(jobs))
+        with _pool(initargs, workers) as ex:
+            yield from ex.map(navm_worker.run_job, jobs,
+                              **_map_kwargs(len(jobs), workers))
+    return _rebuild
+
+
+def _adopt_master_navm_fids(jobs: list, master_index) -> int:
+    """Point jobs at a MASTER's cell at that cell's existing NAVM ids.
+
+    Returns the number of jobs re-pointed.  Every job keeps the id
+    `derive_formid` handed it unless the master already navmeshed its cell:
+    skipping the call would change the allocator's taken-set and move
+    unrelated derived ids.
+
+    See: docs/commentary/tes5_import_navmesh.md#master-owned-cells
+    """
+    if master_index is None:
+        return 0
+    by_cell = defaultdict(list)
+    for job in jobs:
+        by_cell[job['key'][0]].append(job)
+
+    adopted = 0
+    for cell_fid, cell_jobs in by_cell.items():
+        master_fids = master_index.navms(cell_fid)
+        if not master_fids:
+            continue
+        for job, fid in zip(cell_jobs, master_fids):
+            job['navm_fid'] = fid
+            adopted += 1
+    return adopted
+
+
 def precompute_navmeshes(by_type: dict, writer, base_model_by_fid: dict,
-                         door_fids: set, collision_cache: str = '') -> dict:
+                         door_fids: set, collision_cache: str = '',
+                         master_index=None, master_export: dict = None) -> dict:
     """Run every PGRD->NAVM conversion in parallel; return {key: (bytes, meta)}.
 
     FormIDs are pre-allocated serially in builder-visit order, so results are
-    byte-identical to the single-threaded path regardless of completion order.
-    The worker context is initialized HERE, in the parent, before
-    `navm_verify.prepare` rebuilds any sampled cell.
+    byte-identical to the single-threaded path.  The worker context is
+    initialized HERE because `navm_verify.prepare` re-keys entries from it.
+    `collision_cache` is a path or a masters-first chain whose LAST entry is
+    this plugin's own and sites the derived geom/door caches.
 
     See: docs/commentary/tes5_import_navmesh.md#pool-orchestration
     """
@@ -429,23 +575,30 @@ def precompute_navmeshes(by_type: dict, writer, base_model_by_fid: dict,
     if fallout is not None:
         return fallout
 
-    jobs = gather_navm_jobs(by_type, door_fids)
+    jobs = gather_navm_jobs(by_type, door_fids, master_export)
     if not jobs:
         return {}
 
     formid_offset = get_formid_index_offset()
     for job in jobs:
         job['navm_fid'] = writer.derive_formid('NAVM', job['key'])
+    adopted = _adopt_master_navm_fids(jobs, master_index)
+    if adopted:
+        print(f"    {adopted} navmeshes override a master's own "
+              f"(of {len(jobs)})")
 
     n_workers = navm_worker_count(len(jobs))
-    geom_cache = navmesh_geom_cache(collision_cache)
+    own_cache = (collision_cache if isinstance(collision_cache, str)
+                 else (collision_cache[-1] if collision_cache else ''))
+    geom_cache = navmesh_geom_cache(own_cache)
     door_centers = navm_verify.door_centers_cache_path(collision_cache)
     initargs = (base_model_by_fid, door_fids, collision_cache, formid_offset,
                 geom_cache, get_injected_formids(), True, door_centers)
     navm_verify.init_context(base_model_by_fid, door_fids, collision_cache,
                              formid_offset, geom_cache,
                              get_injected_formids(), door_centers)
-    navm_verify.prepare(jobs, geom_cache)
+    navm_verify.prepare(jobs, geom_cache,
+                        pooled_prover(initargs, n_workers))
 
     print(f"  Generating {len(jobs)} navmeshes (PGRD->NAVM) "
           f"across {n_workers} processes...")

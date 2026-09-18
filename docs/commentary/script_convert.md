@@ -391,6 +391,25 @@ Audited output carries only 2 `;TODO:` markers across 18,566 scripts, so marker
 counts measure honesty, not correctness — never treat a clean output scan as
 evidence the conversion is complete.
 
+### <a id="script-type-property-binding"></a>When an attached script class may stand in for a property type
+
+**Code:** `script_convert/resolve_name.py:script_type_binds`
+
+A property naming a record is normally typed by the record's signature. Where
+the record carries an attached script, the generated script class is the more
+useful type — it exposes that script's variables for cross-script reads — but
+the VM refuses to bind a script class to a BASE object, so `script_type_may_override`
+gates it.
+
+One exception is measured: a scripted world object (ACTI/LIGH) with exactly ONE
+placed ref binds fine, because the property binder redirects the binding to that
+ref, which is what actually carries the script instance. Without the exception
+the base gate stripped cross-script variables off unique activators and
+`SE01Metronome.weatherVAR` and the SE11 trigzone stopped compiling.
+
+Inventory types (ARMO/WEAP/…) stay excluded even with a lone world placement:
+their properties mean the BASE (AddItem/RemoveItem), never that placement.
+
 ### <a id="generated-script-types"></a>🔴 A generated script type is recognized by PREFIX, and the prefix is per-game
 
 **`is_generated_script_type()` in `script_convert/constants.py` is the ONLY way
@@ -924,7 +943,59 @@ it. `_has_gamemode` must account for it too, or a script whose only block is a
 bare MenuMode (`SE42Script`, `DAOghmaInfiniumScript`) gets no loop at all.
 
 Two exceptions keep their own routes: the `isPCSleeping` idiom becomes
-`OnSleepStart`/`OnSleepStop`, and menu-ID blocks stay commented.
+`OnSleepStart`/`OnSleepStop`, and menu-ID blocks take the route below.
+
+### <a id="menumode-with-a-menu-id"></a>`begin MenuMode <id>` → `OnMenuClose`
+
+The blanket "menu-ID blocks stay commented" rule above cost a real quest. FNV's
+`VCG01` — Doc Mitchell's opening — parks forever at stage 36:
+
+* INFO `00104BF8` ("How'd I do?") ends with `SetStage VCG01 36`.
+* Stage 36's entire body is `ShowRaceMenu` (the reflectron).
+* Stage 37 is an empty placeholder: *"set when the player leaves menu mode"*.
+* Stage 40 is `DocMitchellREF.SayTo player VCG01Intro` — Doc resuming.
+
+Nothing in the quest data advances 36 → 40. The only writer is `VCG01SCRIPT`:
+
+```
+BEGIN menumode 1036
+	if getstage VCG01 == 36
+		setstage VCG01 40
+	endif
+END
+```
+
+Commented out, the race menu opens and Doc never speaks again.
+
+SKSE is a required install, so `RegisterForMenu` / `OnMenuClose` are available
+and a mapped id gets a **real listener**. TES4 ran the body every frame the menu
+was up; the observable Skyrim moment is the close, so the body runs once there.
+That is the right beat for both known 1036 users — FNV advances a stage *after*
+the player is done, and Nehrim's `CharGenQuest` accumulates a "long in the
+character designer" achievement timer.
+
+**Menu-ID mapping**, `MENU_ID_NAMES` in `constants.py`. The menu-name string is
+copied verbatim from `SkyrimSE.exe` (note the space in `RaceSex Menu`):
+
+| TES4/FNV id | Skyrim menu | Evidence |
+|---|---|---|
+| 1036 | `RaceSex Menu` | FNV stage 36 calls `ShowRaceMenu`; Nehrim's block feeds `LongInCharacterDesigner` |
+
+**The map holds only ids whose body is safe to run on a close**, which is why it
+has one entry rather than the six the menu-name table would allow. 1014
+(lockpicking) is the counter-example: MQ01Script's `begin MenuMode 1014` is
+`setstage MQ01 70`, and firing that the first time the player closes *any*
+lockpick still blows the tutorial through its stage machine — the same defect as
+merging it into the GameMode poll, just later. An id earns a row only when its
+bodies across the corpus are genuinely "the player finished with this menu"
+logic. Everything unmapped keeps the comment treatment: converted so a hand-port
+only has to supply the hook, but never executed.
+
+Census of filtered blocks (`begin MenuMode <id>`) across the three plugins —
+Nehrim 1008×49, 1012×2, 1007×2, 1036, 1044, 1033, 1039; FalloutNV 1001×15,
+1012×3, 1056×2, 1008, 1009; Oblivion 1023×2, 1034×2, 1012, 1040, 1002, 1022,
+1014, 1030. Nehrim's 1008×49 is one script's per-menu bookkeeping, not 49
+triggers.
 
 Before merging, check the bodies are safe on an ordinary frame. All 20 are
 idempotent state machines gated by their own doonce/stage variables; a merged
@@ -1001,12 +1072,52 @@ So the emission is **context-dependent**:
 * **One-shot site** (quest-stage fragment, `OnActivate`) — keeps the
   fall-through `If !busy` form. Nothing repeating re-enters it, so the latch
   can only trip on a genuine race, and there a `Return` would **drop** the
-  authored tail rather than defer it. CharacterGen stage 87 is exactly that
-  shape: `MQ02.SetStage(20)`, the end-of-chargen topic unlocks and the
-  autosave all follow its class menu.
+  authored tail rather than defer it.
 
 The general rule: when a converted call blocks, ask whether its caller
 repeats. A `Return` is only correct where something will call again.
+
+### <a id="chargen-menu-reopens-the-dialogue"></a>A chargen menu closes the dialogue it opened from; the partner must re-greet at once
+
+**Code:** `commands.chargen_menu`, `TES4Polyfill.DialogueSpeaker`.
+
+CharacterGen stage 87: Baurus's class-guess line ends, its End fragment sets
+stage 87, the stage fragment opens the class menu, the player picks, and
+Baurus restarts the conversation only after a long delay. The quest reads 87
+meanwhile, and 88 (the completion stage, set only by the four `CGBaurusI`
+INFOs) is unreachable until he does.
+
+What the records say:
+
+* Stage 87's TES4 result script is **only** `showclassmenu`. Everything the
+  section above once credited to it (`MQ02.SetStage(10/20)`, the topic
+  unlocks, the autosave) is stage **88**.
+* Oblivion authored the re-greet itself: `CGBaurusToPlayerB` (`0001EC0F`) is a
+  player-targeted Ambush gated `GetStage CharacterGen == 87`, beside
+  `CGBaurusToPlayerA` gated `== 86`. TES4's modal menu sat over a dialogue that
+  stayed open; ToPlayerB is the fallback for a player who left it.
+* Skyrim's `Message.Show()` closes the dialogue menu. The CK wiki's ForceGreet
+  procedure "completes after the actor says the line and exits dialogue", and
+  the package stack is otherwise re-evaluated only **periodically** — so
+  Baurus sits on the finished ToPlayerA until the engine's next evaluation,
+  and only then runs ToPlayerB (`fAIForceGreetingTimer` = 3.0s after that).
+  The birthsign path never showed this because stage 44's authored
+  `UrielSeptimRef.evp` re-evaluates the Emperor the moment the menu closes.
+
+The conversion supplies the evp TES4 did not need. `chargen_menu` captures
+`TES4Polyfill.DialogueSpeaker()` before `Show()` — the actor whose line last
+played in the player's dialogue menu, from the Variable05/06 stamp
+`LineBegan` writes on the player (`Actor.GetDialogueTarget()` is documented to
+return None on the player) — and calls `EvaluatePackage()` on it after the
+menu. At a polled site (the birthsign menu) the poll only runs once
+`PlayerIsInDialogue()` is false, which has cleared the stamp, so the call is a
+no-op and that path is byte-identical to before.
+
+Reverted on the way here: a `ReleaseSpokenLine()` polyfill that cleared the
+speaking latch before `Show()`. Emitted at every chargen-menu site it fired
+inside polled bodies mid-line and stopped actors finishing their lines
+game-wide; its theory (the modal swallowing the End fragment) was also wrong —
+the End fragment is what opens the menu.
 
 ### A "no equivalent → 0" fallback can shadow a working handler (2026-07-31)
 <a id="no-equivalent-fallback-shadows-handler"></a>
@@ -3152,6 +3263,7 @@ Routed to a real native, verified against the vanilla headers:
 | `GetHealthPercentage` | `Actor.GetActorValuePercentage("Health")` | 0.0-1.0, matching the authored `< 0.5` tests |
 | `GetDestructionStage` | `ObjectReference.GetCurrentDestructionStage()` | the honest native; returns 0 because this conversion writes no DEST |
 | `GetMapMarkerVisible` | `ObjectReference.IsMapMarkerVisible()` | `bare_bool cmp_bool`, so `== 0` collapses to `!(...)` rather than comparing Bool to Int |
+| `CIOS <spell>` / `CastImmediateOnSelf` | `Spell.Cast(self, self)` | the shared `cast` handler under FNV's names (`FALLOUT_COMMAND_ALIASES`; 49 SCPT + 28 INFO sites) |
 
 Neutralised — no equivalent exists: `GetFurnitureMarkerID`, `GetHitLocation`,
 `IsHardcore`, `GetWeaponHealthPerc`, `GetActorFactionPlayerEnemy`,
@@ -3386,6 +3498,62 @@ others); keying on the raw spelling emitted TWO latches, and a guard could then
 compare against the one the poll tail never updates — so it would never open.
 Papyrus is case-insensitive, so the duplicate declarations compiled and the fault
 would only have shown in game.
+
+### The dialogue poll gate
+<a id="the-dialogue-poll-gate"></a>
+
+**Code:** `script_convert/assemble.py:_dialogue_gate`
+
+TES4 `GameMode` never ran while a dialogue menu was open. Measured in game
+(CharacterGen 40-50) with no gate: the Emperor's poll fired during his stage-42
+dialogue and its `Say()` INTERRUPTED his 17.8 s Goodbye reply, so the reply's
+`setstage 43` was lost and the birthsign menu never opened; the quest poll's
+stage-45 guard fired during the stage-44 dialogue and sent Baurus in to
+force-greet over it.
+
+**Only scripts that SPEAK carry the gate** (`conv.sc.uses_say`). Applying it to
+every poll -- the first attempt, same day -- put `PlayerIsInDialogue` on ~210
+quest polls at 0.1 s and the VM starved: End fragments ran 11-17 s late and
+"Yessir" played twice. A poll that never speaks cannot cut a line, so it does
+not need the gate.
+
+### A worldspace property must use the CONVERTED EditorID
+<a id="worldspace-property-rename"></a>
+
+The importer renames Oblivion's `Tamriel` worldspace to `TES4Tamriel`
+(`tes5_import/record_types/world.py`, `convert_WRLD`): its FormID 0x3C remaps to
+0x0100003C, which would otherwise override Skyrim's own Tamriel. No other
+worldspace is renamed.
+
+A `GetInCell` family whose members include EXTERIOR cells compares them by
+worldspace plus grid square, because a Papyrus `Cell` property cannot bind to an
+exterior (see `split_cell_family`). That emits a `WorldSpace` property named
+after the TES4 worldspace -- and for Tamriel the TES4 name is the one the output
+does NOT use, so the property binds to nothing and reads `None`. Every
+`TES4_ws == Tamriel` arm is then false forever, and the helper returns false for
+any exterior position.
+
+Measured on Oblivion.esm: `Tamriel` was the 4th most common unbound declared
+property, in 51 scripts (`tools/validate/vmad_property_typecheck.py --unbound`).
+
+MQ04 is the case that shows the cost. Its poll bails the Cloud Ruler scene out
+to the waiting stage when the player is not in the temple family:
+
+```
+if (getstage MQ04 >=35 && getstage MQ04 <= 41)
+  if player.getincell CloudRulerTemple == 0
+    setstage MQ04 45
+```
+
+Fast travel lands the player OUTSIDE the gates, in exterior cell
+`CloudRulerTempleExterior02` (grid 3,39) -- inside the prefix family, so vanilla
+does not bail. With the worldspace property unbound the exterior arms cannot
+match, the helper returns false, and stage 35 -> 45 fires on the arrival pass,
+skipping the gate speech, the Blades hail and Martin's speech.
+
+`converted_worldspace_edid()` in `script_convert/constants.py` is the single
+spelling of the rename; `asset_convert/lod/terrain_lod.py` needs the same
+mapping to find LOD worldspaces in the converted ESM.
 
 ### A bare ref command on a receiver parses as a MEMBER
 <a id="a-bare-ref-command-parses-as-member"></a>
@@ -4814,3 +4982,221 @@ So a fragment is emitted only when it actually does something: the INFO has a
 TES4 result script to run; it reveals AddTopic unlock globals; it opens a
 service (barter/training) menu; or its topic is script-driven, so SayLine needs
 the Begin/End hooks.
+
+### <a id="poll-interval"></a>The OnUpdate poll interval
+
+**Code:** `script_convert/poll_interval.py`, read by `assemble.poll`,
+`assemble.lifecycle` and the `GetSecondsPassed` constant in `resolve_name`.
+
+An authored quest delay wins. FNV writes one per quest
+([export](tes4_export_falloutnv.md#quest-delay)); the pipeline maps each
+quest's SCRI to it and `_scpt_batch` seeds `ScriptContext.quest_delay` before
+`convert_standalone`, so the OnUpdate re-arm and the `OnInit` start both use
+it. Values below 0.1 s floor at 0.1: `RegisterForSingleUpdate(0.01)` is every
+frame, which is what 0.1 already delivers under load. The canteen quest's 300 s
+delay is the fix for the sip message that fired every 0.5 s.
+
+Without an authored delay the interval is content-driven: 0.1 s for a script
+that reads `GetSecondsPassed`, 0.15 s for a Say timer, 0.25 s for any other
+timer, else 0.5 s. The 0.15 s figure has history: 0.1 s was tried for Say
+timers and measurably LENGTHENED the gaps between lines, so 0.25 s shipped.
+That measurement was taken when every SayLine also blocked on
+`Utility.Wait(0.05)` for its claim handshake and `Utility.Wait(0.25)` after
+any busy wait, and when fragments blocked the dispatch path; the VM was
+saturated by the Say path itself and extra poll passes queued behind it. All
+three are gone, so 0.15 s buys back most of the tick latency without returning
+to the 0.1 s measured as too aggressive.
+
+### <a id="fnv-showmessage-menus"></a>FNV `ShowMessage <MESG>` + `GetButtonPressed` is the button-menu idiom
+
+**Code:** `message_menus.button_messages`, `commands_falloutnv.show_message`,
+`converter._mesg_for_show`.
+
+Oblivion's choice menu is `MessageBox "text" "A" "B"` polled by
+`GetButtonPressed`; FO3/FNV write `ShowMessage <MESG>` against an authored
+MESG whose `Button[i].Text` rows are the choices, polled by the same
+`GetButtonPressed`. The plan only knew `messagebox` lines, so an FNV script
+that shows a buttoned MESG had no plan entry and its `GetButtonPressed` fell
+to the dead `-1` — `VCG01SCRIPT`'s `bChooseSex` block (stage 17,
+`VCG01ChooseSexMessage`: Mister / Ma'am) could never leave `nButton == -1`.
+(That block is dead in vanilla FNV too — nothing sets stage 17 — but the idiom
+is FNV's standard menu.)
+
+An authored MESG with buttons that a script names in `ShowMessage` now enters
+the plan under the MESG's own EDID with text None; `create_message_menu_records`
+skips those (the record is converted by `convert_MESG`), the converter emits
+`TES4_MsgButton = TES4_ShowMsg(<MESG>)` at the site, and `GetButtonPressed`
+becomes the consume-once `TES4_TakeMsgButton()` exactly as for Oblivion. A
+MESG without buttons keeps the row's plain `Show()`.
+
+### <a id="furniture-use"></a>`IsCurrentFurnitureRef` / `IsCurrentFurnitureObj` read SKSE's GetFurnitureReference
+
+Both were dead `0`s. Skyrim's vanilla `GetSitState()` knows no reference,
+but SKSE (a required install) adds `Actor.GetFurnitureReference()`, so the
+rows call `TES4Polyfill.IsCurrentFurnitureRef(actor, ref)` /
+`IsCurrentFurnitureObj(actor, base)`. FNV's `VCG01DocMitchellCouchTriggerSCRIPT`
+gates its `SetObjectiveCompleted VCG01 40` ("Sit down on the couch") on
+`player.IsCurrentFurnitureRef DocMitchellCouchREF`, so the objective could
+never complete. Its follow-up, `DocMitchellREF.StartConversation Player`,
+still converts to a `Say(GREETING)` bark; the psych test then needs the
+player to talk to Doc, since Skyrim has no scripted "open dialogue" call.
+
+### <a id="fnv-objective-commands"></a>FO3/FNV objective commands
+
+FNV drives the journal through objectives rather than log entries
+([export](tes4_export_falloutnv.md#objectives)). Sites in FalloutNV.esm:
+
+| Command | Sites (SCPT / INFO / QUST) | Papyrus |
+|---|---|---|
+| `SetObjectiveDisplayed Q idx [0/1]` | 49 / 372 / 213 | `Q.SetObjectiveDisplayed(idx, flag)` |
+| `SetObjectiveCompleted Q idx [0/1]` | 21 / 522 / 177 | `Q.SetObjectiveCompleted(idx, flag)` |
+| `SetObjectiveFailed Q idx [0/1]` | 0 | `Q.SetObjectiveFailed(idx, flag)` |
+| `GetObjectiveDisplayed Q idx` | 557 / 325 / 41 | `Q.IsObjectiveDisplayed(idx)` |
+| `GetObjectiveCompleted Q idx` | 551 / 346 / 40 | `Q.IsObjectiveCompleted(idx)` |
+
+The flag argument defaults to 1, as in the GECK. `abForce` is left false: the
+CK wiki defines it as re-showing an objective that was displayed before, which
+FNV's call does not do. `SetQuestDelay Q secs` kicks one
+`RegisterForSingleUpdate`, the same one-shot `set X.fQuestDelayTime` gets.
+
+A quest with authored objectives gets no synthesized `SetObjectiveDisplayed(stage)`
+in its stage fragments: the objective indices are not stage indices, and the
+authored scripts already display them.
+
+### <a id="fnv-unknown-objective-index"></a>Indices the quest never authored
+
+FNV scripts call objective indices their own quest does not define.
+`nVPrimmDeputyConv` authors ten -- 10, 15, 20, 21, 22, 25, 30, 34, 36, 37 --
+and `PrimmDeputyQuestScript` polls `IsObjectiveDisplayed(31)`. The index is
+absent from FalloutNV.esm, so this is authored dead code, not a conversion
+dropout: Fallout ignored the call, while Skyrim logs `unknown quest objective
+N` for every one. In a 2026-09-15 session that single call site produced 1,671
+of 13,795 Papyrus errors, because it sits in a GameMode poll.
+
+`quest_objective_indices()` maps quest EditorID -> authored QOBJ indices and
+`quest_native` drops a call naming an index outside that set, emitting `;NE:`.
+
+Keyed on the quest the call NAMES, never the script's own: of 6,625 objective
+calls in FalloutNV.esm, 5,889 target a different quest. The guard needs a
+literal index (6,625 of 6,627 are; the 2 variables pass through) and stays
+silent for a quest that authors no objectives at all, so a quest whose
+objectives this pipeline has not converted is never second-guessed.
+
+## <a id="script-output-dir"></a>The script output directory: wiped, static scripts by ownership
+
+**Code:** `script_convert/context_setup.py`, called from `pipeline.build_script_context`.
+
+### <a id="wipe-output-dir"></a>Start from an empty directory
+
+Which scripts the conversion produces changes with the plan and with the
+source records, and nothing used to delete the ones that stopped being
+generated, so they SURVIVED in `output/` and kept being attached. Measured:
+scoping speaker-kind Say-timer owners stopped generating 10,268 bogus INFO
+fragments, but the stale `.psc`/`.pex` stayed on disk, so Uriel Septim's
+GREETING went on binding a fragment that cast him to two scripts he does not
+carry: the line kept its subtitle on screen and never advanced to its
+remaining two responses. Wiping is the honest form of the guarantee. Every
+alternative (prefix lists, mtime "written this run" checks) needs a growing
+set of exceptions for the static scripts deployed alongside the generated
+ones, and each exception is another way to keep a stale file. After a wipe,
+anything present IS something this run produced. Both source and compiled
+output are cleared: a stale `.pex` is worse than a stale `.psc`, because the VM
+loads it whether or not the source is still there.
+
+### <a id="bounds-cache-schema"></a>The mesh-bounds cache must be current
+
+A cache from before the HELD bit existed loads fine and answers 0 for every
+mesh, so the release silently vanishes from every converted script. The
+scripts stage cannot rebuild it (`--scripts-only` runs with no mesh scan), so
+it warns instead of emitting quietly wrong scripts: breakaway/trap havok
+releases are not emitted and planks and traps hang instead of falling until
+the import or meshes step rebuilds the cache.
+
+### <a id="static-scripts-ownership"></a>Static scripts belong to the masterless plugin
+
+TES4Polyfill and the shared service-menu fragments are plugin-independent:
+TES4Polyfill is Hidden with none but Global functions, and the two service
+fragments are stateless TopicInfos. A dependent plugin shipping its own copy
+just duplicates the master's `.psc`/`.pex` under the same script name, and
+whichever loads last wins. Dependents still CALL them: the generated bodies
+reference `TES4Polyfill.*` and INFO VMADs name the service fragments, both of
+which resolve to the master's shipped copy (`phase_compile` puts every
+master's source dir on the `-h` header path). Copies an older, pre-skip build
+left in a dependent's output are removed: the stale `.psc` shadows the
+master's fresh copy on the compile header path (Translation.esp's Aug-1
+TES4Polyfill had no ReleaseBreakaway, so every script calling it failed to
+compile), and the stale `.pex` ships under the same script name as the
+master's.
+
+## <a id="quest-fragments"></a>Quest-stage fragment scripts
+
+**Code:** `script_convert/quest_fragments.py` (`quest_fragment_psc`), written by
+`pipeline._qust_batch`; SCRO tables in `script_convert/scro_refs.py`.
+
+A fragment is generated for every stage log entry that has journal text
+(CNAM) or a result script. Each journal fragment calls
+`SetObjectiveDisplayed` / `SetObjectiveCompleted` so the quest appears in the
+Skyrim journal; without those calls CNAM text is never visible. A quest with
+authored objectives ([FNV](#fnv-objective-commands)) skips them.
+
+### <a id="one-objective-per-stage"></a>One objective per stage index
+
+A stage has ONE objective (index = stage index) no matter how many journal
+entries it carried in TES4: MQ01's tutorial stages ship a gamepad text and a
+keyboard text, and emitting the objective calls per entry displayed the same
+objective twice.
+
+### <a id="complete-flag-ends-the-quest"></a>QSDT 0x01 completes the QUEST, not an objective
+
+TES4 QSDT 0x01 marks the stage that ENDS the quest. TES4 has no fail bit: a
+quest's success and failure endings are both flag 0x01, and 89 of Oblivion's
+390 quests have several such stages. Nothing may be left hanging as an open
+bullet, and which branch the player took cannot be known statically, so the
+engine settles it: `CompleteAllObjectives()` closes whatever is still
+displayed and leaves the never-shown entries of the skipped branch alone,
+then `CompleteQuest()`.
+
+### <a id="property-type-merge"></a>Merging case-variant property names
+
+SCRO-derived properties and body-derived ones can spell one name in two
+cases. The merge keeps the first-seen (SCRO-canonical) spelling so it matches
+the VMAD binding, and the more specific type: a non-Quest type beats `Quest`,
+and `ActorBase` beats ANY reference type, Actor and Actor-derived `TES4_*`
+scripts included. Base typing comes from a base-semantics function
+(SetEssential base); the VMAD binds that property to a base (NPC_/CREA)
+record, and a reference-typed property bound to a base is UNBINDABLE: Papyrus
+aborts the whole script's init, the quest never finishes initialising and its
+aliases never fill (FGC01Rats: QuillWeave, an NPC_ base, was typed as the
+Actor script `TES4_FGC01QuillweaveScript`). The same rule holds in
+`scro_refs._add_scro_ref`: an `ActorBase` typing already set is never
+overwritten by the SCRO's record type.
+
+### <a id="unlock-globals-declared-once"></a>Unlock globals are declared once
+
+The stage-reveal unlock globals are declared from `stage_reveals`. The
+converter ALSO registers them, since a script `AddTopic X` emits
+`TES4Unlock_X.SetValue(1)`, and a stage whose result script contains that
+AddTopic is reached by both paths, so the declared set is seeded into
+`property_declarations` or the same name is declared twice ("property with
+`TES4Unlock_...` name already exists").
+
+### <a id="quest-property-never-downgrades"></a>A quest property never downgrades to `Quest`
+
+**Code:** `constants.typed_already`, used by `commands.stage`,
+`commands.quest_state` and `commands_falloutnv.quest_native`.
+
+The same quest is often reached both as a stage target and as a cross-script
+variable owner (`Arena.SetStage 10` beside `Arena.ChorrolMatch`), and the
+specific `TES4_<script>` type is what makes the variable read compile.
+Overwriting it with the base `Quest` failed every such read ("field or
+property ChorrolMatch not found"). A `TES4_XxxScript` extends Quest, so it
+still answers Start/Stop/IsRunning and the objective natives. `Quest` is
+enough when nothing is known: the SCPT-derived name would be wrong for the
+lifecycle calls, since in TES5 the quest's VMAD script is `TES4_QF_<EditorID>`
+rather than the SCPT name. The check is case-insensitive: Papyrus is, so
+`CharacterGen` and `Charactergen` are ONE property, and an exact-match guard
+let a later SetStage overwrite the specific type.
+
+The FNV objective rows first carried `types={0: 'Quest'}`, which registers the
+type unconditionally: 345 FalloutNV scripts then failed with "field or
+property X not found" on quest-variable reads (`VMS16.nGangerDeathCount`).

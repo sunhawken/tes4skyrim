@@ -368,6 +368,10 @@ Triangles are identified by CENTROID between detection and packing — the cull
 and compaction passes reorder both triangles and vertices, so an index captured
 early is meaningless later.
 
+<a id="ledge-lip-is-pushed-to-the-edge"></a>**A ledge lip is pushed out to where the upper floor really ends, and a pair a railing blocks is dropped** (`clean_validate.find_ledge_links`, `corridor._ledge_reach`). Vanilla (1,705 same-mesh Ledge Down links in Skyrim.esm) puts the lip ON the floor's edge, with the landing triangle a median 40u out from under it (p10 14u, p90 72u). Ours sat **24-68u inside the real edge in 7 of 17 pairs across ImperialDungeon01/02/03**: railing segments and an edge curb stand on the ledge edge, the width march stops at anything in the actor slab, and the outline passes trim the corner further. An actor then reaches our lip with floor still under it and the engine drives it in a straight line toward a landing almost directly beneath, through the railing or the ledge face -- "the drop is not vertical enough and clips". After pairing, each lip edge is marched along the drop direction with the same wall slab and floor test the width-grow uses; the two lip vertices move out to where the floor ends (2u short of it), and a pair whose way to the edge is blocked by a wall taller than a step is not linked at all, since no actor can get over that railing.
+
+<a id="tri-target-edge-192"></a>**`TRI_TARGET_EDGE` stays 128; 192 was measured and REJECTED** (`params.py`). Five vanilla interiors carry 3,870-10,022 u² per triangle with p90 areas of 8.5k-25k; ours carry 4,655-5,144 with p90 under 9.2k, because the hex lattice and the outline densify both run at 128u (an equilateral of that edge is ~7,100 u²), so a room never holds a large triangle. Measured with `tools/navmesh/coverage.py` and `slope_check.py` on ImperialDungeon01/02/03 and AnvilFightersGuild: **192 cuts 14-23% of the triangles (887->685, 985->852, 669->562, 220->207) for at most 0.17 points of coverage -- but opens 7 uncovered steep-edge samples on ImperialDungeon02 (0 at 128)**, at stair landings such as node n267 (771, 6634): the landing sits 35.3u above the floor, one unit over `MAX_CLIMB`, so a coarse triangle spanning landing and floor has corners sharing no storey and is dropped, leaving a notch at the node. The lattice, not the densify, is the cause (lattice 192 + densify 128 still misses 4); keeping the fine lattice only on sheets that contain a flight recovers a third of the saving (887->797, 985->855, 669->642) and still misses 1. Vanilla's larger triangles are therefore not reachable by spacing alone; the straddle drop at the storey boundary would have to be solved first.
+
 ### 🔴 The Door Triangle is RESERVED, not protected
 
 Vanilla marks a door with **ONE** triangle whose long edge is the **full width
@@ -626,6 +630,8 @@ A boundary-only CDT triangulates any region wider than one triangle as a FAN, so
 <a id="door-wedges-are-cut-not-stitched"></a>**Door wedges are CUT OUT and triangulated in the same vertex space, never stitched back** (`union_cdt._triangulate`). The wedge's ring coordinates appear verbatim on the pieces' boundaries because the cut created them, so after the shared re-index the door triangle SHARES its base and side edges with the surrounding mesh by construction -- nothing to stitch, no repair pass to go wrong. The old shape (leave a hole, attach the triangle after all cleanup) was never robust: the attach needed the ring to survive weld and decimation exactly, and every drifted corner produced an island door.
 
 Where the wedges consume a whole part, that part WAS the doorway apron and the door triangles replace its ground. Where the cut yields a MultiPolygon every piece is real: the slivers either side of the wedge are the door triangle's edge-connection to the corridor, and an earlier `SPLIT_TINY_AREA` gate that dropped the small ones left **doorways point-joined**. A piece that genuinely leads nowhere is culled later by the island pass, which knows about reachability; area is not a proxy for it.
+
+<a id="densify-on-a-world-grid"></a>**Outline densification lands on a WORLD grid along each segment, not on per-segment fractions** (`union_cdt._grid_stations`). Densifying each ring segment at fractions of its own length puts the two rails of a corridor at STAGGERED positions (each rail starts counting from its own corner), so the Delaunay triangulation zigzags between them -- the "assortment of triangles in a corridor" both hand corrections replaced with rows of quads (ImperialDungeon03's east door corridor: our 4-triangle zigzag against the human's 2 quads; the N-S corridor likewise). Placing a point wherever a segment's along-direction coordinate `p . u` crosses a multiple of `TRI_TARGET_EDGE` makes two parallel rails (same `u` up to sign) hit the same stations, and the CDT then pairs them straight across into quad rows. A point is not placed within a quarter of the spacing of a segment end, where it would only mint a sliver against the corner.
 
 <a id="door-base-line-suppresses-densification"></a>**Densification is suppressed along a door base line** (`union_cdt._triangulate`). The threshold edge is part of the union boundary, so the densify loop would drop samples ALONG it and chop the one big door triangle into pieces -- measured on the CharacterGen assassins' cell door, whose **115u base came out as a 26.8u + 21.6u pair, leaving a 571-unit scrap as the Door Triangle** (every vanilla door triangle is >= 992). The line keeps its two endpoints and nothing between, which is exactly what makes the Delaunay span it with a single triangle.
 
@@ -1116,11 +1122,21 @@ exterior cells regenerate automatically.
 
 <a id="only-dead-ends-extend"></a>**Only DEAD ENDS get the end extension** (`_build_corridor_strips`). Extending past a node another corridor also uses puts this corridor's stub entirely inside that corridor -- guaranteed double coverage at every junction, and the dominant residual overlap (**collinear pairs sharing a node overlapped for 22 triangles each**). At a dead end there is no other corridor, so the stub is the only thing reaching the wall or door ahead and costs nothing. Overlap between ribbons is resolved by the union, so a ribbon never needs to stop short of a junction.
 
-<a id="a-steep-ribbon-is-never-grown"></a>**A STEEP edge is never width-grown, and keeps a wider fixed width** (`_build_corridor_strips`). The ribbon is a tilted plane, so a perpendicular rail immediately leaves the treads -- **the Guild's stair edge grew to 82u and put mesh through the wall beside it**. But a plain corridor's width is too narrow at the mouth: a steep flight keeps `RIBBON_STAIR_HALF_WIDTH` so it presents a mouth comparable to the landing it joins, since otherwise the two meet only at the landing's CORNER vertices -- measured at **the top of Pinarus's stairs, where the entire route from the landing onto the flight ran through two 27-degree wedges (one with edge ratio 6.1) hanging off those corners, each dropping 39-45u**. The mesh was ONE component and still not walkable.
+<a id="a-steep-ribbon-is-never-grown"></a>**The FLIGHT of a steep edge is never width-grown, and keeps a wider fixed width** (`_grown_outline`, `_on_flight`; the flat approaches DO grow, see [steep-edges-are-grown](#steep-edges-are-grown)). The ribbon is a tilted plane, so a perpendicular rail immediately leaves the treads -- **the Guild's stair edge grew to 82u and put mesh through the wall beside it**. But a plain corridor's width is too narrow at the mouth: a steep flight keeps `RIBBON_STAIR_HALF_WIDTH` so it presents a mouth comparable to the landing it joins, since otherwise the two meet only at the landing's CORNER vertices -- measured at **the top of Pinarus's stairs, where the entire route from the landing onto the flight ran through two 27-degree wedges (one with edge ratio 6.1) hanging off those corners, each dropping 39-45u**. The mesh was ONE component and still not walkable.
 
 <a id="stair-end-extension-was-reverted"></a>**A stair-end EXTENSION was tried twice and is wrong both ways** (`_build_corridor_strips`). Sloped, it drives the ramp plane past the node, up into the air above the landing at the top -- **measured: ramp triangles at z=93 where the landing is z=69**. Footprint-only, the overhang keeps interpolating the ramp slope while the landing is flat, so the flight's last row tilts UP off the landing edge -- **measured a 38.9-degree joint whose ramp apex sat 14.8u above the shared edge**, a connection an actor cannot cross. A stair ribbon therefore runs node to node exactly, like any other edge.
 
 <a id="steep-heights-follow-the-treads"></a>**A steep edge's heights follow the REAL treads, not the chord** (`_surface_profile`). The pathgrid draws a straight chord node to node, but a real staircase rarely descends along the whole chord: **Pinarus's flight starts ~90u east of its top node, so the chord ran 39u BELOW the actual landing there, the stair ribbon reported z=30 where the real floor is 68.6**, and the union emitted a near-vertical triangle joining the two fictions (`tools/navmesh_tri_check` measured the same chord error as **+46/-49u float over the whole flight**). The path is a shortest path over the WALKABLE LAYERS along the line: at each 16u station the candidates are every walkable surface within the edge's own z range, a transition may climb at most one step, and the path must START at the near node's height and END at the far node's. That end constraint is what selects the treads -- a greedy walk anchored on the previous height simply followed the GROUND FLOOR continuing UNDER the flight, **ending 260u below the far node with a cliff at the anchor**. The flight is the only layer path that actually arrives. This is NOT the reverted "re-fit the line to collision" experiment, which changed the flight's overall angle: the profile keeps both endpoints and the plan line, replacing only the straight-line INTERPOLATION between them.
+
+<a id="profile-samples-the-cross-section"></a>**The tread profile samples the whole CROSS-SECTION, and falls back to a clamped chord** (`_profile_stations`, `_clamped_chord`). Centerline-only sampling returned no profile for all three stair edges at ImperialDungeon02's prison stairs (n194 to n195/n196/n197): the lines clip the flight's corner, so along the line the layers jump -1248 -> -1195 (53u, more than a step) and the one-step walk finds no path. The chord then ran **32u BELOW the flat -1184 floor for 90% of a 172-281u edge** -- the "clipping into collision" the hand correction (`tests/navmesh_fixed/Oblivion.esm/imperialdungeon02.json`) lifted back to -1187. Sampling +-half/2 and +-half across the line finds the treads at -1230/-1213 beside it and the path closes. When it still cannot, each node's level is held for as long as its own floor continues and one ramp joins the two; only when those plateaus overlap (a lower floor running under the upper) is the chord kept.
+
+<a id="steep-edges-are-grown"></a>**A steep edge IS width-grown, with each station's height taken from the profile** (`_edge_march_rows`). The blanket "never grow a stair" rule left every flat approach a steep edge crosses at the fixed 64u half-width: ImperialDungeon02's three prison-stair edges span 160-250u of FLAT -1184 floor before the 90u flight, and the corridor beside them (y 7300-7373) was covered by nothing but two node discs -- the hand correction pushed the boundary 45-60u north to the pillar line. Marching from the profile height keeps the wall slab and the floor test honest on the flight itself, where the floor test stops the rail as soon as the treads leave the station's level; the flight keeps `RIBBON_STAIR_HALF_WIDTH` as its soft floor where the local profile slope exceeds `RIBBON_GROW_MAX_SLOPE`, and the approaches use the ordinary corridor floor.
+
+<a id="blocked-stations-are-bridged"></a>**A station blocked on BOTH sides at the centerline takes its neighbours' widths** (`_bridge_blocked_stations`). The wall slab straddles the line, so an object hanging over the pathgrid line at head height zeroes both rails: ImperialDungeon03's east corridor (n181-n182) lost **six consecutive stations, 48u of a 74u-wide corridor, to a 4x11x25u block at z 64-90 above the floor** -- the corridor came out as a point in the union. The pathgrid line is the author's assertion that actors pass there, so a station whose line is inside collision cannot be a wall; its widths are interpolated from the nearest stations along the edge that grew on at least one side.
+
+<a id="neighbour-cap-removed"></a>**There is no parallel-neighbour width cap** (`grow_half_width`, `grow.cpp`). Capping a rail at half the distance to a roughly-parallel other edge never changed the union in an open room (both ribbons reach each other either way), but it PINCHED corridor mouths: ImperialDungeon03's N-S corridor (n98-n99) had its right rail cut from 64u to 40u over its last 100u by edge n100-n101 in the room beyond, **27u short of the wall**, and the hand correction ran that rail straight to the wall. Walls, the floor test and the hard cap bound a rail; overlap between ribbons is the union's job.
+
+<a id="disc-radius-capped-by-its-ribbons"></a>**A node disc reaches no further than the ribbons meeting at that node** (`_disc_strip`, `_node_reach`). Removing the neighbour cap let every disc ray run to `RIBBON_GROW_MAX_HALF` (160u) whenever walls and the floor test allowed, and the floor test allows ground a full step below: in-game verified discontinuities, both hand-corrected. ImperialDungeon01 node n74 (-1.7, 3019, z -805) at the top of a 27u flight grew a flat 160u disc over the -832/-840 floor 150u away, emitting a second vertex column at (-1.7, 3171) 30.7u above the corridor's own -- a crack an actor cannot cross (`ImperialDungeon01.json` welds them). ImperialDungeon02 nodes n74-n76 (1530, 5480-5709) each grew a 160u disc and the union of three overlapping fans plus the 57u ribbon between them was a fan of seven slivers (`ImperialDungeon02.2.json` collapses it to two triangles). The pre-change generator had neither, because the neighbour cap bounded discs at half the distance to the next edge. A disc exists to fill the notch between the ribbons that meet at its node, so past their reach it has no business unless the ground really is its own floor: its rays are clamped to the largest half-width any incident ribbon reached at that node's station (never below `RIBBON_HALF_WIDTH`), and may run on beyond that only while the walkable layers there hold a height within `DISC_LEVEL_TOL` (2u, the sampler's own layer dedupe) of the node's level (`_level_reach`). A plain clamp was tried first and split ImperialDungeon02's -992 mezzanine into two components (28 -> 12 + 9 triangles): it carries two pathgrid islands with no edge between them, and the discs running over the level floor between them were the only join. The n74 disc in ImperialDungeon01 stops at its ribbons because the floor beyond is 27u below its level; the mezzanine discs run on because the floor is exactly -992.
 
 <a id="stair-nodes-get-discs-too"></a>**A node touching a steep edge DOES get a node disc** (`_plan_stations`). Excluding them was a blanket rule with no stated justification, and it left the corner at the top of a staircase DEAD: measured on **Pinarus, nodes 0 and 1 (the stair's two endpoints) were the ONLY nodes in the cell without a disc -- every other node, 2 through 38, had one**. The upper floor's ribbon coverage stopped at y=146 with the corner beyond it unmeshed, and the union bridged the gap with a single tilted triangle flapping 38.6u under the landing -- the sole, unnavigable link between the two floors. The disc is a FLAT radial fan at the node's own height, which is exactly what a stair top needs since the landing there IS flat, and it cannot spill over the stairwell because each ray marches against real collision and stops at the drop. The disc excludes only its OWN node, via a synthetic self-pair appended to the edge table; the native `NeighbourField` skips zero-length segments so it adds no geometry. Each ray's width floor is 0, because a wall must always beat any minimum or the disc pushes mesh through a wall standing close to the node.
 
@@ -1144,7 +1160,7 @@ exterior cells regenerate automatically.
 
 <a id="the-wall-sampler-is-lazy"></a>**The door wall-test sampler is built LAZILY** (`build_corridors`). Indexing the blocking soup costs **~0.4s on a dense cell**, and a cell with no doors never asks it a single question; once the grow went native that build was **the second-largest remaining cost**, spent entirely on an object most cells discard unused. Only the DOOR footprint still needs a Python-side wall test, running a few probes per door rather than the ~890k the width march does, so it is not worth crossing into C++ for.
 
-<a id="node-z-snaps-down-onto-collision"></a>**A node's Z is snapped DOWN onto walkable collision, within a window** (`_snap_node_z`). The pathgrid hovers above the walked surface and the navmesh must sit ON it, but the snap must never teleport to a distant floor or rise onto an object standing on the floor -- so it moves only within `SEED_Z_TOLERANCE` above and `SEED_SNAP` below, clamps a far drop, and otherwise trusts the pathgrid.
+<a id="node-z-snaps-down-onto-collision"></a>**A node's Z is snapped DOWN onto walkable collision, within a window** (`_snap_node_z`). The pathgrid hovers above the walked surface and the navmesh must sit ON it, but the snap must never teleport to a distant floor or rise onto an object standing on the floor -- so it moves only within `SEED_Z_TOLERANCE` above and `SEED_SNAP` below, clamps a far drop, and otherwise trusts the pathgrid. **The surface nearest the node's OWN height within `NODE_SNAP_RADII` (8u, 16u) wins over the one directly under it.** ImperialDungeon02's prison stairs are three tread boxes with a few-unit seam between them, and node n194 (authored z -1204) sits in that seam: directly under it the only walkable layer was the -1248 floor running beneath the flight, so the node was snapped 44u down, every edge leaving it became a chord from the wrong floor, and the mesh ran **32u below the flat -1184 floor for 90% of three 172-281u edges** -- the hand correction in `tests/navmesh_fixed/Oblivion.esm/imperialdungeon02.json` lifted it back. The tread 8u to either side is at the node's height and is the surface the author placed the node on.
 
 <a id="winding-must-be-ccw-in-plan"></a>**Every triangle must be CCW in plan** (`build_corridors`). The mesh is a heightfield, and both the engine and the CK's DOWNFACING rule read a CW triangle as a downward-facing surface. Edge collapses in decimation, and the weld, can flip a triangle's plan winding -- **measured two CW triangles in ImperialDungeon01 once the far-side door quads reshaped the local triangulation**. Orientation is a per-triangle property, so flipping is always safe at this point. The degenerate cull runs once more here too, because the attach can mint plan-degenerate seam slivers of its own (**measured: a zero-width 65u wall along ImperialDungeon01's prison-gate quad seam**) and the finalize-era cull ran before the attach. Drop-down pairs are resolved to FINAL triangle indices only after all of it, since the attach both appends (door and stitch fills) and removes (de-stacked overlap) triangles, and any index resolved earlier would be stale.
 
@@ -1199,6 +1215,8 @@ exterior cells regenerate automatically.
 
 <a id="sawtooth-and-concave-allowances"></a>**Sawtooth teeth are cut inward; concave corners get a fraction of the standoff** (`decimate`). A boundary vertex that juts OUTWARD from its neighbours' chord (convex) may be removed with a larger deviation (`DECIMATE_SAWTOOTH_DEV`), because cutting it can only SHRINK the mesh, and the union outline's zigzag teeth are exactly such vertices. Cuts are inward-only, bounded in total by `DECIMATE_MAX_AREA_LOSS` of the mesh's area, so the periphery is straightened and never eaten. CONCAVE corners get a small allowance too: the outline is a wall STANDOFF, not the wall -- a ribbon is laid at `RIBBON_HALF_WIDTH` from its centerline, so the boundary already sits clear of real collision (**measured 11-17u at the Pinarus corner**). Refusing them is what left sliver fans nothing could repair: such a corner cannot be collapsed, cannot be flipped (the quad around a concave corner is non-convex) and cannot be split (its longest edge is under the split floor), and **a census of five reference cells found 16-32 of them EACH, carrying triangles up to badness 68**. The allowance (`CONCAVE_CUT_FRAC`) is a deliberate fraction of the standoff, so it can never cross the wall the standoff buys.
 
+<a id="concave-notches-straightened-against-collision"></a>**A concave notch is cut straight when the chord across it is clear of walls and over floor** (`decimate`, `_outline_move_ok`, `corridor._outline_ground_ok`). Every rail stops at a wall with a standoff that depends on the angle between its march and the wall (the slab's 20u tangent half-width touches an oblique wall up to 14u before the rail does), so where strips meeting a wall at different angles union, the outline is a chain of 10-20u jags -- ImperialDungeon03's chamfered room corner came out as **four steps (2439,10061)-(2465,10032)-(2467,10014)-(2484,10012)-(2505,9992), the concave one 12u inside the chord**, and the hand correction drew one diagonal. The fixed concave allowance (`CONCAVE_CUT_FRAC` of the standoff) cannot take that vertex, because without collision in hand a deeper cut might cross a real pillar corner. With the cell's blocking and walkable soups the question is answered directly: the box between the chord and the notch vertex is probed for walls in the actor band and the chord is sampled for walkable floor within a step, and only then may the notch go, up to `DECIMATE_SAWTOOTH_DEV`. Tools that call `decimate` without collision keep the fixed allowance.
+
 <a id="a-pin-protects-a-position"></a>**A pin protects a POSITION, so the far end may still collapse INTO it** (`decimate`). Door threshold corners are pinned because collapsing them destroys the Door Triangle and the doorway goes dead in the engine. But nothing about a pin requires its NEIGHBOUR to stay: refusing the whole edge froze the merge, since **v464 sits 7.5u from pathgrid node n124, so the 24u node pin vetoed collapsing the redundant v598 into it and two 300u^2 slivers survived on the stairs**. Only both-pinned is a genuine stalemate -- and even then the two may fuse when REDUNDANT, a vertex within `DECIMATE_OUTLINE_TOL` of the straight line between its two boundary neighbours contributing no position of its own. A single door's 24u center pin covers ~50u of boundary, so at **ImperialDungeon01's prison door FOUR consecutive vertices of one near-collinear chain were all pinned and could never collapse into each other**, forcing the fan of 8-360u^2 slivers through the doorway reported as "completely mangled".
 
 <a id="link-condition-guards-the-bowtie"></a>**The link condition guards against a surface closing on itself at a point** (`decimate`). A collapse is edge-topology safe only when the two vertices' neighbourhoods meet EXACTLY at the opposite corners of the triangles being collapsed; any other shared vertex normally means the collapse pinches the surface into a bowtie joined at a single vertex, which edge adjacency then reads as TWO components (**BarrenCave: decimation took one connected cave to [1771, 7]**). The pinch needs the collapsed edge to be INTERIOR: with mesh on both sides, fusing its ends joins two separate fans at a single vertex. On a BOUNDARY edge (one owner) there is no second fan -- one side is open space -- so the collapse merely shortens the outline and cannot bowtie, whatever else the two vertices share. Measured on **ImperialDungeon01's stairs, v600/v601 sit 2.5u apart on the OUTLINE joined by a single 71u^2 sliver, each reaching the V apex v382 through its own 300u^2 sliver**; the strict test saw v382 as an extra shared vertex and refused, so the slivers survived every pass, neither dropped (they carry adjacency) nor merged. Allowing it yields the two fat triangles the author sketched: (394,382,465) and (382,514,464).
@@ -1207,7 +1225,7 @@ exterior cells regenerate automatically.
 
 <a id="decimate-keeps-a-vertex-incidence-map"></a>**The collapse loop maintains a vertex->triangle incidence map** (`decimate`). The previous form scanned and REBUILT the whole triangle list per committed collapse -- O(T) twice per candidate, quadratic per cell -- **which alone pushed a large cell's decimation into minutes**.
 
-<a id="split-at-the-apex-projection"></a>**A needle splits at its APEX'S PROJECTION, not at the midpoint** (`_split_needles`). A cap's badness lives at its apex, so bisecting the long edge at the midpoint just leaves two smaller caps. The projection is clamped so both halves stay above `DECIMATE_MIN_EDGE`. A non-manifold edge (more than two owners) is left alone.
+<a id="split-at-the-apex-projection"></a>**A needle splits at its APEX'S PROJECTION, not at the midpoint** (`_split_needles`). A cap's badness lives at its apex, so bisecting the long edge at the midpoint just leaves two smaller caps. The projection is clamped so both halves stay above `DECIMATE_MIN_EDGE`. A non-manifold edge (more than two owners) is left alone.  Its Z was the CHORD's, which only sits on the ground while the edge stays on one surface: ImperialDungeon01's ramp foot bisected the -590.3 to -632.1 edge and put the new vertex at -614.6, **17.6u above the -632.1 floor under that point**, so the floor rim and the ramp rim came out as two parallel boundaries over the same ground -- 17.6 sq.u. across a 152u span, a mean width of 0.12u, welded by hand in `ImperialDungeon01.json`.  The split now snaps onto walkable collision within `MAX_CLIMB`, sampling near the height of the endpoint it is closest to -- nearest-to-the-chord picks the ramp layer 14u up instead of the floor.  The vertex lands ON a border edge, which the sheet across that edge does not share, so `finalize` re-runs the T-junction zipper after decimation (`_repair_junctions_after_cleanup`); upstream it ran before this vertex existed.
 
 <a id="flips-remesh-a-convex-quad"></a>**A flip re-meshes the same ground with the same four vertices** (`_flip_pass`). For an interior edge (a, b) shared by exactly two triangles (a,b,c) and (b,a,d), when the plan quad c-a-d-b is strictly convex, replacing the diagonal (a,b) with (c,d) changes no coverage. Four guards: the new diagonal must not ALREADY be an edge elsewhere in the mesh -- possible where storeys fold and reuse vertices -- since flipping onto it gives that edge 3+ owners and `_make_manifold` later rips the extras out with no connectivity guard, **measured as whole regions detaching in ChorrolFightersGuild and BarrenCave**; it may not climb more than the old diagonal plus a step, because flipping across a fold bridges two walkable levels; triangles whose three corners are all door-pinned are never touched, the Door Triangle's shape being a contract; and the flip must strictly reduce the pair's worst edge ratio. Strict convexity means a and b sit on OPPOSITE sides of c-d, each a non-degenerate distance off it -- on a non-convex quad they land on the same side and the flip folds the quad over itself. Winding follows from the side.
 
@@ -1312,9 +1330,9 @@ exterior cells regenerate automatically.
 
 <a id="soft-floor-never-beats-a-wall"></a>**A WALL always overrides the caller's soft floor** (`grow_half_width`, `lo`). `lo` keeps junctions overlapping, but forcing the ribbon out to a connectivity floor drove mesh straight through walls near every junction -- the same defect the Phase-1 unconditional width has. So the soft floor is marched too, from zero, and the wall test may cut it short. The walkable-floor test binds only BEYOND `lo`: inside it the pathgrid's own assertion wins (a node at a threshold or a ledge lip would otherwise collapse its corridor to nothing), and no wall was found there, so nothing can be on the far side of anything.
 
-<a id="only-parallel-edges-cap-a-width"></a>**Only roughly-PARALLEL other edges cap a corridor's width** (`NeighbourField`). An edge whose direction is within `RIBBON_GROW_PARALLEL_DOT` of this one counts; a crossing or diverging edge is not an opposing corridor wall, and treating it as one pinched dense junctions.
+<a id="only-parallel-edges-cap-a-width"></a>**The parallel-neighbour width cap is gone** -- see [neighbour-cap-removed](#neighbour-cap-removed). Its last form counted only edges within a parallel-dot of this one, because a crossing or diverging edge treated as an opposing wall pinched dense junctions; removing the cap outright fixed the corridor-mouth pinch the parallel test could not.
 
-<a id="node-discs-fill-junction-notches"></a>**Pathgrid NODES grow radial discs to fill the corner notches** (`grow_node_disc`). Ribbons grow only PERPENDICULAR to their own edge, so where two edges meet at an angle the outer corner is a notch no ribbon reaches -- a right-angle junction leaves a square bite out of the mesh. Marching outward on `RIBBON_GROW_DISC_RAYS` evenly-spaced bearings under the same stop rules as a rail, then closing the ray ends into a polygon, fills exactly that corner; it joins the union like any other strip.
+<a id="node-discs-fill-junction-notches"></a>**Pathgrid NODES grow radial discs to fill the corner notches** (`corridor._disc_march_rows`, `_disc_strip`). Ribbons grow only PERPENDICULAR to their own edge, so where two edges meet at an angle the outer corner is a notch no ribbon reaches -- a right-angle junction leaves a square bite out of the mesh. Marching outward on `RIBBON_GROW_DISC_RAYS` evenly-spaced bearings under the same stop rules as a rail, then closing the ray ends into a polygon, fills exactly that corner; it joins the union like any other strip.
 
 <a id="slab-test-is-a-2d-sat"></a>**The slab test is a separating-axis check in the slab's own frame** (`_tri_hits_slab`). The slab is an oriented box centered at (cx, cy): extent `half_w` along the edge-tangent (~actor width), `depth` along the march direction (thin), full Z span. The triangle's vertices are projected into that frame (tangent = X', march = Y') and tested against the axis-aligned rectangle, gated first by a cheap Z overlap.
 
@@ -2029,6 +2047,38 @@ correct. Measured on a real moved tag: **Morrowind_ob 40/40 identical → 5,239
 entries adopted → 40/40 cache hits, 0 rebuilt**; Nehrim 39/39 → 2,885 adopted.
 With a deliberately corrupted entry the same path refused (1/7 differ) and left
 the stamp uncertified.
+
+**Proving runs on the pool, not in the parent.**
+<a id="proving-runs-on-the-pool"></a>
+Proving rebuilds real cells with the same `navm_worker.run_job` the main stage
+uses, so it takes the same parallelism: `pool.pooled_prover` hands
+`cache_audit.prove_cache` a `rebuild` callable backed by the same
+`ProcessPoolExecutor`, initializer and `initargs` as `_run_pooled`. Serially,
+adoption cost the sample size in full cell builds (**1,869 ms/cell measured**,
+so ~75 s for the default 40) immediately before a stage that fans the identical
+call across every worker.
+
+Results are yielded in **submission order** (`ex.map`, not `as_completed`), which
+is what keeps the early exit deterministic: the first mismatch a caller sees is a
+property of the job list, not of which worker happened to finish first. Two runs
+over the same cache therefore refuse on the same cell and report the same
+`checked` count.
+
+`prove_cache` keeps a serial default (`rebuild=None` calls `run_job` directly),
+because `navmesh_adopt` and the tests drive it outside a pool context, and a
+pool of one worker is slower than no pool at all.
+
+**Proving stops at the first mismatch.**
+<a id="proving-stops-at-the-first-mismatch"></a>
+Both callers of `cache_audit.prove_cache` — `adopt_if_unchanged` and
+`navmesh_adopt.adopt` — refuse on any non-empty `bad`, so a single differing
+cell has already decided the verdict. Continuing spends a full rebuild per
+remaining cell (**measured 1,869 ms/cell**) to enrich a message nothing reads:
+the refusal prints `N/checked differ` and regenerates either way. A cache that
+has genuinely changed is the common failing case — a real behaviour change
+moves most cells, not one — so the break usually lands on cell 1 and turns a
+~75-second sample into ~2 seconds. `checked` therefore counts cells COMPARED,
+not the sample size, and the refusal line reads `1/1 differ`.
 
 Verifying only cells that ALREADY HIT is not enough on its own — that guards a
 cache whose tag matches but whose geometry does not (GEOS drift, a bad adopt),
@@ -2951,18 +3001,28 @@ coverage (`miss` 0→570 on AnvilFightersGuild, 0→5599 on ImperialDungeon01).
 
 Beyond Skyrim: Bruma rebuilt Cyrodiil's architecture in Skyrim and navmeshed it
 **by hand**, so a Bruma interior replicating an Oblivion one is an answer key.
-Seven cells match by name, each with a real Oblivion pathgrid and an authored
-Bruma navmesh (Bruma prefixes cell EditorIDs with `CYR`):
+Seven cells make up the corpus, each with a real Oblivion pathgrid and an
+authored Bruma navmesh (Bruma prefixes cell EditorIDs with `CYR`):
 
-| corpus cell | OB pathgrid nodes | authored tris | ours |
-|---|---|---|---|
-| BrumaCastleGreatHall | 201 | 427 | 996 |
-| BrumaCastleLordsManor | 163 | 300 | |
-| BrumaCastleDungeon | 88 | 208 | |
-| BrumaChapelUndercroft | 43 | 265 | |
-| BrumaChapelHall | 43 | 239 | 256 |
-| BrumaCastleBarracks | 55 | 105 | |
-| BrumaCastleServiceHall | 52 | 120 | |
+| corpus cell | Oblivion source | OB nodes | authored tris | ours |
+|---|---|---|---|---|
+| BrumaCastleGreatHall | same | 201 | 427 | 999 |
+| BrumaCastleLordsManor | same | 163 | 300 | |
+| BrumaCastleDungeon | same | 88 | 208 | 408 |
+| BrumaChapelUndercroft | same | 43 | 265 | |
+| BrumaChapelHall | same | 43 | 239 | 261 |
+| BrumaCathedralofStMartin | BrumaChapel | 73 | 373 | |
+| BrumaCastleBarracks | same | 55 | 105 | 184 |
+
+**A corpus cell need not share its name with its Oblivion source.** The
+Cathedral of St. Martin is the same building as Oblivion's `BrumaChapel`, so
+its entry sets `source_cell` explicitly; the rigid fit lands 70 of 73 nodes on
+the authored mesh (96%), the best of the corpus.
+
+`BrumaCastleServiceHall` was REMOVED: despite the matching name it is a
+different building, and the fit left 32 of 52 nodes off-mesh with 65 of 84
+edges crossing void. A name match is not a building match — check the fit score
+before trusting one.
 
 ### Why the grid must be transplanted, not reused
 
@@ -3022,6 +3082,26 @@ Bruma cells also place **vanilla** Skyrim statics (`Clutter\Barrel01.NIF` and
 friends), so a model missing from both Bruma archives falls back to
 `skyrim_assets.get_asset_bytes`, which resolves from the SSE BSAs.
 
+### <a id="vanilla-bases-need-the-master"></a>Vanilla BASES need the master, not just vanilla assets
+
+Resolving vanilla *assets* is not enough: the REFRs that place them point at
+base records living in **Skyrim.esm**, and a scan of `BSHeartland.esm` alone
+resolves none of them. This is [master-export
+blindness](../../CLAUDE.md#master-blindness) in the editor's own loader.
+
+Measured on `CYRBrumaChapelHall`: 300 REFRs over **174 distinct bases, 105 of
+them vanilla — and 0 of those 105 resolved.** Only 72 of 300 REFRs got a model.
+The missing objects are exactly the furniture a room is made of — beds
+(`NobleBedSingle01`), tables, benches, chairs — so the renderer showed open
+floor where the navmesh correctly stopped at something solid, which is what
+"unexplained gaps" in the chapel actually were.
+
+`cell_refrs` therefore loads base models from Skyrim.esm FIRST, then overlays
+the plugin's own so Bruma's overrides win. Skyrim.esm is read from the live SSE
+install, which CLAUDE.md permits for Papyrus logs and Skyrim.esm specifically.
+A vanilla base carries a `00` master index here only because Bruma lists
+Skyrim.esm first; never assume that index across other plugins.
+
 ## <a id="transplant-editor"></a>The transplant editor
 
 **Code:** `tools/navmesh/transplant_server.py`, `tools/navmesh/transplant_editor.html`.
@@ -3035,7 +3115,7 @@ Hand-placing nodes by reading coordinates off a rendered grid and issuing
 natural interface, and the corpus is already a small JSON a page can read and
 write back.
 
-The page draws three layers, in order:
+The page draws five layers, each independently toggleable:
 
 1. **Bruma's real collision** — the same Havok soup the Oblivion-side renders
    use (see [Bruma collision](#bruma-collision)), clipped to the storey the
@@ -3043,7 +3123,26 @@ The page draws three layers, in order:
    the same reason as in the renderer: it is overwhelmingly vertical wall, so
    the rim carries the shape.
 2. **The authored navmesh**, dim, as context.
-3. **The pathgrid**, draggable.
+3. **Door triangles**, magenta — a subset of layer 2, drawn apart so "did the
+   door land on the mesh" is answerable by eye.
+4. **Our generated mesh**, coloured by `draw.tri_class` so the editor and
+   `render.py` cannot disagree about what counts as a defect. Off by default:
+   it is the thing under test, not context.
+5. **The pathgrid**, draggable.
+
+### <a id="nvnm-flags-vs-cover-flags"></a>An NVNM triangle has TWO flag fields
+
+The triangle struct is `'<6h2H'`: three vertex indices, three neighbours, then
+**Flags at index 6 and Cover Flags at index 7**. `wbNavmeshTriangleFlags` in
+`references/xEdit/Core/wbDefinitionsCommon.pas` puts Door at bit 10 of *Flags*;
+bit 10 of *Cover Flags* means something else entirely, and the two are easy to
+confuse because both are `itU16` and adjacent.
+
+Reading index 7 reports **13 door triangles** in `BrumaChapelHall`; reading
+index 6 reports **one, triangle 224**. The NVNM **Doors array** (parsed into
+`check.py`'s `nm.door_tris`) names its triangle outright and independently
+gives `[224]` — so cross-checking the flag against that array is the way to
+confirm the field index, and any disagreement means the wrong field was read.
 
 **Nodes are placed against the WALLS, never against the authored mesh.** The
 authored layer is there to show which room you are in, not to snap to — a grid
@@ -3056,7 +3155,7 @@ think about where people actually walk, not a number to drive to zero.
 ### Known gap
 
 Six vanilla Skyrim clutter meshes placed in Bruma interiors fail to parse even
-after [Patch 16](asset_convert_nif.md#patch-16-body-flags-width) —
+after [Patch 16](asset_convert_nif.md#patch-16-sse-havok-layouts) —
 `MiscSackLargeFlat01`/`03`, `UpperChest01`, `NobleWardrobe01`, `Barrel01`,
 `StrongBox01`. On BrumaChapelHall that is **8 of 300 placements**, all small
 clutter; every wall, floor, pillar and door extracts. The editor draws what it
@@ -3071,6 +3170,14 @@ re-scores on each drag release, so an uncached index put a ten-second stall
 between letting go of a node and seeing the readout update: `POST /score`
 measured **10,735 ms**. `transplant.index_for` keeps one index per export path
 for the life of the process, which takes that to milliseconds.
+
+The cache key is the NORMALIZED path. The same export reaches `index_for`
+spelled two ways -- `export/Oblivion.esm` from the corpus JSON, and
+`export\\Oblivion.esm` from `os.path.join('export', plugin)` in
+`transplant_server.mesh_bake` -- which are different dict keys. That built two
+NavIndex objects for one export and paid the 10 s load twice on startup. It
+also broke `NavIndex.arm`, whose `_armed` check compared the two spellings and
+reloaded the collision tables on every alternation.
 
 The page-side half of the same problem: the canvas prototype redrew all ~22,000
 collision triangles per mouse-move. The WebGL version uploads each static layer
@@ -3100,7 +3207,441 @@ six meshes that failed from the SSE side:
 
 The SSE failures are pyffi layout bugs in the Havok blocks
 (`bhkConvexVerticesShape`, `bhkCompressedMeshShapeData`) that survive
-[Patch 16](asset_convert_nif.md#patch-16-body-flags-width) — Patch 16 fixes the
+[Patch 16](asset_convert_nif.md#patch-16-sse-havok-layouts) — Patch 16 fixes the
 `bhkRigidBody` Body Flags width, which is necessary but not sufficient. Rather
 than chase each remaining layout, the fetch order is now **Bruma archives → LE
 references → SSE BSAs**, and the LE copies sidestep the whole class.
+
+## <a id="hand-corrected-navmesh-corpus"></a>The hand-corrected navmesh corpus
+
+**Code:** `tools/navmesh/meshedit.py`, served by `tools/navmesh/transplant_server.py`; read back by `tools/navmesh/fix_analyze.py`.
+
+<a id="a-correction-is-read-off-its-result-only"></a>**A correction is read off `result` against `base`; `ops` are keystrokes and mean nothing** (`make_entry`, `fix_analyze.py`). The first two corrections (ImperialDungeon02/03) carried 152 ops for 58 net vertex moves -- one vertex was dragged seven times -- and reading the ops as decisions measured the human's fight with the editor, not the mesh they wanted. `base` (the generator mesh the human edited) is stored in the file so the diff survives the generator moving; without it an index-based diff against a fresh build reads every vertex as changed. The analysis is scoped to the touched region: the two corrections changed 25-45 triangles of 600-940, so cell-wide percentages read as noise ("+0.2% area") while inside the region the human moved **13 of 85 and 45 of 101 vertices** and covered **3.4-3.6% more floor**. What they encoded, measured with the tool: the boundary sat 10-60u inside the real floor edge (steep-edge approaches never grew, a hanging object zeroed a corridor, the neighbour cap pinched a mouth), corridors were zigzag-triangulated where rows of quads belong, and a mid-stair pathgrid node snapped 44u down through a tread seam sank the ramp 32u into the floor. After the fixes the generator covers **326 of the 361 floor samples the human added in ImperialDungeon02 and 249 of 374 in ImperialDungeon03**; what it still does worse than the human is the flight itself, which the profile places where the pathgrid line climbs (compressed to 45u where the line cuts the foot of the stairs) rather than along the flight's own 90u axis, so the stair-mouth triangles run 50-56 degrees against the human's 33.
+
+### Mesh mode lives in the SAME page
+
+Triangle editing is a MODE of the transplant editor (`t`), not a second page:
+the collision, camera, picking and orbit arbitration are already there, and a
+parallel page would duplicate ~800 lines that must not drift apart. The two
+modes share `beginDragAt`/`dragTo`, generalized from node indices to plain
+positions for exactly this. Mesh mode hides the read-only `generated` layer,
+whose editable copy draws the same triangles and would z-fight it.
+
+| key | does |
+|---|---|
+| drag vertex | move in XY |
+| `alt`+drag | move in Z |
+| `shift`+click two vertices | weld the first onto the second (close a crack) |
+| `g` | snap the selected vertex down to the collision under it |
+| `b` | build mode: click 3 corners, each an existing vertex OR bare floor |
+| `del` | delete the selected triangle |
+| `d` | toggle the selected triangle's door flag |
+| `l` | link two triangles as a drop-down, UPPER picked first |
+
+The cell picker is a prefix search against `/plugin_cells`, not a full list: an
+export holds thousands of cells with a pathgrid, and shipping them all to a
+`datalist` stalls the page.
+
+### <a id="welding-rewrites-the-index"></a>Welding rewrites the INDEX, not just the position
+
+The first `snap_vert` moved vertex `v` onto `to_v`'s coordinates and stopped
+there. That looks like nothing happened, because the two corners were already
+almost coincident — and, worse, it fixes nothing: a navmesh crack closes only
+when the two triangles **share a vertex index**. Two distinct indices at
+identical coordinates are still a crack, and the CK's own validation counts
+them as duplicate/asymmetric edges.
+
+So the weld rewrites every triangle that referenced `v` to reference `to_v`,
+and drops any triangle the weld leaves degenerate (fewer than three distinct
+corners). The moved coordinates are kept as well, so an orphaned `v` no longer
+used by any triangle sits harmlessly on top of `to_v`.
+
+### Building a triangle must reach OPEN FLOOR
+
+The first cut collected "the last three vertices clicked", which can only ever
+fill a hole between triangles that already exist — it cannot EXTEND the mesh,
+which is the more common repair. Build mode (`b`) takes each corner as either
+an existing vertex or a click on bare collision, the same gesture that adds a
+pathgrid node in corpus mode; a corner on open floor becomes an explicit
+`add_vert` op so `replay` reproduces it.
+
+Ring corners are drawn enlarged and magenta, and join the handle set even when
+no triangle uses them yet — a corner placed in open floor would otherwise be
+invisible, leaving no indication of what is selected.
+
+### One cell at a time, and the scope follows it
+
+Opening a cell drops **every** layer of the previous one — collision, authored
+underlay and pathgrid alike — via `clearLayers` / `clearPathgrid` /
+`meshDiscard`. The first cut only replaced collision when the name differed,
+which left two cells on screen at once.
+
+The collision-source buttons (Bruma / Oblivion / Both) and the authored/ours
+toggles are **corpus concepts**, hidden for an arbitrary cell which has one
+collision set and no Bruma counterpart. `applyScope` keys that off `G` being
+non-null, and the pathgrid edit modes are disabled rather than silently inert.
+
+**The corpus cell picker always stays visible.** Hiding it made leaving corpus
+mode a one-way door with no way back; it keeps a blank first option so it can
+show "no corpus cell" and still re-select one.
+
+The cell's **pathgrid is drawn read-only** in mesh mode: it is the generator's
+input, so it is the first thing to look at when the output is wrong. Node
+hover is suppressed there, because the thing under the pointer is a vertex.
+
+### <a id="instanced-colour-is-not-vertex-colour"></a>Black nodes: `vertexColors` on an INSTANCED mesh
+
+Per-instance colour and per-vertex colour are different three.js features, and
+asking for both when only one exists paints everything black.
+
+`InstancedMesh.setColorAt` allocates `instanceColor`, and three.js sets
+`USE_INSTANCING_COLOR` by itself when that buffer is non-null. The shader chunk
+is:
+
+```glsl
+#elif defined( USE_COLOR ) || defined( USE_INSTANCING_COLOR )
+    vColor = vec3( 1.0 );
+#endif
+#ifdef USE_COLOR
+    vColor *= color;          // per-VERTEX attribute
+#endif
+#ifdef USE_INSTANCING_COLOR
+    vColor.xyz *= instanceColor.xyz;
+#endif
+```
+
+Setting `vertexColors: true` additionally defines `USE_COLOR`, whose
+`vColor *= color` reads a per-vertex `color` attribute that `SphereGeometry`
+does not have. **An absent attribute reads `(0,0,0)`**, so the multiply zeroes
+the instance colour and every sphere renders solid black.
+
+**`instanceColor` needs no material flag.** The fix is to drop `vertexColors`
+from both instanced handle meshes. `classedLayer` keeps it, correctly — it sets
+a real `color` attribute on its geometry first.
+
+Verified by reading the shader chunks out of the pinned
+`three.js/0.160.0/three.min.js` the page loads, not by inference.
+
+### <a id="never-dispose-a-shared-geometry"></a>Also: never dispose a SHARED geometry
+
+`nodeGeo` is a module-level `SphereGeometry`, built once and reused by every
+`buildPathgrid`. `buildPathgrid` also began by calling
+`nodeMesh.geometry.dispose()` — and `nodeMesh.geometry` **is** `nodeGeo`. So
+the first rebuild freed the shared geometry's GPU buffers, and every rebuild
+afterwards handed that dead geometry to a new `InstancedMesh`. The nodes drew
+**solid black**.
+
+It stayed latent while the page only ever loaded one cell at startup; adding
+`clearPathgrid` (for one-cell-at-a-time switching) made a rebuild happen on
+every cell open, so it surfaced constantly.
+
+**A cached geometry must outlive every mesh that borrows it.** `vertHandles`
+was never affected because it builds a fresh `SphereGeometry` per call — the
+per-build line and triangle geometries are still disposed, correctly.
+
+Two earlier theories for this were wrong and are recorded so they are not
+retried: the material being `MeshLambertMaterial` (an unlit `MeshBasicMaterial`
+is right for markers regardless, but lighting was not the cause), and a
+temporal-dead-zone read of the palette constants (no top-level code calls
+`buildPathgrid`, so the constants are always initialized by then).
+
+Separately, **blue collided with blue**: mesh mode already spends blue on
+vertex handles and white on triangle outlines, so the grid's usual `0x3ba0ff`
+read as more mesh. In mesh mode it switches to violet, which means
+`buildPathgrid` must re-run on a mode change, not only on load.
+
+`cPath` and `cTri` hide the pathgrid and the triangles independently — with
+both layers occupying the same floor, being able to drop one is what makes the
+other readable.
+
+### Drop links are editable
+
+`build_navmesh` returns Ledge Up/Down pairs **out-of-band** through
+`ledges_out` so the long-standing `(verts, tris)` return stays intact;
+`CellCtx.build` now forwards that parameter, which is why the editor can see
+them at all. A link joins two triangles that do NOT share an edge, so the only
+way to see one is to draw it centroid-to-centroid (orange).
+
+Links are **directional** — Ledge Up is not Ledge Down — so `l` takes the upper
+triangle first. `replay` drops a link whose triangle was deleted and remaps the
+survivors, the same tombstone-then-compact rule the door flags follow.
+
+Measured: `ImperialDungeon01` has one (triangle 567 → 276, a 192-unit drop);
+the Bruma corpus interiors have none, being single-storey.
+
+The [pathgrid corpus](#authored-navmesh-corpus) says what the generator's INPUT
+should look like. This says what its OUTPUT should have been, which is a
+sharper signal: a cell where the mesh is visibly wrong gets fixed by hand --
+snap a crack shut, tilt a ramp to match the stairs under it, fill a hole -- and
+the corrected mesh becomes a target to score against.
+
+Corrections live in `tests/navmesh_fixed/<plugin>/<cell>.json`, separate from
+`tests/navmesh_authored/` because they answer a different question and apply to
+**any** cell of **any** plugin, not only the seven Bruma name-matches.
+
+### Ops AND result, not one or the other
+
+Each file stores both:
+
+- **`ops`** -- the reviewable changelist (`move_vert`, `snap_vert`, `add_tri`,
+  `del_tri`, `set_door`). This is what says *what was being fixed*, which is
+  the part that tells the generator what to learn.
+- **`result`** -- the finished `verts`/`tris`/`doors`. This is the scoring
+  target, and it never goes stale.
+
+`base_hash` pins the generated mesh the ops were authored against (SHA-1 over
+vertices rounded to 0.01u and triangle indices; the rounding absorbs float
+jitter that moves nothing a human would call different). When the generator
+improves, the hash stops matching and `is_stale` reports it: the **ops** are
+then suspect, but `result` is still a valid target. Storing only ops would lose
+the target on every generator change; storing only the result would lose the
+intent.
+
+### Deletions tombstone
+
+`replay` sets a deleted triangle to `None` and compacts only at the end, so
+every op keeps addressing triangles by their ORIGINAL index. The page, the
+changelist and the ops all speak the same index space, and an op list stays
+order-independent with respect to deletions.
+
+### Door triangles are editable
+
+A door triangle is marked by bit 10 of an NVNM triangle's Flags (see
+[flags vs cover flags](#nvnm-flags-vs-cover-flags)). Our own door triangles are
+identified with production's `corridor._tri_carries_door`, not a second
+predicate, so what the editor marks is what the writer would flag.
+
+This immediately showed a real defect: `BrumaChapelHall` has **one** authored
+door triangle (224) where we flag **seven** (110, 140, 157, 173-176) -- our
+door quad fragments where Bethesda's is a single triangle.
+
+
+## <a id="navindex-arms-shared-tables"></a>NavIndex arms shared module tables
+
+**Code:** `tools/navmesh/index.py`, `asset_convert/collision/collision_extract.py`
+
+`ce.load_collision` replaces a module-global dict (`_COLLISION`), and
+`load_door_centroids` and `load_origin_shifts` behave the same way. Building a
+`NavIndex` therefore does not give that index its own tables -- it repoints one
+shared set of globals at that export.
+
+In a one-shot tool this is invisible: a process builds one index and exits. The
+transplant editor is long-lived and lists every export that has an audit index
+(measured: `Morrowind_ob.esm`, `Nehrim.esm`, `Oblivion.esm`), so opening a cell
+from a second plugin re-armed the globals and every later Oblivion cell then
+found no collision for its meshes -- `get_collision` returned `None` for every
+path key, and the page drew a navmesh floating in empty space with "walls" and
+"floor" both ticked. Cells baked BEFORE the switch kept working, because
+`transplant_server._CACHE` had already stored their geometry, which made the
+failure look specific to one cell.
+
+Measured on the running editor: of five cells requested, only
+`imperialdungeon03` (cached earlier) returned collision; `imperialdungeon02`,
+`AnvilPinarusInventiusHouse`, `AnvilCastleGreatHall` and
+`ICMarketDistrictTheBestDefense` all returned `walk 0 block 0` while the same
+cells baked correctly in a fresh process.
+
+`NavIndex.arm()` re-arms the globals for its own export and is called from
+`cell()`, so whichever index is used is the one whose tables are live. A
+class-level `_armed` records which export currently owns them, so the common
+single-export case still pays the load exactly once.
+
+
+## <a id="master-owned-cells"></a>Navmesh in a cell the plugin does not own
+
+**Code:** `navmesh/pool.py:gather_navm_jobs`, `overrides/master_index.py:navms`.
+
+A plugin that edits a master's cell — Unique Landscapes moving rocks around an
+Oblivion.esm exterior — must **override** that cell's navmesh, shipping it under
+the master's NAVM FormID. It must not ship a navmesh under a new id: the master's
+navmesh is still loaded, so both cover the same ground.
+
+This is what Skyrim modding practice already requires, for engine reasons rather
+than tidiness:
+
+* The engine resolves navmesh conflicts **by FormID, one winning record per id**.
+  Overrides replace; they never merge. Two records with different ids are not a
+  conflict the engine can resolve — both stay live.
+* xEdit's guidance is explicit that navmesh conflicts are settled by load order
+  and that one mod's navmesh is never forwarded into another's. Its
+  "remove identical to previous override" cleaning exists precisely to strip
+  redundant NAVM overrides, which presupposes overrides share the master's id.
+* NAVI (the Navigation Mesh Info Map) is a singleton, `0x00012FB4`, that every
+  file overrides with its own NVMI entries. An NVMI naming a duplicate navmesh
+  registers a second mesh over the same ground.
+
+### Why the id cannot be derived
+
+`derive_formid` composes every generated id as `(own_index << 24) | offset`, so a
+derived id **always** carries the plugin's own index byte and is structurally
+incapable of naming a master's record. Nor can the master's id be recomputed:
+`_choose_derived_region` picks the hash window from *that plugin's* emptiest 64K
+run of authored ids, so the offset depends on Oblivion.esm's own occupancy, not
+on anything Unique Landscapes can see.
+
+The id is therefore **read back** from the converted master, exactly as
+`MasterIndex.land` reads back reallocated LAND ids — `_scan` already walks every
+record of the built ESM, so keying NAVM by its enclosing cell-children GRUP costs
+one more branch. No formula, nothing to get wrong.
+
+### Why a list, and why the id is chosen BEFORE generation
+
+`navms()` returns a list where `land()` returns a single id: a cell owns at most
+one LAND, but a navmesh may be **split**. Measured on the converted
+`output/Oblivion.esm`: 8,238 NAVM across 8,202 cells, of which 8,182 own one and
+20 own between 2 and 7.
+
+The master id is substituted in `gather_navm_jobs`/`precompute_navmeshes`, before
+`convert_PGRD` runs — never restamped onto finished bytes the way LAND is. A NAVM
+carries its own FormID in **three** places:
+
+1. the record header,
+2. the NVNM body, where every ledge edge-link names the owning navmesh
+   (`_resolve_ledge_links` appends `(type, navm_fid, other)`),
+3. `meta['door_xndp']`, which seeds the door refs' XNDP pathing links,
+
+plus `meta['fid']`, which is what NVMI registers in NAVI. Restamping the header
+alone would leave the NVNM payload and the door links pointing at an id no record
+has. Passing the id in as `navm_fid` makes all four agree by construction.
+
+### The invariant
+
+Substitution happens only when a converted master index is present **and** the
+cell is master-owned. A masterless plugin (Oblivion.esm, Nehrim.esm) has no
+master index, so it takes the unchanged path and its navmesh output is
+byte-identical.
+
+`derive_formid` is still called for **every** job, master-owned or not, and the
+master id replaces the result afterwards. Skipping the call instead would change
+the allocator's `_derived_taken` set, and since collisions are resolved by
+rehashing against that set, unrelated derived ids in the same plugin could move —
+drift for records that have nothing to do with navmesh.
+
+### <a id="cross-plugin-edge-links"></a>Edge links across a plugin boundary
+
+**Code:** `navmesh/edge_links.py:_master_neighbour_views`, `_repack`.
+
+`build_edge_links` indexed `views` from `navm_cache` alone, so a cell the
+plugin does not navmesh simply was not there. Two things went wrong at
+every region boundary:
+
+* `views.get(other)` missed, so the seam was skipped and NO link was made.
+* `live_fids` held only this plugin's ids, so `_prune_links` judged every
+  master-bound link dangling, deleted it, and reverted the triangle edge to
+  a plain border.
+
+Because an override keeps the master's NAVM FormID, the stripped record
+WINS: the master's own links cannot compensate for what its override drops.
+
+Measured on Unique Landscapes Compilation v2.2.0 against Oblivion.esm:
+
+| | |
+|---|---|
+| UL cells bordering a master-only cell | 815 (1,212 edges) |
+| UL cells linked to any master navmesh | **0** |
+| Boundary cells the master linked across | 710 |
+| ...whose link UL destroyed | **710 (100%)** |
+
+Every UL region was a sealed navmesh island: actors path inside it and
+inside vanilla terrain, never between them.
+
+The fix loads each bordering master mesh read-only into `views` (so seams
+match and pruning keeps the links) and re-emits any that gained one as an
+override of the master's NAVM, keyed `('master_navm', fid)` so it cannot
+collide with a `(cell, pgrd)` job key.
+
+### A re-emitted master must keep the links it already had
+
+**Code:** `navmesh/edge_links.py:_prune_dead_links`.
+
+`live_fids` was built from the meshes THIS plugin writes plus the loaded
+neighbours, so a master mesh we re-emit had its links to cells further out
+in the master's own terrain judged dangling and deleted -- shipping an
+override strictly worse than the record it replaced. Measured on Unique
+Landscapes: of 2,675 links the master copies arrived with, 833 were lost.
+
+Every master navmesh id is therefore live, whether or not it was loaded
+here: the master's own records are always present at runtime.
+
+The frontier stops one ring out by design. A master mesh gains the seam
+facing us, but its own outward neighbours are never requested (they enter
+`views` after `wanted` is computed). Those master-to-master seams already
+exist in the master file and need nothing from us -- measured 211 such
+seams, all with a relinked master copy as their source cell.
+
+**Links must stay symmetric.** Both halves of a seam ship: ours through its
+normal cache entry, the master's through that synthetic one. Emitting only
+our side would leave a one-way portal.
+
+### The COLLISION caches must chain too
+
+**Code:** `navmesh/pool.py:collision_cache_chain`,
+`collision/collision_extract.py:load_collision`.
+
+Merging the reference records is only two thirds of the chain. A REFR is a
+placement; carving needs the base record's model path, and then the collision
+mesh cached for that path. `build_base_model_index` already merged
+`master_export`, so the model path resolved — but `load_collision` REPLACED
+the module cache with a single file, and the pipeline handed it the plugin's
+OWN `collision_cache.bin`, which holds only the meshes that plugin ships.
+
+Measured on UL's `CloudRulerTempleExterior02`, over the 154 merged references:
+
+| Cache loaded | entries | collision hits | misses |
+|---|---|---|---|
+| UL's own | 1,083 | **0** | 149 |
+| Oblivion.esm's | 6,093 | 143 | 6 |
+| both, chained | 7,176 | **143** | 6 |
+
+So the record merge alone left the carver with 154 references and collision for
+**none** of them. The triangle count went UP rather than down, because nothing
+carved holes where the buildings are — a denser sheet over the same ground.
+
+`load_collision` therefore takes a path OR an iterable of them, MASTERS FIRST
+so the plugin's own mesh wins a shared path key, and `collision_cache_chain`
+builds that list from the export header's master names. A masterless plugin
+yields a one-element chain and is byte-identical. The 6 residual misses are UL
+meshes absent from both caches.
+
+The parent process loads the same chain (`pipeline.py`), since furniture seats
+and door panels read the module cache too.
+
+### The geometry must merge the masters too
+
+**Code:** `navmesh/pool.py:_merge_master_cell_records`.
+
+Owning the master's NAVM id is only half the contract. A child plugin restates
+**only the references it edits**, so building the navmesh from `by_type` alone
+carves the cell as if the master had furnished nothing.
+
+Measured on Unique Landscapes Compilation v2.2.0, `CloudRulerTempleExterior02`
+(`000044AD`, Tamriel 3,39):
+
+| Source | REFR in cell |
+|---|---|
+| Oblivion.esm | 121 |
+| UL's own export | 45 |
+| of those, NEW in UL | 33 |
+| master refs UL never restates | 109 |
+
+So 109 of the master's 121 references were invisible to the carver. The LAND is
+fully restated (1,888 keys in both files), which is why the symptom was a
+*degenerate, hole-filled* navmesh rather than a missing one: the ground was
+there, almost every static that should carve or support it was not. The part of
+the cell UL does not modify is exactly the part whose geometry lives only in the
+master, and it degraded worst.
+
+This was latent before navmesh overriding landed. The thin navmesh used to ship
+under a **derived** id, so the master's correct navmesh stayed loaded beside it;
+once the child adopted the master's id, the thin mesh *replaced* the good one.
+
+`_merge_master_cell_records` therefore makes the masters the baseline for REFR
+and LAND: master records first, the plugin's own overriding by FormID, and an
+override flagged `DELETED_FLAG` dropping out so a deleted ref cannot resurrect.
+After merging, the cell above carries 154 refs (121 master + 33 new; the 12
+edited ones replace rather than add).
+
+**PGRD is deliberately NOT merged.** Which jobs exist, and their
+`(cell_fid, pgrd_fid)` keys, stay driven by the plugin's own pathgrids — merging
+there would invent jobs and move every derived NAVM id. Verified on UL: job
+count is 1,865 before and after, and the probe cell keeps pathgrid `000392E8`.

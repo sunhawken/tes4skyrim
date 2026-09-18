@@ -12,7 +12,9 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from script_convert.cross_ref import CrossRefGraph
+from script_convert.resolve import resolve_property_formid
 from script_convert.converter import ScriptConverter
+from script_convert.message_menus import build_message_plan
 from script_convert.blocks import BLOCK_MAP, block_filter_guard
 from script_convert.emit.dispatch import emit_command
 from script_convert.constants import (
@@ -51,11 +53,11 @@ from script_convert.objective_completion import (
     objective_lines,
     parallel_stages,
     residue_stages,
+    superseded_stages,
 )
 from script_convert.pipeline import (
     sanitize_name,
     _pack_wstring,
-    _superseded_stages,
     build_vmad_quest_fragments,
     build_vmad_info_fragment,
     convert_all_scripts,
@@ -1064,12 +1066,10 @@ class TestScroRefTyping:
         return x
 
     def test_scro_does_not_shadow_promoted_quest_script_type(self):
-        from script_convert.pipeline import _add_scro_ref
+        from script_convert.scro_refs import add_scro_ref
         x = self._xref()
         conv = ScriptConverter(x)
-        # SCRO preload runs first and seeds the generic base type...
-        _add_scro_ref(conv, '00017606', x)
-        # ...then the body promotes it to the quest's own script class.
+        add_scro_ref(conv, '00017606', x)
         conv.convert_fragment('set MS14.QuestDone to 1', 'Quest')
         refs = conv.get_property_refs()
         # Exactly one entry, under the safe name, with the specific type.
@@ -1079,11 +1079,11 @@ class TestScroRefTyping:
     def test_scro_preload_after_promotion_does_not_downgrade(self):
         """_preload_stage_scro_refs runs once per stage; a later stage must not
         reset a type an earlier stage's body already promoted."""
-        from script_convert.pipeline import _add_scro_ref
+        from script_convert.scro_refs import add_scro_ref
         x = self._xref()
         conv = ScriptConverter(x)
         conv.convert_fragment('set MS14.QuestDone to 1', 'Quest')
-        _add_scro_ref(conv, '00017606', x)   # next stage re-seeds the SCRO
+        add_scro_ref(conv, '00017606', x)
         assert conv.get_property_refs()['myMS14'] == 'TES4_MS14Script'
 
 
@@ -1117,7 +1117,7 @@ class TestScroAliasRecovery:
 
     def test_rename_with_an_inserted_word_is_recovered(self):
         """NDArmorCuirass -> NDArmorHeavyCuirass1 is NOT a prefix relation."""
-        from script_convert.pipeline import resolve_scro_aliases
+        from script_convert.scro_refs import resolve_scro_aliases
         body = ('; quickstart\nsetstage ND02 0\nsetstage ND02 10\n'
                 'setstage ND02 60\nplayer.additem NDArmorCuirass 1\n'
                 'setstage ND03 10')
@@ -1126,7 +1126,7 @@ class TestScroAliasRecovery:
         assert aliases == {'ndarmorcuirass': 'NDArmorHeavyCuirass1'}
 
     def test_alias_binds_the_property_with_the_records_own_type(self):
-        from script_convert.pipeline import resolve_scro_aliases
+        from script_convert.scro_refs import resolve_scro_aliases
         x = self._xref()
         conv = ScriptConverter(x)
         body = 'player.additem NDArmorCuirass 1\nsetstage ND03 10'
@@ -1139,21 +1139,21 @@ class TestScroAliasRecovery:
 
     def test_a_live_editorid_is_never_redirected(self):
         """Every name resolves, so there is nothing to recover."""
-        from script_convert.pipeline import resolve_scro_aliases
+        from script_convert.scro_refs import resolve_scro_aliases
         body = 'setstage ND02 10\nsetstage ND03 10'
         assert resolve_scro_aliases(
             body, ['01002D3F', '01002D3E'], self._xref()) == {}
 
     def test_ambiguity_is_left_alone(self):
         """Two unspelled SCROs cannot be told apart — bind neither."""
-        from script_convert.pipeline import resolve_scro_aliases
+        from script_convert.scro_refs import resolve_scro_aliases
         body = 'player.additem NDArmorCuirass 1\nplayer.additem NDMystery 1'
         assert resolve_scro_aliases(
             body, ['00000014', '01000ECE', '01000FCA'], self._xref()) == {}
 
     def test_an_unnameable_scro_abandons_recovery(self):
         """A master-owned SCRO this export cannot name could be the target."""
-        from script_convert.pipeline import resolve_scro_aliases
+        from script_convert.scro_refs import resolve_scro_aliases
         body = 'player.additem NDArmorCuirass 1'
         assert resolve_scro_aliases(
             body, ['00000014', '0001BEEF'], self._xref()) == {}
@@ -1165,7 +1165,7 @@ class TestScroAliasRecovery:
         and that stage's `IsXBox` — an OBSE command with no FUNCTION_MAP entry —
         then looked like the rename it paired with, binding a variable to a
         statue."""
-        from script_convert.pipeline import resolve_scro_aliases
+        from script_convert.scro_refs import resolve_scro_aliases
         x = CrossRefGraph()
         for fid, edid, rtype in (
                 ('00008032', 'TG03LlathasasBust', 'STAT'),
@@ -1539,7 +1539,7 @@ class TestQuestObjectiveCompletion:
             'Target[1].FormID': '0000BC72',
             'Target[1].Condition[0].Raw': _stage_gate(_EQ, 20),
         }
-        sup = _superseded_stages(rec, _frags(10, 20))
+        sup = superseded_stages(rec, _frags(10, 20))
         assert sup[(20, 0)] == [10], "stage 20 must complete objective 10"
         assert sup[(10, 0)] == [], "nothing precedes stage 10"
 
@@ -1553,7 +1553,7 @@ class TestQuestObjectiveCompletion:
             'Target[1].FormID': '0000BC69',
             'Target[1].Condition[0].Raw': _stage_gate(_EQ, 55),
         }
-        sup = _superseded_stages(rec, _frags(40, 50, 55))
+        sup = superseded_stages(rec, _frags(40, 50, 55))
         assert sup[(50, 0)] == [], \
             "stage 50 shares 40's live marker — 40 is still in progress"
         assert sup[(55, 0)] == [40, 50], \
@@ -1569,7 +1569,7 @@ class TestQuestObjectiveCompletion:
             'Target[1].FormID': '0000BC69',
             'Target[1].Condition[0].Raw': _stage_gate(_EQ, 20),
         }
-        sup = _superseded_stages(rec, _frags(10, 20, 90))
+        sup = superseded_stages(rec, _frags(10, 20, 90))
         assert 10 not in sup[(20, 0)], \
             "objective 10's marker is still live at 20 — it must stay open"
         assert 10 not in sup[(90, 0)] or sup[(90, 0)] == [20], \
@@ -1586,7 +1586,7 @@ class TestQuestObjectiveCompletion:
             'Target[2].FormID': '0000BC73',
             'Target[2].Condition[0].Raw': _stage_gate(_EQ, 30),
         }
-        sup = _superseded_stages(rec, _frags(10, 20, 30))
+        sup = superseded_stages(rec, _frags(10, 20, 30))
         closes = [s for done in sup.values() for s in done]
         assert closes.count(10) == 1, "objective 10 must be completed once"
         assert sup[(30, 0)] == [20]
@@ -1594,7 +1594,7 @@ class TestQuestObjectiveCompletion:
     def test_no_targets_falls_back_to_linear_log(self):
         """A quest with no QSTA gates has nothing to read, so each entry is
         closed when the log moves on — Oblivion's linear default."""
-        sup = _superseded_stages({}, _frags(10, 20, 30))
+        sup = superseded_stages({}, _frags(10, 20, 30))
         assert sup[(20, 0)] == [10]
         assert sup[(30, 0)] == [20]
 
@@ -1609,7 +1609,7 @@ class TestQuestObjectiveCompletion:
         frags = _frags(50, 60, 70)
         assert residue_stages(rec, frags) == [], \
             "an open-ended gate must not leave objectives unresolvable"
-        sup = _superseded_stages(rec, frags)
+        sup = superseded_stages(rec, frags)
         assert sup[(60, 0)] == [50]
         assert sup[(70, 0)] == [60]
 
@@ -1635,7 +1635,7 @@ class TestQuestObjectiveCompletion:
         }
         frags = [(200, 0, 'Rewarded.', '', True, 0, 0),
                  (201, 0, 'He is dead.', '', True, 1, 0)]
-        sup = _superseded_stages(rec, frags)
+        sup = superseded_stages(rec, frags)
         assert sup[(201, 0)] == [], \
             "a quest-ending stage must not be closed by the other ending"
 
@@ -1952,10 +1952,25 @@ End
         assert ';  If (TES4_PCSleeping' not in result
 
     def test_menu_id_block_stays_commented(self, converter):
+        """1014 is UNMAPPED: running MQ01Script's `setstage MQ01 70` on any
+        lockpick close still blows the tutorial's stage machine."""
         result = converter.convert_standalone('TestSleep', self.SRC, 'Quest',
                                               'TestSleep')
         assert 'begin MenuMode 1014' in result
         assert ';  time = 99' in result
+
+    def test_racesex_menu_id_becomes_a_close_listener(self, converter):
+        """1036 IS mapped: FNV's VCG01 parks at stage 36 forever without it —
+        stage 36 is `ShowRaceMenu` and only this block sets stage 40."""
+        src = ('Scriptname TestRaceMenu\n\nshort stage\n\n'
+               'begin gamemode\nset stage to 1\nend\n\n'
+               'Begin MenuMode 1036\nset stage to 40\nEnd\n')
+        result = converter.convert_standalone('TestRaceMenu', src, 'Quest',
+                                              'TestRaceMenu')
+        assert 'Event OnMenuClose(String TES4_MenuName)' in result
+        assert 'RegisterForMenu("RaceSex Menu")' in result
+        assert 'If TES4_MenuName != "RaceSex Menu"' in result
+        assert ';  stage = 40' not in result, 'body must EXECUTE, not comment'
 
     def test_non_sleep_bare_menumode_stays_commented(self, converter):
         src = ('Scriptname TestNoSleep\n\nshort x\n\n'
@@ -2798,6 +2813,23 @@ class TestChargenMenus:
         assert 'Return' not in out
         assert out.rstrip().endswith('EndIf')
         assert out.index('If !TES4_ChargenMenuBusy') < out.index('.Show()')
+
+    def test_menu_reevaluates_the_dialogue_partner(self, converter):
+        """The modal closes the dialogue it opened from (TES4 kept it open),
+        so the partner is captured BEFORE Show() and re-evaluates his
+        packages AFTER the menu: CharacterGen stage 87's class menu ends
+        Baurus's conversation, and his authored `CGBaurusToPlayerB`
+        (`GetStage == 87`) re-greets only when his stack is evaluated.
+        See docs/commentary/script_convert.md#chargen-menu-reopens-the-dialogue.
+        """
+        converter.chargen_menus = self.PLAN
+        converter._current_event = 'Function Fragment_Stage_0087_Item_0()'
+        out = conv_lines(converter, 'ShowBirthsignMenu', 'Quest')
+        assert 'Actor TES4_menuPartner1 = TES4Polyfill.DialogueSpeaker()' in out
+        assert out.index('DialogueSpeaker()') < out.index('.Show()')
+        assert 'TES4_menuPartner1.EvaluatePackage()' in out
+        assert (out.index('TES4_ChargenMenuBusy = False')
+                < out.index('.EvaluatePackage()'))
 
     def test_menu_persists_choice_to_global(self, converter):
         """The pick lands in the choice GLOB as index+1 (0 = unchosen) so
@@ -3918,7 +3950,15 @@ class TestGetInCellSplitsInteriorFromExterior:
     def test_split_separates_the_two(self):
         interior, exterior = self._xref().split_cell_family('Bravil')
         assert interior == ['BravilCastleBarracks']
-        assert exterior == [('Tamriel', 17, -12)]
+        assert exterior == [('TES4Tamriel', 17, -12)]
+
+    def test_renamed_worldspace_resolves_to_its_tes4_formid(self):
+        """The emitted name must bind back to the TES4 record.
+
+        See: docs/commentary/script_convert.md#worldspace-property-rename
+        """
+        fid = resolve_property_formid(self._xref(), 'TES4Tamriel')
+        assert fid == '0100003C'
 
     def test_exterior_gets_no_cell_property(self):
         conv = ScriptConverter(self._xref())
@@ -3931,16 +3971,18 @@ class TestGetInCellSplitsInteriorFromExterior:
         assert 'Cell Property BravilBeach01' not in out
 
     def test_exterior_is_matched_by_grid_instead(self):
+        """The worldspace is a DECLARED property, under its converted name.
+
+        Helpers are emitted after the declarations, so registering the ref
+        while emitting them would leave an undefined identifier.
+        """
         conv = ScriptConverter(self._xref())
         src = ("scn T\nbegin GameMode\n"
                "  if player.GetInCell Bravil == 1\n"
                "    set x to 1\n  endif\nend\n")
         out = conv.convert_standalone('T', src, 'Quest', 'T')
         helpers = '\n'.join(conv.get_cell_family_helpers())
-        # The worldspace must be a declared property, not just cited: the
-        # helpers are emitted AFTER the declarations, so registering the ref
-        # while emitting them would leave an undefined identifier.
-        assert 'WorldSpace Property Tamriel' in out
+        assert 'WorldSpace Property TES4Tamriel' in out
         assert 'TES4_gx == 17' in helpers and 'TES4_gy == -12' in helpers
 
 
@@ -4726,3 +4768,210 @@ class TestScaleEnumAv:
 
     def test_non_enum_actor_value_is_declined(self, converter):
         assert converter._scale_enum_av('health', '50') is None
+
+
+# ===========================================================================
+# FO3/FNV quest delay and objectives
+# ===========================================================================
+
+class TestAuthoredQuestDelay:
+    """An authored FO3/FNV quest delay is the OnUpdate poll interval.
+
+    See docs/commentary/script_convert.md#poll-interval.
+    """
+
+    SOURCE = "ScriptName CanteenScript\n\nBegin GameMode\n  set x to 1\nEnd\n"
+
+    def _convert(self, converter, delay):
+        """The Papyrus for a bare GameMode quest script polling at `delay`."""
+        converter.sc.quest_delay = delay
+        return converter.convert_standalone('CanteenScript', self.SOURCE,
+                                            'Quest', 'CanteenScript')
+
+    def test_delay_replaces_the_content_driven_interval(self, converter):
+        """300 s authored: the OnInit start and the re-arm both use it."""
+        out = self._convert(converter, 300.0)
+        assert out.count('RegisterForSingleUpdate(300.0)') == 2
+        assert 'RegisterForSingleUpdate(0.5)' not in out
+
+    def test_delay_floors_at_the_fastest_poll(self, converter):
+        """0.01 s authored polls at 0.1 s; a faster registration is every frame anyway."""
+        assert 'RegisterForSingleUpdate(0.1)' in self._convert(converter, 0.01)
+
+    def test_no_delay_keeps_the_half_second_default(self, converter):
+        """A TES4 quest script (delay 0) still polls at 0.5 s."""
+        assert 'RegisterForSingleUpdate(0.5)' in self._convert(converter, 0.0)
+
+    def test_quest_script_delays_keys_the_script_by_scri(self):
+        """Only quests writing a non-zero delay and a SCRI contribute."""
+        from script_convert.poll_interval import quest_script_delays
+        by_type = {'QUST': [{'SCRI': '00174091', 'DATA.Delay': '300'},
+                            {'SCRI': '00000001', 'DATA.Delay': '0'},
+                            {'DATA.Delay': '5'}]}
+        assert quest_script_delays(by_type) == {'00174091': 300.0}
+
+
+class TestFalloutObjectiveCommands:
+    """SetObjectiveDisplayed/Completed and their reads route to the Quest natives.
+
+    See docs/commentary/script_convert.md#fnv-objective-commands.
+    """
+
+    def test_set_displayed_defaults_the_flag_to_true(self, converter_with_quests):
+        """`SetObjectiveDisplayed Q 10` is Q.SetObjectiveDisplayed(10)."""
+        line = conv_line(converter_with_quests,
+                         'SetObjectiveDisplayed MQ01 10', 'Quest')
+        assert line == 'MQ01.SetObjectiveDisplayed(10)'
+
+    def test_set_completed_passes_an_explicit_zero(self, converter_with_quests):
+        """The trailing 0 un-completes, as in the GECK."""
+        line = conv_line(converter_with_quests,
+                         'SetObjectiveCompleted MQ01 20 0', 'Quest')
+        assert line == 'MQ01.SetObjectiveCompleted(20, 0)'
+
+    def test_get_completed_reads_the_quest_native(self, converter_with_quests):
+        """GetObjectiveCompleted is Quest.IsObjectiveCompleted."""
+        expr = conv_expr(converter_with_quests,
+                         'GetObjectiveCompleted MQ01 20 == 1', 'Quest')
+        assert expr.startswith('MQ01.IsObjectiveCompleted(20)')
+
+
+_FNV_SEX_MENU_SRC = ('ScriptName VCG01SCRIPT\n\nshort bChooseSex\nshort nButton\n\n'
+                     'BEGIN GameMode\n\tif bChooseSex == 0\n'
+                     '\t\tShowMessage VCG01ChooseSexMessage\n\t\tset bChooseSex to 1\n'
+                     '\tendif\n\tif bChooseSex == 1\n\t\tset nButton to GetButtonPressed\n'
+                     '\tendif\nEND\n')
+
+
+class TestFalloutShowMessageMenus:
+    """FNV `ShowMessage <MESG>` + GetButtonPressed is the button-menu idiom.
+
+    See docs/commentary/script_convert.md#fnv-showmessage-menus.
+    """
+    SRC = _FNV_SEX_MENU_SRC
+
+    @staticmethod
+    def _records():
+        """(SCPT record, buttoned MESG record) for the stage-17 sex prompt."""
+        return ({'EditorID': 'VCG01SCRIPT', 'SCTX': _FNV_SEX_MENU_SRC},
+                {'EditorID': 'VCG01ChooseSexMessage', 'DNAM': '1',
+                 'Button[0].Text': 'Mister', 'Button[1].Text': "Ma'am"})
+
+    def test_authored_mesg_enters_the_plan_with_no_text(self):
+        """The site is keyed by the MESG's own EDID; text None marks it authored."""
+        scpt, mesg = self._records()
+        plan = build_message_plan([scpt], [mesg])
+        assert plan == {'vcg01script': [('VCG01ChooseSexMessage', None,
+                                         ['Mister', "Ma'am"])]}
+
+    def test_buttonless_mesg_is_not_a_site(self):
+        """A MESG without buttons keeps the row's plain Show()."""
+        scpt, _mesg = self._records()
+        assert build_message_plan([scpt],
+                                  [{'EditorID': 'VCG01ChooseSexMessage'}]) == {}
+
+    def test_show_and_poll_share_the_button_state(self, converter):
+        """Show() lands in TES4_MsgButton; GetButtonPressed consumes it once
+        -- without the plan it was the dead `-1` and the poll never fired."""
+        converter.message_menus = build_message_plan(*[[r] for r in self._records()])
+        out = converter.convert_standalone('VCG01SCRIPT', self.SRC, 'Quest',
+                                           'VCG01SCRIPT')
+        assert 'TES4_MsgButton = TES4_ShowMsg(VCG01ChooseSexMessage)' in out
+        assert 'nButton = TES4_TakeMsgButton()' in out
+        assert 'Int Function TES4_ShowMsg(Message TES4_akMsg)' in out
+        assert 'Message Property VCG01ChooseSexMessage Auto' in out
+
+    def test_importer_writes_no_record_for_an_authored_site(self):
+        """The MESG record is converted by convert_MESG; a synthesized twin
+        would collide on the EDID."""
+        from tes5_import.base.owned_records import create_message_menu_records
+
+        class Writer:
+            def __init__(self):
+                """Record the signatures written."""
+                self.added = []
+
+            def derive_formid(self, site, key):
+                """A fixed id; the test only counts records."""
+                return 0x01000001
+
+            def add_record(self, sig, blob):
+                """Remember that a record of `sig` was written."""
+                self.added.append(sig)
+
+        plan = build_message_plan(*[[r] for r in self._records()])
+        plan['other'] = [('TES4Msg_Other_01', 'Pick one', ['A', 'B'])]
+        writer = Writer()
+        out = create_message_menu_records(writer, plan)
+        assert list(out) == ['TES4Msg_Other_01']
+        assert writer.added == ['MESG']
+
+
+class TestFurnitureUse:
+    """IsCurrentFurnitureRef/Obj read SKSE's GetFurnitureReference through the
+    polyfill -- as a dead `0`, VCG01's couch objective could never complete."""
+
+    def test_ref_form(self, converter):
+        """The player's furniture is compared against the named REFR."""
+        expr = conv_expr(converter, 'player.IsCurrentFurnitureRef DocCouchREF == 1',
+                         'ObjectReference')
+        assert expr.startswith(
+            'TES4Polyfill.IsCurrentFurnitureRef(Game.GetPlayer(), DocCouchREF)')
+        assert converter._property_refs['DocCouchREF'] == 'ObjectReference'
+
+    def test_obj_form(self, converter):
+        """The base-object form takes any furniture of that base."""
+        expr = conv_expr(converter, 'DocRef.IsCurrentFurnitureObj DocChair',
+                         'ObjectReference')
+        assert expr.startswith('TES4Polyfill.IsCurrentFurnitureObj(DocRef, DocChair)')
+
+
+class TestQuestFragmentObjectives:
+    """A quest with authored objectives displays none of its own.
+
+    See docs/commentary/script_convert.md#one-objective-per-stage.
+    """
+
+    def _rec(self, authored):
+        """One journal stage, optionally with an Objective[] block."""
+        rec = {'EditorID': 'VMQ01', 'StageCount': '1', 'Stage[0].Index': '10',
+               'Stage[0].LogCount': '1', 'Stage[0].Log[0].Flags': '0',
+               'Stage[0].Log[0].Text': 'Travel to Novac.'}
+        if authored:
+            rec['ObjectiveCount'] = '1'
+        return rec
+
+    def _psc(self, xref, authored):
+        """The generated _QF_ source for that record."""
+        from script_convert.quest_fragments import (quest_fragment_psc,
+                                                    stage_fragments)
+        rec = self._rec(authored)
+        return quest_fragment_psc(rec, 'VMQ01', xref, stage_fragments(rec), {})[1]
+
+    def test_authored_objectives_suppress_stage_objective_calls(self, xref):
+        """The fragment exists, but displays no stage-indexed objective."""
+        psc = self._psc(xref, True)
+        assert 'Function Fragment_Stage_0010_Item_0()' in psc
+        assert 'SetObjectiveDisplayed' not in psc
+
+    def test_derived_objectives_are_displayed_per_stage(self, xref):
+        """A TES4 quest still displays the objective its stage index names."""
+        assert 'SetObjectiveDisplayed(10, true)' in self._psc(xref, False)
+
+
+class TestFalloutCastAliases:
+    """`cios` / `CastImmediateOnSelf` are the shared `cast` handler.
+
+    See docs/commentary/script_convert.md#fnv-unrouted-commands.
+    """
+
+    def test_cios_casts_the_spell_on_the_receiver(self, converter):
+        """`player.cios X` is X.Cast(player, player), never an NE note."""
+        line = conv_line(converter, 'player.cios TestSpell', 'Quest')
+        assert line == 'TestSpell.Cast(Game.GetPlayer(), Game.GetPlayer())'
+
+    def test_long_spelling_is_the_same_handler(self, converter):
+        """CastImmediateOnSelf converts identically."""
+        line = conv_line(converter, 'player.CastImmediateOnSelf TestSpell',
+                         'Quest')
+        assert line == 'TestSpell.Cast(Game.GetPlayer(), Game.GetPlayer())'

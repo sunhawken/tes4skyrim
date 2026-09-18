@@ -513,9 +513,9 @@ def build_wrld_cloud_modl(rec: dict, edid: str = None):
 def convert_CELL(rec: dict) -> bytes:
     """Convert CELL record.
 
-    `LTMP` is required by TES5. TES4 has no equivalent and its XCLL inherits
-    nothing, so it falls back to NULL; an FO3/FNV cell names a converted LGTM,
-    and likewise `XCIM`/`XEZN` in vanilla's own LTMP XCLW XCIM XLCN XEZN order.
+    `LTMP` is required by TES5 and always written NULL: the cell lights from
+    its own XCLL, which inherits nothing. Pointing it at a converted FO3/FNV
+    LGTM turned every interior pitch black. `XCIM`/`XEZN` are FO3/FNV-only.
 
     See: docs/commentary/tes4_export_falloutnv.md#reference-only-types
     """
@@ -545,8 +545,7 @@ def convert_CELL(rec: dict) -> bytes:
     if xcll_payload is not None:
         subs += pack_subrecord('XCLL', xcll_payload)
 
-    subs += pack_formid_subrecord('LTMP',
-                                  get_formid(rec, 'LTMP.LightingTemplate'))
+    subs += pack_formid_subrecord('LTMP', 0)
 
     # Ownership
     xown = get_formid(rec, 'XOWN.Owner')
@@ -895,6 +894,33 @@ def _refr_data(rec: dict, scale) -> bytes:
         _safe_angle(get_float(rec, 'RotZ'))))
 
 
+def _refr_head(rec: dict) -> bytes:
+    """EDID, NAME and the XPRM primitive of a REFR.
+
+    An invisible-marker base is substituted with its Skyrim.esm equivalent so
+    the ref points into index 0.  Oblivion.esm ships 6 refs on the MapMarker
+    base with no XMRK data (campsite/battle position markers); the map code
+    treats every 0x10-based ref as a map marker, so they ground to XMarker.
+    FO3/FNV trigger volumes are XPRM primitives, byte-identical to TES5's, so
+    the raw subrecord is copied through.
+    See: docs/commentary/tes4_export_falloutnv.md#trigger-primitives
+    """
+    subs = b''
+    edid = get_str(rec, 'EditorID')
+    if edid:
+        subs += pack_string_subrecord('EDID', edid)
+    name_raw = int(rec.get('NAME', '0') or '0', 16)
+    name_fid = _refr_base_formid(rec, name_raw)
+    if name_raw == 0x10 and get_str(rec, 'MapMarker') != '1':
+        name_fid = 0x0000003B
+    if name_fid:
+        subs += pack_formid_subrecord('NAME', name_fid)
+    primitive = get_str(rec, 'XPRM.Raw')
+    if primitive:
+        subs += pack_subrecord('XPRM', bytes.fromhex(primitive))
+    return subs
+
+
 def convert_REFR(rec: dict) -> bytes:
     """REFR — placed object reference.
 
@@ -910,26 +936,7 @@ def convert_REFR(rec: dict) -> bytes:
     The `object_scripts` import stays INSIDE the body.
     See: docs/reference/tes5_import_architecture.md#object-scripts-import-is-deferred
     """
-    subs = b''
-    edid = get_str(rec, 'EditorID')
-    if edid:
-        subs += pack_string_subrecord('EDID', edid)
-
-    # NAME = base object FormID (required)
-    # For invisible marker base objects, substitute the Skyrim.esm equivalent
-    # so REFRs point into Skyrim.esm (index 0) rather than our remapped copy.
-    name_raw = int(rec.get('NAME', '0') or '0', 16)
-    name_fid = _refr_base_formid(rec, name_raw)
-    # Oblivion.esm ships 6 refs on the MapMarker base with no XMRK marker
-    # data at all (campsite/battle position markers). Skyrim's map code
-    # treats every 0x10-based ref as a map marker and the CK flags them
-    # ("Mapmarker ref does not have map marker data") — they are plain
-    # position markers, so ground them to XMarker.
-    if name_raw == 0x10 and get_str(rec, 'MapMarker') != '1':
-        name_fid = 0x0000003B
-    if name_fid:
-        subs += pack_formid_subrecord('NAME', name_fid)
-
+    subs = _refr_head(rec)
     subs += _refr_xtel(rec)
 
     lock_bytes, barrier_door = _refr_xloc(rec)
@@ -1242,15 +1249,13 @@ def _cell_music(rec: dict) -> bytes:
 def _cell_pointers(rec: dict) -> bytes:
     """Every CELL subrecord naming another record, in xEdit order.
 
-    XCIM and XEZN exist only in FO3/FNV sources; XCWT overrides the
-    worldspace NAM2.
+    XEZN exists only in FO3/FNV sources; XCWT overrides the worldspace NAM2.
+    XCIM is deliberately NOT written: TES5 HNAM has no FNV source, so the
+    imagespace HDR block is approximated and darkened every interior.
 
     See: docs/commentary/tes5_import_landscape.md#cell-water-and-music
     """
     subs = _cell_regions(rec)
-    xcim = get_formid(rec, 'XCIM.Imagespace')
-    if xcim:
-        subs += pack_formid_subrecord('XCIM', xcim)
     subs += _cell_location(rec)
     xezn = get_formid(rec, 'XEZN.EncounterZone')
     if xezn:

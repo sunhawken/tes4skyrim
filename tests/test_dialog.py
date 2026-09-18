@@ -33,7 +33,8 @@ from tes5_import.base.conditions import (
 )
 from tes5_import.dialogue.converter import DIAL_TYPE_COMBAT, DIAL_TYPE_CONVERSATION, DIAL_TYPE_DETECTION, DIAL_TYPE_MISC, DIAL_TYPE_PERSUASION, DIAL_TYPE_SERVICE, DIAL_TYPE_TOPIC, _EDID_SUBTYPE, classify_topic, convert_DIAL, convert_INFO, make_dlbr, make_dlvw, should_skip_dial
 from tes5_import.dialogue.groups import build_dialog_groups
-from tes5_import.dialogue.quest import convert_QUST
+from tes5_import.dialogue.quest import (convert_QUST,
+                                        set_assigned_var_names)
 from tes5_import.base.tes5_reader import records
 from tes5_import.base.text_reader import set_formid_index_offset
 
@@ -670,6 +671,66 @@ class TestQUST:
         assert prio == 30
         assert formver == 0
 
+    #: Charactergen stage 17 log entry 1: GetQuestVariable(0002466E, 19) == 1.
+    DEBUG_CTDA = '000000000000803f4f0000006e4602001300000000000000'
+
+    def _chargen(self):
+        """A one-stage Charactergen export whose entry 1 is the debug note."""
+        return {
+            'FormID': '0002466E', 'RecordFlags': '0',
+            'EditorID': 'Charactergen', 'DATA.Flags': '0', 'StageCount': '1',
+            'Stage[0].Index': '17', 'Stage[0].LogCount': '2',
+            'Stage[0].Log[0].Flags': '0',
+            'Stage[0].Log[1].Flags': '0',
+            'Stage[0].Log[1].Text': 'DEBUG: Stage 17: Emperor approaches',
+            'Stage[0].Log[1].ConditionCount': '1',
+            'Stage[0].Log[1].Condition[0].Raw': self.DEBUG_CTDA,
+        }
+
+    def test_stage_log_entry_conditions_are_written(self):
+        """A log entry's own CTDAs decide whether its text displays, and the
+        importer used to drop them -- which is why 24 'DEBUG:'/'TEMP:' notes
+        reached the player's journal during Oblivion's chargen. The variable
+        name rides along as CIS2 so Skyrim can read it.
+
+        See: docs/commentary/tes5_import_quest.md#stage-log-entry-conditions
+        """
+        sv = {0x02466E: {19: 'debug'}}
+        out = convert_QUST(self._chargen(), script_vars=sv)
+        assert len(_find_all_subrecords(out, b'CTDA')) == 1
+        assert b'debug' in _find_subrecord(out, b'CIS2').lower()
+        assert b'DEBUG: Stage 17' in _find_subrecord(out, b'CNAM')
+
+    def test_never_assigned_gate_mints_no_objective(self):
+        """The journal line is gated by its CTDA, but a HUD objective carries
+        no condition of its own -- so an entry gated on a variable nothing
+        assigns must not become one.
+
+        See: docs/commentary/tes5_import_quest.md#stage-log-entry-conditions
+        """
+        sv = {0x02466E: {19: 'debug'}}
+        set_assigned_var_names({'convtimer'})
+        try:
+            out = convert_QUST(self._chargen(), script_vars=sv)
+        finally:
+            set_assigned_var_names(None)
+        assert _find_all_subrecords(out, b'QOBJ') == []
+
+    def test_assigned_gate_still_mints_its_objective(self):
+        """THE REGRESSION THAT MATTERS. Gating on a script variable is the
+        ORDINARY way Oblivion picks between journal variants (SE46's Mania vs
+        Dementia lines). Only a NEVER-ASSIGNED variable is a debug switch.
+
+        See: docs/commentary/tes5_import_quest.md#stage-log-entry-conditions
+        """
+        sv = {0x02466E: {19: 'debug'}}
+        set_assigned_var_names({'debug'})
+        try:
+            out = convert_QUST(self._chargen(), script_vars=sv)
+        finally:
+            set_assigned_var_names(None)
+        assert len(_find_all_subrecords(out, b'QOBJ')) == 1
+
     def test_journal_quests_get_side_quest_type(self):
         """Quests with journal stages must be Type 8 (Side Quest). Type 0
         (None) is Skyrim's journal-INVISIBLE control-quest type — the quest
@@ -821,6 +882,95 @@ class TestQUST:
         assert _find_subrecord(out, b'CNAM').rstrip(b'\x00') == b'Journal text.'
         assert _find_subrecord(out, b'ANAM') is not None
         assert _sub_order(out).index('NEXT') < _sub_order(out).index('INDX')
+
+
+class TestAuthoredObjectives:
+    """FO3/FNV Objective[] blocks are written as authored, not derived.
+
+    See docs/commentary/tes5_import_quest.md#authored-objectives.
+    """
+
+    #: FNV GetDisabled (35), Run On 2 (Reference) 00177D36 -- a real VMQ01 target gate.
+    REF_CTDA = '000000000000803f23000000000000000000000002000000367d1700'
+
+    def _rec(self):
+        """VMQ01 in miniature: a stage with no CNAM and two authored objectives."""
+        return {
+            'FormID': '000842DD', 'RecordFlags': '0', 'EditorID': 'VMQ01',
+            'DATA.Flags': '0', 'DATA.Priority': '100', 'DATA.Delay': '0',
+            'StageCount': '1', 'Stage[0].Index': '10', 'Stage[0].LogCount': '1',
+            'Stage[0].Log[0].Flags': '0',
+            'ObjectiveCount': '2',
+            'Objective[0].Index': '40', 'Objective[0].Text': 'Head to Novac.',
+            'Objective[0].TargetCount': '2',
+            'Objective[0].Target[0].FormID': '0009289B',
+            'Objective[0].Target[0].Flags': '1',
+            'Objective[0].Target[0].ConditionCount': '1',
+            'Objective[0].Target[0].Condition[0].Raw': self.REF_CTDA,
+            'Objective[0].Target[1].FormID': '000CDF13',
+            'Objective[0].Target[1].Flags': '0',
+            'Objective[1].Index': '50', 'Objective[1].Text': 'Intercept the Khans.',
+            'Objective[1].TargetCount': '1',
+            'Objective[1].Target[0].FormID': '0009289B',
+            'Objective[1].Target[0].Flags': '1',
+        }
+
+    def test_objectives_keep_their_authored_index_and_text(self):
+        """QOBJ is the authored index; NNAM the authored line, verbatim."""
+        out = convert_QUST(self._rec())
+        qobjs = [struct.unpack('<H', q)[0] for q in _find_all_subrecords(out, b'QOBJ')]
+        assert qobjs == [40, 50]
+        nnams = [n.rstrip(b'\0') for n in _find_all_subrecords(out, b'NNAM')]
+        assert nnams == [b'Head to Novac.', b'Intercept the Khans.']
+
+    def test_targets_share_aliases_and_keep_their_conditions(self):
+        """One alias per distinct target; the CTDA follows its QSTA with Run On kept."""
+        out = convert_QUST(self._rec())
+        qstas = _find_all_subrecords(out, b'QSTA')
+        assert [struct.unpack_from('<i', q)[0] for q in qstas] == [0, 1, 0]
+        assert [q[4] for q in qstas] == [1, 0, 1]
+        assert struct.unpack('<I', _find_subrecord(out, b'ANAM'))[0] == 2
+        ctda = _find_subrecord(out, b'CTDA')
+        assert len(ctda) == 32
+        assert struct.unpack_from('<H', ctda, 8)[0] == 35
+        assert struct.unpack_from('<II', ctda, 20) == (2, 0x00177D36)
+        order = _sub_order(out)
+        assert order.index('CTDA') == order.index('QSTA') + 1
+
+    def test_authored_objectives_make_the_quest_a_journal_quest(self):
+        """No CNAM anywhere, yet the quest must list: type 8, not 0."""
+        dnam = _find_subrecord(convert_QUST(self._rec()), b'DNAM')
+        assert struct.unpack_from('<I', dnam, 8)[0] == 8
+
+
+class TestFalloutConditions:
+    """A 28-byte CTDA is Fallout's: function remapped, Run On carried.
+
+    See docs/commentary/tes5_import_conditions.md#fallout-ctda.
+    """
+
+    def test_moved_function_is_renumbered(self):
+        """GetIsVoiceType is 427 in FNV and 426 in Skyrim."""
+        raw = bytes.fromhex('000000000000803fab010000dd420800000000000000000000000000')
+        out = convert_ctda(raw)
+        assert struct.unpack_from('<H', out, 8)[0] == 426
+
+    def test_absent_function_is_dropped(self):
+        """GetObjectiveCompleted (420) has no Skyrim function."""
+        raw = bytes.fromhex('000000000000803fa4010000dd420800000000000000000000000000')
+        assert convert_ctda(raw) is None
+
+    def test_tes4_index_at_a_fallout_slot_is_not_misread(self):
+        """A 24-byte raw is TES4: 427 there is GetPlantedExplosive and stays put."""
+        raw = bytes.fromhex('000000000000803fab010000dd42080000000000000000')
+        assert struct.unpack_from('<H', convert_ctda(raw), 8)[0] == 427
+
+    def test_run_on_target_takes_the_tes4_target_path(self):
+        """Fallout Run On 1 is TES4's run-on-target bit, dropped under drop_run_on_target."""
+        raw = bytes.fromhex('000000000000803f2e000000000000000000000001000000'
+                            '00000000')
+        assert struct.unpack_from('<I', convert_ctda(raw), 20)[0] == 1
+        assert convert_ctda(raw, drop_run_on_target=True) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1084,6 +1234,10 @@ class TestAddTopicUnlocks:
                 {'FormID': '000C0004', 'ParentDIAL': '000B0003',
                  'QSTI.Quest': '000A0001', 'ResponseCount': '0',
                  'ChoiceCount': '0', 'ConditionCount': '0', 'DATA.Flags': '0'},
+                {'FormID': '000C0006', 'ParentDIAL': '000B0003',
+                 'ResultScriptEnd': 'AddTopic ratsTOPIC',
+                 'QSTI.Quest': '000A0001', 'ResponseCount': '0',
+                 'ChoiceCount': '0', 'ConditionCount': '0', 'DATA.Flags': '0'},
             ],
         }
 
@@ -1098,6 +1252,7 @@ class TestAddTopicUnlocks:
         # data-list revealer + mention revealer
         assert plan['info_reveals'][0x0C0001] == ['TES4Unlock_ratsTOPIC']
         assert plan['info_reveals'][0x0C0002] == ['TES4Unlock_ratsTOPIC']
+        assert plan['info_reveals'][0x0C0006] == ['TES4Unlock_ratsTOPIC']
         # stage script revealer
         assert plan['stage_reveals'] == {('fgquest', 10): ['TES4Unlock_stageTopic']}
 
@@ -1702,21 +1857,21 @@ class TestNpcConversationChains:
         assert any('unsupported gate' in why for _fid, why in plan['skipped'])
 
     def test_generated_psc_shape(self):
+        """Each hop waits out TES4Polyfill.SayLine plus the 0.6s beat.
+
+        The measured length is only the FALLBACK argument, and the `!= None`
+        guards disable a chain whose binding diverged instead of aborting the
+        poll function.
+        """
         from tes5_import.dialogue.conversations import generate_driver_psc
         plan = self._plan()
         psc = generate_driver_psc(plan, {'info:000AAA31': 3.0})
         assert psc.startswith('ScriptName TES4NPCConvTest extends Quest')
-        # Each hop goes through TES4Polyfill.SayLine, which blocks until the
-        # engine has begun the line and returns its real length; the driver
-        # waits that out plus the 0.6s beat.  The measured length is only the
-        # FALLBACK argument (a line with no voice file).
         assert 'Utility.Wait(TES4Polyfill.SayLine(Conv0A, Conv0T0, 4.00) + 0.6)' in psc
         assert 'TES4Polyfill.SayLine(Conv0B, Conv0T1, 3.00) + 0.6' in psc
         assert 'TES4Polyfill.SayLine(Conv0A, Conv0T2, 4.00) + 0.6' in psc
         assert '.Say(' not in psc
         assert 'Conv0Q0.GetStage() == 26' in psc
-        # Unbound-property guards: a binding divergence disables the chain
-        # instead of aborting the poll function.
         assert 'Conv0T0 != None' in psc and 'Conv0Q0 != None' in psc
 
     def test_property_bindings_mirror_the_psc(self):
@@ -1753,6 +1908,59 @@ class TestNpcConversationChains:
         psc = generate_driver_psc(plan, {})
         done1 = [l for l in psc.splitlines() if l.strip() == '_done1 = True']
         assert len(done1) == 2      # its own block and chain 0's
+
+
+class TestScriptStartedChains:
+    """`StartConversation A B topic` hands a whole chain to Oblivion's
+    scheduler; Skyrim's Say plays ONE line, so the chain must be replayed.
+    See: docs/commentary/tes5_import_dialogue.md#script-started-conversation-chains"""
+
+    QUEST, TOPIC = 0x000BBB10, 0x000BBB20
+    A_BASE, B_BASE = 0x000BBB01, 0x000BBB02
+
+    @staticmethod
+    def _f(v: float) -> int:
+        """`v` as its raw float bits, the CTDA comparison encoding."""
+        return struct.unpack('<I', struct.pack('<f', v))[0]
+
+    def _line(self, fid, conv_value, npc_addressed=True):
+        """One INFO gated on `conv == conv_value`."""
+        conds = [_tes4_ctda(func=72, p1=self.A_BASE)]
+        if npc_addressed:
+            conds.append(_tes4_ctda(type_byte=0x02, func=72, p1=self.B_BASE))
+        conds.append(_tes4_ctda(func=79, comp=self._f(float(conv_value)),
+                                p1=self.QUEST, p2=9))
+        rec = {'Signature': 'INFO', 'FormID': f'{fid:08X}',
+               'ParentDIAL': f'{self.TOPIC:08X}', 'DATA.DialogType': '1',
+               'DATA.NextSpeaker': '0',
+               'QSTI.Quest': f'{self.QUEST:08X}',
+               'ConditionCount': str(len(conds))}
+        for i, c in enumerate(conds):
+            rec[f'Condition[{i}].Raw'] = c.hex()
+        return rec
+
+    def _map(self, edid='MyConvo', lines=3, npc_addressed=True):
+        """The chain map for one topic carrying `lines` gated INFOs."""
+        from tes5_import.dialogue.conversations import build_script_chain_map
+        infos = [self._line(0x000BBB30 + n, n, npc_addressed)
+                 for n in range(lines)]
+        return build_script_chain_map({
+            'DIAL': [{'Signature': 'DIAL', 'FormID': f'{self.TOPIC:08X}',
+                      'EditorID': edid, 'DATA.Type': '1'}],
+            'INFO': infos,
+        })
+
+    def test_consecutive_counter_run_is_a_chain(self):
+        """A run of conv==0..3 is four lines to replay."""
+        assert self._map(lines=4) == {'myconvo': 4}
+
+    def test_single_line_topic_is_not_a_chain(self):
+        """One line needs no replay -- it keeps the plain Say."""
+        assert self._map(lines=1) == {}
+
+    def test_player_facing_topic_is_excluded(self):
+        """No run-on-target identity means no chain: else GREETING loops."""
+        assert self._map(edid='GREETING', npc_addressed=False) == {}
 
 
 class TestForceGreetOncePerDay:

@@ -74,14 +74,19 @@ class CellCtx(object):
     def has_pathgrid(self):
         return bool(self.nodes)
 
-    def build(self):
-        """Regenerate this cell's navmesh exactly as the pipeline would."""
+    def build(self, ledges_out=None):
+        """Regenerate this cell's navmesh exactly as the pipeline would.
+
+        `ledges_out` collects `(upper_tri, lower_tri, drop)` drop-down links,
+        which production returns out-of-band so `(verts, tris)` stays intact.
+        """
         verts, tris = build.build_navmesh(
             self.refrs, self.index.base_model, ce.get_collision,
             self.nodes, self.edges, land_rec=self.land,
             doors=[(x, y, z, r, tp, w)
                    for (x, y, z, r, _f, tp, w) in self.doors],
-            door_bases=set(self.index.door_fids.keys()))
+            door_bases=set(self.index.door_fids.keys()),
+            ledges_out=ledges_out)
         return verts, [tuple(int(i) for i in tri[:3]) for tri in tris]
 
     def collision(self):
@@ -95,6 +100,30 @@ class CellCtx(object):
             self.refrs, self.index.base_model, ce.get_collision,
             land_rec=self.land,
             skip_bases=set(self.index.door_fids.keys()))
+
+    def collision_sources(self):
+        """[(model path, walkable tris, blocking tris)] per placed REFR.
+
+        The renderer labels each triangle with the mesh it came from, so a
+        surface that should not be there can be named instead of guessed at.
+        """
+        from tes5_import.navmesh import world
+        skip = set(self.index.door_fids.keys())
+        out = []
+        for refr in self.refrs:
+            name = refr.get('NAME')
+            try:
+                base_low = int(name, 16) & 0x00FFFFFF if name else None
+            except ValueError:
+                continue
+            if base_low is None or base_low in skip:
+                continue
+            w, b = world._placed_soup(refr, self.index.base_model,
+                                      ce.get_collision)
+            if (w is None or not len(w)) and (b is None or not len(b)):
+                continue
+            out.append((self.index.base_model.get(base_low) or '?', w, b))
+        return out
 
     def walked_samples(self, step=16.0):
         """Yield (x, y, z) points along every pathgrid edge.
@@ -113,12 +142,13 @@ class CellCtx(object):
 
 
 class NavIndex(object):
+    #: Export whose tables are currently armed in the shared module globals.
+    _armed = None
+
     def __init__(self, export=DEFAULT_EXPORT, quiet=True):
         self.export = export
-        ce.load_collision(os.path.join(export, 'collision_cache.bin'), quiet=quiet)
-        load_door_centroids(os.path.join(export, 'door_centers_cache.json'),
-                            quiet=quiet)
-        load_origin_shifts(export, quiet=quiet)
+        self._quiet = quiet
+        self.arm()
         with open(os.path.join(export, 'audit_index3.pkl'), 'rb') as fh:
             (self.base_model, self.refr_by_cell, self.pgrd_by_cell,
              self.land_by_cell, self.door_fids, self.cells) = pickle.load(fh)
@@ -129,8 +159,29 @@ class NavIndex(object):
                 self._by_name.setdefault(eid, c)
         self._by_fid = {(c.get('FormID') or '').upper(): c for c in self.cells}
 
+    def arm(self):
+        """Point the shared collision/door globals at THIS export's tables.
+
+        `ce.load_collision` and `load_door_centroids` write module globals, so
+        two NavIndex objects in one process share one table and the last one
+        built wins -- every cell of the other export then finds no collision.
+
+        See: docs/commentary/tes5_import_navmesh.md#navindex-arms-shared-tables
+        """
+        key = os.path.normcase(os.path.normpath(self.export))
+        if NavIndex._armed == key:
+            return
+        ce.load_collision(os.path.join(self.export, 'collision_cache.bin'),
+                          quiet=self._quiet)
+        load_door_centroids(
+            os.path.join(self.export, 'door_centers_cache.json'),
+            quiet=self._quiet)
+        load_origin_shifts(self.export, quiet=self._quiet)
+        NavIndex._armed = key
+
     def cell(self, name_or_fid):
         """Look up by EditorID (case-insensitive) or by FormID hex."""
+        self.arm()
         rec = self._by_name.get(str(name_or_fid).lower())
         if rec is None:
             rec = self._by_fid.get(str(name_or_fid).upper().lstrip('0X').rjust(8, '0'))

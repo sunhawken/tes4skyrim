@@ -58,12 +58,11 @@ OVERRIDE_UNMAPPABLE_TYPES = frozenset({'ROAD'})
 # shipped ALIVE at the master's position.
 DELETED_FLAG = 0x20
 
+#: status is 'emitted'|'deleted'|'unchanged'|'no-base'|'no-path'|'reconvert'.
 Override = namedtuple('Override', ['status', 'out_fid', 'record_bytes'])
-# status: 'emitted' | 'deleted' | 'unchanged' | 'no-base' | 'no-path'
-#         | 'reconvert'
 
 
-def _export_master_names(export_dir: str) -> list:
+def export_master_names(export_dir: str) -> list:
     """This plugin's TES4 master names, in load order, from its export header."""
     header = os.path.join(export_dir, '_HEADER.txt')
     if not os.path.isfile(header):
@@ -120,28 +119,13 @@ def load_master_export(export_dir: str) -> dict:
     conversion) is what makes the override path deterministic: a field neither
     export touches is never rewritten, so it cannot drift.
 
-    **Each master's ids are re-keyed into THIS plugin's index space.** A record
-    is named by its index byte, which is the master's slot in *this* plugin's
-    master list — NOT the slot it uses in its own file. Merging the exports on
-    the raw id instead collapses every master's id space into one, so the
-    last-loaded master silently wins ids that belong to an earlier one, and the
-    override is then diffed against a record of a COMPLETELY DIFFERENT TYPE.
+    Each master's ids are re-keyed into THIS plugin's index space, and
+    `remap` carries that mapping for everything a master can name: its own
+    records, plus each of ITS masters by name.
 
-    Measured on TWMP Valenwood/Elsweyr (masters Oblivion.esm, Tamriel.esp,
-    ElsweyrAnequina.esp): 119,443 of 121,505 shared ids resolved to the wrong
-    record type — 59,770 LAND and 59,668 CELL clobbered, mostly by ANQ's REFRs.
-    `0102DDE5` is a LAND in Tamriel.esp and the creature ANQCORPantherCaged
-    ("Black Panther Cub") in ElsweyrAnequina.esp, so the terrain override was
-    diffed against a creature and the builder spliced that creature's FULL (and
-    DESC) into the LAND. xEdit: "record LAND contains unexpected (or out of
-    order) subrecord FULL", and the engine hangs forever on the main menu.
-
-    A master's OWN records carry the index byte equal to its own master count.
-    Ids BELOW that belong to the master's own masters and are translated by
-    NAME through this plugin's list — the two orders usually agree, but relying
-    on that is the same unchecked assumption this function exists to remove.
+    See: docs/commentary/tes5_import_override.md#re-keying-the-masters-ids
     """
-    names = _export_master_names(export_dir)
+    names = export_master_names(export_dir)
     if not names:
         return {}
     slot_of = {n.lower(): i for i, n in enumerate(names)}
@@ -154,9 +138,7 @@ def load_master_export(export_dir: str) -> dict:
             print(f"  WARNING: master export not found ({mdir}); "
                   f"overrides cannot be diffed against it")
             continue
-        # Index byte -> this plugin's index byte, for everything this master
-        # can name: its own records, plus each of ITS masters by name.
-        own = _export_master_names(mdir)
+        own = export_master_names(mdir)
         remap = {len(own): slot}
         for k, sub in enumerate(own):
             target = slot_of.get(sub.lower())
@@ -671,6 +653,49 @@ def emit_nested_overrides(records: list, writer: PluginWriter,
     return len(records) - orphans, orphans, anchored
 
 
+def _append_relinked_navms(pending: list, ctx) -> None:
+    """Queue the MASTER navmeshes that edge-linking rewrote, ONCE.
+
+    `build_nested_overrides` runs per signature group (CELL/WRLD/REFR, then
+    DIAL/INFO), so the list is cleared as it is consumed: appending it in both
+    passes shipped all 751 master navmeshes twice, and the duplicate record
+    shadowed the real one.
+
+    See: docs/commentary/tes5_import_navmesh.md#cross-plugin-edge-links
+    """
+    relinked = getattr(ctx, 'relinked_master_navms', None)
+    if not relinked:
+        return
+    for record_bytes, meta in relinked:
+        pending.append((meta['fid'], record_bytes,
+                        ctx.master_index.group_path(meta['fid'])))
+    ctx.relinked_master_navms = []
+
+
+def _readd_bark_parents(by_type: dict, unattached: list) -> int:
+    """Re-add the DIAL parents of handed-back bark INFOs; return how many.
+
+    A bark INFO needs its parent DIAL in the same batch or the normal
+    builder has no topic to group it under.  That parent is the MASTER's
+    shared GREETING/HELLO record, counted as an unchanged override and
+    dropped, so this plugin's own copy is re-added.  The builder re-keys it
+    into per-quest topics of our own; the master's record stays untouched.
+    """
+    parents = {(r.get('ParentDIAL') or '').upper()
+               for s, r in unattached if s == 'INFO'}
+    if not parents:
+        return 0
+    seen = {(r.get('FormID') or '').upper()
+            for s, r in unattached if s == 'DIAL'}
+    added = 0
+    for rec in by_type.get('DIAL', []):
+        fid = (rec.get('FormID') or '').upper()
+        if fid in parents and fid not in seen:
+            unattached.append(('DIAL', rec))
+            added += 1
+    return added
+
+
 def build_nested_overrides(by_type: dict, sigs: tuple, ctx: OverrideContext,
                            writer: PluginWriter, label: str) -> list:
     """Emit overrides for record types that live inside GRUP hierarchies.
@@ -716,24 +741,11 @@ def build_nested_overrides(by_type: dict, sigs: tuple, ctx: OverrideContext,
             pending.append((ov.out_fid, ov.record_bytes,
                             ctx.master_index.group_path(ov.out_fid)))
 
+    _append_relinked_navms(pending, ctx)
+
     new_done, unattached = _attach_new_records(new_records, ctx, pending)
 
-    # A bark INFO handed back above needs its parent DIAL in the same batch or
-    # the normal builder has no topic to group it under. That parent is the
-    # MASTER's shared GREETING/HELLO record, which this loop just counted as an
-    # unchanged override and dropped — so re-add this plugin's own copy of it.
-    # The builder re-keys it into per-quest topics of our own; the master's
-    # record is left untouched (we ship no override for it).
-    _bark_parents = {(r.get('ParentDIAL') or '').upper()
-                     for s, r in unattached if s == 'INFO'}
-    if _bark_parents:
-        seen = {(r.get('FormID') or '').upper()
-                for s, r in unattached if s == 'DIAL'}
-        for rec in by_type.get('DIAL', []):
-            fid = (rec.get('FormID') or '').upper()
-            if fid in _bark_parents and fid not in seen:
-                unattached.append(('DIAL', rec))
-                dropped -= 1
+    dropped -= _readd_bark_parents(by_type, unattached)
 
     emitted, orphaned, anchored = emit_nested_overrides(
         pending, writer, ctx.master_index, ctx.anchored_wrld)
@@ -853,6 +865,35 @@ def _navm_of(rec: dict, ctx: OverrideContext) -> tuple:
     return (navm_bytes or b''), (meta or {})
 
 
+def _attach_navmesh(rec: dict, ctx: OverrideContext, parent_out: int,
+                    parent_path: tuple, pending: list) -> tuple:
+    """(navm_bytes, group_chain) for a PGRD nested under a MASTER's cell.
+
+    Returns (b'', ()) when the precompute declined the pathgrid.  Appends the
+    meta to `ctx.navm_metas`, which is what registers the navmesh in NAVI, and
+    any split extras to `pending`.  The bytes are NOT restamped: the precompute
+    already built them under the master's NAVM id where there is one.
+
+    See: docs/commentary/tes5_import_navmesh.md#master-owned-cells
+    """
+    record_bytes, meta = _navm_of(rec, ctx)
+    if not record_bytes:
+        return b'', ()
+
+    metas = getattr(ctx, 'navm_metas', None)
+    if metas is not None:
+        metas.append(meta)
+        for _xb, _xm in meta.get('extra_navms', ()):
+            metas.append(_xm)
+
+    label = struct.pack('<I', parent_out)
+    chain = ((6, label), (9, label))
+    for _xb, _xm in meta.get('extra_navms', ()):
+        pending.append((struct.unpack_from('<I', _xb, 12)[0], _xb,
+                        parent_path + chain))
+    return record_bytes, chain
+
+
 def _attach_new_records(new_records: list, ctx: OverrideContext,
                         pending: list) -> tuple:
     """Convert NEW records that live inside a MASTER's GRUP tree.
@@ -941,33 +982,10 @@ def _attach_new_records(new_records: list, ctx: OverrideContext,
                 if master_land:
                     record_bytes = _restamp_formid(record_bytes, master_land)
             elif sig == 'PGRD':
-                # The navmesh was already generated in parallel by
-                # _precompute_navmeshes and is keyed by (cell, pgrd) in the
-                # plugin's OWN FormID space — the same key the group builders
-                # use. Unlike LAND this is NOT restamped to a master id: a NAVM
-                # is a new record the master has no counterpart for, so it keeps
-                # the id the precompute allocated (restamping would collide with
-                # the master's own navmesh for that cell).
-                record_bytes, meta = _navm_of(rec, ctx)
+                record_bytes, chain = _attach_navmesh(rec, ctx, parent_out,
+                                                      parent_path, pending)
                 if not record_bytes:
-                    # No geometry (too few pathgrid nodes to form a ribbon) —
-                    # convert_PGRD already declined it. Not an error.
                     continue
-                # Registering the meta is what puts this navmesh in NAVI. The
-                # group builders do it for their own cells; nothing else does
-                # it for one nested into the master's hierarchy.
-                metas = getattr(ctx, 'navm_metas', None)
-                if metas is not None:
-                    metas.append(meta)
-                    for _xb, _xm in meta.get('extra_navms', ()):
-                        metas.append(_xm)
-                label = struct.pack('<I', parent_out)
-                chain = ((6, label), (9, label))
-                # A cell split into several navmeshes ships the extras in the
-                # same children group.
-                for _xb, _xm in meta.get('extra_navms', ()):
-                    pending.append((struct.unpack_from('<I', _xb, 12)[0], _xb,
-                                    parent_path + chain))
             else:
                 conv = convert_ACHR if sig in ('ACHR', 'ACRE') else convert_REFR
                 record_bytes = conv(rec)

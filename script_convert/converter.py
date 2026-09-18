@@ -10,9 +10,8 @@ from script_convert.constants import (
     KNOWN_GLOBALS, LOOSE_OPS, PAPYRUS_BOOL_FUNCTIONS, PLACED_REF_SIGS,
     PLAYER_ALIAS_EXTENDS, RETURN_TYPES, SELF_NAMES, TYPE_MAP, _REF_TYPES,
     _canonical_global, digit_stripped_formid, _record_type_to_base_papyrus,
-    generated_script_stem, is_generated_script_type, record_type_to_papyrus, safe_property_name, papyrus_script_name,
+    generated_script_stem, is_generated_script_type, safe_property_name, papyrus_script_name,
     resolve_property_formid,
-    script_type_may_override
 )
 from script_convert.command_rows import (
     COMMAND_ROWS, DISPATCH_EVENTS, ENUM_ACTOR_VALUES, ENUM_AV_LADDERS,
@@ -26,6 +25,7 @@ from script_convert import resolve_name as _resolve_name
 from script_convert import assemble as _assemble
 from script_convert import commands as _commands
 from script_convert.context import ScriptContext
+from script_convert.poll_interval import update_interval
 from script_convert.emit import dispatch as _dispatch
 from script_convert.cross_ref import CrossRefGraph
 from script_convert.tes4.parser import (
@@ -100,6 +100,9 @@ class ScriptConverter:
 
     #: DIAL EditorID (lower) -> `TES4Unlock_<topic>` global, from build_unlock_plan.
     topic_unlock_globals: dict = {}
+
+    #: DIAL EditorID (lower) -> chain line count, from build_script_chain_map.
+    conversation_chains: dict = {}
 
     # script EditorID (lower) -> [(mesg_edid, text, buttons)], from
     # script_convert.message_menus.build_message_plan. Populated once per run
@@ -526,7 +529,8 @@ class ScriptConverter:
         """
         prev = self.sc
         self.sc = ScriptContext(property_refs=dict(prev.property_refs),
-                                scro_aliases=dict(prev.scro_aliases))
+                                scro_aliases=dict(prev.scro_aliases),
+                                quest_delay=prev.quest_delay)
         return _assemble.build(self, name, source, extends, editor_id)
 
     def convert_fragment(self, source: str, extends: str = 'Quest') -> list[str]:
@@ -567,15 +571,11 @@ class ScriptConverter:
             tree = parse(source, Mode.FRAGMENT)
         except Exception:
             return []
-        result = []
         for var in tree.variables:
-            ptype = TYPE_MAP.get(var.vtype.lower(), 'Int')
             self.sc.local_vars.add(var.name.lower())
-            self.sc.var_types[var.name.lower()] = ptype
-            result.append('  %s %s = %s'
-                          % (ptype, var.name, '0.0' if ptype == 'Float' else '0'))
-        result += _script.emit_body(self, tree.body, extends, 1)
-        return result
+            self.sc.var_types[var.name.lower()] = TYPE_MAP.get(var.vtype.lower(), 'Int')
+        body = _script.emit_body(self, tree.body, extends, 1)
+        return [_script.fragment_local(self, v) for v in tree.variables] + body
 
 
     _CONTROLS_WRITE_RE = re.compile(
@@ -1256,38 +1256,6 @@ class ScriptConverter:
                 return
         self.sc.property_refs[key] = 'Topic'
 
-    def _papyrus_type_for(self, fid: str, rtype: str) -> str:
-        """Papyrus property type for a record, as the IMPORTER writes it.
-
-        `record_type_to_papyrus` maps the TES4 signature, which is right until
-        the importer changes the signature on the way out. A BOOK carrying an
-        ENAM becomes a SCRL (see project_enchanted_book_is_a_scroll), so a
-        `Book` property naming one cannot bind and reads None in-game.
-        """
-        ptype = record_type_to_papyrus(rtype)
-        if (ptype == 'Book' and self.xref
-                and fid in getattr(self.xref, 'enchanted_books', ())):
-            return 'Scroll'
-        return ptype
-
-    def _script_type_binds(self, ptype: str, fid: str) -> bool:
-        """Whether an attached script class may stand in for `ptype` HERE.
-
-        Base-object types normally cannot (the VM refuses the base record —
-        see script_type_may_override), but a scripted world object (ACTI/LIGH)
-        with exactly ONE placed ref can: the property binder redirects the
-        binding to that ref, which carries the script instance. Without this,
-        the base gate stripped cross-script variables off unique activators —
-        `SE01Metronome.weatherVAR` and the SE11 trigzone stopped compiling.
-        Inventory item types (ARMO/WEAP/...) stay excluded even with a lone
-        world placement, because their properties mean the BASE (AddItem /
-        RemoveItem), never that placement.
-        """
-        if script_type_may_override(ptype):
-            return True
-        return (self.xref.record_type.get(fid, '') in ('ACTI', 'LIGH')
-                and bool(self.xref.unique_placed_ref(fid)))
-
     def _register_cell_family(self, name: str, cells: list,
                               exterior: list = None) -> str:
         """Record a GetInCell prefix family and return its helper's name.
@@ -1365,26 +1333,7 @@ class ScriptConverter:
     _GAMEMODE_GATE = 'TES4Polyfill.SafeGameModeGate(Self)'
 
     def _get_update_interval(self) -> str:
-        if self.sc.uses_getsecondspassed:
-            return '0.1'
-        # A script that drives a spoken line with a timer (`set T to Say ...`)
-        # ticks fast: its `T <= 0` guard is what starts the next line, so the
-        # tick is pure dead air between lines (TES4 ran it every frame).
-        #
-        # 0.1s was tried and measurably LENGTHENED the gaps, so
-        # it was set to 0.25s.  That measurement was taken when every SayLine
-        # also blocked on Utility.Wait(0.05) for its claim handshake and
-        # Utility.Wait(0.25) after any busy wait, and when fragments blocked
-        # the dispatch path -- the VM was saturated by the Say path itself and
-        # extra poll passes queued behind it.  All three are gone, so the
-        # contention that made a faster tick counterproductive is gone with
-        # them, and 0.15s buys back most of the tick latency without
-        # returning to the 0.1s that was measured as too aggressive.
-        if self.sc.uses_say_timer:
-            return '0.15'
-        if self.sc.uses_timer:
-            return '0.25'
-        return '0.5'
+        return update_interval(self.sc)
 
 
     def _parse_source(self, source: str):
@@ -1735,7 +1684,7 @@ class ScriptConverter:
             # Use canonical EditorID (original case) as key to match _add_scro_ref
             canon_edid = self.xref.formid_to_edid.get(fid, name)
             rtype = self.xref.record_type.get(fid, '')
-            ptype = self._papyrus_type_for(fid, rtype)
+            ptype = _resolve_name.papyrus_type_for(self.xref, fid, rtype)
             # Prefer attached script type over generic Actor/ObjectReference
             # so cross-script property access works (e.g., NPCRef.rent).
             # Base-object types (Armor/Weapon/Potion/...) are excluded: the VM
@@ -1743,7 +1692,8 @@ class ScriptConverter:
             # record, and the property then reads None. A unique-placed
             # ACTI/LIGH is the exception — the binder redirects to its ref.
             script_type = self.xref.get_record_script_type(name)
-            if script_type and self._script_type_binds(ptype, fid):
+            if script_type and _resolve_name.script_type_binds(
+                    self.xref, ptype, fid):
                 ptype = script_type
             safe = safe_property_name(canon_edid)
             # Don't downgrade a more specific type (e.g., Actor from
@@ -2093,9 +2043,10 @@ class ScriptConverter:
             # Upgrade property type to Actor when used with actor-only functions
             canon = self._convert_ref(ref_name, extends, as_receiver=True)
             if actor_func:
-                # akSpeakerRef is a fixed ObjectReference parameter; cast it rather than upgrading
-                if canon == 'akSpeakerRef':
-                    return '(akSpeakerRef as Actor)'
+                if canon == 'akSpeakerRef' or (
+                        self._current_event == 'Fragment'
+                        and canon.lower() in self.sc.local_vars):
+                    return f'({canon} as Actor)'
                 cur = self.sc.property_refs.get(canon, '')
                 # Upgrading an existing ObjectReference entry is always right;
                 # creating a NEW one is only right for a bare identifier (see

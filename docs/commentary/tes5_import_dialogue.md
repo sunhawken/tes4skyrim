@@ -60,6 +60,7 @@ game, see the `oblivion-dialog-system`, `skyrim-dialog-system`, and
 
 - **DLBR (Dialog Branch)**: EDID + QNAM(quest FID) + TNAM(0=Player) + DNAM(0=Normal or 1=TopLevel) + SNAM(starting DIAL FID). Created for ALL non-bark DIAL topics. Top-level topics get DNAM=1 (appear in dialog menu). TCLT chain topics get DNAM=0 (only reachable via TCLT choice links, not shown in menu).
 - **DLVW (Dialog View)**: EDID + QNAM(quest) + BNAM[](branch FIDs) + TNAM[](topic FIDs) + ENAM(view type) + DNAM(show all text). CK UI metadata, one per quest.
+- **Service-menu gate (`_service_gate`)**: Barter/Training topics carry two ANDed CTDAs — who offers the service (merchant marker / trainer faction, `GetInFaction`) AND `GetOffersServicesNow` (func 255). Faction membership is permanent, so the faction condition alone left shopkeepers offering "What have you got for sale?" in the street at any hour; TES4 gated this implicitly through its service menu, which has no converted equivalent. Only ONE faction condition either way: an OR-chain over every vendor faction put 25-30 CTDAs on each INFO (vanilla max 22, max OR-run 20) and the engine silently dropped every gated line. Func 255 is vanilla-legal and measured — 165 vanilla Skyrim INFO CTDAs use it, all with run-on 0, operator `==`, params 0. The gate is prepended per-INFO, so it covers all 57 Barter and 10 Training INFOs from one site. Repair/Recharge/Travel remain dropped upstream in `SERVICE_MENU_TOPICS` (26 more INFOs); each needs its own Papyrus menu fragment and Skyrim has no direct Travel equivalent.
 
 ## Voice types and conditions
 <a id="voice-types-conditions"></a>
@@ -126,7 +127,7 @@ game, see the `oblivion-dialog-system`, `skyrim-dialog-system`, and
   A pair totalling <=25 is used VERBATIM — which is why the failing lines (23 and 18 chars) needed no cut at all. This matches Skyblivion's `Skyblivion - Copy voice files.pas` (`InfoFileName`), which was correct all along. **Do NOT re-derive this by fitting Oblivion's own filenames**: those follow Oblivion's rule, not Skyrim's — "no truncation" scores 99.8% against them and is WRONG for the engine (the engine rule scores 77.6%, the old bug 52.4%). Agreement with source names is irrelevant because `organize_voice_files` renames by INFO FormID. **Never mirror the rule** — `tools/dialog/voice_audit.py` kept a private copy that drifted and made the audit agree with the bug it existed to catch; it now imports `voice_file_prefix` directly.
 - **Lip sync (2026-07-16)**: generated per voice line with the SSE Creation Kit's own `LipGenerator.exe` (`<SSE install>/Tools/LipGen/LipGenerator/`, auto-detected via registry; needs its sibling `FonixData.cdf`). Inputs are the intermediate 44.1 kHz WAV (it resamples internally — writes a `tmp16khz.wav` into its CWD, so every parallel job runs in a private temp dir) and the line's transcript. Transcripts come from the importer: `build_dialog_groups` collects `{(info_fid24, response_number): NAM1 text}` at the same site that fills the voicemap, and `_write_lip_text` emits `<esm>.liptext.txt` next to the ESM. **SSE only reads lip data from `.fuz` containers** (loose `.lip` files are LE-only), so `convert_file_to_xwm` packs lip+xwm as `.fuz` (`FUZE` magic, u32 version=1, u32 lip size, lip, xwm); lines with no transcript stay bare `.xwm` (audio plays, mouth doesn't move). Oblivion's own `.lip` files are an older FaceFX format and stay skipped at BSA extraction. The INFO `ENAM 0x0800 "No LIP File"` bit is intentionally never set. CLI: `LipGenerator <wav> "<text>"` → `<wav basename>.lip`.
 - **Lip generation parallelism (2026-07-19)**: the Fonix engine inside LipGenerator.exe serializes ALL running instances machine-wide through a named mutex (`FonixMemoryMutex`, cleartext in the exe), capping aggregate throughput at **~8 lips/s no matter how many processes run** — the symptom is dozens of LipGenerator processes each at ~0.1% CPU (0.2s CPU per 6–9s wall; the tool's 1s sleep-poll loop waits on the contended mutex, so latency balloons too). The exe creates **no file mapping** (imports checked), so the mutex guards nothing shared between processes and renaming it is safe. `build_lipgen_pool()` (asset_convert/audio/audio_converter.py) writes per-worker copies of the exe with unique same-length mutex names (`FonixMemMtx_0000`…) + hard-linked `FonixData.cdf` into a temp pool dir; workers check exes out of a `queue.Queue`. Measured: ~8.5 → ~105 lips/s at 32 workers (128/s at 64), per-call latency 6–9s → ~0.3s; full-chain smoke (mp3→wav→lip→xwm→fuz) ~75 lines/s. Voice batches with transcripts use `_LIP_WORKER_COUNT` (2×CPU, ≤64) threads since jobs are mostly subprocess-wait. Fallback: if the mutex string isn't found exactly once (unknown exe version), the stock exe is used unpatched. Lip output is nondeterministic run-to-run even stock (gesture track seeding) — don't byte-compare .lip files. Nukem9's FaceFXWrapper was evaluated and rejected: same Fonix core, same machine-wide cap, and its copy of the mutex name is compressed (unpatchable).
-- **Race→VoiceType mapping** is in `TES4_VOICE_TYPE_MAP` in bsa_extract.py; includes all Oblivion playable races + Shivering Isles races
+- **Race→VoiceType mapping** is derived, not tabulated: `asset_convert/audio/voice_races.py` reads the RACE records of the plugin AND its masters, keying each voice folder on the race's `FULL` display name (the folder on disk IS that name). This replaced a hardcoded 39-entry table; measured equivalent on all 466 real (folder, gender) pairs across every export. See: asset_convert_audio.md#race-identity-spans-the-masters
 - **Voice audit + the three silent-line causes (2026-07-16)**: `tools/dialog/voice_audit.py` recomputes every INFO's expected voice file (GetIsVoiceType folders × prefix × TRDT response numbers) from the BUILT ESM and diffs against the files on disk, classifying every miss (also finds orphan files and voicemap drift). It found and drove these fixes:
   1. **Shivering Isles voices were never extracted**: Steam GOTY merges SI INTO Oblivion.esm (the SE quests/dialogue/voice-types are in the ESM) but the assets stay in `DLCShiveringIsles - *.bsa`, which `get_bsa_files` keyed to DLCShiveringIsles.esp. All SI lines were silent and the golden saint/dark seducer/sheogorath voice folders didn't exist (~4,300 INFOs, 10.8K missing lookups). Fix: bsa_extract adds the `DLCShiveringIsles` BSAs for Oblivion.esm.
   2. **Generic voice gates routed voice types to lines they have no recording of**: Oblivion recorded MANY generic lines (rumors/INFOGENERAL, greetings, Question/Attack barks, service lines) for only a subset of race folders (histogram over 19.3K voiced lines: ~10K exist in ONE folder, only ~1.2K in all 11) — Oblivion played silence for the rest; in Skyrim a selected line with no voice file flashes past unreadably, which players see as "NPC has no voice". The injected topic-inherited GetIsVoiceType chains spanned every sibling voice type (19.5K missing lookups over 3,088 INFOs), and 2,073 generic INFOs had NO gate at all. Fix: **NOT IMPLEMENTED — `build_voice_inventory` does not exist anywhere in the source** (grepped 2026-08-08; this paragraph described a design that was never built). The intent was: scan the extracted `sound/Voice` tree into {info_fid24 → set(VTYP fid with a recording)} and have `_build_injected_ctdas` set each GENERIC INFO's gate to `(inherited ∩ recorded) or recorded` — **the recorded folders are ground truth of who speaks a line** (INFOGENERAL race/sex-conditioned lines are recorded for exactly that audience; an inherited gate that excludes the recorded voice type contradicts the line's own GetIsRace/GetIsSex conditions and the line can NEVER play). Unrecorded voice types fall through to a voiced sibling/catch-all. NPC-specific (GetIsID) lines are never touched (the NPC must keep their line; relocation already routes their audio), and lines with no recordings anywhere stay ungated (unvoiced content kept, as in Oblivion). 3,691 INFOs re-gated; recorded sets are ≤14 entries so OR-chains stay under the engine's ~20/22-condition drop threshold (see Barter lesson).
@@ -566,6 +567,58 @@ families do not.
 
 ---
 
+## Script-started conversation chains
+<a id="script-started-conversation-chains"></a>
+
+**Code:** `tes5_import/dialogue/conversations.py:build_script_chain_map`,
+`script_convert/commands.py:start_conversation`
+
+The scheduler section below covers chains the ENGINE starts. A second family is
+started explicitly by a script: `StartConversation <target> <topic>`. Oblivion
+treats the two identically once begun — both hand the whole TCLT chain to the
+scheduler, which alternates speakers per `DATA.NextSpeaker` and runs each
+INFO's result.
+
+`Actor.Say(topic)` plays exactly ONE line, so converting the call to a bare Say
+restores the first line and drops the rest. A chain whose lines gate on a
+counter the results advance then stalls on line 0 forever, and any caller
+polling that counter re-speaks it every tick.
+
+Measured in Oblivion.esm: Savlian Matius' Kvatch chapel scene (`MS48Convo`,
+quest MS48 stage 90) is 10 lines gated `MS48.conv == 0..8`, each result setting
+the next value. `SavlianMatiusScript` polls `if MS48.conv == 0` at 0.25s and
+called `StartConversation TierraRef MS48Convo`; Tierra's own script speaks only
+at `conv == 8`. Converted as a single Say, nothing ever spoke lines 1-7, `conv`
+stayed 0, and Savlian repeated "Report, soldier." indefinitely (live readback:
+`TES4_MS48Script::Conv_var = 0` at stage 90).
+
+Fix: `build_script_chain_map` linearizes the chain behind every multi-line
+topic, and `start_conversation` emits the same replay the driver quest uses —
+`Utility.Wait(TES4Polyfill.SayLine(actor, topic, len) + beat)` per hop,
+alternating self/target. The call site names BOTH actors, so unlike the
+scheduler's chains no identity CTDA is needed to resolve speakers. Line
+selection stays with the engine (per-INFO CTDAs), so End fragments — the
+`set MS48.conv to N` payloads — fire exactly as before.
+
+Single-line topics (the Daedric-prince speeches, announcer barks) produce no
+chain entry and keep the plain `Say`.
+
+**Detection is by CTDA shape, never by name.** A chain is a topic whose INFOs
+gate on a consecutive run of ONE quest variable AND whose every counted line
+names a non-player listener through a run-on-target `GetIsID` — the scheduler's
+own signature. The identity test is what excludes `GREETING`: it also carries a
+counter run in places, and without the test 87 of Oblivion's 162
+`StartConversation` sites would have looped the player's greeting.
+
+Measured on Oblivion.esm: **18 topics** qualify, changing **12 of 16,519**
+generated scripts — MS48 (Kvatch), MQ12 Jauffre/Martin, DANocturnal
+(WeebamNa), four Dark Brotherhood scenes, SE06, MS40, Erthor, RallusOdiil and
+SulinusVassinus. No CharacterGen script changes and `TES4NPCConv<plugin>.psc`
+is byte-identical, because those chains are HELLO-headed and belong to the
+scheduler path below, not this one.
+
+---
+
 ## The NPC-to-NPC conversation scheduler
 <a id="npc-npc-conversation-scheduler"></a>
 
@@ -644,6 +697,45 @@ sequence, each hop's speaker, and the expected line length; which INFO plays
 within a topic is decided by that INFO's own converted conditions — exactly
 Oblivion's rule. So per-line CTDA fidelity is preserved and the INFO End
 fragments (the `setstage` payloads) fire as they do for any other `Say()`.
+
+### The MQ04 gate conversation: what actually stalled it
+<a id="chain-atomicity"></a>
+
+The driver latches `_done<N>` after the last line, so an interrupted chain
+retries on a later poll. That is all this section's original theory left
+behind; the rest of it was WRONG and is recorded here so it is not rebuilt.
+
+**Disproven:** "the MQ04 poll advances 35 -> 40 during Cyrus's line because
+`convTimer <= 0 && speaker == 0` is already true". Stage 35's own result script
+sets `convTimer` to 30, so that guard is closed for 30 s. A poll hold built on
+the theory (`ConversationInProgress()` in the dialogue gate) changed 152
+scripts, lengthened the pause between lines, and was reverted. So was a driver
+retry for "refused" lines: no refusal was ever observed.
+
+**The two real causes, both measured in the running game:**
+
+1. **Cyrus never walked out.** `MQ04CyrusGreetJauffre` is a TES4 Ambush on an
+   actor. It converted to Follow using `PLDT.Radius` (1800, the watch area) as
+   the follow distance, so at 1,560 units Cyrus was already "in range" and the
+   driver's 500-unit `CanConverse` never passed. The approach distance is
+   `PTDT.Count` (210). Across all 80 Oblivion Ambush packages Count is a
+   100-250 talking distance; only two target an NPC, this one and
+   `MQ13NarinaCarvainToMartin`, and both open a restored chain. Fixed in
+   `tes5_import/packages/converter.py:_pick_ambush`, which also stopped giving
+   a walk-up to a named reference the weapon-drawn / sneak ambush flags.
+
+2. **Jauffre read as "still speaking" for ten minutes.**
+   `Utility.GetCurrentRealTime()` restarts at zero with the process, but the
+   SayLine stamps are actor values and persist in the save. His `Variable03`
+   ("last line ended") held 3,455 from a longer earlier session; in a fresh
+   session `now - 3455` is negative, which passed `< SAY_GRACE`, and `SayLine`
+   sat in its 600 s wait. `_IsSpeaking` now requires `since >= 0`, and
+   `_OtherLineInProgress` treats a deadline over 120 s ahead as stale. This
+   affects ANY speaker whose last line was in a longer earlier session.
+
+Diagnostic that settled it: the console `say <topic>` on a selected actor
+prints every condition it evaluates, and `getav variable03/07/08/09` on the
+speaker shows a live claim token being renewed.
 
 ### The selection rules (and why each exists)
 
@@ -1186,6 +1278,11 @@ The plan comes from `message_menus.build_chargen_menus`, the SAME function the
 script pipeline runs, so the Message properties in the emitted `.psc` bind to
 exactly these records and the page/button order matches the converter's
 `Show()` chain arithmetic.
+
+**Authored FO3/FNV menus** (`ShowMessage <MESG>`) enter the same plan under
+the MESG's own EDID with text None; `create_message_menu_records` writes
+nothing for them, since `convert_MESG` converts the record itself
+([script_convert.md](script_convert.md#fnv-showmessage-menus)).
 
 **Choice-persistence globals** sit at fixed slots ABOVE the page window
 (`base+0x40`, `+0x41`) so a changed page count can never move them. Menu

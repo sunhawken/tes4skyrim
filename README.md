@@ -184,8 +184,10 @@ game hands off to that game's own character generation, with its real starting
 equipment and start location. Games whose plugin is not in your load order are
 detected at runtime and simply never appear in the menu, so any subset works.
 
-Ready-to-install files are in [TESGameSelect/dist/](TESGameSelect/dist/) — copy
-them into your `Data` folder and enable `TESGameSelect.esp`.
+Build it with the **Pack Start Mod** button (or `python
+tools/release/package_start_mod.py`) to get
+`output/Finished Mods/TESGameSelect.zip`, then install it like any other
+converted mod and enable `TESGameSelect.esp`.
 Because it overrides `MQ101`, it conflicts with other alternate-start mods
 (Live Another Life, Skyrim Unbound, Alternate Perspective) — use one at a time.
 See [TESGameSelect/README.md](TESGameSelect/README.md) for how it works,
@@ -213,6 +215,15 @@ If you'd like to use any modded Oblivion assets such as models or textures, firs
 `Documents\My Games\Skyrim Special Edition\SKSE\TESRuntime.log`.
 See [tes_runtime/README.md](tes_runtime/README.md) for the details and for
 building it yourself.
+
+#### HavokWorldSize
+
+`HavokWorldSize.dll` installs alongside TESRuntime as a separate plugin. Skyrim's
+physics only works within 64 cells of the world center — past that, NPCs bounce
+in and out of the ground and you can't open doors or hit anything. Big
+worldspaces like Tamriel Rebuilt go well beyond that, so this widens the limit.
+Edit `Data\SKSE\Plugins\HavokWorldSize.ini` to change it (128 by default; use the
+smallest that fits your worldspace).
 
 #### Changing the gun reload key
 

@@ -843,11 +843,93 @@ Attribution is positional: the CTDAs after an EFIT belong to that effect, so the
 subrecords are walked in order. Gathering them per signature, as the other
 emitters do, cannot say which effect a condition guards.
 
-Dropping them is not neutral. `PreordVault13CanteenQuest` polls
-`If player.GetItemCount PreordVaultCanteen > 0 / ShowMessage / player.cios`
-with **no guard of its own** — `IsHardcore` on the cast spell is the only thing
-that makes it a no-op, so without the condition the sip message repeats forever.
+`IsHardcore` gates the dehydration effect only. It does NOT gate the
+`PreordVault13CanteenQuest` sip message, which repeats because the quest's
+authored delay was dropped — see [Quest delay and objectives](#quest-delay-and-objectives).
 
-🛑 Skyrim has **no function 586** (580, 584, 589 are assigned; 586 is not), and
-`convert_ctda` passes unknown indices through. An FO3/FNV-only function must be
-resolved at import, never emitted.
+🛑 Skyrim has **no function 586** (580, 584, 589 are assigned; 586 is not).
+Fallout indices are reconciled at import by
+[the generated remap](tes5_import_conditions.md#fallout-ctda), never emitted raw.
+
+## <a id="quest-delay-and-objectives"></a>Quest delay and objectives
+
+**Code:** `tes4_export/record_types/quest_falloutnv.py`
+
+FNV's QUST differs from TES4's in two places the shared `export_QUST` cannot
+see (xEdit `wbDefinitionsFNV.pas` vs `wbDefinitionsTES4.pas`):
+
+| | TES4 | FO3/FNV |
+|---|---|---|
+| `DATA` | 2 B: Flags, Priority | **8 B**: Flags, Priority, 2 unused, **Quest Delay float** |
+| Targets | bare `QSTA` list | nested in **Objectives**: `QOBJ` index, `NNAM` text, then `QSTA` + conditions |
+
+### <a id="quest-delay"></a>The delay is the poll cadence
+
+The float is the seconds between quest-script passes. Measured over the 441
+FNV quests: 359 write 0.0 (engine default), 82 write an authored value from
+0.001 to 300.0. `PreordVault13CanteenQuest` writes **300.0** — the sip message
+is scripted to fire every 5 real minutes, and with the field dropped the
+converted poll ran at 0.5 s, 600x too often.
+
+xEdit labels flag `0x10` "Default Script Processing Delay", but the data says
+the engine does not consult it: the canteen quest sets `0x10` AND writes 300.0,
+`VERGoodsprings01` sets it with 17.0, `VMS01Nightkin` with 60.0, while the
+`*Timer`/`*FX` quests with 0.1 leave it clear. Every non-zero value reads as
+authored, so the export emits `DATA.Delay` unconditionally and the script
+converter honors any non-zero value
+([poll interval](script_convert.md#poll-interval)).
+
+### <a id="objectives"></a>Objectives are authored, not derived
+
+125 of the 441 quests carry `QOBJ` objectives (1,045 in all), keyed by their
+own index, not the stage index: `VMQ01`'s stages are 10/15/40/50/60/100 and its
+objectives 10/20/25/30/34/36/38/40/45/46/50/60. Their `NNAM` is the journal
+line; most FNV stages carry **no** `CNAM` at all (VMQ01 has one, "Travel to
+Novac."). The shared walker treated the first `QSTA` as the start of a flat
+target list, so every `QOBJ`/`NNAM` fell through and the flat `Target[]` lost
+the objective grouping.
+
+The FNV emitter writes `Objective[i].Index/.Text` and, under each,
+`Target[j].FormID/.Flags/.Condition[k].Raw`, and `export_falloutnv.superseded_keys`
+drops the shared `Target[]` lines for QUST. FNV `QSTA` is FormID + a u8 flag +
+3 unused bytes; the TES4 reader unpacked those four bytes as one u32 flag word.
+Target conditions: 1,229, Run On 2 (Reference) on 844 of them.
+
+## <a id="info-end-script"></a>INFO carries two result scripts; the exporter dumped one
+
+**Code:** `tes4_export/record_types/falloutnv.py:info_result_scripts`,
+`tes5_import/base/text_reader.py:info_result_script`.
+
+An FO3/FNV INFO embeds a *Begin* script and an *End* script, back to back and
+split by the `NEXT` marker (xEdit `wbDefinitionsFNV`: `Script (Begin)`, then
+`NEXT` + `Script (End)`). TES4 embeds one. The shared INFO exporter took the
+FIRST `SCTX` in the stream, so an INFO whose Begin was empty exported its End
+text as `ResultScript`, and an INFO with both lost its End text entirely.
+
+Measured on FalloutNV.esm: 23,247 INFO records, 4,499 with a non-empty End
+script. `VCG01` (Doc Mitchell's opening) parks at stage 80 on this: the psych
+test's closing lines (`VCG01DocMitchellTopic072`..`075`, "Well, that's all she
+wrote.") bump `VCG01Test` counters in Begin and carry `SetStage VCG01 85` in
+End, and nothing else in the plugin sets 85.
+
+The exporter now walks the subrecords positionally and emits `ResultScript`
+(Begin) and `ResultScriptEnd` (End). Every consumer reads the pair through
+`info_result_script`, which joins them Begin-then-End: the converter already
+runs a TES4 result script in the INFO's End fragment, so both halves land
+there in authored order.
+
+## <a id="trigger-primitives"></a>Trigger volumes are XPRM primitives, and the importer dropped them
+
+**Code:** `tes4_export/record_types/falloutnv.py:_emit_refr_deltas`,
+`tes5_import/record_types/world.py:_refr_head`.
+
+FO3/FNV place a trigger as a REFR of a model-less ACTI plus an `XPRM`
+primitive (bounds, RGBA, type) — 5,677 REFRs in FalloutNV.esm carry one. TES5's
+`XPRM` has the identical 32-byte layout (xEdit: bounds, `wbFloatRGBA`, type
+enum with Box = 1), and vanilla Skyrim triggers are the same shape
+(`DA09Trigger`'s REFR is NAME + XPRM alone). The exporter only dumped the
+bounds and the importer wrote no XPRM at all, so every converted trigger
+volume was a bare REFR with nothing to enter: `OnTriggerEnter` never fired.
+VCG01 hung on this — `VCG01VigorTesterTriggerSCRIPT` sets stage 60 from
+`onTriggerEnter`, and the tester's `OnActivate` only advances at stage 60.
+The raw subrecord now round-trips as `XPRM.Raw`.

@@ -514,6 +514,14 @@ def script_type_may_override(record_ptype: str) -> bool:
     return record_ptype not in _BASE_OBJECT_PAPYRUS
 
 
+def converted_worldspace_edid(edid: str) -> str:
+    """The EditorID a TES4 worldspace carries in the CONVERTED plugin.
+
+    See: docs/commentary/script_convert.md#worldspace-property-rename
+    """
+    return 'TES4Tamriel' if edid == 'Tamriel' else edid
+
+
 def wants_placed_reference(ptype: str) -> bool:
     """Whether a VMAD property of this Papyrus type must bind a PLACED
     reference rather than an actor BASE record.
@@ -625,6 +633,11 @@ __all__ = ['resolve_property_formid', 'digit_stripped_formid']
 #: TES4 block types whose body becomes the OnUpdate poll.
 POLL_BLOCKS = ('gamemode', 'scripteffectupdate')
 
+#: `begin MenuMode <id>` -> menu whose close runs it; docs/commentary/script_convert.md#menumode-with-a-menu-id
+MENU_ID_NAMES = {
+    '1036': 'RaceSex Menu',
+}
+
 
 #: Reference types, WIDEST first: the later one is the more specific.
 REF_SPECIFICITY = ('Form', 'ObjectReference', 'Actor')
@@ -656,3 +669,12 @@ FAME_GLOBALS = {
     'getpcinfamy': ('TES4Infamy', 'TES4Infamy.GetValueInt()'),
     'getinfame': ('TES4Infamy', 'TES4Infamy.GetValueInt()'),
 }
+
+
+def typed_already(property_refs: dict, prop: str) -> bool:
+    """Does this property already carry a type, under any casing of its name?
+    See: docs/commentary/script_convert.md#quest-property-never-downgrades
+    """
+    low = prop.lower()
+    return any(name.lower() == low and ptype
+               for name, ptype in property_refs.items())

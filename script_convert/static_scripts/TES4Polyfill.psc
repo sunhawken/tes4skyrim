@@ -388,6 +388,22 @@ Function SetFactionOwnership(ObjectReference akRef, Faction akFaction) Global
 EndFunction
 
 ; ==========================================================================
+; Furniture (TES4 IsCurrentFurnitureRef / IsCurrentFurnitureObj)
+; ==========================================================================
+
+; True while `a` is using exactly the furniture reference `akFurniture`.
+; (GetFurnitureReference is SKSE's; the vanilla GetSitState knows no ref.)
+Bool Function IsCurrentFurnitureRef(Actor a, ObjectReference akFurniture) Global
+  Return akFurniture != None && a.GetFurnitureReference() == akFurniture
+EndFunction
+
+; True while `a` is using any furniture whose base object is `akBase`.
+Bool Function IsCurrentFurnitureObj(Actor a, Form akBase) Global
+  ObjectReference f = a.GetFurnitureReference()
+  Return f != None && f.GetBaseObject() == akBase
+EndFunction
+
+; ==========================================================================
 ; AI Package Wrappers
 ; ==========================================================================
 
@@ -1139,6 +1155,18 @@ Bool Function PlayerIsInDialogue() Global
   Return False
 EndFunction
 
+; The actor whose line last played in the player's dialogue menu, while that
+; dialogue is still open or its last line still playing; None once it is over.
+; (Actor.GetDialogueTarget() always returns None on the player.)
+Actor Function DialogueSpeaker() Global
+  If !PlayerIsInDialogue()
+    Return None
+  EndIf
+  Actor p = Game.GetPlayer()
+  Int fid = (p.GetActorValue("Variable05") as Int) * 65536 + (p.GetActorValue("Variable06") as Int)
+  Return Game.GetForm(fid) as Actor
+EndFunction
+
 ; True while a re-Say on THIS actor would be dropped or would cut a live line.
 ;
 ; Two states count as speaking:
@@ -1173,7 +1201,10 @@ Bool Function _OtherLineInProgress() Global
   If until <= 0.0
     Return False
   EndIf
-  Return Utility.GetCurrentRealTime() < until
+  ; GetCurrentRealTime restarts with the process, so a deadline saved by a
+  ; LONGER earlier session sits far in the future: no line lasts two minutes.
+  Float left = until - Utility.GetCurrentRealTime()
+  Return left > 0.0 && left < 120.0
 EndFunction
 
 Bool Function _IsSpeaking(Actor a) Global
@@ -1184,7 +1215,10 @@ Bool Function _IsSpeaking(Actor a) Global
   If ended <= 0.0
     Return False
   EndIf
-  Return (Utility.GetCurrentRealTime() - ended) < SAY_GRACE()
+  ; A stamp from an earlier, longer session is in the FUTURE of this one;
+  ; read as "just ended" it held the speaker busy for the whole 600s wait.
+  Float since = Utility.GetCurrentRealTime() - ended
+  Return since >= 0.0 && since < SAY_GRACE()
 EndFunction
 
 ; How long after a line's End fragment a re-Say on the SAME actor is still

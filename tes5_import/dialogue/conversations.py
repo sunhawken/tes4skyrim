@@ -47,6 +47,8 @@ unbound, which the generated script guards against but cannot repair.
 import re
 import struct
 
+from ..base.text_reader import info_result_script
+
 # TES4 CTDA layout constants (24-byte raw conditions from the export dump).
 CTDA_OR = 0x01
 CTDA_RUN_ON_TARGET = 0x02
@@ -333,8 +335,8 @@ def _same_quest_closure(head: dict, quest_raw: str, info_by_dial: dict) -> list:
 
 def _is_quest_advancing(head: dict, closure: list) -> bool:
     """True when the head or its closure advances the quest."""
-    return bool(_QUEST_ADVANCING_RE.search(head.get('ResultScript', ''))
-                or any(_QUEST_ADVANCING_RE.search(i.get('ResultScript', ''))
+    return bool(_QUEST_ADVANCING_RE.search(info_result_script(head))
+                or any(_QUEST_ADVANCING_RE.search(info_result_script(i))
                        for i in closure))
 
 
@@ -666,6 +668,67 @@ def _gate_exprs(chain):
     return decls, terms
 
 
+def build_script_chain_map(by_type: dict) -> dict:
+    """topic EditorID (lower) -> line count of its NPC-to-NPC chain.
+
+    `Actor.Say` plays one line, so a multi-line chain must be Said once per
+    line; the engine's per-INFO CTDAs pick which, so only the COUNT is
+    needed. Player-facing topics are excluded and keep the plain Say.
+    See: docs/commentary/tes5_import_dialogue.md#script-started-conversation-chains
+    """
+    info_by_dial = _infos_by_parent(by_type.get('INFO', []))
+    out = {}
+    for dial in by_type.get('DIAL', []):
+        edid = dial.get('EditorID', '')
+        if not edid:
+            continue
+        n = _counter_chain_len(info_by_dial.get(_raw_fid(dial), []))
+        if n > 1:
+            out[edid.lower()] = n
+    return out
+
+
+def _counter_chain_len(infos: list) -> int:
+    """Lines gating on a consecutive run of one quest variable, else 0.
+
+    Every counted line must name a non-player listener via a run-on-target
+    GetIsID -- the scheduler's own signature, and what separates an NPC
+    chain from a player topic that happens to use a counter.
+    """
+    per_var = {}
+    for inf in infos:
+        if not head_is_npc_addressed(inf):
+            continue
+        for (t, v, f, p1, p2) in _conds(inf):
+            if f == FUNC_GET_QUEST_VARIABLE and (t & _COMPARISON_MASK) == 0:
+                per_var.setdefault((p1, p2), set()).add(int(v))
+    if not per_var:
+        return 0
+    vals = max(per_var.values(), key=len)
+    run = lo = min(vals)
+    while run + 1 in vals:
+        run += 1
+    return run - lo + 1
+
+
+def _chain_body(chain, i: int, cond: str, say) -> str:
+    """One chain's `if` block, latched only once the last line has played."""
+    done_sets = [f'        _done{i} = True']
+    done_sets += [f'        _done{j} = True'
+                  for j in chain.get('exclusive_with', ())]
+    body = [f'    ; {chain["owner_quest_edid"]}: head INFO '
+            f'{chain["head_fid"]:08X}',
+            f'    if {cond}']
+    body.append(say(f'Conv{i}A', f'Conv{i}T0', chain['head_fid'], 'HELLO'))
+    for k, hop in enumerate(chain['hops']):
+        spk = 'A' if hop['speaker'] == 'A' else 'B'
+        body.append(say(f'Conv{i}{spk}', f'Conv{i}T{k + 1}',
+                        hop['info_fid'], hop['topic_edid']))
+    body += done_sets
+    body.append('    endif')
+    return '\n'.join(body)
+
+
 def generate_driver_psc(plan, say_durations: dict = None) -> str:
     """The full TES4NPCConv<plugin>.psc source, or '' when no chains."""
     if not plan['chains']:
@@ -685,9 +748,7 @@ def generate_driver_psc(plan, say_durations: dict = None) -> str:
         return _FALLBACK_LINE_SECONDS
 
     def _say(actor, topic, hop_or_head, topic_edid):
-        # SayLine blocks until the engine has begun the line and returns its
-        # real length (+ tail); waiting that out is what Oblivion's scheduler
-        # did between lines.  A dropped line returns 0 and the chain moves on.
+        """One blocking SayLine, waited out; a drop returns 0 and moves on."""
         return (f'        Utility.Wait(TES4Polyfill.SayLine({actor}, {topic}, '
                 f'{_fallback(hop_or_head, topic_edid):.2f}) + {_LINE_BEAT})')
 
@@ -712,20 +773,7 @@ def generate_driver_psc(plan, say_durations: dict = None) -> str:
                         for k in range(len(chain['hops']) + 1)]
         cond = ' && '.join([f'!_done{i}'] + topic_guards + terms
                            + [f'CanConverse(Conv{i}A, Conv{i}B)'])
-        done_sets = [f'        _done{i} = True']
-        done_sets += [f'        _done{j} = True'
-                      for j in chain.get('exclusive_with', ())]
-        body = [f'    ; {chain["owner_quest_edid"]}: head INFO '
-                f'{chain["head_fid"]:08X}',
-                f'    if {cond}']
-        body += done_sets
-        body.append(_say(f'Conv{i}A', f'Conv{i}T0', chain['head_fid'], 'HELLO'))
-        for k, hop in enumerate(chain['hops']):
-            spk = 'A' if hop['speaker'] == 'A' else 'B'
-            body.append(_say(f'Conv{i}{spk}', f'Conv{i}T{k + 1}',
-                             hop['info_fid'], hop['topic_edid']))
-        body.append('    endif')
-        bodies.append('\n'.join(body))
+        bodies.append(_chain_body(chain, i, cond, _say))
 
     lines += decls
     lines += [
