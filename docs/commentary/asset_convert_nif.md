@@ -6,6 +6,7 @@
 
 - [Asset Conversion Notes](#asset-conversion-notes)
 - [Asset Pipeline](#asset-pipeline)
+- [One mesh plan per mod](#one-plan-per-mod)
 - [DOOR conversion notes](#door-conversion-notes)
 - [NIF mesh rotation](#nif-mesh-rotation)
 - [NIF particle system conversion](#nif-particle-system-conversion)
@@ -90,7 +91,7 @@ The `-ExtractAssets` flag triggers BSA extraction and mesh conversion:
 2. **Mesh Conversion** — Uses PyFFI-based NIFConverter (from external/NIFConverter/) to convert Oblivion NIF 20.0.0.4/5 → Skyrim NIF 20.2.0.7
 3. **Texture Copy** — DXT textures from Oblivion are compatible with Skyrim; copied as-is under `tes4\` namespace
    - **Path rewriting (`rewrite_tex_path`) must normalize separators FIRST** (fixed 2026-07-27). Oblivion NIFs mix `/` and `\`, sometimes in one file. Testing only for a backslash `'textures\'` prefix let `textures/lowres/foo.dds` fall through and come out as `Textures\tes4\textures/lowres/foo.dds` — a path resolving to nothing, so the mesh renders untextured and the LOD tiles built from it reference 100 nonexistent textures. 96 Morrowind_ob source NIFs hit this; **zero Oblivion.esm ones**, which is why it stayed hidden.
-   - `textures\lowres\` is an Oblivion **_far.nif authoring convention** for low-res LOD copies (pyffi ships a `modify_texturepathlowres` spell writing exactly this prefix, documented "used mainly for making _far.nifs"). We ship no lowres tree — converted textures live at the normal path — so the segment is **dropped**, resolving the reference to the real texture. The rewrite is idempotent on already-correct `Textures\tes4\…` paths.
+   - `textures\lowres\` is an Oblivion **_far.nif authoring convention** for low-res LOD copies (pyffi ships a `modify_texturepathlowres` spell writing exactly this prefix, documented "used mainly for making _far.nifs"). The segment is **kept** when its source file exists and falls back to the full-res twin otherwise — see [lowres textures](asset_convert_shader.md#lowres-textures). The rewrite always prefixes, even a path whose first folder already spells the namespace: Nehrim authors a `Nehrim\` folder, and the asset copy writes it under `nehrim\nehrim\` (see [per-game asset namespace](asset_convert_texture.md#per-game-asset-namespace)).
 4. **BSA Repacking** — Not yet automated. Use BSArch.exe or Skyrim CK Archive tool.
 
 ### Prerequisites for mesh conversion
@@ -102,6 +103,41 @@ The `-ExtractAssets` flag triggers BSA extraction and mesh conversion:
 - `Oblivion - Meshes.bsa`, `Oblivion - Textures - Compressed.bsa`
 - `DLCShiveringIsles - Meshes.bsa`, `DLCShiveringIsles - Textures.bsa`
 - `Knights.bsa` (single BSA for smaller DLCs)
+
+### <a id="skip-paths-fixtures"></a>Skipped folders still convert what a placed record names
+
+**Code:** `SKIP_PATHS` and `_collect_nifs` in `asset_convert/nif/nif_batch.py`
+
+The batch skips every mesh under `menus`, `creatures` or `characters`: creatures
+and characters have their own stages, which convert only what CREA, NPC_, RACE
+and HAIR use and write it under `actors\` or the hair folder. A static or
+activator can name one of those meshes as its OWN model, and then nothing wrote
+the path its record points at, so it was invisible. Measured on the exports:
+Nehrim 15 ACTI + 23 STAT, Oblivion 6 ACTI + 23 STAT -- the Endgame effect meshes
+(`Creatures\Endgame\Spawn.NIF`, `Transformation.NIF`, `Destruction.NIF` ...) that
+Nehrim's MQ14/MQ34 explosions reuse, `LucienLachanceDead.NIF`, hanging chickens,
+`Characters\RaceTextures*.NIF`.
+
+A skipped-folder mesh now converts when a placed-fixture record
+(`fixture_plan.FIXTURE_TYPES`: STAT, ACTI, LIGH, CONT, DOOR) names it, into the
+normal `meshes\<ns>\creatures\...` path the record already carries.
+
+### <a id="one-plan-per-mod"></a>One mesh plan per mod, from every member's records
+
+**Code:** `_exported_members`, `_mesh_plan` in `asset_convert/asset_pipeline.py`
+
+An imported mod's plugins share one asset tree and convert into one output
+tree, and the batch reconverts every NIF on each run. The per-mesh plan --
+wearable variants, clutter mass, door and fixture models, sit travel, resting
+items -- used to come from the converting plugin's records alone, so whichever
+member ran Meshes last decided how the shared meshes came out: converting
+`Sky_Main_Grass.esp` after `Sky_Main.esm` rebuilt every door and fixture
+without `Sky_Main.esm`'s records. The plan now merges every exported member
+(variant bits OR-ed, the largest mass, model sets united, the first travel per
+marker), so every member's run writes the same tree. A plugin outside any
+mod, or alone in one, gets exactly its own plan. The post-passes need no merge:
+hair, grass and magic-effect phase meshes are written beside the batch's
+output, and hair prunes only files named after its own plan's hairs.
 
 ## DOOR conversion notes
 <a id="door-conversion-notes"></a>
@@ -290,12 +326,32 @@ serializer always emits an empty inline pool with
 Every vanilla Skyrim particle system also carries a `BSPSysLODModifier`
 (**498/498** census), without which the system culls at all distances.
 
-### <a id="billboard-axis-fix"></a>Oblivion and Skyrim disagree on the billboard axis
+### <a id="billboard-axis-fix"></a>Billboards ship as authored — both engines run the same billboard math
 
-Oblivion mode-1 billboards keep local +Y up and +Z at the camera; Skyrim keeps
-local +Z up and −Y at the camera. Oblivion-authored flat-XY quads therefore need
-a −90° about-X rotation on their billboard node — byte-identical to vanilla
-`campfire01burning` "Plane05".
+A pure-geometry billboard keeps its authored rotation and mode; no axis
+correction is applied. Disassembled `NiBillboardNode`'s rotate-to-camera in
+`Oblivion.exe` (Nehrim install; `0x721b70`, called from the cull override at
+vtable slot 31) and SkyrimSE 1.6.1170 (`0xd3e650`, from slot 52's `0xd3f720`):
+
+- Both build `world = parent × local` with the **full local rotation**, pick the
+  case from `mode & 7` (Oblivion `+0xdc`, Skyrim `+0x128`), and finish with
+  `world = world × face`, `face` starting at identity.
+- **Mode 1 (rotate about up)** is term-for-term identical: the camera offset is
+  taken into the billboard's own frame and `face = [[z',0,x'],[0,1,0],[-x',0,z']]`
+  spins about **local +Y**. The node's rotation decides which axis that is, so it
+  is live data: `sky\sunbeam01.nif` authors −90°X, which stands its downward
+  quad (local −Y) vertical.
+- **Modes 0/3 and 2/4** (face camera / face center) build `face` from the
+  camera's columns taken into the same frame (both read −col0, col1, col2), so
+  the node's rotation cancels. **Mode 5** resets world rotation to identity and
+  spins about world Z in both.
+
+Vanilla authors the same way: 112 Skyrim mode-1 billboards carry −90°X over a
+flat-XY quad (thin axis Z), and every mode's quads are flat-XY in both games'
+meshes. The removed "Oblivion +Y up / Skyrim +Z up" correction composed −90°X
+onto every such node: a no-op for modes 0/2/3/4/5, and for mode 1 a second turn
+— the sunbeam shipped at 180°, lying flat. Removing it changed only mode-1
+billboards: 74 in Oblivion's meshes, 48 in Nehrim's, none of them `Fire\*.nif`.
 
 **A wrapper this converter builds carries NO axis correction.** These meshes are
 authored +Y-up and their PLACED REFERENCES carry the stand-up rotation: censused
@@ -304,8 +360,7 @@ across Oblivion.esm, **494** REFRs of the `Fire\*.nif` lights use RotX = ±90°
 — quads AND emitter markers — shares that one +Y-up frame, and the REFR rotates
 all of it together. Pre-rotating the quad to +Z-up made it the ONLY part in a
 different frame, so the REFR's −90° then laid it flat: the "third flame component
-on its side", with the smoke and flame beside it looking correct. Such wrappers
-are tagged so the later pass leaves them alone.
+on its side", with the smoke and flame beside it looking correct.
 
 ### <a id="billboard-demotion"></a>Demoting a billboard that contains particles
 
@@ -313,15 +368,23 @@ A billboard whose subtree holds a particle system is DEMOTED to a plain `NiNode`
 — a billboarding ancestor would spin the emitters — and its direct geometry
 children are wrapped in fresh billboard nodes instead.
 
-**The demoted node does NOT inherit the billboard's rotation.** A
-`NiBillboardNode` DISCARDS its own rotation at runtime and substitutes identity in
-view space — NifSkope's `BillboardNode::viewTrans` (`glnode.cpp`):
-`t = parent->viewTrans() * local; t.rotation = Matrix();`. So the authored
-rotation was never used for orientation, and copying it onto the plain
-replacement RESURRECTS a dead value: `firetorchsmall`'s "Sparks-Emitter" and
-`firecandleflame`'s "FlameParticles-Emitter" are billboards carrying
-+Z=(0,−1,0), and reviving that aims the emitter sideways — the horizontal jet
-beside the upright flame.
+**In the face-camera modes the demoted node does NOT inherit the billboard's
+rotation.** In modes 0/2/3/4 and mode 5 the engine's camera-facing matrix cancels
+a `NiBillboardNode`'s own rotation ([billboard-axis-fix](#billboard-axis-fix)), so
+the authored rotation was never used for orientation, and copying it onto the
+plain replacement RESURRECTS a dead value. (NifSkope's `BillboardNode::viewTrans`
+in `glnode.cpp` drops it for every mode, mode 1 included, so NifSkope is no guide
+here.)
+
+**Mode 1 KEEPS its rotation**, because there it picks the spin axis. Morroblivion's
+`lights\dunmer\firepit_f.nif` is a +Z-up host that embeds Oblivion's +Y-up
+FireOpenSmall fire under a mode-1 `FireOpenSmallSmoke` billboard authored at
+−90°X, which turns the fire's local +Y into the host's +Z. Zeroing it on demotion
+laid the whole fire (quads, emitters, AttachLight) on its side. The fresh
+wrappers around the quads stay identity: under the kept −90°X their local +Y spin
+axis is already model up. `firetorchsmall` and `firecandleflame`, whose mode-1
+emitter billboards carry ±90°X, convert with no rotation change (A/B of every
+node rotation against the previous build). Guarded by `TestBillboardDemotion`.
 
 **EXCEPT when the node is an EMITTER MARKER.** Rotation-is-discarded applies to
 how a billboard DRAWS its subtree; a `NiPSysEmitter` reads its `emitter_object`
@@ -339,13 +402,13 @@ the reference dangles ("block is missing from the nif tree") and the sim breaks.
 ## NIF FlameNode → grafted converted flame (rewritten 2026-07-05, replaces the MPS/AddonNode substitution)
 <a id="nif-flamenode-grafted-converted-flame"></a>
 - Oblivion marks where a flame burns with an empty `FlameNode*` NiNode (a bare marker: name + transform, no children) and attaches a flame NIF there at RUNTIME (`fire\firecandleflame.nif` for candles/sconces/lamps/etc., torch flame for torches). 108 Oblivion meshes have them.
-- **Conversion (`_convert_flame_nodes` + `_load_converted_flame` in nif_converter.py)**: the flame NIF for each marker's socket (see the FlameNode STAT table below) is run through the FULL converter once per worker (cached as serialized bytes; deep copies by re-reading — requires the patched-PyFFI NiPSysData `read`), and the converted root's children are grafted under each empty FlameNode marker. Marker keeps TRANSLATION, SCALE **and ROTATION** — all three are authored. The rotation is the hook-up between two model frames: the flame NIFs are +Y-up, and a +Z-up host carries the −90°X correction on its marker (`uppersilverplatecandles01`'s FlameNode0 is `[1,0,0][0,0,1][0,-1,0]`, i.e. `_BB_AXIS_FIX` itself — that host is a flat plate, extent X=23 Y=23 Z=2, and all 121 of its REFRs use RotX=0, so nothing else would stand the flame up). Zeroing it laid the candle flames on their side; +Y-up hosts author an identity marker and are unaffected. Host root gets BSX bit 0 OR'd in (grafted controllers must tick); the flame's flip-book atlas jobs are merged into the host stats so `convert_nif` writes the atlas into every output tree that needs it. Graft runs in `convert_nif` BEFORE the atlas build step.
+- **Conversion (`_convert_flame_nodes` + `_load_converted_flame` in nif_converter.py)**: the flame NIF for each marker's socket (see the FlameNode STAT table below) is run through the FULL converter once per worker (cached as serialized bytes; deep copies by re-reading — requires the patched-PyFFI NiPSysData `read`), and the converted root's children are grafted under each empty FlameNode marker. Marker keeps TRANSLATION, SCALE **and ROTATION** — all three are authored. The rotation is the hook-up between two model frames: the flame NIFs are +Y-up, and a +Z-up host carries the −90°X correction on its marker (`uppersilverplatecandles01`'s FlameNode0 is `[1,0,0][0,0,1][0,-1,0]`, i.e. −90°X — that host is a flat plate, extent X=23 Y=23 Z=2, and all 121 of its REFRs use RotX=0, so nothing else would stand the flame up). Zeroing it laid the candle flames on their side; +Y-up hosts author an identity marker and are unaffected. Host root gets BSX bit 0 OR'd in (grafted controllers must tick); the flame's flip-book atlas jobs are merged into the host stats so `convert_nif` writes the atlas into every output tree that needs it. Graft runs in `convert_nif` BEFORE the atlas build step.
 - **The earlier "embedding crashes the engine" lesson is OBSOLETE**: that crash (`vmovntdq` past page end, `BSEffectShaderProperty "CandleFat02Fake"`) was actually the PyFFI NiPSysData 66-vs-70-byte misalignment (+ uv_scale=(0,0)) — both long fixed. The interim `BSValueNode`/`AddOnNode` MPS substitution (`_ADDN_CANDLE_FLAME`=49 / `_ADDN_TORCH_FIRE`=46 / BSX bit 0x10) is deleted per user directive: convert, don't substitute.
-- **Billboard handling is now GENERAL (any tree depth, `_skyrimize_billboard`)**: firecandleflame.nif nests its particle emitter under TWO levels of NiBillboardNode, so root-only handling was insufficient. Every non-root NiBillboardNode on the walk (and root's direct children — they use a separate loop in `_convert_nif` that needs the same hook): contains a NiParticleSystem anywhere in its subtree → DEMOTE to plain NiNode + wrap its direct geometry children via `_wrap_in_billboard` (fresh NiBillboardNode, source mode, `_BB_AXIS_FIX` −90°X rotation); pure-geometry billboard → keep but COMPOSE the axis fix into its rotation (Oblivion billboards are authored identity over flat-XY quads). **When demoting, remap `emitter_object`/`gravity_object` refs that pointed at the old billboard node to the replacement** — else they dangle ("block is missing from the nif tree") and the particle sim breaks.
+- **Billboard handling is now GENERAL (any tree depth, `_skyrimize_billboard`)**: firecandleflame.nif nests its particle emitter under TWO levels of NiBillboardNode, so root-only handling was insufficient. Every non-root NiBillboardNode on the walk (and root's direct children — they use a separate loop in `_convert_nif` that needs the same hook): contains a NiParticleSystem anywhere in its subtree → DEMOTE to plain NiNode + wrap its direct geometry children via `_wrap_in_billboard` (fresh identity NiBillboardNode, source mode); pure-geometry billboard → keep as authored ([billboard-axis-fix](#billboard-axis-fix)). **When demoting, remap `emitter_object`/`gravity_object` refs that pointed at the old billboard node to the replacement** — else they dangle ("block is missing from the nif tree") and the particle sim breaks.
 
-- **FLAME QUADS STAY IN THE MODEL FRAME — no axis fix on the wrapper (fixed 2026-08-20)**: `_wrap_in_billboard` used to compose `_BB_AXIS_FIX` (−90°X) into every wrapper it built. That is wrong for these meshes: they are authored **+Y-up and their PLACED REFERENCES carry the stand-up rotation** — censused across `Oblivion.esm`, **494 REFRs** of the `Fire\*.nif` lights use `RotX = ±90°` (10/10 for `FireTorchLargeSmoke`, 188+51 of 395 for `FireOpenSmall`). The whole model — quads AND emitter markers — shares that one frame and the REFR rotates all of it together. Pre-rotating only the quad made it the sole part in a different frame, so the REFR's −90° then laid it flat: reported in game as "a third flame component on its side" beside a correct-looking flame and smoke. `_wrap_in_billboard` now applies NO fix and only tags `bb._axis_fixed = True`, so the later `_skyrimize_billboard` pass leaves its wrappers alone (that guard still fires — measured 27 times over 81 billboard meshes — and without it the pure-geometry branch would compose the fix back in). `_compose_axis_fix` remains live for genuinely Oblivion-authored pure-geometry billboards (249 calls over the same 81 meshes). Guarded by `test_flame_keeps_the_authored_model_frame`.
-- **A DEMOTED BILLBOARD INHERITS IDENTITY — except emitter markers**: a `NiBillboardNode` DISCARDS its own rotation at runtime and substitutes identity in view space (NifSkope `BillboardNode::viewTrans`, glnode.cpp: `t = parent->viewTrans() * local; t.rotation = Matrix();`). Copying that dead rotation onto the plain replacement resurrects a value the engine never used. **But a `NiPSysEmitter` reads its `emitter_object` node's orientation as the emission DIRECTION**, which is live data — `firecandleflame` authors quad and emitter in one +Y-up frame (quad identity, local extent `[1.3, 2.6, 0.0]`; emitter `[1,0,0][0,0,-1][0,1,0]`, local +Z → model +Y), and zeroing the emitter made it +Z-up while the quad stayed +Y-up: an upright flame with a second, sideways particle jet, most visible once a FlameNode marker rotated the mismatched pair into a +Z-up host. `_is_emitter_marker()` keeps the rotation for nodes referenced as `emitter_object`/`gravity_object`; every other demoted billboard still gets identity. Guarded by `test_emitter_and_quad_agree_on_up`.
-- **WHICH FLAME BURNS AT A SOCKET IS AUTHORED — read the FlameNode STATs**: Oblivion ships one STAT per socket (WorldObjects/Static, EditorID `FlameNode<N>`) whose MODL is the flame to attach: `FlameNode0` `0x1E` FireCandleFlame, `1` `0x1F` FireTorchSmall, `2` `0x20` FireTorchLarge, `3` `0x21` FireTorchLargeSmoke, `4` `0x22` FireOpenSmall, `5` `0x23` FireOpenSmallSmoke, `6` `0x24` FireOpenMedium, `7` `0x25` FireOpenMediumSmoke, `8` `0x26` FireOpenLarge, `9` `0x27` FireOpenLargeSmoke. Those FormIDs are the keys `Oblivion.exe` hardcodes — the socket-name table at `0xB06818` is walked in lockstep with `0xB067C0` holding `0x1E..0x32`, looked up in the form map at `0xB0613C` — so the **plugin owns the mapping and a mod may repoint it**; `flame_socket_map()` parses it from the export's `STAT.txt` (cached per export root). Keying on the host FILENAME instead ('torch' in the name) put the 1.3×2.6-unit candle flame on every lamp in the game: `castlelight02` is a 105-unit fixture on socket 2, i.e. FireTorchLarge (32×64). Resolution is **per marker** — `lecternworkstation1` mixes FlameNode0 candles with a FlameNode1 torch. Guarded by `test_flame_comes_from_the_flamenode_stat`.
+- **FLAME QUADS STAY IN THE MODEL FRAME — no axis fix on the wrapper (fixed 2026-08-20)**: `_wrap_in_billboard` used to compose `_BB_AXIS_FIX` (−90°X) into every wrapper it built. That is wrong for these meshes: they are authored **+Y-up and their PLACED REFERENCES carry the stand-up rotation** — censused across `Oblivion.esm`, **494 REFRs** of the `Fire\*.nif` lights use `RotX = ±90°` (10/10 for `FireTorchLargeSmoke`, 188+51 of 395 for `FireOpenSmall`). The whole model — quads AND emitter markers — shares that one frame and the REFR rotates all of it together. Pre-rotating only the quad made it the sole part in a different frame, so the REFR's −90° then laid it flat: reported in game as "a third flame component on its side" beside a correct-looking flame and smoke. `_wrap_in_billboard` now applies NO fix. The axis fix itself was later removed for every billboard ([billboard-axis-fix](#billboard-axis-fix)). Guarded by `test_flame_keeps_the_authored_model_frame`.
+- **A DEMOTED BILLBOARD INHERITS IDENTITY — except mode 1 ([billboard-demotion](#billboard-demotion)) and emitter markers**: a face-camera `NiBillboardNode` DISCARDS its own rotation at runtime and substitutes identity in view space (NifSkope `BillboardNode::viewTrans`, glnode.cpp: `t = parent->viewTrans() * local; t.rotation = Matrix();`). Copying that dead rotation onto the plain replacement resurrects a value the engine never used. **But a `NiPSysEmitter` reads its `emitter_object` node's orientation as the emission DIRECTION**, which is live data — `firecandleflame` authors quad and emitter in one +Y-up frame (quad identity, local extent `[1.3, 2.6, 0.0]`; emitter `[1,0,0][0,0,-1][0,1,0]`, local +Z → model +Y), and zeroing the emitter made it +Z-up while the quad stayed +Y-up: an upright flame with a second, sideways particle jet, most visible once a FlameNode marker rotated the mismatched pair into a +Z-up host. `_is_emitter_marker()` keeps the rotation for nodes referenced as `emitter_object`/`gravity_object`; every other demoted billboard still gets identity. Guarded by `test_emitter_and_quad_agree_on_up`.
+- **WHICH FLAME BURNS AT A SOCKET IS AUTHORED — read the FlameNode STATs**: Oblivion ships one STAT per socket (WorldObjects/Static, EditorID `FlameNode<N>`) whose MODL is the flame to attach: `FlameNode0` `0x1E` FireCandleFlame, `1` `0x1F` FireTorchSmall, `2` `0x20` FireTorchLarge, `3` `0x21` FireTorchLargeSmoke, `4` `0x22` FireOpenSmall, `5` `0x23` FireOpenSmallSmoke, `6` `0x24` FireOpenMedium, `7` `0x25` FireOpenMediumSmoke, `8` `0x26` FireOpenLarge, `9` `0x27` FireOpenLargeSmoke. Those FormIDs are the keys `Oblivion.exe` hardcodes — the socket-name table at `0xB06818` is walked in lockstep with `0xB067C0` holding `0x1E..0x32`, looked up in the form map at `0xB0613C` — so the **plugin owns the mapping and a mod may repoint it**; `flame_socket_map()` parses it from the `STAT.txt` of the plugin and its masters (cached per asset folder; see [Flame STATs from the masters](#flame-stats-from-the-masters)). Keying on the host FILENAME instead ('torch' in the name) put the 1.3×2.6-unit candle flame on every lamp in the game: `castlelight02` is a 105-unit fixture on socket 2, i.e. FireTorchLarge (32×64). Resolution is **per marker** — `lecternworkstation1` mixes FlameNode0 candles with a FlameNode1 torch. Guarded by `test_flame_comes_from_the_flamenode_stat`.
 - **A ZERO-PADDED SOCKET BURNS NOTHING**: the engine matches socket names EXACTLY, and its table holds only unpadded `FlameNode<N>` — `Oblivion.exe` contains `FlameNode7` and `FlameNode1` but neither `FlameNode07` nor `FlameNode01`, and the STATs are likewise unpadded. Two vanilla meshes are authored with padded markers and show **no flame in the original game**: `clutter/metalsmith/forgeopen01.nif` (`FlameNode07`) and `clutter/lecternworkstation1.nif` (`FlameNode01`). Matching them loosely put a 468-unit FireOpenMediumSmoke on the forge. `_FLAME_SOCKET_RE` is `^FlameNode(0|[1-9][0-9]*)(?![0-9])` and an unmatched socket grafts NOTHING — there is no default-flame fallback. Guarded by `test_zero_padded_socket_burns_nothing`.
 - **FX BRIGHTNESS IS THE AUTHORED VALUE, NEVER THE FILENAME (2026-08-27)**: a 2026-08-20 revision classified flames by the diffuse PATH — `_is_fire_fx()` matched `fire`/`flame`/`torch` minus a `smoke`/`mist`/`fog`/`dust`/`steam`/`cloud` veto — and forced `soft_effect=0, emissive_multiple=1.5` on every hit. **That was wrong and is removed.** It misfired on `textures\lights\torch02.dds`, the WOODEN HANDLE whose host `lights\torch02noflame.nif` contains no flame at all, and it could only ever work for meshes following Bethesda's naming — never Nehrim, Morroblivion or any third-party plugin. Oblivion states brightness per SHAPE in `NiMaterialProperty.emissive_color`, and across all 778 particle systems under `meshes/` the populations do not overlap: **flames author full white 1.0** (`firetorchlarge` "Fire", `crtfirelogs` "PCloud08BigFlame"; 227 systems at 1.0) while **fog/dust author 0.047–0.337** (`fxcloudthick01` 0.078, `fxcloudthin01` 0.047, `fxdustcloud01` (0.337,0.337,0.294); 190 systems below 0.5). Better than 12x separation, and per-shape — which matters because `firetorchlargesmoke.nif` holds a flame AND a smoke plume in one file, so any per-file test must give them the same answer. Rule: **carry `emissive_color` through verbatim and hold `emissive_multiple` at the vanilla-neutral 1.0.** A flame authored full white is already at full emission and needs no boost. Guarded by `test_fx_emissive_is_the_authored_value`.
 - **A SELF-LIT FLAME MUST NOT TAKE THE SOFT DEPTH FADE (2026-08-27)** — user report: candles like `lights\uppersilverplatecandles01.nif` "glow red instead of the flames". **The red was never a new light**: the candle WAX authors `NiMaterialProperty.emissive_color` (0.953, 0.910, 0.678) on the LIGHTING path (`slsf_1_own_emit`), code unchanged since the initial commit. What regressed is that the FLAME in front of it disappeared. Removing the filename classifier (entry above) dropped BOTH halves of that commit's behaviour, but only the brightness half was given an authored replacement — flames then started taking `slsf_1_soft_effect`, and the depth fade attenuates a quad against whatever it intersects. A candle flame sits directly on its own wax and a sconce flame against its own bracket, so the fade dimmed each flame into its own holder, leaving only the wax glow visible. **Vanilla authors the split inside ONE mesh**: `mps\mpscandleflame01.nif` — both particle systems, both additive `0x100d`, both `emissive_multiple` 1.0 — has `CandleFlame01` **soft=0** (falloff 2.0) and `CandleGlow01` **soft=1** (falloff 6.0); likewise every mounted fire core (`slighthousefire` Fireball, `torchsconce01` pFireballCore04, `giantcampfire01burning` PFireball — 49 such particle systems across 281 vanilla fire meshes). **Skyrim's value is NOT reconstructible from structure**: over 511 vanilla FX shaders neither block type (particle 119/168 soft=1 vs geometry 159/343), nor alpha flags (`0x100d` splits 163/74), nor `double_sided` (78% vs 44%) predicts it — it is authored per effect, and Oblivion has no equivalent field to carry across. So key it on the one authored quantity that DOES separate the populations, the same emissive that drives brightness: **full-white (>=0.999) = self-lit light source -> soft=0**; anything dimmer = ambient haze -> soft=1 (fog 0.047-0.078, dust 0.337, mist 0.310). The asymmetry justifies the cut: a missing fade only omits a Skyrim-era nicety from a flame, while a wrongly-applied one ERASES the flame. Guarded by the soft_effect assertion in `test_fx_emissive_is_the_authored_value`.
@@ -380,7 +443,8 @@ The blocks READ fine (they inherit `NiParticles` → `NiGeometry`, so PyFFI pars
 
 - `upgrade_legacy_particles` runs in the Morrowind pre-pass (`run_morrowind_fixups`), BEFORE the version upgrade and the geometry walk. It rewrites each legacy emitter as a `NiParticleSystem`, so the normal Oblivion path (`particles.py: convert_particle_system`) then finishes the job unchanged — no parallel conversion path.
 - Every emission parameter is AUTHORED on the controller and is mapped verbatim: `speed`/`speed_random` → speed, `vertical_angle` → declination_variation, `horizontal_angle` → planar_angle_variation, `lifetime`/`lifetime_random` → life_span, `size` → initial_radius, `emitter` → emitter_object, and `emit_rate` → the `NiPSysEmitterCtlr`'s NiFloatInterpolator value (birth rate lives on the CONTROLLER in Skyrim, not on the emitter).
-- The `particle_extra` chain maps to the modifier array: `NiParticleGrowFade` (139 files) → `NiPSysGrowFadeModifier`, `NiGravity` (4) → `NiPSysGravityModifier`, `NiParticleRotation` (1) → `NiPSysRotationModifier`. `NiParticleColorModifier` (3) is left to the Oblivion path, which builds `BSPSysSimpleColorModifier` from the authored material.
+- The `particle_extra` chain maps to the modifier array: `NiParticleGrowFade` (139 files) → `NiPSysGrowFadeModifier`, `NiGravity` (4) → `NiPSysGravityModifier`, `NiParticleRotation` (1) → `NiPSysRotationModifier`, `NiParticleColorModifier` (3) → `NiPSysColorModifier` on its own `NiColorData`, which `particles._simple_color_from` samples into a `BSPSysSimpleColorModifier`. A system without one gets an empty `NiPSysColorModifier`, which becomes the neutral white ramp.
+- <a id="morrowind-particles-invisible"></a>**Every field the upgrade builds from scratch must be written, never left to PyFFI's default** — the first version loaded (no red triangle) but rendered nothing: every candle, torch and fire was invisible. Census of 150 converted Morrowind meshes (344 systems) against 150 vanilla Skyrim meshes (267 systems) and the 13 converted Oblivion fire meshes (37 systems), each unanimous: `NiPSysUpdateCtlr.frequency` was **0.0 on 344/344** (PyFFI's default; 1.0 on 267/267 vanilla and 37/37 Oblivion), so the simulation clock never advanced; `NiPSysEmitter.initial_color` was **(0,0,0,0) on 344/344**, a transparent black birth color; and **0/344 carried a color modifier** against 267/267 vanilla, because the legacy `NiParticleColorModifier` was dropped on the claim that the Oblivion path would add one — it only rewrites a modifier the source already has. Now the update controller takes the legacy controller's frequency, the birth color is opaque white, and every system carries a color modifier. Negative emitter start times (23 vanilla systems) and object-space systems (26 vanilla) are vanilla-legal and left alone.
 - **A freshly built controller MUST carry `target`, or the game crashes.** `NiTimeController::m_pTarget` (x64 offset 0x38) is loaded and dereferenced with NO null check: `mov rax,[rcx+0x38]` then `mov rbx,[rax+0x18]` (stable ID 74716 +0x3c; 1.6.659 RVA 0xd517fc) — the engine then walks `[rbx+0x40]` down the target's children calling a vtable method, so it wants the owning NiParticleSystem. A null there is an instant EXCEPTION_ACCESS_VIOLATION reading 0x18 the moment the system updates. This shipped once and crashed on a Morrowind candle; the Oblivion path never hit it because authored sources already carry `target`, and it is invisible to every structural check. Both controllers get `target = psys`, and `visibility_interpolator` gets a true NiBoolInterpolator (40/40 vanilla emitter controllers carry one; 0 are null). Update-controller flags are 0x4c, not the emitter's 0x48.
 - Modifier `order` is not set here: `_skyrimize_modifiers` sorts and stamps the whole chain against `_PSYS_ORDER` on the second pass, which is the single source of that vocabulary.
 - The parent `NiBSParticleNode` and `NiLODNode` are separately handled by `_REWRITE_AS_NINODE` — see [legacy block types](#legacy-block-types); an emitter fix alone is not enough for these files.
@@ -400,6 +464,18 @@ PyFFI reports **every unreferenced block** as a root, not just scene-graph roots
 - The orphans are unreachable from the real root — dead weight, so dropping them also shrinks output. PyFFI's "block is missing from the nif tree: omitting reference" notice on write is the expected, benign confirmation.
 - **Files whose ONLY root is a non-node** are standalone animation files (`creatures/*/idleanims/*.nif` → a lone `NiControllerSequence`). There is no geometry to convert; `convert_nif` returns `error='NOGEO'` and skips instead of crashing.
 - Related trap: **never trust `num_vertices`/`has_normals` over the actual array length.** `leyawiinhouselower01_far.nif` has a shape with `num_vertices=16` but an empty `vertices` array (stale count, `has_vertices` unset), which made `np.array([...])` a `(0,)` array and blew up the matmul in `inv_marker._gather_area_normals`. Guard with `len(gd.vertices)` and `len(gd.normals) == len(gd.vertices)`.
+
+## A shape listed under two parents converts once
+<a id="shared-shapes-convert-once"></a>
+A NIF may reference one `NiTriShape` block from two child slots — Nehrim's
+`ptcreatures\nightmaretroll\nightmaretroll.nif` lists its body `Troll01:0` twice
+under the root. The walk visited it twice. The first `process_geometry` pass built
+the `troll.dds` shader and cleared the Oblivion properties; the second pass found no
+`NiTexturingProperty`, so it replaced that shader with the `Textures\white.dds`
+fallback. Every creature on that mesh rendered its body untextured.
+`_walk_geometry` now memoizes by block identity (`stats['_converted_shapes']`),
+so a later visit returns the first result, and both slots keep pointing at the
+same converted block, as authored.
 
 ## NIF NiDefaultAVObjectPalette fixup
 <a id="nif-nidefaultavobjectpalette-fixup"></a>
@@ -476,7 +552,7 @@ block after the swap must retarget *all* of them — it already handled
 - Marker-bearing NIFs live outside meshes/furniture too: clutter/castleinterior (castle beds/thrones), architecture (cathedral pews, tents/sleepingmat, ships/sibed, anvil tree bench), dungeons (benches, thrones, sacrifice altar), oblivion/architecture/citadel. Find them with a binary grep for the ASCII string `BSFurnitureMarker` (block type names are plaintext in NIF headers).
 - BSFurnitureMarker lives in root NiNode's extra_data_list. During NiNode→BSFadeNode conversion, it must be explicitly converted and transferred (bulk extra_data_list copy breaks animated objects). Marker offsets are model-space and stay valid under the root-rotation wrap pass.
 - **FURN record linkage (CRITICAL)**: TES5 FURN `MNAM` bits 0-23 enable NIF marker POSITION index 0-23. TES4 MNAM bits indexed the Oblivion NIF's ENTRY list — passing the bitmask through after seat clustering leaves dangling bits and the engine seats NPCs at garbage positions FAR from the mesh. The shared algorithm lives in `asset_convert/nif/furniture_markers.py`; `tes5_import` (items.py `load_furniture_seats`, called in import Phase 0e) recomputes the same seat list from the source NIF and writes MNAM=(1<<n_seats)−1 + preserved high bits (0x40000000 sit-type / 0x80000000 bed-type, same in both games; beds add 0x08000000 MustExitToTalk like all vanilla beds) + WBDT(0,-1) + one FNPR per seat.
-- **Oblivion entry-restriction variants**: many TES4 FURN records share one NIF and enable different entry-marker subsets (SEChair01F/R/L, 19 LCBench01* variants like `Fall`=front row only, `RL`=ends only). Conversion carries this into per-seat FNPR entry flags: only the entry directions whose TES4 entry bit was enabled are allowed (seats with no enabled entries fall back to all their entries). Verified vs vanilla: converted bench = 0x40000007 + 3×FNPR like CommonBench01; converted bed = 0x88000001 + FNPR 0x000C0002 byte-identical to CommonBed01; LCBed02L keeps right-entry-only (FNPR 0x00040002).
+- <a id="furniture-entry-restrictions"></a>**Oblivion entry-restriction variants**: many TES4 FURN records share one NIF and enable different entry-marker subsets (SEChair01F/R/L, MCStool01F/B/R/L, 19 LCBench01* variants like `Fall`=front row only, `RL`=ends only). Vanilla Skyrim does this with the record's **ENAM + NAM0 "Disabled Entry Points"**, never FNPR: FNPR mirrors the mesh's entry sides (CommonWritingChair01R on CommonChair01.nif: FNPR front|right|left, NAM0 disables front|left; 185 of 400 vanilla FURN records carry NAM0). So each seat's FNPR is the mesh's full entry set, and a seat whose TES4 record allows fewer sides gets ENAM(seat index) + NAM0(0, the disallowed sides) (seats with no enabled entries keep all their entries). The earlier conversion put the allowed sides into FNPR and wrote no NAM0; the engine then used the mesh's four sides: run 38c, Baurus (MCStool01B = behind only) got up off the FRONT of a stool facing Luther Broad's bar counter, 62 units along the stool's facing, inside the counter, and fell out of the world (also 24g, 28d). Not yet confirmed in game by the user.
 - FURN models whose NIF is missing from the export (SI furniture, palace thrones) get a conservative fallback: MNAM bit 0 + high flags, FNPR all entries. NIFs with NO markers get MNAM high flags only (no active positions — never enable bits beyond the NIF's position count).
 
 ## NiControllerSequence conversion
@@ -531,6 +607,48 @@ is defensive, for plugins whose exporter did not follow the convention.
 
 `None` means no accum root, or one whose authored transform is identity, where
 the pose is a no-op either way.
+
+**At rest the root rotation moves to NonAccum** (`_bake_accum_root_pose`).
+When the accum root is the FILE root, its entry is dropped and its identity pose
+is baked onto the root node. NonAccum's rest transform is identity; the real
+pose exists only as its frame-0 key, which applies only while a sequence plays.
+A mesh with no load sequence (see `_start_state_id` in `hkx_animobject.py`)
+starts in the graph's Rest state, plays nothing, and showed the bare rest pose,
+so its authored rotation was lost. Nehrim's torch posts (`cplog01`, 168.6°) lay
+tipped over with their braziers floating; confirmed fixed in game.
+
+Census over the Oblivion and Nehrim exports: **127** meshes bake a root pose over
+a non-identity root rotation (59 Oblivion, 68 Nehrim). In **all 127**, NonAccum's
+rest is identity and `root · NonAccum rest` equals NonAccum's frame 0 exactly, so
+moving the rotation changes nothing during playback. 29 of them (non-menu) start
+in Rest and looked wrong in game: the cave logs, swing-blade traps (40°), the
+harrada plants, claw switch, mine and spike traps, root gate, blacksap tank, and
+the Open/Close doors (benirus, Leyawiin middle/upper interior, rootskin). The rest
+play Idle/SpecialIdle at load and never showed the rest pose.
+
+**The pose is baked whenever the entry's rotation is un-keyed, not only when the
+entry is data-less** (`_rotation_keyed`). A `NiTransformInterpolator` plays its
+pose on every channel its data does not key, so an entry whose data holds only
+scale keys still plays the identity rotation. Two meshes in the converted
+folders of Oblivion.esm have a rotated root under such an entry:
+`oblivion\fire column\oblivioncitadelfirecolumn01.nif` (a quarter turn about X)
+and `architecture\lowerclass\doorfulllower02.nif` (half a turn about Z), each
+with two constant scale keys and no rotation or translation key. The root's
+rotation is the one NonAccum's keys start from in the fire column's `Idle` and
+in the door's `Open`. With the bake skipped the root kept its rotation, the
+root-rotation wrapper moved it one node down, and NonAccum's keys applied it
+again: the fire column, which plays `Idle` from load, stood a quarter turn off
+(seen in game: a column placed level stood upright). 20 more meshes have a
+keyed entry over an unrotated root, where the bake moves at most rounding
+residue; a third rotated one,
+`menus\armor repair\white spot.nif`, is in a folder the batch skips and converts
+the same either way. No root entry in Oblivion.esm, Knights.esp, DLCFrostcrag.esp
+or the Unofficial Patch holds a rotation key. Guarded by
+`TestDroppedAccumRootPose`.
+
+A pyffi `Matrix33` is the transpose of the column-vector quaternion matrix;
+`_apply_rotation` writes that layout. No mesh in either export has a
+non-identity dataless root pose, so the layout fix changed no output.
 
 ## Sequence controller retargeting
 <a id="sequence-controller-retargeting"></a>
@@ -628,9 +746,12 @@ sentinel applies.
 
 ### <a id="morph-swap-block-mechanics"></a>How the swap is built
 
-The morph target is baked into a hidden sibling shape and the sequence gains
-`NiVisController` entries swapping base → target as the weight curve crosses 0.5.
-The base shape is visible exactly while NO target weight is at or above 0.5.
+Each distinct 30 fps pose of the morph is baked into a sibling shape, each shape
+is wrapped in its own `"<shape> Swap"` NiNode, and the sequence gains one
+`NiVisController` entry per wrapper, on for exactly the frames that show its
+pose; the base shape is on while the pose is the unmorphed one. Why the
+flipbook, the wrappers, and why each shape must own its shader: see
+[asset_convert_animation.md](asset_convert_animation.md#morph-emulation).
 
 **Bool keys MUST be CONST_KEY (5).** **3449/3449** vanilla and **1296/1296**
 Oblivion `NiBoolData` blocks store it, and LINEAR crashed the engine in
@@ -647,7 +768,9 @@ while the vertices live on `NiTriBasedGeomData` — so the MRO is walked base-fi
 and counts still precede their arrays. A single in-order pass with
 `update_size()` at each array therefore keeps dimensions valid. Reference-typed
 fields are copied as POINTERS (shared blocks); the caller overrides the ones the
-clone must own (data, controller, collision).
+clone must own (data, controller, collision, and its shader/alpha properties with
+their texture set — a shared shader property draws the newly shown shape
+semi-transparent until it leaves the screen).
 
 ### <a id="shared-property-fan-out"></a>A shared property drives several shapes
 
@@ -675,7 +798,7 @@ class for it and vanilla ships 0 — so the entry must go. But the morph IS the
 visible effect for a whole family of Oblivion meshes (`ctrigtripwire01`'s wire
 snap, `se01waitingroomwalls`, the forming Oblivion gate), so everything
 `emulate_morphs` needs to rebuild it as a baked target shape plus a
-wrapper-node scale swap is harvested first.
+wrapper-node visibility swap is harvested first.
 
 ## The controlled block is resolved BY STRING at activation
 <a id="controlled-block-id-strings"></a>
@@ -822,6 +945,21 @@ from Oblivion's `NiTextureTransformController`.
 Vanilla never leaves one dangling: across **80** meshes carrying shader float
 controllers, **481/481** are reachable from `shader.controller`. The pass mirrors
 that — the controller goes on the shader's chain, targeted at the shader.
+
+**Known deviation, not a proven crash cause.** In vanilla `meshes/magic`,
+**11,215/11,215** controllers that a sequence entry names have the manager bit
+(`0x20`, flags `0x6c`/`0x68`) and their own `NiBlend*Interpolator`. Ours ship
+`0x48|cycle` with the block's `NiFloatInterpolator`: 173 controllers in 22
+Oblivion magic-effect NIFs. Making them vanilla-shaped was tried and reverted,
+because it was never tied to a crash:
+- **The crash:** a player's 1.5.97 crashes die in `NiBlendInterpolator::RemoveInterpInfo`
+  (`+0CCC1A5`) on a garbage entry pointer (`0x7F7FFFFF`, `-1`, `1`). One of them is
+  on `fireball_area.nif`.
+- **Headless test on 1.6.1170:** the debugger was attached
+  (`questtest --crash-capture --break 0xd976b0|...`) while the explosion was spawned
+  with `placeatme`, using the player-era mesh. Every `RemoveInterpInfo` index was
+  in range (325 calls).
+- **Open:** the cause, and whether these meshes are involved.
 
 ## Ambient animation: Oblivion's Idle becomes vanilla's AutoPlay pair
 <a id="autoplay-ambient-sequences"></a>
@@ -1226,6 +1364,28 @@ graph-less mesh with fewer dead keys loses nothing.
 A missing or failing hkxcmd never loses the mesh. The object still converts and
 renders; it just stays unanimated, and the error is recorded in the result.
 
+### <a id="specialidle-is-the-load-state"></a>SpecialIdle is the state an object loads into
+
+**Code:** `_start_state_id`, `_LOAD_SEQUENCES` in `asset_convert/havok/hkx_animobject.py`
+
+The generated graph starts on a do-nothing `Rest` state so a door or wall does
+not play `Forward` by itself — unless the mesh carries a sequence the object plays
+from load: `AutoLoop`, `AutoPlay`, or Oblivion's `SpecialIdle`.
+
+Oblivion plays an object's `SpecialIdle` at load when it has no `Idle`. Census of
+Oblivion.esm: **130** meshes carry `Idle`, **28** carry `SpecialIdle`, and **no
+mesh carries both**. Every `SpecialIdle` is the object's resting state — either a
+`CYCLE_LOOP` (the SE01Metronome tick, 1.53 s; the Oblivion gate swirls, 5 s) or
+a one-frame hold pose (`se11sheopooffx`, `se09poollid`, `lorgrenskeleton01`).
+Scripts treat it the same way: `SE01DoorScript` only stops the metronome
+(`playgroup forward 4`), and the gate scripts replay `specialidle` only when
+`IsAnimPlaying == 0`, to return to it after a one-shot `Forward`.
+
+Starting on `Rest` left the metronome frozen: nothing ever sent `SpecialIdle`.
+Starting on it is vanilla's own mechanism — `GenericBehaviors\Autoplay.hkx` sets
+`startStateId` to a state whose generator plays `AutoPlay`, and looping comes
+from the sequence's cycle type. Confirmed in-game on SE01Metronome.
+
 ### <a id="bged-clears-bsx-bit-80"></a>A BGED forces BSXFlags bit 0x80 CLEAR
 
 Attaching the graph also rewrites the root's BSXFlags: the Animated bit goes ON
@@ -1264,6 +1424,19 @@ NIFs, hidden at runtime through the node's hidden flag. Conversion clobbers node
 flags with `NIF_FLAGS` (visible), so the marker would show in game as an
 untextured black shape. Vanilla Skyrim NIFs carry no editor markers in these
 objects.
+
+**Morrowind's `Tri EditorMarker*`, only under an `MRK` root.** Morrowind
+spells its marker shapes `Tri EditorMarker*`, which the Oblivion prefix above
+never matches, so they shipped visible (Tamriel Data's `tr_note_pin.nif`, the
+developer notes pinned around TR dungeons, rendered as white slabs). The engine
+hides them only when the root carries an `MRK` string extra
+(`openmw/components/nifosg/nifloader.cpp`, `mHasMarkers`); without it the shape
+renders and collides. `is_marker_shape` (`nif_converter_morrowind.py`) is that
+one rule, read from the latched source-root flags, and both the render walk and
+the collision walker call it. Of the 100 Tamriel Data NIFs with a
+`Tri EditorMarker` shape, 99 carry `MRK`; the one that doesn't,
+`tr_f_ushukur_mummy_uni.nif`, uses the shape as its `RootCollisionNode` box —
+stripping it unconditionally deleted the mummy's collision.
 
 **Every `NiDynamicEffect` subtype.** `NiTextureEffect` (projected-texture
 environment mapping) has a completely different rendering path in Skyrim, and
@@ -1517,6 +1690,8 @@ backslashes instead silently never matches on Linux.
 - **Record side** (`tes5_import/record_types/equipment.py::convert_BOOK`): one `InvArt_<base>` STAT per distinct model (cached on the writer — BOOKs convert serially), INAM → that STAT; vanilla `HighPolySkyrimBook` only for model-less books. DATA.Type is ALWAYS 0: the CK lists 255 = Note/Scroll but vanilla Skyrim.esm types all 821 BOOKs (notes included) as 0, so 255 is engine-untested; TES4 scroll-ness survives via the vendor keyword + note-rig INAM.
 - Pipeline: runs inside `convert.py phase_assets` after `convert_meshes`; standalone CLI `python -m asset_convert.ui.book_inam Oblivion.esm [--extract-dir export] [--output-dir output] [--templates-dir <explicit meshes tree>] [--skyrim-data <SSE Data>] [--workers N]`. Tests: `tests/test_book_inam.py`.
 - **Basename uniqueness (fixed 2026-07-28)**: `inv_basename()` keyed on the MODL leaf filename only, so plugins that merge several asset trees collided — Morroblivion ships both `Clutter\Books\Note01.NIF` and `Morroblivion\Clutter\Paper\Note01.nif`, and the guard `raise ValueError('INAM basename collision')` **aborted the entire asset stage** (book INAM + everything after it) for the whole plugin. Now names outside the conventional `clutter\books` tree are qualified by their parent directory (`paper_note01`), leaving vanilla-layout names untouched so existing generated assets stay stable; a residual clash logs and skips that one model instead of killing the stage. `equipment.py::convert_BOOK` **imports `inv_basename` instead of re-deriving it** — the rule had been duplicated in both files, which is exactly how the STAT target and the generated mesh could drift apart.
+<a id="book-inam-master-ownership"></a>
+- **Master ownership (`split_master_owned`)**: a plugin's BOOK.txt lists every book it PLACES, masters' included, and the generated pair is named after the model's leaf filename, so two plugins baking the same master book both write `clutter/books/inv/<base>.nif|.dds` with differing bytes (each atlas is baked from whichever extract root won) and install order picks one. Ownership therefore follows the SOURCE mesh: a model in the plugin's own ASSET root (never its record dir -- that has no `meshes/`, so every model would defer) is its own; one a master ships is left to the master's run, which writes the identical path the importer's STAT names. A plugin that overrides a master's mesh ships its own copy and keeps the bake. A master bakes only the models ITS OWN BOOK records list, so a model is deferred only when some master lists it: TR_Mainland places 5 models (e.g. `Text_Octavo_open_07`, `tr_book_burned_01`) whose meshes Tamriel Data/Morroblivion ship but never use, and deferring those left their STATs pointing at meshes nobody generated.
 - **`i.shape in page_shapes` was a numpy trap (fixed 2026-07-28)**: shapes are dicts holding numpy arrays, so `in` runs dict `__eq__` → element-wise array comparison, raising `ValueError: operands could not be broadcast together` the moment two shapes have different vertex counts. Books whose shapes happened to share a vertex count worked; mixed ones failed to bake (35 failures on Morroblivion, now 0). Compare islands to shapes by `id()`, never by `in`/`==`.
 
 ## SSE-format NIF read support + BSA auto-extraction (2026-07-19)
@@ -1809,6 +1984,28 @@ Reading it beats any heuristic. Keying on the host FILENAME ("torch" in the name
 put the 1.3x2.6-unit candle flame on every lamp in the game — `castlelight02` is
 `FlameNode2`, i.e. FireTorchLarge (32x64).
 
+### Flame STATs from the masters
+
+The ten FlameNode STATs and the flame NIFs under `meshes/fire/` ship in
+`Oblivion.esm`. A plugin that places a socket in its own mesh usually ships
+neither, so reading only the STAT.txt and `meshes/fire/` of the mesh's own
+export folder left every socket of such a plugin empty. For a mod that ships
+several plugins, whose records sit one level down in `export/<Mod>/<plugin>/`,
+the folder above `meshes/` holds no records at all.
+
+`flame_socket_map` reads the chain `base_plugins.record_chain_for_assets`
+returns for the mesh's asset folder: the record dirs that folder serves
+(`output_layout.record_dirs_for_assets`: the folder itself for a flat plugin,
+each exported plugin of a nested mod), then each one's exported masters, last
+master first, then the bases recorded at import. The nearest STAT wins a
+socket, so a plugin may still repoint one. The flame NIF is taken from
+`meshes/fire/` beside the host mesh, else from the first asset folder of that
+chain that has it, matched ignoring case (`game_paths.find_nocase`).
+
+The exported plugins of one mod are read in name order (`source_registry.plugins`),
+not load order; if a mod with several exported plugins needs load order for a
+socket two of them define, order `record_dirs_for_assets` by it.
+
 ### Socket names match exactly, never zero-padded
 
 The engine matches socket names EXACTLY against its own table, which holds only
@@ -1839,7 +2036,7 @@ authored FlameNodes with ~2x scale that the attached flame NIF expects). The
 rotation is the authored hook-up between two DIFFERENT model frames: the flame
 NIFs are authored +Y-up, and a host authored +Z-up carries exactly the −90°X
 correction on its marker. `uppersilverplatecandles01`'s FlameNode0 is
-`[1,0,0][0,0,1][0,-1,0]` — `_BB_AXIS_FIX` itself, mapping the flame's +Y onto the
+`[1,0,0][0,0,1][0,-1,0]` — a −90°X turn, mapping the flame's +Y onto the
 plate's +Z. That host is a flat plate (extent X=23 Y=23 Z=2) and all 121 of its
 REFRs use `RotX=0`, so nothing else would stand the flame up. Zeroing it laid the
 candle flames on their side. Hosts that are themselves +Y-up author an identity
@@ -1879,6 +2076,70 @@ a 7-byte block: it runs into the next block and `AddRef`s whatever it finds.
 That is the `lock inc [rax+0x08]` CTD on entering **Vilverin**, where `rax`'s
 high half was `0xBF800000` — the `-1.0f` default of the Single Time field the
 block never had.
+
+### <a id="controller-owns-its-interpolator"></a>A managed controller owns its interpolator
+
+**Code:** `_unshare_controller_interpolators` in `asset_convert/nif/morphs.py`
+(run by `normalize_blend_interpolators`).
+
+A controller driven by a NiControllerManager never holds the interpolator one of
+its sequence's controlled blocks plays: in a vanilla sample (11 NIFs under
+`meshes/dungeons` with a manager, 158 managed controllers) 0 share, and the
+colour, float and bool ones hold a `NiBlend*Interpolator` with header 0x201 and
+the "unset" value (-FLT_MAX per axis, bool 2). Our conversion handed every
+emissive `BSLightingShaderPropertyColorController` (`_convert_color_ctrl`), every
+sibling entry and every UV companion the SAME block as its entry. The pass gives
+each such controller its own blend (a clone for a transform, as vanilla's
+transform controllers hold a separate `NiTransformInterpolator`). It was written
+for the `ClawStandContainer` crash below, and that crash came back on it (run
+38k): the shared block was not the cause. It stays because it is vanilla's
+shape; a before/after in game showed the same picture and pulse.
+
+### <a id="palette-lists-every-target"></a>The object palette lists every sequence target
+
+**Code:** `complete_object_palette` in `asset_convert/nif/morphs.py` (last of
+`_run_animation_passes`).
+
+The crash: in about 1 of 3 runs the game died on the first cell change after the
+Bruma Oblivion gate closed (runs 36a, 38i, 38k).
+`BGSGamebryoSequenceGenerator` (vanilla `GenericBehaviors\Autoplay.hkx`) was
+deactivating the `AutoLoop` sequence of a detached `ClawStandContainer`
+(`tes4\oblivion\clutter\containers\clawstandcontainer.nif`). The deactivate
+(AddrLib 72464) removes each block's entry from its blend by the slot it was
+given, with no check. NiBlendInterpolator's remove-entry (72544) ran with slot
+0xFF on an empty `NiBlendPoint3Interpolator`, reading past its array.
+
+Read from the dump (pid28212):
+- The bad block is the colour controller on `Box02:2`, a SKINNED shape. Its blend
+  array was never written. The same kind of block on `Box01:2` had its slot
+  filled at activation.
+- Activation (0xd92eb0) adds only blocks that already have a blend.
+- The bind (0xd92910) finds targets through the manager's
+  `NiDefaultAVObjectPalette`.
+- Oblivion's own palette for this mesh lists `Box01:2` but not `Box02:2`. So the
+  block got its blend from a later bind, after activation, and kept the "never
+  added" slot 0xFF.
+
+Census:
+- Vanilla: 2 of 700 managed NIFs have a sequence target missing from the palette,
+  both actors.
+- Ours: 17 of 535 managed Oblivion meshes (obelisk energy, Oblivion traps, the
+  palace font, the citadel ring, morph flipbooks). Two of them miss a skinned
+  shape: the claw stand, and `oblivionclawtrap01`.
+
+Nehrim had 12 such meshes, including the claw stand. One of them,
+`nehrim/natur/sportest2.nif`, has a manager with no palette at all; all 134
+vanilla managed clutter meshes have one.
+
+The pass adds every named scene object a sequence targets to the palette, and
+gives a manager without a palette a new one. `object_palette` is the one palette
+builder; the Morrowind door, Morrowind object-animation and FNV gun-part
+managers use it as well.
+
+Confirmed on the headless test instance: `mq10_report` from its checkpoint ran 4
+of 4 with no crash (1 of 3 crashed before). In `OblivionMqKvatchSmallTower02`
+the claw stand looks and pulses the same before and after. Not yet confirmed in
+game by the user.
 
 ## NiFlipController → frame-strip atlas
 <a id="niflipcontroller-atlas"></a>
@@ -2011,6 +2272,10 @@ mesh parked under a `RootCollisionNode`, which the engine consumes and never
 draws. Left alone that node ships to Skyrim as *visible* geometry and the
 object gets no collision at all -- both halves wrong at once.
 
+One exception replaces the node with the render geometry: a single-box node
+the plugin places items inside, a stand-in that would eject them. See
+[stand-in boxes](asset_convert_collision.md#morrowind-stand-in-boxes).
+
 ### Detection is by BLOCK TYPE, never by name
 
 The 217 collision nodes found in a strided sample of the corpus **all carry an
@@ -2069,9 +2334,10 @@ The rigid body is the vanilla static block already established by the
 SpeedTree generator -- identity transform, mass 0, layer 1 (`SKYL_STATIC`),
 motion system 5 -- and the triangles go through the real Havok bridge
 (`cms_builder.build_cms_collision`), so the result is a genuine
-`bhkMoppBvTreeShape` + CMS rather than an approximation. Material is
-`SKY_HAV_MAT_STONE`, the same fallback `convert_materials` uses for an unknown
-material: Morrowind records no havok material, so nothing finer is recoverable.
+`bhkMoppBvTreeShape` + CMS rather than an approximation. The material comes
+from the mesh's own texture names ([surface materials](#morrowind-surface-materials)),
+falling back to `SKY_HAV_MAT_STONE` — the same fallback `convert_materials`
+uses for an unknown Oblivion material.
 
 The node is stripped whether or not a shape was built -- it must never render.
 
@@ -2095,6 +2361,369 @@ the root carries an `MRK` extra. Triangles are taken in the ROOT frame
 longer offsets the shape. Every mesh goes through the same Havok bridge, so
 the generated case is a real MOPP + CMS too.
 
+### The flag extras must be READ before the root swap (2026-09-21)
+
+Both rows that depend on a string extra read it off the root that
+`attach_morrowind_collision` is handed, which is the POST-swap
+`BSFadeNode`. `_to_fade_node` rebuilds the root and carries extra data
+selectively — a bulk copy breaks animated objects — and `_copy_root_frame`
+forwards name, flags, transform, havok material, collision object, children
+and controller, but not `extra_data_list`. `NC`/`NCC`/`NCO` and `MRK` stayed
+on the discarded `NiNode`:
+
+```
+BEFORE swap: old root NiNode     ['nco']
+AFTER  swap: new root BSFadeNode []
+```
+
+So every flagged mesh fell through to the "no node" row and collided with its
+own render geometry. `Arktwend/lichtstrahl.NIF`, a light shaft, shipped a MOPP
++ CMS over its alpha-blended plane and read in-game as an invisible wall
+(`mw_collision_generated = 1`). A byte scan of Arktwend's 9,705 NIFs found
+**510** roots carrying an `NC` variant and **16** carrying `MRK`, all losing
+the flag.
+
+**Latch them, do NOT copy them.** The obvious fix — appending those blocks to
+the new root beside `_carry_bsbound` / `_carry_furniture_markers` — ships a
+Morrowind flag into a Skyrim mesh. Morrowind identifies these extras by their
+VALUE and leaves `name` empty; Skyrim identifies an extra by `name`
+(`equipment_rig.py:232` finds `Prn` that way), and of 4,002 vanilla meshes
+scanned, 117 carry a `NiStringExtraData` and every one is `Prn` or
+`AnimObjectR` — none is `NC`/`NCC`/`MRK`. Copying them put an unreadable block
+on 519 shipped NIFs, clothing and castle pieces among them.
+
+So `latch_root_flags` records the flags off the SOURCE root before any
+replacement, and `collision_source` / `collision_triangles` read
+`source_root_flags()`. The latch sits before the whole root-normalization
+branch, so worn armor — which skips the swap entirely — is covered too. The
+blocks themselves are simply dropped with the old root, and nothing
+Morrowind-specific reaches the output.
+
+### `NC` means "actors pass through", NOT "no physics"
+
+Carrying the flag is only half the rule, because honoring it everywhere
+breaks item pickup. OpenMW never skips shape generation for `NC`: it builds
+the collision and then downgrades the object to `CollisionType_VisualOnly`
+(`mwphysics/physicssystem.cpp:423`), which `collisiontype.hpp:20` leaves out
+of `CollisionType_AnyPhysical`. The body exists; actors and projectiles just
+do not test against it.
+
+Skyrim has no equivalent collision class, so the closest translation —
+shipping no `bhkCollisionObject` — costs more than it buys. Morrowind
+activates an item through its REFERENCE, Skyrim through its collision, so a
+bodyless MISC/APPA is unlootable. Of Arktwend's 526 flagged meshes, **20 are
+named by item records** (every alembic/retort/calcinator, a kwama egg, a
+redware pot, a muck shovel).
+
+The gate is therefore a WHITELIST of record types that are placed scenery —
+`fixture_plan.FIXTURE_TYPES` = STAT/ACTI/LIGH/CONT/DOOR, latched per mesh
+exactly as `door_plan` latches doors. The record type is the authored answer
+to "is this scenery?"; a mesh no fixture record names keeps its body whatever
+extras it carries. Counts by type over the flagged set:
+
+| Type | Flagged meshes | Honors `NC` |
+|---|---|---|
+| STAT | 178 | yes |
+| ACTI | 115 | yes |
+| LIGH | 98 | yes |
+| CONT | 73 | yes |
+| DOOR | 1 | yes |
+| APPA / MISC / INGR | 20 | **no** — keeps its body |
+
+Guarded by `tests/test_morrowind_nc_flag_survives_root_swap.py`.
+
+
+
+<a id="morrowind-door-animation"></a>
+
+## Morrowind doors: the swing lives in the ENGINE, not the mesh (2026-09-21)
+
+**Code:** `asset_convert/nif/door_anim_morrowind.py`, `asset_convert/nif/door_plan.py`;
+`animate_morrowind_door` is called from `_convert_roots` after
+`attach_morrowind_collision`.
+
+Converted Morrowind doors behaved as statics: activating one played the sound
+and swapped the lock state, but the panel never moved.
+
+### The two games disagree about where a door's motion is stored
+
+Morrowind stores none of it in the mesh. `World::rotateDoor`
+(`references/openmw/apps/openmw/mwworld/worldimp.cpp:1419`) rotates the
+REFERENCE itself:
+
+```cpp
+float minRot = door.getCellRef().getPosition().rot[2];
+float maxRot = minRot + osg::DegreesToRadians(90.f);
+float diff = duration * osg::DegreesToRadians(90.f) * (state == Opening ? 1 : -1);
+```
+
+90 degrees about Z, over one second (`duration` is seconds and the rate is
+90 deg/s), applied to every non-teleport door uniformly. A teleport door never
+swings at all — `Door::activate` returns an `ActionTeleport` before reaching
+the `// animated door` branch (`mwclass/door.cpp:184-200`).
+
+Skyrim has no equivalent. Its doors carry `Open` and `Close`
+`NiControllerSequence` blocks inside the NIF and the engine plays them by name.
+Measured on the corpus: **0 of 76** converted Morrowind door meshes contain any
+`NiControllerManager`, `NiControllerSequence`, `NiKeyframeController` or
+`NiTransformController` block, and a byte scan of the 76 *source* TES3 meshes
+finds no `NiKeyframeController` either — the animation was never there to lose.
+So the sequences have to be synthesised.
+
+### The sign of the rotation
+
+Morrowind's `rot[2]` turns about the NEGATIVE Z axis. OpenMW builds the node
+attitude as `osg::Quat(rot.z(), osg::Vec3f(0, 0, -1))`
+(`mwrender/objectpaging.cpp:820`), so Morrowind's +90 deg is **-90 deg about
+NIF +Z**. Vanilla Skyrim agrees independently: `farmhouseanimdoor01.nif` ends
+its `Open` sequence at Z = -1.6057 rad (-92 deg), and `mrkdoor01.nif`'s two
+leaves likewise open negative. The synthesised key is therefore -pi/2.
+
+### The contract, read off vanilla
+
+`farmhouseanimdoor01.nif` and `mrkdoor01.nif`:
+
+| Piece | Value |
+|---|---|
+| Root controller | `NiControllerManager`, flags 76 (0x4C), `cumulative` false |
+| Object palette | `NiDefaultAVObjectPalette` naming the hinge node and its geometry |
+| Sequences | `Open`, `Close`; `start_time` 0.0, `stop_time` 1.0, `cycle_type` 2 (CLAMP), `frequency` 1.0, `weight` 1.0 |
+| Text keys | `start` at 0.0, `end` at 1.0 |
+| Controlled block | `controller_type` `NiTransformController`, `priority` 0, driven by one shared `NiMultiTargetTransformController` |
+| Interpolator | `NiTransformInterpolator` whose `NiTransformData` has `rotation_type` 4 (XYZ_ROTATION_KEY) and Z keys only |
+| Hinge node | `NiNode`, flags 142 (0x8E) — the physics-sync bit the keyframed body needs |
+| Hinge body | `bhkCollisionObject` flags 137, `bhkRigidBodyT` motion system 4 (KEYFRAMED), layer 2 (SKYL_ANIMSTATIC), quality 1, solver deactivation 1, mass 0 |
+| Root BSXFlags | animated + havok + complex |
+
+Sound is NOT carried as a `Sound:` text key. Vanilla writes one, but Skyrim
+also honours the record channel, and the converted DOOR records already carry
+`SNAM`/`ANAM` resolved to sound descriptors, so the mesh channel would only
+double it.
+
+### The hinge is the mesh origin, because Morrowind's is
+
+Morrowind rotates the reference, so the pivot is the REFR origin and the
+authored hinge is wherever the mesh meets it. The converter re-pivots nothing:
+turning about the mesh origin is exactly what Morrowind does.
+
+<a id="a-door-turns-about-its-edge"></a>
+
+### A door turns about its EDGE, so a centred panel gets no swing
+
+Not every door mesh can be swung about that origin. A hinged door's panel lies
+entirely to one side of its pivot; a panel wrapped AROUND the pivot would sweep
+through its own frame, which is a revolving door, and neither game ships one.
+Such a mesh has no hinge, and synthesising a rotation for it invents motion
+that the source never had — in Morrowind a load door does not rotate at all,
+because `Door::activate` returns its `ActionTeleport` first.
+
+`hinge_offset` measures the panel's centre against its own half-width, **in the
+ROOT's frame**, because that is where the synthesised `Door01` hinge is inserted
+and where its sequences turn.
+
+The frame is the whole point. `In_CI_door_01`'s shapes sit at translation
+(59.2, −2.7) carrying geometry centred at (−59.2, 0.0): measured in each shape's
+own space that is a ratio of 0.532, and an earlier version animated it — but the
+two cancel at the root, where the ratio is 0.015. Synthesis re-parents every
+child under one hinge at the mesh origin, so a swing built there sweeps the panel
+through its own middle. 13 Morrowind doors were spinning in game for exactly
+this reason.
+
+| Mesh | Ratio at root | Verdict |
+|---|---|---|
+| `In_impsmall_door_01` | 1.005 | hinged |
+| `Ex_t_door_01` | 0.641 | hinged |
+| `Ex_nord_door_01` | 0.180 | no hinge |
+| `Ex_common_door_01` | 0.181 | no hinge |
+| `In_CI_door_01` | 0.015 | no hinge |
+
+`strip_hingeless_swing` measures per DRIVEN NODE instead, since an authored
+sequence turns a node the root cannot see: `DEMdoorAnim01Door` sits at (48.8,
+2.9) with its panel beneath it, invisible from a root at the origin.
+
+### The verdict is latched on the SOURCE mesh
+
+`latch_source_hinge` runs in `convert_nif` immediately after `_read_source`,
+before any pass alters the tree, and `animate_morrowind_door` reads that latch
+rather than re-measuring. Measuring later disagrees with the authored geometry:
+`strip_collision_nodes` runs first, and `Ex_nord_door_01`'s collision node is
+half the mesh's width, so dropping it took the measured total from 195.4 to
+114.5 and flipped the door from hingeless to hinged. Any measure relative to
+the tree is unstable while passes add and remove siblings.
+
+`strip_spinning_doors` runs only on the non-Morrowind branch, so it can never
+remove the swing synthesis has just built.
+
+Measured across the corpus at a 0.25 cutoff, **every door that swings is
+hinged, with no exception**: 8/8 Morrowind, 18/18 Morroblivion, 66/66 Oblivion.
+The 15 Oblivion non-teleport meshes that score below it are portcullises and
+iron gates, which lift rather than turn and carry translation sequences, not
+rotations. On the other side, 30 Morrowind and 53 Morroblivion door models are
+centred on their pivot and get no synthesised swing.
+
+Morroblivion re-exported those same centred Morrowind meshes with a 92 degree Z
+rotation baked in, so its load doors visibly spin about their middle in game.
+`Ex_common_door_01` scores 0.181 from either plugin — the identical mesh, the
+identical verdict — so the authored geometry settles it without reference to
+which plugin supplied it.
+
+### Every hinged door mesh gets the sequences, including the load doors
+
+Among hinged meshes a base is not reliably one kind or the other. Splitting the
+139 DOOR bases by whether their REFRs carry `XTEL`: 27 bases are swing-only, 81
+teleport-only and **23 are BOTH** — `In_velothismall_ndoor_01` alone has 438
+plain and 516 teleport references. The mesh cannot encode that distinction, and
+it does not need to: a Skyrim teleport door ignores its `Open`/`Close`
+sequences, exactly as vanilla does. `orcdoorload01.nif` — a vanilla Skyrim LOAD
+door — ships the sequences anyway, which settles it.
+
+
+
+<a id="teleport-door-static-twin"></a>
+
+### REJECTED: a per-reference static twin keyed on XTEL
+
+An earlier fix read the swing as a property of the REFERENCE, since both source
+games gate it there — `Door::activate` returns its `ActionTeleport` before
+reaching the `// animated door` branch (`mwclass/door.cpp:183`), so an `XTEL`
+reference never rotates, and Skyrim has no such gate. Because the same base
+routinely serves both uses (`in_velothismall_ndoor_01`: 438 plain against 516
+teleport), the decision could not sit on the base, so the build minted a twin
+DOOR base per teleport-used model, naming a `*Static.nif` with the sequences
+stripped, and `_refr_base_formid` retargeted teleport references to it.
+
+It was removed. Rewriting REFR base pointers modifies Oblivion by construction
+— 287 bases and 162 meshes — and Oblivion's doors were already correct. The
+mechanism answered "which references must not swing" when the defect was
+narrower: **which meshes cannot swing at all.** That is a property of the
+geometry, so it is settled in the mesh by
+[the hinge measurement](#a-door-turns-about-its-edge), no record-level
+machinery and no `XTEL` read. A hinged door that also teleports keeps its
+swing, which is what Oblivion ships: `AnvilDoorMCAnim01` is a hand-authored
+teleport swing, as are 16 teleport-only and 18 mixed bases, with durations from
+1.43s to 5.67s, multi-node drives, overshoot and settle, and double doors
+turning opposite ways (`CDoor03`: −86.7 and +91.9 degrees).
+
+<a id="a-load-door-needs-reach"></a>
+
+### A load door needs reach, because Skyrim's pick is less forgiving
+
+**Code:** `door_anim_morrowind.py:widen_load_door` / `give_door_reach`,
+`door_plan.py:places_morrowind_doors`
+
+Morrowind content sets its non-swinging exterior load doors at hand-placed depths
+behind the building around them, and a Morrowind building's collision is one
+flat wall across the whole facade with **no doorway cutout**: house base
+`T_Rga_SetReach_X_HouseBase_02` is 13 triangles, its front wall one plane over
+y 41640…41916 with the door at y 41656…41750. Morrowind activates the door
+anyway; Skyrim's activation ray stops on the wall. The door still blocks the
+player, so it reads as solid; noclipping past the wall puts the ray origin in
+front of the panel and it answers at once. Disabling the building fixes the
+door in game (`211693` frees `B0AA0C`, `DF7D4B` frees `496D72`).
+
+Measured with converted collision (`collision_extract`) placed the navmesh's
+way, casting 49 rays from 70 units out on the door's arrival-marker side at eye
+height across the panel. Every reported verdict reproduces. The smallest gap
+between the door's hit and the nearest other hit, at the authored collision:
+
+| Verdict | Doors | Smallest gap |
+|---|---|---|
+| works | TR `ABBA81 D380A2 87CFC2 752640 75BF94` | 4.7, 4.9, 9.3, 9.4, 11.2 |
+| half (metal works, wood does not) | TR `837B0C B3F2A4 4F2666` | 0.8, 1.1, 2.0 |
+| broken | TR `290BBF C92CCA 8A58A3 762C6B 496D72` | −1.7 … −16.2 |
+| broken | Sky_Main `E7E108 E4B069 4FC23E 8180DD B0AA0C` | −6.4 … −12.0 |
+| works | Sky_Main `BC1085`, `757038` (centre) | 6.6, edges only behind the frame |
+
+Being in front is not enough: a door under ~2 units clear only answers where its
+latch box sticks out, so the target is at least 5 units clear. Collision depth
+needed for that: Sky_Main up to 12.0 (`B0AA0C`), TR up to **16.5** (`496D72`).
+`LOAD_DOOR_REACH = 18` leaves every example at least 6.5 clear. A 5-unit reach
+fixes only the three shallowest Sky_Main doors and leaves `B0AA0C`/`8180DD`
+broken, which an earlier build shipped.
+
+The rule is one contract wherever collision enters: the door's collision is at
+least `2 * LOAD_DOOR_REACH` deep along its thinnest axis. Width and height never
+change.
+
+- A Morroblivion door with authored `bhk` boxes: `widen_load_door` grows the
+  broadest box's thin half-extent (the panel, not the latch and handle boxes).
+- A Morroblivion door with triangle collision, already a compressed mesh:
+  decoded with `decode_cms_materials`, swept by `give_door_reach`, rebuilt by
+  `build_cms_collision` with every triangle's material kept. Five Morrowind_ob
+  doors are this shape, `exumhupalaceugate` a flat sheet among them.
+- A true Morrowind door has only `RootCollisionNode` triangles, often one flat
+  sheet (`sky_ex_red_door_01`: four vertices at y = −2.2); `give_door_reach`
+  sweeps them in `attach_morrowind_collision`, before the compressed mesh is
+  built.
+
+Scope, each from an authored source:
+
+- **Never swings.** A door with a `NiControllerManager` anywhere, or whose source
+  has a hinge (`source_had_hinge`), keeps its collision. A slab on a swinging
+  panel would narrow every opened doorway.
+- **Morrowind-placed.** `places_morrowind_doors`: a TES3 export, or the
+  Morroblivion plugin (`MORROBLIVION_PREFIX`, the same test the TES3 exporter
+  picks Morroblivion's master with). Neither hinge nor shape separates them from
+  Oblivion's own static load doors: Oblivion has 46 such door meshes thinner than
+  the reach (34 centred, 12 hinged, the Bruma city gate among them), and they are
+  left as authored.
+- A dependent's DOOR record that names a master's mesh which the master itself
+  does not use as a door (TR: 13, Sky_Main: 2) is not covered; every one measured
+  is a non-panel teleport trigger (steps, bookshelf, skull, platform).
+
+
+## Morrowind surface materials
+<a id="morrowind-surface-materials"></a>
+
+**Code:** `asset_convert/nif/nif_materials_morrowind.py`
+
+Morrowind authors no havok material, so every converted mesh collided as stone
+— a wooden crate thudded like rock. The classification itself, and the proof
+that no better signal exists, is in
+[surface materials](tes4_export_morrowind.md#surface-materials); this section
+covers only the two mesh-side traps.
+
+### Sample BEFORE the upgrade
+
+`attach_morrowind_collision` runs after `_convert_one_root`, which has already
+replaced `NiTexturingProperty` with a `BSLightingShaderProperty`. Reading the
+diffuse there would mean reading converted data, so `sample_materials` runs in
+`run_morrowind_fixups` — pre-upgrade, on real TES3 blocks — and stashes the
+result on the root as `_mw_havok_material`, the same pattern
+`_mw_no_collision` already uses.
+
+### Sample the RENDER geometry, never the collision shapes
+
+A mesh with an authored `RootCollisionNode` collides with an **untextured
+proxy**: its shapes carry no `NiTexturingProperty` at all, and the texture
+lives only on the render geometry.
+
+```
+ex_common_plat_cent.nif
+  collision shapes (RootCollisionNode)
+     tris=10   <no NiTexturingProperty, 0 props>
+  render shapes
+     Tri Ex_common_plat_Cent 0   tris=4    Tx_wood_siding.tga
+     Tri Ex_common_plat_Cent 3   tris=80   Tx_wood_docks_01.tga
+```
+
+That is 190 of 447 collidable vanilla meshes (43%). Sampling the collision
+shapes scores those at 0% and drags whole static folders to 2-10%; sampling
+render geometry instead takes them to 83.2%, ABOVE the auto-generated case
+(74.3%), because a mesh that earned a hand-authored proxy is usually
+substantial architecture with clear textures.
+
+The proxy decides WHERE collision is, never what it is made of.
+
+Measured over collidable meshes, area-weighted vote per root:
+
+| Corpus | collidable | resolved |
+|---|---|---|
+| Morrowind (1,011 nifs) | 447 | 349 = 78.1% |
+| Tamriel Data (HD) | 490 | 322 = 65.7% |
+
+Shapes vote by triangle area so a one-triangle decal cannot outvote a wall.
+
 
 ## Morrowind specular
 <a id="morrowind-specular"></a>
@@ -2117,6 +2746,33 @@ glossiness 0.0, specular (0,0,0), no `NiSpecularProperty`. So every
 `BSLightingShaderProperty` on a 4.0.0.2 source gets `SLSF1_Specular` cleared;
 glossiness and strength keep the vanilla defaults, exactly as vanilla's own
 non-specular shapes do.
+
+
+## Morrowind material alpha
+<a id="morrowind-material-alpha"></a>
+
+**Code:** `asset_convert/nif/nif_converter_morrowind.py::opaque_unblended_shapes`,
+called from `_convert_roots` beside `disable_specular`; 4.0.0.2 sources only.
+
+Tamriel Data's Hlaalu ledge/wall set (`tr_in_hla_ldgwall_side.nif` and
+relatives) vanished in game: every shape carries `NiMaterialProperty` alpha
+0.0 and no `NiAlphaProperty`. Morrowind draws these solid -- OpenMW only puts
+material alpha into the diffuse color
+(`references/openmw/components/nifosg/nifloader.cpp:2765`), and without an
+alpha property nothing blends. Skyrim's `BSLightingShaderProperty` alpha (and
+`BSEffectShaderProperty` emissive alpha) fades the shape regardless, so the
+straight copy in `shaders.py::_harvest_material` made them invisible.
+
+The pass raises shader alpha to 1.0 on every converted shape with no alpha
+property; a shape that has one keeps its authored alpha. Oblivion and later
+meshes never reach it -- there the copy is unchanged.
+
+Measured: 180 of 38,637 converted Tamriel Data meshes had a faded unblended
+shape (41 in `tr/i`, 31 `tr/f`, 27 `pc/f`, 16 `sky/m`, rest scattered); 0
+after the rebuild. Vanilla Morrowind (1,330 meshes): every low-alpha shape
+carries its own `NiAlphaProperty`, so none change. No sampled 4.0.0.2 shape
+(2,681 TR + 1,330 vanilla) inherits its alpha property from a parent node,
+which this pass would otherwise make opaque.
 
 
 ## Morrowind triangle flag
@@ -2249,6 +2905,17 @@ form leaves that ref unwritten, and there are **0** `NiLODData` blocks in
 vanilla Skyrim, so the ref can never be satisfied. The authored children are
 the LOD levels — `tr_flora_sh_bush_06.nif` carries `blend` over 0–500 and
 `test` over 500–∞ — so keeping child 0 keeps the level that renders nearest.
+
+"Lossless" includes the extras, which a 4.0.0.2 file chains through the single
+`Extra Data` ref (`until="4.2.2.0"`), not `Extra Data List` (`since="10.0.1.0"`).
+The rewrite once copied only the list, so every rewritten node lost its extras:
+788 of 39,049 Tamriel Data + Morrowind source NIFs. On a root that erased the
+flags the converter reads — `MRK` on 3 (`pi_cont_fschool_*`, whose
+`Tri EditorMarker` then rendered) and `NC`/`NCO` on 23 (waterfalls, lava, a
+geyser, which then collided) — and 2 roots' text keys. The rest were 3ds Max
+leftovers (`sgoKeep`, `Clamp =`) on inner nodes; carried now, they reach the
+header string table as unreferenced strings, the state ordinary nodes already
+ship in (`tr_dremora.nif`).
 
 ### The `RootCollisionNode` strip missed nested nodes
 

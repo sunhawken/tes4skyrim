@@ -52,6 +52,8 @@ from script_convert.command_rows import (
     ACTOR, AV, COMMAND_ROWS, COMPARISON_BOOL_FUNCTIONS, OBJREF, RAW
 )
 
+from script_convert.misc_stats import COMMAND_STATS, misc_stat_global
+from script_convert.symbols import RESTRAINED, owned_formlist
 from script_convert.tes4 import lexer as L
 
 #: A placeholder is one atom: `{a0} == {a1}` compares, `Foo({a0})` does not.
@@ -165,8 +167,7 @@ class _Args(dict):
         if kind == 'p':
             return safe_property_name(self._c.arg_src(n, default))
         if kind == 'b':
-            return ('true' if self._c.arg_src(n, default).lower()
-                    in ('1', 'true') else 'false')
+            return self._bool(n, default)
         arg = self._c.arg_expr(n, self._e, default)
         if kind == 'i':
             # Cast only a Float: the branches this replaced left an Int alone.
@@ -177,6 +178,17 @@ class _Args(dict):
         if kind == 'f':
             return self._c._cast(arg, 'Float')
         return arg
+
+    def _bool(self, n: int, default: str) -> str:
+        """Argument n under TES4's truth test: any nonzero value is true.
+
+        A literal folds to `true`/`false` (`SetIgnoreFriendlyHits 3` is on); a
+        variable is cast, which Papyrus also reads as nonzero-is-true.
+        """
+        try:
+            return 'true' if float(self._c.arg_src(n, default) or 0) else 'false'
+        except ValueError:
+            return self._c._cast(self._c.arg_expr(n, self._e, default), 'Bool')
 
 
 def emit_row(conv, row, ref_name, func_name, args_str, extends):
@@ -207,7 +219,16 @@ _CONVERTER_VALUES = {
     'event_actor': lambda conv, extends: conv._current_event_actor_param(),
     'self_ref': lambda conv, extends: conv._self_reference(extends),
     'action_ref': lambda conv, extends: conv._get_action_ref_param(),
+    'gates_shut': lambda conv, extends: _counted_stat(conv, 'closecurrentobliviongate'),
+    'restrained': lambda conv, extends: owned_formlist(conv, RESTRAINED),
 }
+
+
+def _counted_stat(conv, command: str) -> str:
+    """The global of the stat `command`'s engine code counted, now a property."""
+    held = misc_stat_global(COMMAND_STATS[command])
+    conv.sc.property_refs[held] = 'GlobalVariable'
+    return held
 
 
 #: Commands converting to a Bool call. A MAP row's `emit` is a bare name.

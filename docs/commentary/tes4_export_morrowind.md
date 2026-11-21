@@ -174,6 +174,26 @@ records (9,366 of 10,486); most of the remainder are engine markers, which are
 named rather than converted and handed to the existing
 `skyrim_overrides.TES4_MARKER_FORMID_TO_SKYRIM` table.
 
+### <a id="interior-cells-by-name"></a>Interior cells escape without the `0`
+
+**Code:** `IdIndex.lookup_interior`, `_add_record` in `tes4_export/morrowind_ids.py`.
+
+Cells do not follow the base-object escape. Across the 1,328 vanilla interior
+names, Morroblivion's CELL EditorID is the escape WITHOUT the leading `0` for
+1,061 (`Vivec, Alusaron: Smith` -> `VivecVSAlusaronXSSmith`), the raw name for
+104, and something else for 175 -- mostly names with a hyphen
+(`Ald-ruhn, ...`). Its `FULL`, the display name, is the vanilla name for all
+but 8 of those, and drops the town prefix for others (`Balmora, Caius
+Cosades' House` is `FULL=Caius Cosades' House`).
+
+The lookup tried only the raw name and the `0`-escape, so **92% of vanilla
+interiors resolved to nothing** in Morroblivion mode, and anything placed in
+one was parented to a freshly derived cell of the same name instead of
+Morroblivion's. The index now also files an interior under its `FULL`, and
+the lookup tries the escape without the `0`: 1,320 of 1,328 resolve. The 8
+left are Mournhold's open-air districts, two Ald-ruhn guard towers, a Gnaar
+Mok house and `Sotha Sil,`, which Morroblivion carries under other names.
+
 ## <a id="per-type-id-namespaces"></a>Morrowind namespaces IDs by type; FormIDs do not
 
 A TES3 string ID is unique only *within* a record type, so one name may denote
@@ -338,6 +358,44 @@ is byte-identical. Measured: TXST diffuse files missing on disk went from
 **107 of 107 to 2 of 107**, and those two (`Tx_MA_sandstone02`,
 `tx_lavacrust00`) are in no Morrowind BSA at all and are referenced by zero
 terrain layers — dead LTEX records Bethesda shipped without assets.
+
+### <a id="land-texture-fold"></a>A re-declared master texture is the master's record
+
+A TES3 LAND names its textures by index into **its own plugin's** LTEX list
+(OpenMW `esmterrain/storage.cpp`: `{ tex, land->getPlugin() }`), so a landmass
+has to re-declare every texture it paints with, master-owned or not.
+Sky_Main.esm re-declares 105 of Tamriel_Data's textures under the same id (103
+with the same image); TR_Mainland re-declares 162, all with the same image.
+Skyrim's LAND names an LTEX by FormID, from any master, so the copy is a
+format artifact, not authored identity.
+
+`_land_texture_id` therefore resolves an LTEX to the master's FormID when a
+master has one with the same id AND the same ICON, and the record is not
+written again. A same-id record over a different image stays the plugin's own,
+because it is a different texture. LTEX is not in the master index
+(`BASE_TYPES`): a texture id can equal a base object's, so the fold reads the
+masters' LTEX dumps directly.
+
+The fold is what lets a groundcover plugin bind grass at all: its LTEX
+override must name a record from a file its header lists. Sky_Main_Grass.esp
+lists Tamriel_Data.esm but not Sky_Main.esm; after the fold, 99.0% of its
+146,546 on-land clumps sit on Tamriel_Data's textures.
+
+For the same reason `_plugin_context` adds a master's master to the list when
+it owns the texture under any grass clump: Aesthesia's TR grass names only
+TR_Mainland.esm, and 62 of its bound textures fold onto Tamriel_Data's. The
+test is the ground under a clump, not whether the pairing survives binding:
+binding turns on tuning constants (`MIN_PAIR_SUPPORT`, the 3-grass cap,
+density rounding), and a master list that moved with them would renumber the
+plugin on every retune. Any ancestor qualifies, Oblivion.esm included; one
+under no clump is never added. The ancestor is listed but not indexed
+(`load_context(declared=...)`), so its EditorIDs cannot capture a Morrowind
+id. Textures are keyed `<file>|<low 24 bits>` (`_texture_key`) until emit,
+since the plugin's own slot numbers are not final while the ground is sampled.
+
+Cost: one-off FormID drift. The folded LTEX records leave Sky_Main.esm and
+TR_Mainland, and Aesthesia gains a master. Approved 2026-09-30; Sky_Main's
+grass confirmed growing in game.
 
 ## <a id="pathgrids"></a>Pathgrids become PGRD, then navmesh
 
@@ -512,6 +570,17 @@ before the gate existed: TR_Mainland, whose chain is four long, took byte
 where Bloodmoon's belong. The refusal names each missing master and the command
 that converts it.
 
+**Morroblivion mode builds dependent mods only** (`morroblivion_allowed`).
+Morrowind.esm, Tribunal.esm and Bloodmoon.esm, and any plugin with no masters
+(a standalone TES3 game such as Arktwend), REFUSE the export in that mode. A
+standalone game owns every object it names, so bolting Morroblivion on as its
+master swaps its authored records for Morroblivion's (Arktwend's starting
+`common_shirt_01` became Morroblivion's `0commonUshirtU01`). The three vanilla
+files were silently exported in authored mode before; they now fail loudly so
+the mode setting is never mistaken for what was built. `convert.py
+--morrowind-source vanilla` builds one run in authored mode without changing
+the saved setting.
+
 The master list is the plugin's own `MAST` chain, in its order (`record_dir`,
 so an imported mod's folder resolves). The own load-order byte is the length of
 that list, the TES4 convention the importer's `load_master_export` re-keys
@@ -536,7 +605,10 @@ FormID with the union bounds, which the importer applies as an override.
 Morrowind source in the GUI): `vanilla` borrows from the declared masters;
 `morroblivion` puts every converted `Morrowind_ob*` export first and drops the
 three vanilla ESMs from the list, so a mod shares Morroblivion's objects
-instead of shipping a second copy of every static. Morroblivion's cells and
+instead of shipping a second copy of every static. Choosing Morroblivion in
+the GUI builds the [gap patch](#morroblivion-gap-patch) when it is missing,
+and asks whether to rebuild it when it exists; the mode refuses every
+conversion without the patch, so the two are one choice. Morroblivion's cells and
 worldspace use its own EditorIDs, so in that mode doors into vanilla interiors
 link only where the escaped name matches, and exteriors do not link at all.
 
@@ -557,6 +629,14 @@ file under `Data Files\Meshes`, else the archive entry, read through
 whole archive) and extracted once into `export/morrowind_assets/meshes/`. The
 BODY records themselves are read from the master ESMs resolved the same way,
 by `resolve_plugin_path`.
+
+The compatibility patch deliberately skips `base_anim*` when extracting, and
+Morroblivion ships no Morrowind skeleton, so the registered install is the only
+source of `base_anim.nif`. A user who built the patch (CLI
+`--build-morrowind-patch <dir>` or the GUI folder picker) but never registered
+that folder got `base_anim.nif not found; N worn meshes skipped` on Tamriel
+Rebuilt. `--build-morrowind-patch` now registers the Data Files folder it was
+given (`register_source`), and the patch's Export step reads it back from there.
 
 ### <a id="who-owns-a-mesh"></a>Ownership is asked of the SOURCE, not the extracted tree
 
@@ -674,6 +754,120 @@ states for every other generated record.
 The patch is generated only in Morroblivion mode. With all masters converted
 the index is complete, no gap exists, and no patch is written.
 
+### <a id="globals-are-always-filled"></a>GLOB is filled even where Morroblivion supplies it
+
+The "absent from the index" test is right for a base object: a STAT the index
+resolves is a STAT the game can place, whoever owns it. **It is wrong for a
+GLOB**, because a global is not placed -- it is READ, by TES3 dialogue
+conditions and MWScript, through the runtime's sidecar.
+
+Morroblivion's global is an OBLIVION record. Morroblivion carries no TES3 data
+and gets no Morrowind sidecar, so a global only it defines reaches the runtime
+nowhere. Only the patch stages a sidecar the runtime reads, so the patch must
+carry every vanilla GLOB whether or not Morroblivion also declares one.
+
+Measured: `WearingOrdinatorUni` is declared by Morrowind.esm AND by
+Morrowind_ob.esm (`01F2A3C9`). The index found Morroblivion's copy, the gap
+scan skipped it, and the patch shipped 139 GLOBs instead of 140 -- while its
+siblings `WearingLegionUni` and `wearingHelmHHDA`, which Morroblivion does not
+define, were filled.
+
+The consequence is not a missing value but an INVERTED condition. A global the
+sidecar lacks makes the dialogue filter IGNORE the condition testing it
+(matching OpenMW's `filter.cpp`, which returns true when
+`getGlobalVariableType == ' '`), so `Greeting 0` ordinal 25 --
+"The armor you wear is sacred to our Order" -- passed its only condition for
+every player, and Ordinators set fight 100 and attacked on sight. A `set`
+cannot repair it either: the compiler's `getGlobalType` returns `' '` for an
+unknown global, so the patch's own `OrdinatorUniform` script fails to compile.
+
+A short or long global's FLTV is read the way OpenMW's `floatCast`
+(`variantimp.cpp`) reads it: truncated toward zero, with NaN or a value beyond
+32 bits read as INT32_MIN, and a short keeps only the low 16 bits of the
+result. INT32_MIN's low 16 bits are 0, so an out-of-range short reads as 0.
+Tribunal's `MuseumDonations` holds 7.6e+23; written as -2,147,483,648, Torasa
+Aram's two donations could never bring it to 2, and The Blade of Nerevar
+stopped at 40.
+
+BSGN is always filled for the same reason: a birthsign is read, by the
+runtime's one birthsign menu, never placed, and Morroblivion's 13 signs are
+Oblivion's records with Oblivion's effects. The patch carries Morrowind's 13,
+which take Oblivion's slots by name in the menu (`message_menus._birthsign_plan`,
+later wins); their spells resolve to Morroblivion's copies where it has them
+(`elfborn ability` is `Morrowind_ob.esm|01060332`) and to the patch's own
+otherwise (`star-curse`). See
+[morrowind_runtime.md](morrowind_runtime.md#chargen-menus).
+
+### <a id="split-pairs"></a>Two-handed pairs are split back into left and right
+
+**Code:** `tes4_export/morroblivion_pairs.py`.
+
+Morroblivion keeps the RIGHT id of every Morrowind left/right gauntlet, bracer
+and glove pair as one two-handed item, and drops the left: of 41 vanilla pairs
+it keeps the right in 22 and neither half in 19, and never the left. Every
+left placement in those cells is gone (31 interior placements), and every
+inventory holding both halves holds only the pair item.
+
+The pair is found from the AUTHORED id: swap the side word in the left's id
+(`left`/`right`, or a lone or trailing `l`/`r`) and look the result up.
+Morroblivion's EditorID is that right id under its escape
+(`steel_gauntlet_right` -> `0steelUgauntletUright`), so the lookup names the
+pair item directly; 49 of vanilla's 61 lefts pair this way. Bethesda's typos
+(`left gauntlet of the horny fist` vs `right gauntlet of horny fist`) do not,
+and stay unsplit.
+
+For each pair whose worn models split
+([meshes](asset_convert_armor.md#split-pair-gauntlets)) the patch:
+
+- keeps the vanilla LEFT record it already fills, under its own FormID, and
+  gives it the left half's models -- so any plugin placing the vanilla left id
+  gets the new model;
+- overrides Morroblivion's pair item as the right half, under the vanilla
+  right's name;
+- gives each half HALF the pair's armor rating, so a worn pair totals
+  Morroblivion's, and its own vanilla weight and value;
+- restores every vanilla placement of the left into Morroblivion's cell,
+  keyed on the placement's authored file and reference number.
+
+The override changes the worn model, which lives in the ARMA companion, so it
+is reconverted rather than spliced (`RECONVERT_KEYS`).
+
+Morroblivion also dropped the left from every inventory that held both: 474
+of its NPCs, 27 containers and 11 leveled item lists hold a pair item. Each
+one whose VANILLA counterpart held the left is overridden with every entry
+naming the pair item doubled for the left, same count or level
+(`holder_overrides`). An NPC wears a gauntlet, so the change lands in its
+outfit ([worn-inventory-changes](tes5_import_override.md#worn-inventory-changes)).
+162 of those NPCs also carry Oblivion.esm items, gold among them, so the
+patch declares Morroblivion's own masters too (`patch_masters`): a copied
+record then means the same thing in the patch, as xEdit's copy-as-override
+adds the masters a record needs.
+
+#### <a id="split-pair-scripts"></a>Scripts that hand out a pair item bind a child
+
+**Code:** `tes4_export/morroblivion_pair_scripts.py`.
+
+Morroblivion's reward lines and object scripts hand out the pair item
+(`player.additem 0BMUIceUgauntletR 1`; Heart-Fang's death script adds the
+Nordic mail set), so after the split they would give only the right. Their
+converted scripts cannot be regenerated in the patch's run: it does not know
+Morroblivion's dialogue plan, and the snow-bear order's fragment alone also
+sets three topic-unlock globals and a quest flag the regeneration would drop.
+
+So each such script keeps its code and the patch binds a CHILD of it
+(`<parent>_Pairs extends <parent>`). Every function whose TES4 source adds or
+removes a pair item -- found in the parse tree, the INFO's End fragment or the
+block's `BLOCK_MAP` event -- is overridden to read the holder's count of the
+pair item, call `Parent`, and add or remove as many lefts as that count
+changed. Both forms come from `Game.GetFormFromFile`, so the child declares no
+property the master's VMAD would leave unbound. The record binding the
+script -- the INFO, or every record whose SCRI attaches it AND every
+placement of such a record -- is overridden with a script swap
+([script-swap](tes5_import_override.md#script-swap)). The placements matter:
+an actor script handling a reference event is moved onto the placed ACHR, so
+Heart-Fang's base NPC carries no VMAD at all and a swap on it alone renamed
+nothing.
+
 ### Textures are extracted WHOLESALE, meshes are not
 
 Meshes are pulled per gap record; textures cannot be, and the difference is not
@@ -696,16 +890,42 @@ in `export/Morrowind.esm`, plus 308 only in Bloodmoon.
 `_extract_assets` therefore writes every `textures\` entry of the vanilla
 BSAs, with no reference to what any record or mesh names.
 
+The same pass keeps the bytes of every vanilla mesh Morroblivion replaced
+through its records, from which the Export step proves the
+[Morroblivion texture map](asset_convert_texture.md#morroblivion-texture-substitution).
+The map does not let the patch ship fewer textures: it swaps only mesh diffuse
+slots, while records (landscape textures, inventory icons) and the other slots
+still name the vanilla files.
+
 ### <a id="the-patch-builds-its-own-plugin"></a>The build produces the PLUGIN, not just its export
 
-**Code:** `_import_records` in `tes4_export/morrowind_patch.py`.
+**Code:** `export_patch` / `run_patch_export` / `stage_pair_scripts` in
+`tes4_export/morrowind_patch.py`; the `PATCH_NAME` branches in `convert.py`;
+`PATCH_STEPS` in `convert_cli.py`.
 
-Building the patch is one user action, so it runs the whole chain: export
-records, extract assets, convert assets, and **import the records into the
-plugin itself**. The last step was missing, and its absence was invisible from
+The patch is an ordinary `-f` target. Only its Export step is its own
+(`export_patch`: gap records, BSA assets, gap sounds, split pairs, barks, the
+Morroblivion texture map, and the split pairs' child scripts saved to
+`export/<patch>/pair_scripts/`). Every
+later step is the normal stage: Meshes, Creatures, Import, Sounds (the gap
+SOUNs' files and the barks' recordings, which the Export step only copied raw)
+and Scripts (which copies the saved child scripts to `scripts/source` and
+compiles them). Extract
+does nothing for the patch, because its Export step already pulled what it ships.
+`--build-morrowind-patch <dir>` registers `<dir>` and runs `PATCH_STEPS` in
+order, and each step also runs alone:
+
+```bash
+python convert.py -f Morrowind-Morroblivion-Compatibility.esp --import-only
+python convert.py -f Morrowind-Morroblivion-Compatibility.esp --meshes-only
+```
+
+The GUI menu runs `--build-morrowind-patch` as a run in the main log pane.
+
+The import step was once missing entirely, and its absence was invisible from
 every angle the user could check.
 
-`build_patch` wrote `export/<patch>/` and an asset tree under
+The build then wrote `export/<patch>/` and an asset tree under
 `output/<patch>/`, then reported `records` and `assets` and declared the patch
 "a master of every Morroblivion-mode conversion". No plugin file was ever
 written, because nothing called the import stage for it -- `PATCH_NAME` reached
@@ -717,19 +937,19 @@ Three things hid it:
   on `_HEADER.txt` in the export dir, which `_write_records` does create, so
   Morroblivion-mode exports stopped reporting the patch missing and the build
   looked finished.
-- **`output/<patch>/` existed and was full.** `_convert_assets` populated it
+- **`output/<patch>/` existed and was full.** Mesh conversion populated it
   with meshes and textures, so the folder the user would check was there --
   just with no plugin in it.
 - **The record count was real.** It counts what was written to text.
 
-So `ok` now means the plugin FILE exists: a build that wrote records and assets
-but no plugin reports failure and says the records survived in `export/`. The
-patch declares no TES4 master and its export carries no `Master[N]=` line, so
-`_reconcile_masters` leaves the list at `Skyrim.esm` and it builds standalone.
+Import is now its own pipeline step, and a failed Import reports as that step
+failing. The patch declares the converted Morroblivion plugins as its masters
+([why](#the-patch-masters-morroblivion)), so `_reconcile_masters` builds its
+list from the export header like any other dependent's.
 
 The build has two doors, because the refusal that sends a user to it fires on
 the command line too: the GUI menu, and `convert.py --build-morrowind-patch
-"<Morrowind>/Data Files"`. Both run `build_patch`, so neither can drift.
+"<Morrowind>/Data Files"`. The GUI runs that same command, so neither can drift.
 
 It is written **ESM-flagged**, keeping its `.esp` extension -- the one converted
 plugin that does not wait for `tools/esm/make_master.py`. Every Morroblivion-mode
@@ -762,11 +982,12 @@ Morrowind enum translated to the TES4 one where they differ:
 | WPDT type 0-13 | `DATA.Type` | short/long blade 1H -> 0, long blade 2H and spear -> 1, blunt 1H and axe 1H -> 2, blunt 2H and axe 2H -> 3, bow/crossbow -> 5, thrown -> 0; arrow/bolt become **AMMO** |
 | WPDT chop/slash/thrust max | `DATA.Damage` | the largest of the three |
 | WPDT enchant | `ANAM` | Morrowind stores points x10 |
+| WEAP/ARMO/CLOT/BOOK `ENAM` (enchantment id) | `ENAM` | the ENCH FormID. It was written as `EITM` (TES5's name) from the first pass, so every Morrowind-format item lost its enchantment and no enchanted book became a scroll. Fixed, the build gives Tamriel_Data 523 enchanted weapons and 351 armor, TR_Mainland 308 and 431, and turns 131 and 33 of their books into SCRL under the same FormIDs |
 | LHDT color u32 | `DATA.Color.R/G/B` | little-endian RGBA bytes |
 | LHDT flags | `DATA.Flags` | identical bits; 0x10 (Fire) is masked by the importer |
 | CNDT weight, FLAG | `DATA.Weight`, `DATA.Flags` | Respawn 0x02 -> TES4 0x01 |
 | MCDT flags & 1 (key) | record becomes **KEYM** | 285 of 536 MISC records |
-| BKDT skill | `DATA.Teaches` | the 27-skill enum mapped onto TES4's 21 (medium armor -> heavy, axe/spear -> blunt, short blade -> blade, unarmored -> light armor, enchant -> mysticism) |
+| BKDT skill | `DATA.Teaches` | the 27-skill enum mapped onto TES4's 21 (medium armor -> heavy, axe/spear -> blunt, short blade -> blade, unarmored -> light armor); enchant, which TES4 lacks, is `MW_ENCHANT_SKILL` (100, actor value 112) |
 | BKDT isScroll | `DATA.Flags` 0x01 | |
 | ALDT autocalc | `ENIT.Flags` | TES4's bit is "NO auto-calc", so it is inverted |
 | REPA / PROB / LOCK | **MISC** | Skyrim has no repair or probe items; the importer had no dispatch for these signatures, so their references dangled |
@@ -792,6 +1013,18 @@ clothing's its `CTDT` type. Each maps onto TES4's `BMDT.BipedFlags`:
 | Ring | Right Ring (0x40) |
 | Amulet | Amulet (0x100) |
 | Pauldron, Belt | none -- no slot exists in either later game |
+
+The raw type is exported too (`MorrowindWearableType`), because TES4's one
+Hand bit cannot say which hand: the importer gives one-sided pieces their
+own Skyrim slot from it (left gauntlet/bracer/glove 33, right 59, pauldrons
+57/58; [body slots](asset_convert_armor.md#body-slot-layout)).
+
+A helmet keeps the Head bit only when its part list fills the Head part
+(`_covered_biped` in `tes4_export/morrowind_armor.py`); an open helm fills only
+Hair and must not hide the face. OpenMW draws the head model unless an item
+fills `PRT_Head`, and removes the hair for any helmet
+(`npcanimation.cpp` `updateParts`). Vanilla: 40 helmets fill Head, 18 only
+Hair.
 
 Weight class is not stored either; Morrowind derives it from weight against a
 per-type GMST (`iHelmWeight` 5, `iPauldronWeight` 10, `iCuirassWeight` 30,
@@ -820,9 +1053,9 @@ masters, names a synthetic worn model per record
 (`armor\morrowind\m\<escaped id>.nif`, `f\` when any female part exists) as
 `Male/Female.BipedModel.MODL`, and lists the parts as
 `MorrowindPart[i].Slot/.Male/.Female`. Because the biped key is present the
-importer builds an ARMA exactly as for Oblivion armor. Parts are listed only
-for records with a biped slot; pauldrons and belts have none in either later
-game.
+importer builds an ARMA exactly as for Oblivion armor. Every record with parts
+lists them and names a worn model, pauldrons included, although their
+`BMDT.BipedFlags` stay 0.
 
 The mesh stage assembles the model before the ordinary conversion runs
 (`assemble_armor`, called from `asset_pipeline.convert_meshes`), reproducing
@@ -848,11 +1081,43 @@ OBLIVION race FormID (`RNAM.Race=000191C1` for Dark Elf), because
 `_resolve_npc_race` maps that id through `TES4_RACE_FID_TO_EDID` and
 `RACE_MAP` to the Skyrim race; no RACE record is needed or written.
 
+### <a id="custom-races"></a>A custom race stands in as the vanilla race it names or looks like
+
+A race outside the ten vanilla ids used to fall back to Imperial. `RaceTable`
+reads every RACE and every skin head/hair BODY part from the plugin and its
+declared masters (the same pass that reads their BODY meshes) and gives a
+custom race a vanilla race's FormID by two authored indicators, in order:
+
+1. **Its display name.** Tamriel_Data's six Khajiit breeds (`T_Els_Cathay`,
+   `-raht`, `Dagi-raht`, `Ohmes`, `Ohmes-raht`, `Suthay`) all carry
+   `FNAM=Khajiit`. Several use their own EPoS meshes, so the name is the only
+   indicator for them.
+2. **The head and hair meshes it shares most** with one vanilla race; a tie or
+   no share keeps Imperial. This is the TES3 form of
+   [new races by face parts](tes5_import_actors.md#new-races-by-face-parts).
+
+`MorrowindRace` keeps the authored id, so dialogue filters and face grouping
+still tell the races apart.
+
+| Plugin | Race | NPCs | Becomes | By |
+|---|---|---|---|---|
+| TR_Mainland | the six Khajiit breeds | 91 | Khajiit | name |
+| Arktwend | Normanen | 198 | Nord | meshes |
+| Arktwend | Korinther | 124 | Redguard | meshes |
+| Arktwend | Zwerge, Zwerge Sitzend | 162 | Wood Elf | meshes |
+| Arktwend | Schattenelfen | 25 | Dark Elf | meshes |
+| Arktwend | HydorWesen | 14 | Argonian | meshes |
+| Arktwend | kAllemanen | 12 | Breton | meshes |
+| Arktwend | Alamanen, dAllemanen | 592 | Imperial | meshes |
+
+Races with only their own meshes (Imga, Tsaesci, Ogre, Arktwend's Skelett)
+still fall back to Imperial.
+
 | Morrowind | TES4 |
 |---|---|
 | FLAG Female 0x01 / Essential 0x02 / Respawn 0x04 / Autocalc 0x10 | `ACBS.Flags` 0x01 / 0x02 / 0x08 / 0x10 |
 | CREA FLAG Biped 0x01 / Respawn 0x02 / Weapon 0x04 / Essential 0x80 | `ACBS.Flags` 0x01 / 0x08 / 0x04 / 0x02 (swims, flies, walks keep their bits) |
-| NPDT 52-byte: level, 8 attributes, 27 skills, health, mana, fatigue, gold | `ACBS.Level`, `DATA.<attribute>`, `DATA.<skill>` (the 27 folded onto 21, taking the larger where two collide), `DATA.Health`, `ACBS.SpellPoints`, `ACBS.Fatigue`, `ACBS.BarterGold` |
+| NPDT 52-byte: level, 8 attributes, 27 skills, health, mana, fatigue, gold | `ACBS.Level`, `DATA.<attribute>`, `DATA.<skill>` (the 27 folded onto 21 plus `DATA.Enchant`, taking the larger where two collide), `DATA.Health`, `ACBS.SpellPoints`, `ACBS.Fatigue`, `ACBS.BarterGold` |
 | NPDT 12-byte (autocalc): level, disposition, reputation, rank, gold | `ACBS.Level`, `ACBS.BarterGold`; stats come from the Autocalc bit |
 | AIDT hello, fight, flee, alarm, services | `AIDT.EnergyLevel` 50, `AIDT.Aggression`=fight, `AIDT.Confidence`=100-flee, `AIDT.Responsibility`=alarm, `AIDT.Services` with Morrowind-only bits (picks 0x20, probes 0x40, repair items 0x200, spellmaking 0x8000) cleared |
 | ANAM faction + NPDT rank | `Faction[0].FormID` / `.Rank` |
@@ -891,8 +1156,20 @@ whose conditions pass.
 | `AI_A` id | Find (0) | object id, which the importer turns into Activate |
 
 Coordinates are cell-local, and the package sits on the BASE actor, so a
-destination marker goes into the exterior grid the position falls in, else into
-the cell of the actor's first placement. A package whose marker cell or target
+destination marker goes into the interior the actor's first placement stands in;
+an actor placed outdoors (or not placed by this plugin) gets the exterior grid the
+position falls in, else its placement's cell. Morrowind never walks an AiTravel
+actor out of its cell (OpenMW `AiTravel::execute` paths within the current cell
+and stands still when the point is out of range), but a Skyrim Travel package
+crosses cells: picking the grid first sent Tanusea Veloth's Travel, authored at
+(29472, -82112, 3008) for the Vivec Arena Pit, to the Vivec exterior, and the
+engine moved her out of the Pit before the player ever arrived. Measured on
+Morrowind.esm: 148 of 177 package markers had landed in the wilderness grids
+round the origin (Ashlands X0Y0 alone took 42); all 148 now share their actor's
+cell. A Travel point more than 7168 units from the actor is ignored by Morrowind
+(OpenMW `isWithinMaxRange`, for both the walk and the fast-forward), so the
+actor stands where it is; its marker goes at the actor's own placement, since a
+Skyrim Travel to the far point would place the unloaded actor there. A package whose marker cell or target
 placement cannot be found is dropped and counted (`package:<kind>` in the
 unresolved tally). The schedule is "any time" with Morrowind's duration in
 hours, which the importer converts to minutes; the per-package idle chances have
@@ -990,6 +1267,63 @@ written under the NonAccum name, where `split_root_motion` extracts the
 locomotion and keeps frame 0 (measured: NonAccum first sample (4.3, 28.1,
 50.1) at 90°, forward motion 107.8 units).
 
+### Held and numbered creature idles
+
+An authored `Idle` whose Start equals Stop is a held pose, not an absent
+animation. The creature splitter emits a short looping KF with two identical
+samples from that exact source instant. It does not sample the next source
+frame. This handles Tamriel Data's `pc_packmule_01/02` without changing the
+shared timeline reader's rules for object animations.
+
+When no base Idle exists, an explicitly looping numbered idle supplies it
+(the nine `tr_le_{g,p,r}_but_{micro,small,tiny}` butterfly variants). If only
+one-shot numbered idles exist (`sky_deer01/02`), the base clip holds the
+skeleton reference pose; the original numbered KFs remain separate. Normal
+base idles and the swim-idle selection retain priority. A creature with no
+usable idle group still reports an error before skeleton/HKX generation.
+
+`--creatures-only --only <folder names>` limits the source splitting as well
+as project generation. Repaired projects require a subsequent Import step to
+create their RACE/ARMA records, followed by archive packaging. The existing
+CreatureRuntime composes the updated animation fragments when the game loads;
+its DLL does not need rebuilding. Ordinary NIF mesh conversion is not needed
+for this fix.
+
+See: [upstream issue #117](https://github.com/bryantmh/tes4skyrim/issues/117).
+
+### <a id="rig-root-is-the-file-root"></a>A rig authored with no scene node
+
+**Code:** `find_skeleton_root` (`hkx_skeleton.py`), `prepare_creature_rig`
+(`equipment_rig.py`).
+
+Most rigs wrap the bones in a scene node, so the file root is a filename
+(`udyrfrykte.NIF`) and the first NiNode child is `Bip01`. 9 of 151 Tamriel Data
+creature skeletons instead make `Bip01` itself the file root: `tr_vermai`,
+`tr_vermai_helmet`, `tr_velk`, `tr_nixmount`, `tr_nixrouge`, `tr_skylamp_01`
+through `_03`, `tr_skeleton_arise01`. No Oblivion creature does (0 of 43).
+
+Two passes assumed the scene node.
+
+`find_skeleton_root` skipped the file root and returned `Bip01 Pelvis`, one bone
+too deep, so `_insert_nonaccum` built the accum child under the pelvis and
+`skeleton.hkx` had no `NPC Root [Root]` bone at all. It now returns the file root
+when the root's own name is one `BONE_RENAMES` knows.
+
+The second is the one that made the actor INVISIBLE, and it is an ALIASING bug,
+not a naming rule. `_to_fade_node` wraps the NiNode root in a BSFadeNode, and
+`_copy_root_frame` did `fade.name = root.name` -- a pyffi string object copied by
+REFERENCE. Normally the old root is discarded and nothing notices. When the file
+root IS a bone it survives as the fade node's child, so the two share one name
+object and `prepare_creature_rig`'s `Bip01` -> `NPC Root [Root]` rename wrote
+through to BOTH: the file ended up with two `NPC Root [Root]` nodes (measured: 9
+of 278 converted creatures). The engine binds the actor through that name,
+reaches the scene node instead of a bone in the animated skeleton, and nothing
+renders -- collision, AI and sound all work.
+
+The fix is `fade.name = bytes(root.name)`. Renaming the root by hand instead
+leaves BOTH nodes named `Bip01` and no root bone at all -- the same invisible
+actor by the opposite route.
+
 ### <a id="morroblivion-creatures"></a>Who converts a creature mesh
 
 **Code:** `_emit_creature_model` (`morrowind_actors.py`),
@@ -1019,6 +1353,136 @@ each one's `x<name>.nif`/`.kf` pair beside the model and runs the creature
 stage, so it owns those projects once and every dependent plugin inherits
 them.
 
+### <a id="creature-particle-emitters"></a>The split must upgrade particle emitters before it strips controllers
+
+`NiAutoNormalParticles` has no Skyrim RTTI, and an actor skeleton carrying one
+CTDs the game during actor creation -- reported on the converted Ascended
+Sleeper under both `PlaceAtMe` and a player race change, and confirmed by a
+diagnostic patch that neutered only those blocks. Header version does not
+save it: the shipped `character assets/skeleton.nif` read 20.2.0.7 / uv2=83
+and still held 4 `NiAutoNormalParticles` + 4 `NiAutoNormalParticlesData`.
+
+`particles_morrowind.upgrade_legacy_particles` already converts these, and
+`convert_nif` runs it on the skeleton like any other creature mesh -- but it
+was reaching a tree the upgrade could no longer read. Two properties of the
+split combined:
+
+- `_strip` clears `controller` on every `NiObjectNET`, which is right for the
+  50 `NiKeyframeController`s the timeline holds but also removed each
+  emitter's `NiParticleSystemController` / `NiBSPArrayController`. The upgrade
+  reads the authored rate, speed, cone and lifetime off that controller, so
+  with it gone `_as_particle_system` returns None and the legacy block is left
+  exactly as it was. Measured on `r\ascendedsleeper.nif`: 4 emitters with
+  controllers in the source, 4 with `ctrl=NONE` in both split outputs.
+- `_strip(keep_geometry=False)` drops `NiTriBasedGeom` children, and
+  `NiAutoNormalParticles` derives from `NiParticles` -> `NiGeometry`, NOT
+  `NiTriBasedGeom` -- so the geometry cull never reached them either. The BODY
+  came out clean only because `convert_nif`'s geometry walk discards what it
+  cannot classify; the skeleton keeps its whole node tree by design.
+
+The fix is to keep the input the upgrade needs, not to evict the blocks:
+`_strip` spares a legacy emitter's controller, and `convert_nif` then upgrades
+it where it already did. One line, and the effect survives the conversion, so
+nothing has to be recreated later with a Skyrim-native system.
+
+Running the upgrade inside the split instead does NOT work, and was measured:
+`_write_nif` writes the intermediate at the SOURCE header (0x4000002), a
+version with no modifier array and no `NiPSysEmitterCtlr` interpolator, so a
+system built there round-trips back as `num_modifiers=0` with a null
+interpolator -- an emitter that cannot emit. The upgrade has to run downstream
+of the version bump, which is exactly where `run_morrowind_fixups` already
+sits.
+
+Measured on the Ascended Sleeper after the fix: 0 legacy blocks in the
+converted `skeleton.nif`, 4 `NiParticleSystem` with the full modifier chain,
+0 `NiBSParticleNode`, every `NiPSysEmitterCtlr.target` non-null (a null there
+is an access violation the moment the system updates), and the authored rates
+intact -- `PArray` 75.0/67.5, `SuperSpray` 112.5/112.5.
+
+Morroblivion mode was never affected: its creature meshes are Oblivion-era and
+already ship `NiParticleSystem`. Sweeps after the fix: 78 of 78 built creature
+meshes clean under `Morrowind.esm`, 155 of 155 under `Morrowind_ob.esm`.
+
+Tamriel Data owns 431 `MorrowindModel` creatures and takes the same path: 17
+of its 318 distinct models carry legacy emitters (42 in total, every one with
+a controller), backing 27 CREA records -- the ghosts, wraiths, liches, dremora
+and Dwemer spectres. Tamriel Rebuilt itself owns none and inherits those
+projects. The 9 that build a creature project all convert clean.
+
+### <a id="orphaned-split-folders"></a>An orphaned split folder is converted forever
+
+`split_creatures` writes only what `_sources` lists -- the `MorrowindModel`
+line, emitted only for a mesh the plugin OWNS -- while the conversion stage
+claims ANY folder holding a `skeleton.nif`. A folder left over from an older
+export is therefore re-converted from its frozen intermediate on every run and
+never re-splits, so an `[ok] <name>` line in the build log does NOT mean that
+creature was split this run.
+
+`Morrowind.esm` had 10 such folders (`byagram`, `dagothr`, `dremora`,
+`g_centurionspider`, `guar`, `guar_white`, `guar_withpack`, `heart_akulakhan`,
+`hunger`, `lordvivec`) against 41 live sources; none appeared in `CREA.txt` or
+`creature_projects.json`, so nothing could load them. Deleting them under both
+`export/` and `output/` dropped the creature stage from 4 errors to 2 -- the
+`dremora` and `lordvivec` "no idle clip" failures were purely the orphans. The
+2 that remained (`skeleton`, `r`) are covered under
+[bipedal creatures](#bipedal-creatures).
+
+Check with `_sources` rather than by eye: a folder whose name is a substring of
+other records (`guar`) still greps as referenced when it is not.
+
+### <a id="bipedal-creatures"></a>Bipedal creatures play the humanoid animation
+
+A creature with the Bipedal flag (TES4 `ACBS.Flags` bit 0x01, carried through
+unchanged) animates like an NPC: the engine loads `xbase_anim.kf` first and
+the creature's own `x<name>.kf` on top, own groups winning (OpenMW
+`creatureanimation.cpp`, `addAnimSource(mXbaseanim)` under `Bipedal`). The
+split read only the creature's own file, so on Morrowind.esm all four bipedal
+models (26 records) came out broken:
+
+| Model | Records | Own groups | Before |
+|---|---|---|---|
+| Skeleton | 14 | `walkforward1h` | "no idle clip" |
+| Dremora | 8 | `death1`..`death5` | deaths only |
+| Golden Saint | 3 | none (no `x` .kf) | no clips |
+| Lord Vivec | 1 | `idle2` | `idle2` only |
+
+With the layer the split writes 44 (Golden Saint) to 48 (Dremora) clips: idle, the full gait set, stance idles,
+recoil/stagger/death, equip + attacks for hand-to-hand, one-hand, two-hand and
+bow, the three cast deliveries, and block. From the base file only the groups a
+claim table reads are written; its other ~100 groups (`sneak*`, `*1h` gaits,
+`idle3`..`idle9`) would convert as unused clips.
+
+Weapon, spellcast and shield groups pack several actions on one span, with
+`<action> start`, `<action> hit` and so on as the group's events. Each action
+is cut into its own clip: an attack runs `<a> start`..`<a> large follow stop`
+(contiguous: the large follow-through starts one frame after `<a> hit`) with
+`hit` at `<a> hit`; a cast runs `<d> start`..`<d> stop` with `hit` at
+`<d> release`; the bow's `shoot` hits at `shoot release`. Stems follow the
+Oblivion stance prefixes (`onehandattackchop`, `twohandequip`,
+`handtohandidle`) so `attack_stance` gates each attack on the equipped weapon.
+`weapontwowide` shares the `twohand` prefix, so `weapontwohand` claims it
+first. `crossbow` and `throwweapon` have no Oblivion stance and are not cut.
+The guard is the pose at `block hit`, held for one frame.
+
+The same cutting fixes non-bipedal casters: the storm atronach's `spellcast`
+group has no plain `start`/`stop`, so it never produced a cast clip; it now
+yields `castself`, `casttarget` and `casttouch`.
+
+Two more defects surfaced here:
+
+- **The source folder was claimed as a creature.** The skeleton's source is
+  `r\Skeleton.NIF`, so `meshes\r\` holds a `skeleton.nif` and dozens of `.kf`
+  files. `_creature_folders` now skips a folder that holds a source model
+  (`source_dirs`) and that no CREA points at.
+- **The skeleton's body overwrote its bones.** The export names that body
+  `skeleton_body.nif` (`NIFZ[0]`), but the split wrote `<stem>.nif`, i.e.
+  `skeleton.nif`, over the bones-only file. The split now takes the body name
+  from the record's `NIFZ[0]`.
+- **Then the body was converted as a skeleton.** `_convert_parts` treats any
+  `skeleton*` NIF as a skeleton, deliberately: Morroblivion's horker ships
+  alternates like `skeleton_10d.nif`. A file a CREA names in NIFZ is a body
+  part whatever its name, so that authored list now overrides the prefix.
+
 ## <a id="scripts"></a>Scripts
 
 **Code:** `tes4_export/record_types/morrowind_scripts.py`, `tes3_reader.script_name`.
@@ -1038,6 +1502,21 @@ and every script ships as declarations only (median 159 bytes of Papyrus). The
 records are attached (1,474 VMAD attachments) and inert. The converter needs a
 Morrowind block mode and the `->` member-call syntax before the bodies survive;
 Morrowind.esm carries 632 scripts, and 1,231 across the three ESMs.
+
+## <a id="class-quiz"></a>The class quiz comes from Morrowind.ini
+
+**Code:** `tes4_export/record_types/morrowind_quiz.py`.
+
+`EnableClassMenu` first offers three ways to pick a class. "Answer his
+questions" asks ten questions that no plugin holds: the game reads them from
+`[Question 1]` .. `[Question 10]` in Morrowind.ini (`Question`, `AnswerOne` ..
+`AnswerThree`, `Sound`), and OpenMW imports them as its `Question_<n>_*`
+fallback settings (`charactercreation.cpp`, `sGenerateClassSteps`). The ini
+sits beside the install's `Data Files`, so only a masterless plugin's export
+dumps it: one `MWQZ` record per question (`chargenquiz:<n>`), and for each
+`Sound` the same mouthless `Say` SOUN a scripted line spoken by no actor gets
+(`morrowind_say.say_sound`). The runtime plays it when the question is asked,
+as OpenMW does. All 10 questions are in the Steam install's Morrowind.ini.
 
 ## <a id="leveled-lists"></a>Leveled lists
 
@@ -1137,9 +1616,17 @@ Two things kept the master's cell invisible to the export:
 * It is not indexed. `_add_record` keyed exterior cells on `XCLC` alone, and a
   persistent cell carries `XCLC` too (Morrowind_ob's reads `(0, 0)`), so it was
   filed as the real cell at grid (0, 0). `_add_cell` now checks the Persistent
-  bit first and keys it under `persistent_key(<worldspace>)`.
+  bit first and keys it under `persistent_key(<worldspace>)`. Our own TES3
+  export writes the cell with NO `XCLC`, so `_add_record` must route a
+  persistent cell to `_add_cell` on the flag alone; gating on `XCLC` filed
+  Morrowind.esm's as an interior named `WrldMorrowindPersistent`.
 * `persistent_cell_id` derived unconditionally. It now prefers
   `index.lookup_persistent`, so a dependent plugin names the MASTER's cell.
+  `IdIndex` keys are lowercase, so the lookup must lowercase too: an
+  uppercase `persistent:008D2E7E` never matched, and Morroblivion's
+  `00380000` only worked because it has no hex letters. Pure-Morrowind
+  dependents (worldspace `008D2E7E`) minted their own cell and lost every
+  exterior load door and map marker.
 
 **The cell is written either way.** A plugin that rehomes a persistent
 reference defines the cell holding it, re-emitting a master's as an OVERRIDE at
@@ -1214,6 +1701,13 @@ Morrowind's `Place, Sub` convention collapses the group: the ~40 interiors of
 `Balmora, ...` become one Balmora marker. On Morrowind.esm this yields 402
 markers against Morroblivion's 483, **351 of them name-matching (73%)**, and
 95% of generated places correspond to a real Morroblivion marker.
+
+`place_name` splits on **comma or colon**. Tamriel Rebuilt separates a ship's
+rooms with a colon (`TEM Princess Morgiah: Hold`, `: Cabin`), which a
+comma-only split leaves whole, so every room became its own place: 47 such
+cells in TR_Mainland cover 21 real places, 16 of them multi-room (five
+`Grand Hlaalu Ancestral Tomb` rooms, and the boardable galleons). The symptom
+is one map marker and one LCTN per cabin instead of one per ship.
 
 ### Classification
 
@@ -1295,6 +1789,342 @@ Morrowind's sounds are LOOSE files under `Data Files\Sound`, not in the BSA,
 so the extract stage copies that tree into `export/<plugin>/sound` where the
 audio stage expects to find every plugin's sounds.
 
+### <a id="voiced-barks"></a>Voiced barks leave the sidecar
+
+Morrowind is barely voiced, and everything it DOES voice is a bark. Measured
+over Morrowind.esm + Tamriel Rebuilt + Tamriel Data: **8,549 voiced INFOs, every
+one of topic type `Voice`** -- Hello 6,338, Attack 724, Hit 699, Idle 440, Flee
+157, Thief 151, Intruder 39, Alarm 1. There is no voiced conversation at all.
+Each names its audio outright in `SNAM` (6,152 distinct files, ~118 MB), and all
+8,549 carry `Response` text, so every line can have a lip track generated.
+
+These alone are exported as TES4 `DIAL`/`INFO` instead of `MWDI`/`MWIN`, because
+**the engine moves an actor's mouth only for a voice line it plays itself**, from
+a `.fuz` carrying lip data. A SNDR played through `Sound.Play` is audio with a
+closed mouth. Taking the ordinary TES4 road gets the rest for free: the eight
+channels already have entries in `_EDID_SUBTYPE` (Hello->`HELO`, Attack->`ATCK`,
+Hit->`HIT_`, Idle->`IDLE`, Flee->`FLEE`, Thief->`STEA`, Intruder->`TRES`,
+Alarm->`ASSA`), and `build_info_gates` already adds the voice-type gate.
+
+#### The audience is authored; the folder means nothing
+
+**Code:** `tes4_export/record_types/morrowind_audience.py`
+
+A TES3 INFO states its speaker outright -- `ONAM` one actor, `RNAM`/`CNAM`/
+`FNAM` a race, class and faction, `DATA` the rank and gender -- and
+`MWDialogue::Filter` tests those fields and nothing else. So the audience is
+read off the record by porting the identity half of that filter
+(`filter.cpp TestInfo`, mirrored in `Audience.accepts`) over the actors the
+export can see: this plugin's own, plus every converted master's, loaded from
+their `NPC_.txt`/`CREA.txt` dumps.
+
+🛑 **The folder a recording sits in is NOT its audience.** Measured across the
+chain: `Vo\ord\` and `Vo\at_ord\` hold Ordinator lines whose records say
+`class=guard, faction=temple` -- Ashlanders are Dark Elves with
+`faction=ashlanders`, not a race; `Vo\v\` holds vampire grunts whose records
+NAME each vampire (`actor=aundae vampire 1`); `Vo\ay\` is `race=t_cyr_ayleid`
+and `Vo\ogr\` is `race=t_hr_ogre`; and 393 of Tamriel Rebuilt's `Vo\k\`
+lines state a gender and no race at all. A hand-written folder table got
+`Vo\v\` wrong in the worst direction -- mapping it to Dark Elf would have put
+vampire grunts on every Dark Elf in the game.
+
+Signatures memoise the work: 6,264 vanilla barks share **333 distinct filter
+signatures**, so every audience in Morrowind.esm resolves in 0.01s.
+
+#### Which gate each audience gets
+
+| The record states | Gate emitted | Why |
+|---|---|---|
+| a vanilla race | that race's VTYP (`BarkRace`) | plugin-owned, so it cannot bleed |
+| a class / a faction | `GetIsClass` / `GetInFaction` | each has its own TES4 function |
+| a faction rank | `GetFactionRank >= n` | alongside the faction |
+| a custom race, or one named actor | `GetIsID` over the real speakers | every custom race exports as Imperial |
+| nothing | nothing | the record leaves it open on purpose |
+
+🛑 **Race is NOT exported as a condition**, though 7,743 barks carry one.
+`convert_ctda` rewrites `GetIsRace`'s parameter to a VANILLA Skyrim race, so
+the condition stops scoping to the converting plugin and every bark bleeds
+across plugins. The VOICE TYPE carries race and gender instead, is plugin-owned,
+and is gated by `GetIsVoiceType` (426).
+
+A CUSTOM race cannot ride a VTYP: `RNAM.Race` collapses every unknown race onto
+Imperial, so an Ayleid gate would catch every Imperial. Those name their
+speakers instead, which always fits -- measured largest custom-race audience is
+**9 actors**, largest of any id-gated audience **14**.
+
+#### Script locals are CONDITIONS, not identity
+
+🛑 **A script local is runtime state and never an audience.** `T_Local_NPC` is
+declared by **1,553 Tamriel Rebuilt scripts across 21 races**, and the companion
+script SETS `T_Local_Khajiit` to 1 or -1 as it runs -- so the actors declaring a
+variable are not the ones speaking the line. Treating declarers as the audience
+was wrong in both directions.
+
+Each local travels as its own condition: the export emits TES4
+`GetScriptVariable` (53) with the authored name beside it
+(`Condition[i].Variable`), and `convert_script_var_ctda` turns that into
+`GetVMScriptVariable` (630) plus a `CIS2` naming the mangled Papyrus property.
+The name is stated because a bark names no reference, so the usual
+REFR->base->SCRI chain has nothing to walk. Built output carries
+`::TR_abomination_var` on 20 grunts, `::TR_Map_var` on 116 regional lines and
+`::TR_NecromOrd_var` on 49.
+
+A `NotLocal` rule (kind `C`) is the local rule NEGATED -- its comparison is
+inverted on export.
+
+#### <a id="bark-conditions"></a>🛑 Every other rule is a condition too, or the line goes
+
+**Code:** `tes4_export/record_types/morrowind_bark_conditions.py`
+
+The identity gate alone let every Hello play to everyone: "Diseased! Go away.
+You make us sick!" (`PcCommonDisease == 1`), "Hiss!" (`PcVampire == 1`) and
+the guild-rank greetings (`DNAM` + PC rank) all reached healthy, unaffiliated
+players. Measured over Morrowind + Tribunal + Bloodmoon + Tamriel_Data +
+TR_Mainland (10,300 barks), the rules that were being dropped:
+
+| Rule | Barks | Becomes |
+|---|---|---|
+| `Random100` | 6,458 | `GetRandomPercent` |
+| disposition (DATA) | 6,028 | `GetDisposition` -> relationship rank |
+| `PCRace` | 1,437 | `GetPCIsRace`, the set `RaceCheck` numbers 1..10 |
+| cell (`ANAM`) | 1,334 | runtime GLOB `cell:<prefix>` |
+| PC faction (`DNAM`) / PC rank | 725 / 693 | `GetFactionRank` on the player |
+| Health % / PcHealth % | 419 / 416 | `GetHealthPercentage` (TES5 430) |
+| PcExpelled | 415 | `GetPCExpelled` on the stated faction |
+| PcClothingModifier | 257 | `GetClothingValue`, naked-or-not only |
+| journal | 252 | runtime GLOB `journal:<id>` |
+| PcCrimeLevel | 190 | `GetCrimeGold` |
+| SameFaction / SameSex / SameRace | 139 / 88 / 51 | `Same*AsPC` |
+| Weather | 139 | `GetIsCurrentWeather` over `mw*` WTHRs where loaded, else runtime GLOB `weather`; outdoors only |
+| FactionRankDifference | 122 | `GetFactionRankDifference(F, PlayerRef)`, sides swapped |
+| FriendHit | 113 | `GetFriendHit(PlayerRef)` |
+| PcCommonDisease | 88 | `GetDisease` on the player |
+| PcVampire / PcCorprus | 39 / 2 | `HasMagicEffect` of `MW133Vampirism` / `MW132Corpus` |
+
+A player-side rule sets the run-on-target bit and `Condition[i].RunOn=Player`;
+the importer points it at PlayerRef. `GetFactionRankDifference` was read off
+the 1.6.1170 condition callback (0x32bd80): SUBJECT rank minus the parameter's,
+so TES3's player-minus-speaker swaps sides.
+
+`GetClothingValue` scores worn clothing 0..100 by coverage while TES3 sums its
+gold value, so only a rule that splits naked from dressed (`<= 0`, 95 barks)
+carries across; a gold threshold drops the line.
+
+**Dropped, because Skyrim cannot ask:** CreatureTarget (134; `GetIsCreature`
+is always 0 in Skyrim), Reputation (43), Werewolf (7), Alarm (7),
+RankRequirement (7), FacReaction (6), the eight attributes, and a
+speaker-faction rule (PcExpelled, FactionRankDifference, PC rank) on a bark
+that states no faction.
+
+Built: Morrowind.esm keeps 4,306 of 4,513 barks, the patch 3,812 (207 drop
+on a rule in each); the most conditions on one line is 21, under the 22
+ceiling. Every GetDisease, HasMagicEffect and player GetFactionRank lands as
+Run On Reference = PlayerRef.
+
+#### Measured result
+
+Built ESMs, both conversion modes:
+
+| Plugin | Barks | With no gate | Worst CTDA count |
+|---|---|---|---|
+| Morrowind.esm | 4,608 | 0 | 17 |
+| Tamriel_Data | 3,792 | 0 | 5 |
+| TR_Mainland | 391 | 0 | 8 |
+
+The engine drops a line past ~22 conditions (vanilla max 22, max OR-run 20), so
+every one fits. Checked separately, **no bark admits an actor TES3 would not
+have given it** in either mode, with one stated exception: a `factionless`
+filter has no single TES4 equivalent and becomes one `GetInFaction == 0` per
+faction the speakers could hold. That fits in vanilla (15 exclusions) but needs
+25 under Tamriel Rebuilt, past the ceiling, so 41 generic Imperial greetings
+fall back to the race VTYP alone and may also reach faction Imperials -- who
+already share 104 unrestricted greetings from the same pool.
+
+#### <a id="the-patch-owns-vanilla-barks"></a>The patch owns vanilla's barks
+
+**Code:** `tes4_export/morrowind_patch.py`
+
+In Morroblivion mode vanilla's 4,608 voiced barks have no owner. Morrowind.esm
+is not a conversion target -- Morrowind_ob.esm replaces it -- and Morroblivion
+converted **19,610 INFOs, not one of them voiced**: it reuses Morrowind's audio
+files but never carried the bark records across. A dependent plugin only ever
+exports its OWN dialogue, so nothing supplies them.
+
+The compatibility patch does, for the same reason it owns the gap sounds: one
+shared master, converted once, declared by every Morroblivion-mode conversion.
+`GAP_TYPES` cannot express this -- it filters base objects by record id, while
+DIAL/INFO are a sequential stream whose INFOs are identified by `INAM` and
+belong to the last DIAL seen -- so `collect_bark_records` walks the vanilla
+ESMs separately, keeping the topic order the exporter depends on and carrying
+the NPC_/CREA/SCPT records the audience resolver needs.
+
+Nothing is duplicated: a voiced line exists in exactly one place, and
+Morroblivion has none of them.
+
+#### <a id="the-patch-masters-morroblivion"></a>The patch masters Morroblivion
+
+**Code:** `tes4_export/morrowind_patch.py` `_write_records`,
+`tes5_import/pipeline.py` `_prescan_special_records`
+
+The patch is useless without Morroblivion, so it declares every converted
+`Morrowind_ob*` export as a master and resolves names through `load_context`
+exactly as Tamriel Rebuilt does. Its own records take the load-order byte that
+follows them; only the byte moved, the hashed low 24 bits did not, and the
+engine identifies a form by plugin plus those 24 bits, so no save is affected.
+
+It was masterless at first, which left it unable to name any faction, class or
+actor Morroblivion holds. Measured on the vanilla ESMs: 192 voiced barks state
+a faction and the masterless export kept **0** positive `GetInFaction` tests,
+and 494 of 4,572 barks named something it could not reach.
+
+It declares Morroblivion's OWN masters too (`patch_masters`: Oblivion.esm,
+then Morrowind_ob.esm), because it overrides Morroblivion records that name
+Oblivion.esm objects ([split pairs](#split-pairs)). So it now ADOPTS
+Oblivion's voice types (85) and `TES4*` support records rather than creating
+its own -- the rule is "adopt what a master supplies, create what none does".
+Adding the master moved the patch's own load-order byte, which renumbered 497
+of its generated records once (179 outfits, 83 projectiles, 80 sound
+descriptors, 77 statics renumbered; 47 voice types, 12 factions, 9 form
+lists, 5 globals, 4 game settings and 1 quest now adopted); the gap fills
+themselves keep their low 24 bits.
+
+#### <a id="an-audience-that-cannot-be-named"></a>An audience that cannot be named drops the LINE, never the filter
+
+A bark filtered on a class, a faction or an actor that NO converted plugin in
+the chain defines has nothing to point a condition at. Skipping the test and
+keeping the line would widen it to its race and sex alone, and TES3 topics put
+their specific lines FIRST -- as does Skyrim, which takes the first INFO that
+passes -- so an Ordinator's `faction=temple` greeting would beat the generic
+Dark Elf pool on every Dark Elf male.
+
+`_audience_lines` returns None for such a bark and `dialogue_records` counts it
+under `unresolved['bark audience']`.
+
+#### <a id="when-a-bark-fires"></a>When a bark fires: the package has to allow it
+
+**Code:** `tes4_export/record_types/morrowind_packages.py`,
+`tes5_import/packages/interrupt_morrowind.py`
+
+A correct bark record is not enough. Skyrim asks the actor's RUNNING PACKAGE
+whether it may speak unprompted (PKDT interrupt flags; CK wiki `Package_Flags`:
+"Hellos to player: Allow the actor to say hello to the player", "Allow Idle
+Chatter"). Every converted package carried `DEFAULT_INTERRUPT` (0x0044, the
+combat bits only), which is why Attack/Hit/Flee were audible and Hello/Idle
+never were.
+
+OpenMW decides the same thing from authored data (`actors.cpp`
+`updateGreetingState` / `playIdleDialogue`), so the flags are derived, not
+guessed:
+
+| OpenMW rule | Skyrim interrupt flag |
+|---|---|
+| greets only with AIDT `Hello` > 0, and only under Wander, Travel or no package | 0x01 Hellos to player on wander/travel packages |
+| idle voice needs `Hello` != 0 and no Follow/Escort package | 0x80 Allow Idle Chatter on everything but follow/escort |
+| thief / intruder are not package-gated | 0x10 Reaction to player actions on every package |
+
+The export writes the actor's `Hello` onto each of its PACKs as
+`MorrowindHello`; a PACK without that field is not Morrowind's and keeps the
+default.
+
+#### The patch masters Morrowind_ob.esm
+
+So barks can name Morroblivion's factions, classes and actors, the compat patch
+lists `Morrowind_ob.esm` as a master: 4,495 bark lines kept, 18 dropped (an
+unnameable audience drops the LINE). The patch still CREATES its own
+VTYPs/origin/vendor records (`is_support_root`: adopt what a master supplies,
+create what none does). 419 GENERATED patch records (OTFT/SNDR/PROJ/1stPerson
+STAT) changed id when the master was added, because `derive_formid` keys carry
+the load-order byte. Gap ids must be in `ctx.taken` or a bark collides. A silent
+ambient bark with correct records: check the package flags and the origin gate
+first.
+
+### <a id="which-sounds-a-plugin-ships"></a>Which sounds a plugin ships
+
+`Data Files\Sound` is SHARED: Morrowind, its expansions and every installed mod
+write into one tree, so presence on disk says nothing about ownership. Measured
+on the dev install, 1,810 non-voice files sit there but Morrowind.esm's records
+name only 378 of them -- the remaining 1,433 include whole folders (`tr` 456,
+`sky` 261, `va` 212, `pc` 76, `ac` 37) belonging to Tamriel Rebuilt and other
+mods. Copying the tree wholesale would make every plugin re-ship its neighbours'
+audio.
+
+A plugin therefore ships a file when **it names the file and no master of it
+does**. `SOUN.FNAM` is the only record-side path -- DOOR, LIGH and ACTI name a
+SOUN by ID, which resolves to that SOUN's own file -- so the reference set is
+one scan of `SOUN.txt` per plugin, minus the same scan over each converted
+master. An unconverted master contributes nothing, which keeps a standalone
+plugin self-sufficient.
+
+The `vo` tree is excluded and NOT yet converted: Morrowind has no voice-type
+record, and resolves NPC voice purely by path convention
+(`Vo\<race>\<sex>\<code><linekind><NN>.mp3`, 7,024 files on the dev install),
+so nothing on a record references it and this ownership rule cannot see it.
+The `Say` opcode names those paths literally (42 call sites in Morrowind.esm).
+Converting it needs its own pass.
+
+### <a id="creature-sound-generators"></a>SNDG: Moan is Aware, not Idle
+
+`SNDG` binds a creature to a sound by type (UESP `Mod File Format/SNDG`):
+0 Left Foot, 1 Right Foot, 2 Swim Left, 3 Swim Right, 4 Moan, 5 Roar, 6 Scream,
+7 Land. Morrowind.esm holds 168 of them over 43 creatures.
+
+Morrowind gives a creature ONE vocal triad, and the files name it: every
+generator resolves to `Cr\<creature>\moan.wav`, `roar.wav`, `scrm.wav`.
+Oblivion instead has TWO idle-ish slots, CSDT 4 Idle and 5 Aware, with distinct
+folders (`fx\npc\bear\idle\` beside `fx\npc\bear\aware\`). Moan therefore maps
+to **Aware (5)**, not Idle (4): slot 4 is deliberately never annotated onto a
+clip, because the idle clip LOOPS and an embedded `SoundPlay` fires every cycle
+-- the confirmed squeak-spam bug (`hkx_behavior.generate_creature_project`).
+Measured before the fix: Oblivion populated slot 5 on 40 of 42 creature folders
+while Morrowind populated it on 0 of 43, so all 47 Morrowind creature projects
+came out with empty `vocal_events` and zero `SoundPlay` annotations -- every
+creature silent.
+
+Swim Left/Right and Land reuse the back-foot and Death slots (2, 3, 8), which
+`CSDT_TO_CLIP` already annotates; before this they were dropped outright, which
+cost 5 of Morrowind.esm's 168 generators.
+
+### <a id="sound-gen-creature"></a>The sound-gen creature is TES4's inherit-sound source
+
+**Code:** `tes4_export/record_types/morrowind_actors.py` `_emit_sound_slots`,
+`asset_convert/havok/creature_sounds.py`
+
+OpenMW (`mwclass/creature.cpp` `getSoundIdFromSndGen`) looks a generator up
+under the creature's `CNAM` sound-gen creature BEFORE its own id, and failing
+that under any creature sharing its model. The exporter looked only under the
+creature's own id, in its own plugin. Measured with OpenMW's rule against the
+old export: Morrowind.esm voices 236 of 260 creatures (43 by own id, 176 through
+`CNAM`, 17 through a shared model); TR_Mainland voices 714 of 721, **679 of them
+through `CNAM`** -- and its export gave 0 of 721 a sound slot.
+
+TES4 has the same indirection natively: `CSCR` names a creature to inherit
+sounds from, and 817 of Oblivion's 909 CREA records use it. So `CNAM` is
+exported as `CSCR.InheritSound` whenever the generators are not this plugin's
+own, and the shared-model rule is already what "the richest slot set in a mesh
+folder wins" does.
+
+The creature pipeline's lookup was master-blind: it read only the plugin's own
+`CREA.txt` and `SOUN.txt`, so an inherit source or a SOUN owned by a master
+resolved to nothing. `creature_sounds` now folds each master's resolved view in
+first, re-keyed into the borrower's id space. Old against new lookup on the
+real exports: Oblivion.esm 42 folders and Nehrim.esm 59, every entry identical;
+Morrowind_ob.esm 60 -> 94 folders (its sounds live in Oblivion.esm), Tamriel
+Data 76 -> 173, and the compatibility patch and TR_Mainland 0 -> 94 and 0 -> 173.
+
+Two Morroblivion-mode gaps remained after that, both measured on TR_Mainland's
+721 creatures:
+
+* **The patch never read vanilla's SNDG records.** Its 19 gap creatures -- the
+  `dremora` many others inherit from among them -- exported with no slot at
+  all. `collect_bark_records` now carries `SNDG` and `_patch_context` registers
+  them: 14 of the 19 sit in a voiced folder, and TR went 616 -> 653.
+* **Morroblivion renames its creatures**, so a sound-gen creature such as
+  `skeleton` (88 TR creatures name it) or `ancestor_ghost` (66) resolves to
+  nothing by id. `MorroblivionModels.paired_creature` finds the stand-in
+  through the MESH the two share, the pairing `MORROBLIVION_CREATURES` already
+  records; all 76 EditorIDs in that table resolve in the Morrowind_ob index.
+  TR went 653 -> 721 of 721, Tamriel Data 372 -> 469 of 527.
+
 ## <a id="tes3-bsa"></a>The TES3 BSA
 
 A different format from every later BSA: magic `0x00000100` (not `BSA\0`), a
@@ -1332,13 +2162,30 @@ same land textures at the same coarseness, which is the most a procedural
 scatter can preserve. Deliberately mowed patterns are the part that is lost,
 because Skyrim has no way to express them.
 
-### The terrain belongs to the master
+### The terrain is never the plugin's own
 
 A groundcover plugin ships CELL and STAT records only — the TR grass ESP has
-**no LAND and no LTEX at all** — so the texture grid comes from the master's
-export dump, not the plugin. Reading only the plugin leaves every sample empty
-and silently emits no grass, the master-blindness failure this project keeps
-hitting.
+**no LAND and no LTEX at all** — so the texture grid comes from other exports,
+not the plugin. Reading only the plugin leaves every sample empty and silently
+emits no grass, the master-blindness failure this project keeps hitting.
+
+Its grass statics may be a master's too: Sky_Main_Grass.esp defines no STAT,
+and all 146,726 clumps name Tamriel_Data's `Grass\` statics. A placed id
+resolves to the master's static first, as `ctx.resolve` does.
+
+The land is not always a master's either. Morrowind identifies an exterior cell
+by its grid alone, so a groundcover plugin attaches to whatever landmass owns
+the grid without naming it: Sky_Main_Grass.esp's masters are Morrowind,
+Tribunal, Bloodmoon and Tamriel_Data, while Sky_Main.esm owns land under 1,172
+of its 1,210 grids (Morrowind_ob 4, Tamriel_Data none). `groundcover_grid`
+reads a master's land wherever a master has any, and elsewhere any other
+converted Morrowind ESM's whose cells overlap the plugin's. Only textures the
+plugin's masters own can be bound, which the
+[texture fold](#land-texture-fold) makes the common case; two ESMs naming
+different textures on one grid leave it unknown.
+
+A clump over no known ground stays the authored static; it used to be
+dropped. Interior cells never feed the tally.
 
 The master's LAND is already split into Oblivion quadrants, so sampling reads
 `BTXT` (the quadrant's base texture) and `ATXT`/`VTXTCount` (an alpha layer,
@@ -1366,33 +2213,37 @@ that are skipped outright; nothing renormalises the kept densities.
 their own model before reattribution (2 kept 55%, 7 would keep 89%; the
 author places a median 16 distinct models per texture).
 
-**The planter multiplies density by the layer's blend weight, so the area a
-texture is solved over is its weight summed across quads, not a quad count.**
-Binding every clump to the quad's dominant texture and dividing by the number
-of quads it dominates assumed weight 1.0; on TR's 41,164 quads the dominant
-texture's mean weight is 0.685 (median 0.665, p10 0.43), because the export
-paints alpha ramps at every patch boundary and a quad averages 2.2 alpha
-layers, so roughly a third of the intended clumps never planted.
-`_quadrant_weights` gives each ALPHA layer its mean opacity and the BASE what
-they leave uncovered, `GrassTally.area` sums those per texture, and the grid
-is `floor(2048 / PositionRange)` per side as the planter lays it (14 at the
-140 clamp, not 14.6).
+**Skyrim plants a quad as 8x8 blocks of 256 units, not as one 2048 grid**
+(SkyrimSE.exe 1.6.1170, disassembled). The block side is `2 x 128`
+(`0x201318`: a static 1 shifted by 7, so two LAND vertex spacings). The
+generator (`0x203810`) lays `min(floor(256/PositionRange),
+floor(256/iMinGrassSize))` candidates per block side and keeps each when
+`rand(0x7fff) < weight x 32768`, the weight bilinear over the block's 3x3
+vertices. So a quad gets `64 x floor(256/PositionRange)^2` candidates: at the
+old PositionRange 140 that is 64, where the export assumed
+`floor(2048/140)^2 = 196`. Measured on the shipped records, the engine
+planted 0.37x of the authored clumps for Sky_Main_Grass and 0.58x for
+Aesthesia, against 0.92x for Oblivion and 0.91x for Morrowind_ob (both at
+PositionRange 80, 3 per block). `POSITION_RANGE` is now 85: 3 per block side,
+576 per quad. Exactly 256/3 truncates to 2 in the engine's float32 divide,
+and `convert_GRAS` floors PositionRange at 80.
+
+**The vertex weight is full Density wherever the texture shows at all, not
+Density x blend.** The weight builder (`0x2a9f90`) gives each of the 9
+vertices `Density x 0.01` when the texture's opacity there is above
+`fTexturePctThreshold` (default 0.0), else 0; the BASE's opacity is
+`1 - sum(alpha bytes)/255` (`0x2a5590`). So the area a texture is solved over
+is the vertices it is visible on, each weighed by its share of the bilinear
+blocks (1/4 interior, 1/8 edge, 1/16 corner; `_vertex_share`). The blend
+share still decides which texture a clump stands on. With both corrections
+the engine plants 0.99x (Sky_Main_Grass) and 0.96x (Aesthesia) of the
+authored clumps; confirmed much denser in game.
 
 **A pairing whose density rounds to 0 is dropped, not planted at 1.** The
-Density byte cannot express less than 1% of 196 candidates per quad, so the
 old `max(1, ...)` floor planted 36 sparse pairings at 2-28x their authored
-count (one texture at 28.8x). Those 36 carry 0.49% of all clumps; dropping
-them costs that and nothing else. Re-measured with the planter's own formula
-(`area x floor(n)^2 x Density/100` summed over a texture's grasses, against
-its authored clumps): median 1.00 across 172 textures, range 0.58-1.60 from
-integer rounding on the sparsest pairings. 494 GRAS records. NOT yet
-in-game verified.
-
-The planter is the one measured in
-[grass placement parity](asset_convert_terrain.md#grass-placement-parity): per
-LAND quad it lays `n = min(2048/PositionRange, 2048/iMinGrassSize)` candidates
-per side and keeps each with probability `Density%`. Skyrim's iMinGrassSize is
-20.
+count. At 576 candidates a pairing needs about 3 clumps per quad to survive:
+Sky_Main_Grass keeps 31 GRAS over 17 textures (from 50 over 19), Aesthesia
+401 over 147 (from 497 over 173), with the totals above.
 
 Vanilla fixes PositionRange at 29-55 and varies Density over 3-23, because each
 of its 27 GRAS records carpets a texture on its own. A groundcover set does not
@@ -1419,15 +2270,18 @@ texture's whole clump count in proportion, and every kept pairing gets ITS
 OWN GRAS (356 records for 180 textures; FormID keyed on the static id plus
 the LTEX FormID, both authored), so each texture carries the density its
 author gave it rather than a mean over the model's textures. PositionRange is
-solved per pairing for a mid-vanilla density and clamped to 80-140; Density
-then follows the authored count. The floor is `convert_GRAS`'s Oblivion-parity
-rule (`PositionRange = max(80)`, Density x 80/PositionRange), which is not
-count-preserving: a record solved at 65 came out 20% under authored on the
-densest textures, so the exporter never goes below 80 and raises Density
-instead (up to 31 at 200 clumps per quad). Re-measured with the harness in
-`temp/`-style form (per texture: authored clumps per quad vs
-`(2048/PositionRange)^2 * Density/100` summed over its grasses): identical on
-all 180 textures, median 50 per quad. NOT yet in-game verified.
+fixed (above) and Density follows the authored count. The floor of 80 is
+`convert_GRAS`'s Oblivion-parity rule (`PositionRange = max(80)`, Density x
+80/PositionRange), which is not count-preserving, so the exporter never goes
+below it.
+
+**HeightRange is the authored spread relative to the mean.** The planter
+scales an instance by `1 + HeightRange x rand(-1..1)`, so the old `max - min`
+of the authored scales (up to 1.49) drew scales from below zero to 2.5x, in
+game "overly large and small grass". `height_range` now returns
+`sqrt(3) x std / mean`, capped at 0.9: 0.15-0.30 for Sky_Main_Grass, about
+0.47 for Aesthesia. The authored MEAN scale (1.31 for Sky_Main_Grass, 0.76
+for Aesthesia) is still not carried: a GRAS record has no base scale.
 
 The rest of DATA comes from the vanilla census (27 records in
 `references/Skyrim.esm/GRAS.txt`, DATA stored as hex): MaxSlope 45 (vanilla
@@ -1529,3 +2383,400 @@ Measured on the Tamriel Rebuilt set: 3.3s to parse the 212 MB ESP (838k
 refs/sec), 3.4s to build the texture lookup from the master's 352 MB
 `LAND.txt`, 1.0s to sample and tally all 2.73M placements. Single-threaded and
 well under any stage that would justify a pool.
+
+
+## <a id="interior-lighting"></a>Interior lighting
+
+Morrowind hand-lights each interior with an `AMBI` subrecord: ambient color,
+sunlight color, fog color and a fog-density scalar, all three colors packed
+`0x00BBGGRR`. `morrowind_cell.py` parsed `AMBI` into `cell.ambient` from the
+start, but nothing read the field and no `XCLL` key was ever emitted, so every
+converted interior reached the import with no lighting record at all.
+
+`build_cell_xcll` returns `None` when `XCLL.AmbientR` is absent, and `LTMP` is
+written NULL, so those cells inherited nothing either -- they ran entirely on
+engine defaults plus whatever placed lights they held. The symptom is flat,
+characterless interior lighting across the whole plugin.
+
+`_interior_cell` now emits the ambient, directional and fog colors whenever
+the source cell carries `AMBI`. The import side needed no change: it already
+packs all 92 XCLL bytes from those keys, and `get_int`/`get_float` default the
+components Morrowind does not author (fog near/far, directional rotation) to
+0.
+
+### The colors are authored, and varied
+
+Measured on TR_Mainland: **3,390 of 5,871 interior cells (58%) carry `AMBI`**.
+Their ambient mean-luminance spreads 0-143 with a peak in the 48-63 bucket
+(987 cells), and the colors are plainly deliberate -- `3E495A` blue-grey for a
+Dwemer ruin, `1B1111` with `413529` fog for a warm cave, `1B1921`/`2C1F2E` for
+a purple-tinted interior. It is per-cell authored color variation, which is
+exactly what the flat look was missing.
+
+The remaining 2,481 interiors author no `AMBI` and still fall through to
+engine defaults; nothing in the source can fill them.
+
+### Ambient alone is the mechanism
+
+Oblivion's interiors look correct in-game and set almost nothing else: of
+1,770 vanilla cells with `XCLL`, **1,643 (93%) have a pure-black directional
+color**, and the median fog near and fog far are both 0.0. Ambient carries the
+result on its own.
+
+That retires the obvious follow-up. Morrowind's fog density is a scalar rather
+than the near/far pair TES4 uses, so mapping it would mean fitting against
+Morroblivion's converted cells -- but it is a component vanilla Oblivion
+mostly leaves at zero, so it buys nothing until an interior is shown to need
+it. The six-way directional-ambient block stays a replicated flat ambient for
+the same reason: Oblivion proves that reads fine.
+
+### <a id="quasi-exterior-interiors"></a>A quasi-exterior interior keeps its sky
+
+`_interior_cell` hardcoded `DATA.Flags=1`, discarding every other authored bit.
+Two of them matter, and all three games agree on their meaning -- TES3
+`QuasiEx = 0x80` (`components/esm3/loadcell.hpp`, "Behave like exterior
+(Tribunal+), with skybox and weather") is bit 7 in TES4's "Behave Like
+Exterior" and TES5's "Show Sky"; bit 1 is "Has Water" in all three.
+
+Arktwend's opening cell `Melee Monastery` authors `DATA 830000...` -- interior
++ has water + quasi-exterior -- and carries neither `AMBI` nor `WHGT`, because
+a quasi exterior takes its light, sky and water from the world rather than
+from per-cell fields. Dropping bit 7 left Skyrim rendering the default black
+interior void through the cell's windows, and dropping bit 1 left it dry.
+
+Vanilla Skyrim does exactly this at scale: **229 of 590 interior cells set
+Show Sky**, 73 of them with Has Water, normally alongside an `XCCM` and an
+ordinary `XCLL`. "Use Sky Lighting" (bit 8) is set on **1** cell in the whole
+master, so it is deliberately not synthesized. The flags pass through the
+import unchanged -- `convert_CELL` only strips TES4 bits 3 and 6 -- so
+carrying them in the export is the whole fix.
+
+`XCCM` names the region a show-sky interior draws its sky and weather from,
+which is the same `RGNN` the cell already authored, and it is emitted only for
+quasi exteriors.
+
+A Has Water cell with no `WHGT` gets `XCLW.WaterHeight=0.0`. That is what
+Morrowind itself reads — `mWater` is initialized to 0 and only overwritten by
+an authored `WHGT`/`INTV` (`components/esm3/loadcell.cpp`) — and sea level is
+0 in both games, since the conversion applies no Z offset.
+
+Of Arktwend's 8 quasi exteriors, **7 author no height at all**. Level 0 is
+still right for them: Melee Monastery places 46 of its 718 references below
+Z=0 with the bulk just above, which is a shoreline sitting at sea level.
+
+The height alone is not sufficient — the cell also needs an `XCLL`, which
+these cells have no `AMBI` to supply
+([why](tes5_import_world.md#every-interior-gets-an-xcll)).
+
+## <a id="region-weather"></a>Region weather
+
+**Code:** `tes4_export/morrowind_region.py`
+
+Morrowind authors no weather records. The engine hardcodes ten weather types
+and a region's `WEAT` subrecord is one chance byte per type, in the order
+OpenMW's `WeatherManager` registers them
+(`references/openmw/apps/openmw/mwworld/weather.cpp`): Clear, Cloudy, Foggy,
+Overcast, Rain, Thunderstorm, Ashstorm, Blight, Snow, Blizzard. The colors
+behind each live in `Morrowind.ini`, not the plugin.
+
+So in Morroblivion mode there is nothing to mint: Morroblivion already
+converted all ten as real WTHR (`mwClear` ... `mwBlizzard`, plus
+`mwWeatherAshstorm*`), and a region converts by naming them through the
+EditorID index. `WEATHER_EDITOR_IDS` is that whole mapping. This is why the
+region's NAME never has to match a Morroblivion region: the region is
+self-describing, and only the ten weather slots are shared vocabulary.
+
+Measured sources: `Morrowind.esm` 9 regions (8-byte `WEAT`, Bloodmoon widened
+it to 10), `TR_Mainland.esm` 1, `Tamriel_Data.esm` 80.
+
+**Slots 6 and 7 are NOT named after the weather.** Morroblivion calls them
+`mwAsh` and `mwWeatherAshstormBlight`, not `mwAshstorm`/`mwAshstormBlight`,
+and guessing the names silently drops ash and blight. The identity is pinned
+by real data, not the naming: Morrowind's `RedMountainRegion` authors
+`[0,0,0,0,0,0,0,100]` -- 100% at slot 7 -- and Morroblivion's own
+`RedMountainRegion` gives that entry `01F8B26B`
+(`mwWeatherAshstormBlight`).
+
+**A weather region needs a polygon.** All 53 of Skyrim.esm's weather-bearing
+REGN records carry `RPLD`, so `convert_REGN` rightly returns None without one
+-- and Morrowind, which assigns a region per CELL, authors none. The polygon
+is therefore synthesized as the bounding rectangle of the grid squares the
+region's own cells occupy. It is approximate on purpose: region weather
+reaches the sky through the CELL's `XCLR` list, exactly as it does in Skyrim,
+so the rectangle only has to make the record legal.
+
+`Override=1 Priority=95` matches vanilla Skyrim's own weather regions.
+
+## <a id="magic"></a>Magic: an effect is an index, not a code
+
+TES4 gives every magic effect a four-character code and its own record, so the
+import side keys its archetype table on `FIDG`, `SHLD` and the rest. TES3 has
+no such vocabulary: magic effects are an engine-fixed table of **143**, and a
+spell names one by its integer index. A plugin may override an effect's cost,
+flags or art, but it can never invent one.
+
+So the index is the authored datum. Every exported effect carries it as
+`Effect[i].MorrowindIndex`, beside a synthesized EditorID (`MW014FireDamage`)
+naming the MGEF record it resolves to. Keying on the index rather than minting
+four-character codes leaves the Oblivion tables untouched and keeps FormIDs
+derived from authored data.
+
+Measured across Morrowind, Tribunal and Bloodmoon: 990 SPEL, 708 ENCH, 137
+authored MGEF records, and **3,479 effect uses over 139 distinct effects**.
+
+### The name table is generated, and only LENGTH is enforced
+
+`tools/generators/gen_morrowind_mgef_table.py` reads the two index-ordered
+arrays OpenMW carries in `components/esm3/loadmgef.cpp` and writes
+`tes4_export/morrowind_mgef_names.py`.
+
+It requires both arrays to span `MagicEffect::Length`, and deliberately does
+**not** require them to agree on spelling: 13 entries differ by upstream style
+alone -- index 19 `DrainSpellpoints` vs `DrainMagicka`, 132 `Corpus` vs
+`Corprus`, 138-140 the Bloodmoon summons under generic vs real names. A length
+change would renumber every converted spell and must fail loudly; a spelling
+difference is cosmetic and must not.
+
+### <a id="engine-flags"></a>Most of an effect's flags live in the engine, not the file
+
+**Code:** `record_types/morrowind_magic.py` (`_engine_flags`), generated `morrowind_mgef_names.MW_HARDCODED_FLAGS`
+
+A MEDT flags field holds only what the construction set lets you tick
+(spellmaking, enchanting, negative light). The engine ORs a fixed 143-entry
+table into every effect as it loads (OpenMW `components/esm3/loadmgef.cpp`,
+`HardcodedFlags`): Harmful, NoDuration, NoMagnitude, TargetSkill,
+TargetAttribute, ContinuousVfx and the allowed ranges. Without it, Fire Damage
+converted with no Hostile or Detrimental bit (TES5 `0x00200000`, where
+Oblivion's and vanilla's damage effects carry `0x00201005`), so every damage
+effect was a friendly value modifier. The generator reads the table beside the
+names; the export ORs it in except the three range bits, which stay the ranges
+the plugin's own spells use (`_used_ranges`), since those pick each effect's
+Skyrim delivery.
+
+### <a id="spell-flags"></a>SPDT flags are not TES4's SPIT flags
+
+**Code:** `record_types/morrowind_magic.py` (`_spell_flags`)
+
+| Bit | TES3 SPDT (OpenMW `loadspel.hpp`) | TES4 SPIT (xEdit) |
+|---|---|---|
+| 0x1 | Autocalc | Manual Spell Cost |
+| 0x2 | PCStart | Immune to Silence |
+| 0x4 | Always Succeeds | Player Start Spell |
+
+Copied raw, every hand-authored cost was thrown away for Skyrim's autocalc, and
+every always-succeeds spell became a player start spell. OpenMW uses the stored
+cost unless Autocalc is set (`spellutil.cpp`, `calcSpellCost`), and the stored
+cost is TES3's own computed one: Morrowind.esm's 695 autocalc spells all store a
+non-zero cost. So the export always sets Manual Spell Cost, and PCStart becomes
+Player Start Spell. Always Succeeds has no counterpart; no Skyrim spell fails.
+
+### <a id="bound-items"></a>A bound effect's item is named by a GMST
+
+**Code:** `record_types/morrowind_magic.py` (`_emit_bound_item`, `game_settings`)
+
+A TES3 bound effect (indices 120-125 weapons, 127-131 armor) carries no item.
+The engine reads the item's ID from a GMST: `sMagicBoundDaggerID` through
+`sMagicBoundShieldID`, and `sMagicBoundRightGauntletID` /
+`sMagicBoundLeftGauntletID` for Bound Gloves (OpenMW
+`mwmechanics/spelleffects.cpp`). The export resolves that GMST's value
+(`bound_battle_axe`, ...) as the effect's `DATA.AssocItem`. Without it every
+bound effect converted as a Bound Weapon with a null item, and casting one
+crashed in `BoundItemEffect` (`cmp byte ptr [rcx+0x1A], 0x29`, the WEAP form
+type, on a null form). Bound Gloves takes the right gauntlet: both pieces land
+in Skyrim's one Hands slot, so only one can be worn.
+
+The patch reads the GMSTs from the vanilla masters in `collect_magic_effects`;
+an authored-masters export reads its own.
+
+### <a id="effects-come-from-the-patch"></a>Effects come from the patch, with vanilla's authored data
+
+**Code:** `morrowind_patch.py:collect_magic_effects`, `export_morrowind.py:magic_effect_records`
+
+A TES3 MGEF has no record id, so `collect_gap_records` never collected one and
+the compat patch shipped all 143 effects as stubs: name, index and range flags,
+no school, base cost or description. Every TES3 plugin exported in Morroblivion
+mode then wrote its OWN stub over each of them (TR's `MW075RestoreHealth` is
+`0140EBAA`, the patch's id), so TR's and Tamriel_Data's spells converted with
+no school at all.
+
+The patch now exports vanilla's authored MGEFs through `export_MGEF`, a later
+master's copy winning as TES3 loads them, under the ids dependents already
+name, and synthesizes only the indices no vanilla master authors. A plugin
+synthesizes an effect only when no master supplies it: a stub loaded after the
+patch hides the authored record. An effect a plugin itself authors is still
+exported as its override.
+
+### <a id="restored-magic"></a>Morroblivion's scripted magic is restored to vanilla's effects
+
+**Code:** `morroblivion_magic.py`. **Status: built, NOT yet confirmed in game.**
+
+Morroblivion stood a script effect (SEFF) in for each Morrowind effect Oblivion
+lacked. The patch overrides a Morroblivion SPEL, ENCH or ALCH with its vanilla
+original's effects, keeping Morroblivion's FormID and EditorID, when four
+conditions hold:
+
+1. The record pairs to vanilla by escaped id and type (`mark` ↔ `0mark`).
+2. It carries a script effect, OR its vanilla original carries an effect only
+   MorrowindRuntime can do. Neither Oblivion nor Skyrim has such an effect, so
+   whatever Morroblivion authored is a stand-in, scripted or not: Buoyancy
+   and Swimmer's Blessing fake SwiftSwim with Water Breathing plus Feather or
+   Fortify Athletics.
+3. Every vanilla effect converts (`mw_converts`). That means a Skyrim archetype,
+   with an actor value where one is needed, or an effect the runtime carries.
+4. Each dropped script EITHER does nothing, OR the runtime carries every
+   vanilla effect and nothing left behind depends on the script. "Does nothing"
+   means no script at all, or only blocks, locals and `return`.
+
+   Nothing depends on a script when it stages, starts or stops no quest, and
+   when each global, quest variable or reference it writes is either read
+   nowhere else or written somewhere else too. A read counts by name in any
+   script or result script, and by FormID in a raw `CTDA`.
+
+   A function script that only dropped scripts `Call` is dropped with them,
+   and its own writes are checked the same way. `JDLevitate` reads the
+   `JDLevitationData` factors the Levitate stand-ins write, and nothing else
+   calls it.
+
+Measured over Morrowind_ob: 52 vanilla records pair to a Morroblivion record
+with a script effect, and **21 are restored**. They are the Mark, Recall and
+Intervention spells, scrolls and potions, plus records whose script effect had
+no script (`rilm's gift`, `corprus`, `panacea`) or a placeholder
+(`mwElothEffectPlaceholderScript`).
+
+Once SwiftSwim, Levitate and SlowFall became runtime-carried, 18 SPEL, 11 ALCH
+and 8 ENCH more flipped: every Levitate spell (Vampire Fly included),
+Slowfall, Buoyancy, Swimmer's Blessing and the Swift Swim and Levitate
+potions and enchantments
+([how](morrowind_runtime.md#adding-a-runtime-effect)).
+
+🛑 **A restored enchantment on a BOOK does not reach its scroll.** The patch
+overrides `0scUreynosfinsUen` with Swift Swim 50, but the SCRL the player
+reads is built from the book when Morrowind_ob.esm converts, and it keeps
+Morroblivion's magnitude-1 effect. Unfixed.
+
+Kept as Morroblivion's, and why:
+
+- **The blight cures:** `mwSpellBlightCure` stages `fbmwILGnisisBlight`.
+- **The blight resistances:** they write `mwPlayerBlightResistance`, which the
+  blight scripts read and nothing else writes.
+- **Icarian Flight, the ghost ability, Fenrick's Doorjam and the summons:** each
+  script does something, and the vanilla effect's Skyrim mapping is only a
+  stand-in. Fortify Acrobatics lands on Stamina and Chameleon on Invisibility.
+
+`PlayerInMorrowind`, which Recall sets, passes: `mwMorroDefaultQuestScript`
+writes it every frame from the worldspace. The Mark marker and the
+Intervention marker pass too: `mwTeleportManagerQuestScript` moves both.
+
+A restored Intervention also carries `InterventionKind` and
+`InterventionTargets`, the `Player.MoveTo` destinations of its replaced script
+([the runtime's markers](morrowind_runtime.md#divine-intervention-in-any-world)).
+
+`start_scripts` writes `MWSS.txt`, never imported: each vanilla SSCR whose
+source names no record but itself. Comments, keywords and GetPCCell's cell
+name are not names. Only `TribunalMain` qualifies. `MarkTRStartScript`,
+`TribFabAttackCheck` and `BMStartUpScript` start quest content Morroblivion
+runs under its own names.
+
+### Magnitude is the mean of the authored range
+
+A TES3 effect authors `magnMin` and `magnMax`; a TES5 EFIT holds one number.
+The export writes the mean, because taking the maximum would overstate every
+spell in the game.
+
+### An enchantment is a separate subrecord
+
+The int inside `AODT`/`CTDT`/`BKDT` that reads like an enchantment is the
+enchant-point **capacity**. The enchantment itself is a separate `ENAM` string
+subrecord naming an ENCH record, and until it was followed, **836 enchanted
+items** (83 ARMO, 309 CLOT, 315 WEAP, 129 BOOK) lost their magic on conversion.
+
+### Soul gems are identified by ID prefix
+
+TES3 has no soul-gem flag and no SLGM record type: a soul gem is a MISC whose
+ID starts `misc_soulgem`, which is the same test OpenMW makes
+(`mwclass/misc.cpp`, `isSoulGem`). `tes4_signature` routes those to SLGM and
+derives the TES5 capacity from the tier suffix -- petty 1 through grand 5, with
+Azura's Star, whose suffix names no tier, holding a grand soul.
+
+Vanilla Morrowind has six: petty, lesser, common, greater, grand and Azura.
+They ship empty (`SOUL=0`), because TES3 stores a captured soul on the
+inventory stack rather than on the base record.
+
+### <a id="filled-soul-gems"></a>The filled variants are SYNTHESIZED
+
+The two games disagree about where a trapped soul lives. TES3 keeps it on the
+inventory stack, so one `misc_soulgem_grand` record serves empty and full
+alike. **Skyrim makes a filled gem a separate base record** whose `SOUL` is
+the trapped size — `SoulGemGrand` has `SOUL=0` and `SoulGemGrandFilled` has
+`SOUL=5`, same `SLCP=5`, differing only in `SOUL` and value.
+
+So a filled variant is synthesized per gem per soul size it can hold:
+`<gem id>_Filled<n>`, capacity 1..N. Six vanilla gems yield 20 records
+(1+2+3+4+5+5). Without them `AddSoulGem` has nothing to add — the command
+names a creature, and the gem it must produce is the one holding **that
+creature's** soul.
+
+The soul size comes from the creature's own `DATA.Soul`, which the CREA
+exporter already emits in Skyrim's 1..5 enum, so no new mapping is needed.
+
+🛑 The key is the gem's **authored id**, never its capacity or an ordinal, so
+a derived FormID never moves ([the save-game contract](performance.md#formid-determinism--the-save-game-contract-rewritten-2026-08-17)).
+
+## <a id="surface-materials"></a>Surface materials
+
+**Code:** `tes4_export/record_types/morrowind_materials.py`
+
+Morrowind records no material anywhere, so footsteps and impacts had nothing
+to read and every Morrowind surface converted as stone.
+
+This was confirmed against OpenMW rather than assumed:
+
+- TES3 LTEX accepts only `NAME`, `INTV`, `DATA` and its loader's `default:`
+  case is `esm.fail("Unknown subrecord")`
+  (`references/openmw/components/esm3/loadltex.cpp:36`) — a material field
+  could not exist without breaking vanilla loading.
+- LAND carries normals, heights, world-map colours, vertex colours and texture
+  indices; the "material palette" comment at `loadland.hpp:48` means the LTEX
+  index table.
+- `bulletnifloader.cpp` assigns no material to any shape, and `grep -i
+  material` over `apps/openmw/mwphysics/` returns nothing.
+- Both NIF candidates are version-gated above Morrowind: `mMaterialHash` needs
+  >= 10.0.1.0 **and** Bethesda-version > FO3 (`nif/data.cpp:116`), and
+  `NiGeometry::MaterialData` early-returns below 10.0.1.0 (`nif/node.cpp:236`).
+  `NiMaterialProperty` holds only ambient/diffuse/specular/emissive/gloss/alpha
+  (`nif/property.cpp:505`).
+- Morrowind's own footsteps come from swim state plus the armor SKILL of the
+  equipped boots — 12 sound ids, ground never consulted
+  (`apps/openmw/mwclass/npc.cpp:71,1161`).
+
+So there is **no faithful port available**; a material assignment here is new
+authored intent, not a reproduction of engine behaviour.
+
+### The signal is the texture name
+
+The one authored, semantic, per-surface string is the texture name, in
+Bethesda's `tx_<material>_<detail>` scheme. `NiMaterialProperty.name` was
+measured and rejected: over a 60-file sample its values are 3ds-Max defaults
+and typos (`Material #1` x22, `core` x8, `bttom`, `k./kl'kjl'`).
+
+Measured coverage of `material_of`:
+
+| Corpus | LTEX | resolved |
+|---|---|---|
+| Morrowind.esm | 107 | 107 = 100% |
+| Tamriel Rebuilt | 325 | 300 = 92.3% |
+| Tamriel Data (HD) | 358 | 321 = 89.7% |
+
+Vanilla's 107 land textures resolve to 33 Stone / 29 Grass / 18 Dirt /
+13 BrokenStone / 7 Sand / 6 Mud / 1 Gravel — close to vanilla Skyrim's own
+terrain distribution. The residual misses are dungeon FLOOR textures
+(`T_Imp_DngRuinCyr_TxFloor_01`), for which the Stone fallback is right anyway.
+
+**Match anywhere in the name, never by position.** Vanilla puts the material
+second (`tx_wood_siding`), but Tamriel Rebuilt prepends a province
+(`tx_skyrim_wood_brown_03`, the single most common prefix at 361/1871 refs);
+a positional read scores those as material "skyrim" and returns nothing.
+
+LTEX classifies from its EditorID first — the authored `NAME` field, e.g.
+`Sand`, `Road Dirt`, `AI_Grass_Cobbles` — with the texture file name as
+tiebreak for the records whose EditorID is itself a filename.

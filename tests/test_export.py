@@ -615,6 +615,29 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
+class TestSkillData:
+    """SKIL DATA starts with the skill's own Action index, before the governing attribute.
+
+    See: docs/plans/character_sheet.md#bug-skil-shift
+    """
+
+    #: SkillAlchemy (Oblivion.esm SKIL 00000044) DATA, verbatim.
+    RAW = bytes.fromhex('1300000001000000010000000000a0400000003f')
+
+    def test_fields_land_on_their_own_names(self):
+        """Alchemy: Action 19, Intelligence, Magic, use values 5.0 and 0.5."""
+        from tes4_export.tes4_reader import Record, Subrecord
+        from tes4_export.record_types.actors import export_SKIL
+        rec = Record(type='SKIL', data_size=0, flags=0, form_id=0x44,
+                     subrecords=[Subrecord('EDID', b'SkillAlchemy\x00'), Subrecord('DATA', self.RAW)])
+        got = dict(line.partition('=')[::2] for line in export_SKIL(rec))
+        assert got['DATA.Action'] == '19'
+        assert got['DATA.Attribute'] == '1'
+        assert got['DATA.Specialization'] == '1'
+        assert float(got['DATA.UseValue1']) == 5.0
+        assert float(got['DATA.UseValue2']) == 0.5
+
+
 class TestFalloutActorAcbs:
     """FO3/FNV ACBS drops TES4's SpellPoints, shifting every later field.
 
@@ -733,6 +756,34 @@ class TestFalloutQuestDeltas:
         assert 'TargetCount=' in superseded_keys(rec)
 
 
+class TestFalloutIdle(unittest.TestCase):
+    """FO3/FNV IDLE keeps its Parent/Previous in ANAM and its anim data in DATA, the reverse of TES4.
+
+    See docs/commentary/tes4_export_falloutnv.md#idle-anam-data-swapped.
+    """
+
+    #: SitDownStool (FalloutNV.esm 00027980): parent StoolSitting, previous DefaultSitIdleStool.
+    ANAM = bytes.fromhex('7e7902007f790200')
+
+    def test_anam_carries_parent_and_previous(self):
+        """The parent link survives whole instead of as its low two bytes."""
+        from tes4_export.tes4_reader import Record, Subrecord
+        from tes4_export.record_types.falloutnv import export_deltas
+        rec = Record(type='IDLE', data_size=0, flags=0, form_id=0x00027980,
+                     subrecords=[Subrecord('ANAM', self.ANAM),
+                                 Subrecord('DATA', bytes([20, 1, 3, 0, 0xF6, 0xFF, 1, 0]))])
+        got = dict(line.partition('=')[::2] for line in export_deltas(rec))
+        assert (got['ANAM.Parent'], got['ANAM.Previous']) == ('0002797E', '0002797F')
+        assert (got['DATA.AnimGroupSection'], got['DATA.LoopMin'], got['DATA.LoopMax']) == ('20', '1', '3')
+        assert (got['DATA.ReplayDelay'], got['DATA.Flags']) == ('-10', '1')
+
+    def test_tes4_layout_lines_are_superseded(self):
+        """The TES4 exporter's ANAM/DATA reading is dropped for an FNV IDLE."""
+        from tes4_export.export_falloutnv import superseded_keys
+        from tes4_export.tes4_reader import Record
+        assert superseded_keys(Record(type='IDLE', data_size=0, flags=0, form_id=1)) == ('ANAM.', 'DATA.')
+
+
 class TestINFOResultScripts(unittest.TestCase):
     """FO3/FNV INFOs embed a Begin and an End script split by NEXT; TES4 one.
 
@@ -792,3 +843,22 @@ class TestFalloutTriggerPrimitive(unittest.TestCase):
         _emit_refr_deltas(lines, rec)
         self.assertIn('XPRM.Raw=' + raw.hex().upper(), lines)
         self.assertTrue(any(l.startswith('XPRM.BoundX=') for l in lines))
+
+
+class TestPGRDInterCell(unittest.TestCase):
+    """PGRI local point is U16; the 2 bytes after it are CS garbage.
+
+    See: docs/commentary/tes5_import_navmesh.md#-corridor-redesign-regressed-edge-links--the-ribbons-never-reach-the-seam-found-2026-07-23
+    """
+
+    def test_local_point_ignores_unused_high_bytes(self):
+        """Nehrim (-16,-9) node 1 was written 0x2F620001 and dropped as out of range."""
+        import struct
+        from tes4_export.tes4_reader import Record, Subrecord
+        from tes4_export.record_types.world import export_PGRD
+        pgri = struct.pack('<HHfff', 1, 0x2F62, -61342.2265625, -34966.16015625, 2254.0)
+        rec = Record(type='PGRD', data_size=0, flags=0, form_id=1,
+                     subrecords=[Subrecord('PGRI', pgri)])
+        lines = export_PGRD(rec)
+        self.assertIn('InterCell[0].LocalPoint=1', lines)
+        self.assertIn('InterCell[0].X=-61342.2265625', lines)

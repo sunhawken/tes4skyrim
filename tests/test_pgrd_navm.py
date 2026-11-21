@@ -23,6 +23,7 @@ pytest.importorskip("numpy")
 pytest.importorskip("scipy")
 
 from tes5_import.navmesh import from_pgrd as p2n
+from tes5_import.navmesh.lookup_grid import build_navmesh_grid
 from tes5_import.navmesh.navi import build_navi_record
 
 
@@ -62,6 +63,18 @@ def test_vhgt_offset_is_scaled_like_the_deltas():
     assert grid is not None
     assert grid.min() == pytest.approx(offset * 8.0)
     assert grid.max() == pytest.approx(offset * 8.0)
+
+
+def test_wall_face_rotated_flat_becomes_floor():
+    """A cached wall face that the placement lays flat is walkable (Nehrim cave rocks)."""
+    import math
+    from tes5_import.navmesh.world import gather_cell_geometry
+    wall = [0, 0, 0, 100, 0, 0, 0, 0, 100]
+    refr = {'NAME': '00000ABC', 'PosX': '0', 'PosY': '0', 'PosZ': '0',
+            'RotX': str(math.pi / 2), 'RotY': '0', 'RotZ': '0'}
+    walk, block = gather_cell_geometry([refr], {0xABC: 'rock'},
+                                       lambda _k: {'w': [], 'b': wall})
+    assert len(walk) == 1 and len(block) == 0
 
 
 def test_vhgt_constant_slope_accumulates_linearly():
@@ -161,12 +174,23 @@ def test_all_triangles_carry_found_flag():
     assert d['flags'][0] & p2n._TRI_FLAG_FOUND
 
 
+def test_lookup_grid_lists_a_triangle_in_every_cell_it_overlaps():
+    """A long triangle is in both cells it crosses; a cell it misses lacks it.
+
+    See: docs/reference/navmesh_engine_contracts.md#the-lookup-grid
+    """
+    verts = [(0.0, 0.0, 0.0), (190.0, 10.0, 0.0), (10.0, 20.0, 0.0),
+             (150.0, 150.0, 0.0), (160.0, 150.0, 0.0), (150.0, 160.0, 0.0)]
+    grid = build_navmesh_grid(verts, [(0, 1, 2), (3, 4, 5)], 0.0, 0.0, 200.0, 200.0, 2)
+    assert grid == [[0], [0], [], [1]]
+
+
 def test_water_flag_set_below_water_height():
     verts = [(0.0, 0.0, -50.0), (100.0, 0.0, -50.0), (100.0, 100.0, -50.0),
              (0.0, 0.0, 50.0), (100.0, 0.0, 50.0), (100.0, 100.0, 50.0)]
     tris = [(0, 1, 2), (3, 4, 5)]
-    flags = p2n._compute_water_flags(verts, tris, water_z=0.0)
-    assert flags[0] == p2n._TRI_FLAG_WATER
+    flags = p2n.compute_water_flags(verts, tris, water_z=0.0)
+    assert flags[0] == p2n.TRI_FLAG_WATER
     assert flags[1] == 0
 
 
@@ -386,6 +410,17 @@ class TestNativeGrowGuards:
         return np.array([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, -1.0]],
                         dtype=np.float64)
 
+    def _params(self):
+        """The march tunables grow_strips reads, with no LAND."""
+        from tes5_import.navmesh import params as p
+        return {'land_from': float(2 ** 31 - 1), 'land_ox': 0.0, 'land_oy': 0.0,
+                'step': p.RIBBON_GROW_STEP, 'min_half': p.RIBBON_GROW_MIN_HALF,
+                'half_width': p.RIBBON_HALF_WIDTH, 'slab_half_w': p.RIBBON_GROW_SLAB_HALF_WIDTH,
+                'slab_depth': p.RIBBON_GROW_SLAB_DEPTH, 'slab_z_bottom': p.RIBBON_GROW_SLAB_Z_BOTTOM,
+                'agent_height': p.AGENT_HEIGHT, 'max_climb': p.MAX_CLIMB,
+                'ztol': p.SEED_Z_TOLERANCE, 'cap': p.RIBBON_GROW_MAX_HALF,
+                'bisect': p.RIBBON_GROW_BISECT}
+
     def _tri(self, np, y):
         return np.array([[[0.0, y, 0.0], [10.0, y, 0.0], [0.0, y, 10.0]]],
                         dtype=np.float64)
@@ -399,7 +434,7 @@ class TestNativeGrowGuards:
                                    self._tri(np, 8.936455989415117e+17)])
         with pytest.raises(ValueError):
             cg._native.grow_strips(
-                blocking, None, self._stations(np), cg._native_params())
+                blocking, None, self._stations(np), self._params())
 
     def test_non_finite_coordinate_raises(self):
         """NaN/Inf propagate through the extent maths, so reject them up front."""
@@ -410,7 +445,7 @@ class TestNativeGrowGuards:
             blocking = np.concatenate([self._tri(np, 0.0), self._tri(np, bad)])
             with pytest.raises(ValueError):
                 cg._native.grow_strips(
-                    blocking, None, self._stations(np), cg._native_params())
+                    blocking, None, self._stations(np), self._params())
 
     def test_normal_soup_still_grows(self):
         """The guards must not reject legitimate cell-sized geometry."""
@@ -420,7 +455,7 @@ class TestNativeGrowGuards:
         # A 4096-unit exterior cell is 33x33 buckets -- far under the ceiling.
         blocking = np.concatenate([self._tri(np, 0.0), self._tri(np, 4096.0)])
         out = cg._native.grow_strips(
-            blocking, None, self._stations(np), cg._native_params())
+            blocking, None, self._stations(np), self._params())
         assert len(out) == 1
         assert out[0] >= 0.0
 
@@ -429,58 +464,35 @@ class TestPlacementSanity:
     """Garbage REFR placements must be dropped before they reach the native code."""
 
     def test_absurd_and_non_finite_placements_rejected(self):
+        """Nehrim's PosY 8.9e17, NaN, inf, a NaN scale and 2x MAX_PLACEMENT all fail."""
         np = pytest.importorskip("numpy")
-        from tes5_import.navmesh.world import (_finite_placement,
-                                              MAX_PLACEMENT)
+        from tes5_import.navmesh.world import finite_placement, MAX_PLACEMENT
 
         ok = np.array([100.0, -200.0, 30.0])
-        assert _finite_placement(ok, 1.0)
-        # Nehrim's real garbage value.
-        assert not _finite_placement(
-            np.array([1.68e-36, 8.936455989415117e+17, 0.0]), 1.0)
-        assert not _finite_placement(
-            np.array([0.0, float('nan'), 0.0]), 1.0)
-        assert not _finite_placement(
-            np.array([0.0, float('inf'), 0.0]), 1.0)
-        assert not _finite_placement(ok, float('nan'))
-        assert not _finite_placement(
-            np.array([MAX_PLACEMENT * 2, 0.0, 0.0]), 1.0)
+        assert finite_placement(ok, 1.0)
+        for bad in ([1.68e-36, 8.936455989415117e+17, 0.0], [0.0, float('nan'), 0.0],
+                    [0.0, float('inf'), 0.0], [MAX_PLACEMENT * 2, 0.0, 0.0]):
+            assert not finite_placement(np.array(bad), 1.0)
+        assert not finite_placement(ok, float('nan'))
 
+    def test_wild_pathgrid_points_dropped_and_renumbered(self):
+        """Issue #112: points 1 and 3 at 1.5e9 go with their edges; the rest and the InterCell renumber."""
+        from tes5_import.navmesh.from_pgrd import cell_graph, record_graph
 
-class TestStoreyGroupsDoorGrouping:
-    """group_polys must stay index-aligned with the group list it mirrors."""
+        wild = (1523151872.0, -1074418304.0, 1388934016.0)
+        pts = [(10.0, 10.0, 0.0), wild, (500.0, 10.0, 0.0), wild, (900.0, 10.0, 0.0)]
+        nbrs = {0: [1, 2], 1: [0, 3], 2: [0, 4], 3: [1, 4], 4: [2, 3]}
+        rec = {'DATA.PointCount': '5', 'ParentWRLD': '0000003C',
+               'InterCellCount': '2', 'InterCell[0].LocalPoint': '4',
+               'InterCell[0].X': '4200.0', 'InterCell[0].Y': '10.0', 'InterCell[0].Z': '0.0',
+               'InterCell[1].LocalPoint': '3',
+               'InterCell[1].X': '4200.0', 'InterCell[1].Y': '20.0', 'InterCell[1].Z': '0.0'}
+        for i, (x, y, z) in enumerate(pts):
+            rec.update({'Point[%d].X' % i: repr(x), 'Point[%d].Y' % i: repr(y),
+                        'Point[%d].Z' % i: repr(z), 'Point[%d].Connections' % i: str(len(nbrs[i]))})
+            rec.update(('Point[%d].Edge[%d]' % (i, n), str(t)) for n, t in enumerate(nbrs[i]))
 
-    def test_unmatched_door_strips_do_not_desync_group_polys(self):
-        """A door that matches no group appends to `out`; group_polys must grow too.
-
-        Without that, the NEXT door's group_polys[gi] ran off the end and raised
-        IndexError -- which run_job swallowed, so the cell silently shipped with
-        no navmesh at all (measured on Nehrim cells 012217C1 and 01193F44).
-        """
-        pytest.importorskip("numpy")
-        pytest.importorskip("shapely")
-        from tes5_import.navmesh import corridor_union as cu
-
-        def ribbon(x, y, z, edge):
-            half = 20.0
-            return {
-                'edge': edge,
-                'a': (x, y, z), 'b': (x + 100.0, y, z),
-                'na': (x, y, z), 'nb': (x + 100.0, y, z),
-                'poly': [(x, y - half), (x + 100.0, y - half),
-                         (x + 100.0, y + half), (x, y + half)],
-            }
-
-        # The failure needs a specific ORDER. Door 1 matches nothing (far from
-        # the ribbon in plan), so it self-appends as a new group. Door 2 then
-        # OVERLAPS door 1 in plan and height, so the `enumerate(out)` scan
-        # reaches that newly-appended index and reads group_polys[gi] -- which,
-        # unless group_polys grew in step, is off the end of the list.
-        strips = [
-            ribbon(0.0, 0.0, 0.0, (0, 1)),              # real ribbon
-            ribbon(50000.0, 50000.0, 9000.0, (-1, -1)),  # door 1: no match
-            ribbon(50010.0, 50000.0, 9000.0, (-1, -1)),  # door 2: overlaps it
-        ]
-        groups = cu._storey_groups(strips)
-        placed = sum(len(g) for g in groups)
-        assert placed == len(strips), 'every strip must land in exactly one group'
+        assert record_graph(rec) == ([pts[0], pts[2], pts[4]], [(0, 1), (1, 2)])
+        points, edges, *_ = cell_graph(rec, {'XCLC.X': '0', 'XCLC.Y': '0'})
+        assert points[3] == (4200.0, 10.0, 0.0)
+        assert edges == [(0, 1), (1, 2), (2, 3)]

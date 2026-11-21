@@ -17,6 +17,9 @@ import hashlib
 import struct
 import threading
 
+from core.skyrim_language import text_codec
+
+from .formid_hash import hash_key
 from .tes5_reader import (GRP_HDR, GRP_TEMPORARY_CHILDREN, REC_HDR,
                           SUB_HDR, walk)
 
@@ -79,16 +82,17 @@ def pack_subrecord(sig: str, data: bytes) -> bytes:
     return sig_bytes + struct.pack('<H', len(data)) + data
 
 
-def pack_string_subrecord(sig: str, value: str) -> bytes:
-    """Pack a null-terminated string subrecord.
+def encode_string(value: str) -> bytes:
+    """`value` NUL-terminated, in the code page Skyrim reads plugin text in.
 
-    TES5 plugins store text as cp1252 (Windows-1252) -- the same encoding
-    TES4 uses, and xEdit's default (wbEncoding := wbMBCSEncoding(1252)).
-    Writing UTF-8 turns one authored character into a multi-byte run that
-    the engine renders as one garbage glyph per byte.
+    See: docs/commentary/tes4_export_text_encoding.md#writing-skyrim-text
     """
-    data = value.encode('cp1252', errors='replace') + b'\x00'
-    return pack_subrecord(sig, data)
+    return (value or '').encode(text_codec(), errors='replace') + b'\x00'
+
+
+def pack_string_subrecord(sig: str, value: str) -> bytes:
+    """Pack a null-terminated string subrecord."""
+    return pack_subrecord(sig, encode_string(value))
 
 
 def pack_record(sig: str, form_id: int, flags: int, subrecords: bytes,
@@ -784,6 +788,9 @@ class PluginWriter:
         w.write('output.esm')
     """
 
+    #: A child plugin's overrides.adoption.MasterAdoption, else None.
+    adoption = None
+
     def __init__(self, masters: list = None, is_esm: bool = True,
                  author: str = "TES4-to-TES5 Converter",
                  description: str = ""):
@@ -906,7 +913,7 @@ class PluginWriter:
             if existing is not None:
                 return existing
 
-            payload = f'{site}\x00{key!r}'.encode('utf-8')
+            payload = f'{site}\x00{hash_key(key, self.masters)!r}'.encode('utf-8')
             probe = 0
             while True:
                 salt = b'' if probe == 0 else b'\x00%d' % probe
@@ -984,6 +991,22 @@ class PluginWriter:
                 self._top_groups[group_sig] = []
             self._top_groups[group_sig].append(record_bytes)
             self._record_count += 1
+
+    def top_records(self):
+        """Yield every top-level record's bytes, never a pre-built GRUP."""
+        for blobs in self._top_groups.values():
+            yield from (b for b in blobs if b[:4] != b'GRUP')
+
+    def remove_records(self, unwanted) -> int:
+        """Remove each top-level record for which `unwanted(bytes)` holds; returns the count."""
+        removed = 0
+        with self._lock:
+            for blobs in self._top_groups.values():
+                kept = [b for b in blobs if b[:4] == b'GRUP' or not unwanted(b)]
+                removed += len(blobs) - len(kept)
+                blobs[:] = kept
+            self._record_count -= removed
+        return removed
 
     def add_raw_group(self, group_sig: str, group_bytes: bytes):
         """Add pre-built group bytes (for CELL/WRLD/DIAL hierarchies)."""
@@ -1105,6 +1128,7 @@ class PluginWriter:
         after CELL/WRLD, so never rely on the tail for a base-object type.
 
         See: docs/commentary/ck_reference_init_hang.md#top-level-group-order-1852
+        See: docs/commentary/ck_reference_init_hang.md#group-slot-reasons
         """
         order = [
             'GMST', 'KYWD', 'TXST', 'GLOB', 'CLAS', 'FACT', 'HDPT', 'EYES',
@@ -1114,61 +1138,27 @@ class PluginWriter:
             'IPCT', 'IPDS', 'FSTP', 'FSTS',
             'STAT', 'MSTT', 'ACTI', 'TACT', 'CONT', 'DOOR',
             'FLOR', 'FURN', 'GRAS', 'TREE', 'LIGH', 'MISC', 'KEYM', 'ARMO',
-            'ARMA', 'BOOK', 'AMMO', 'ENCH', 'SPEL', 'ALCH', 'INGR', 'SCRL',
-            'PROJ',
+            'ARMA', 'BOOK', 'AMMO', 'ENCH', 'SPEL', 'ALCH', 'IDLM', 'INGR', 'SCRL',
+            'PROJ', 'EXPL', 'ADDN',
             'SLGM', 'VTYP', 'OTFT', 'NPC_', 'LVLN', 'LVLI', 'LVSP',
-            # IMGS before WTHR: a weather's IMSP points at the imagespaces
-            # carrying its HDR tone mapping, and CLMT/REGN then point at WTHR.
             'IMGS', 'WTHR',
             'CLMT', 'REGN', 'IDLE', 'PACK', 'EFSH', 'LSCR', 'ANIO',
             'WEAP', 'NAVI',
-            # References resolved by quests must exist before QUST loads:
             'CELL', 'WRLD',
             'DIAL',
             'QUST',
-            # LCTN must come AFTER CELL/WRLD (vanilla: ... ECZN LCTN ... DLBR
-            # DLVW at the very end): the CK resolves each Location's LCEC
-            # worldspace + MNAM marker ref when the LCTN group loads, and with
-            # LCTN first every location logged "Could not find worldspace
-            # (0100003C) in load" — 512 warnings and undiscoverable markers.
-            # Vanilla order after CELL is …ANIO WATR EFSH … IMAD FLST PERK …
-            # ECZN LCTN MESG…, so WATR and FLST belong here rather than in the
-            # leftover tail.  Nothing resolves either at parse time (vanilla
-            # itself puts them after CELL), but pinning them keeps the layout
-            # independent of the order groups were added in.
-            'WATR', 'FLST',
+            'WATR', 'FLST', 'PERK',
             'ECZN',
             'LCTN',
-            # Vanilla puts MESG just after LCTN. Nothing in a MESG is resolved
-            # order-sensitively at load (ours carry no conditions), but keep
-            # the canonical slot rather than letting it append after DLVW.
             'MESG',
-            # DOBJ sits between MESG and MUSC in vanilla (…LCTN MESG RGDL
-            # DOBJ LGTM MUSC…).  Ours overrides the master's default-object
-            # table to repoint BTMS at our Battle music, so it must precede
-            # MUSC for the form it names to already be in the file.
             'DOBJ',
             'LGTM',
-            # MUSC/MUST sit AFTER CELL in vanilla (measured on the real
-            # Skyrim.esm top-level order: CELL 57, WRLD 58, LCTN 86, MUSC 91,
-            # DLBR 97, MUST 98).  Unlike a REFR base object, a cell's XCMO is
-            # not resolved when the CELL group parses -- vanilla's own 701
-            # XCMO cells load with the music groups 34 slots later -- so the
-            # base-object rule above does not apply and the canonical slot is
-            # the right one.  MUSC precedes MUST even though MUSC.TNAM points
-            # at MUST, for the same reason.
             'MUSC',
             'SMBN', 'SMQN', 'SMEN',
-            'DLBR', 'MUST', 'DLVW',
-            # Vanilla tail: …MATO MOVT HAZD SNDR DUAL SNCT SOPM COLL CLFM REVB.
+            'DLBR', 'MUST', 'DLVW', 'SCEN',
             'MOVT',
-            # CLFM holds the generated hair colors (one per distinct authored
-            # Oblivion HCLR — see record_types/actors.convert_hair_colors).
-            # Nothing resolves it at parse time; pinning the canonical slot
-            # keeps the layout independent of when the group was added.
             'CLFM',
         ]
-        # Append any groups not in the canonical order
         for sig in self._top_groups:
             if sig not in order:
                 order.append(sig)

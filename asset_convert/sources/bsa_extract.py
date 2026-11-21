@@ -1,11 +1,11 @@
-"""Extract assets from Oblivion BSA archives with caching support.
+"""Extract assets from BSA archives with caching support.
 
 Extracts meshes, textures, and sounds from BSA files into the export directory,
 organized by source file. Uses a manifest file to track what has already been
 extracted, preventing redundant re-extraction on reruns.
 
-Uses a native BSA reader (no external dependencies) that handles both
-uncompressed and zlib-compressed Oblivion BSAs.
+Reads TES4, FO3 and Skyrim LE/SE archives natively; Morrowind's are read by
+bsa_extract_morrowind.
 
 Voice file organization:
   TES4 voice path: Sound\\Voice\\<plugin>\\<Race>\\<Gender>\\<quest>_<topic>_<infoFID>_<resp>.mp3
@@ -19,8 +19,11 @@ import shutil
 import struct
 import zlib
 from pathlib import Path
+import lz4.frame
 from asset_convert.sources.bsa_extract_morrowind import (
-    copy_loose_sounds, is_morrowind_bsa, iter_bsa as iter_morrowind_bsa)
+    is_morrowind_bsa, iter_bsa as iter_morrowind_bsa)
+from asset_convert.sources.bsa_extract_morrowind_sounds import (
+    extract_loose_audio)
 from asset_convert.audio.audio_converter import (
     organize_voice_files,
 )
@@ -30,81 +33,13 @@ from core.worker_budget import worker_count
 _WORKER_COUNT = worker_count()
 
 
-def read_bsa_files(bsa_path, wanted_names):
-    """Read specific files out of a TES4/FO3/Skyrim LE/Skyrim SE BSA
-    (versions 103/104/105) without extracting the archive.
-
-    Layout differences (verified against xEdit wbBSArchive.pas):
-      - v105 (SSE) folder record = hash(8) count(4) unk(4) offset(8);
-        v103/104 = hash(8) count(4) offset(4)
-      - archiveFlags 0x100 (v104/105): file data prefixed with bstring name
-      - compression: zlib (v103/104), LZ4 *frame* (v105); compressed data =
-        u32 uncompressed size + payload
-
-    `wanted_names`: full archive paths (``folder\\file``, any case/slashes).
-    Returns {normalized_path: bytes} for entries found; only matched entries
-    are decompressed.
-    """
-    wanted = {w.lower().replace('/', '\\') for w in wanted_names}
-    found = {}
-    with open(bsa_path, 'rb') as fh:
-        head = fh.read(36)
-        if head[:4] != b'BSA\x00':
-            raise ValueError(f'Not a BSA file: {bsa_path}')
-        (version, dir_offset, flags, folder_count, _file_count, _,
-         total_fname_len, _) = struct.unpack_from('<IIIIIIII', head, 4)
-        compress_default = bool(flags & 0x0004)
-        embedded_names = version >= 104 and bool(flags & 0x0100)
-
-        fh.seek(dir_offset)
-        folder_counts = []
-        for _ in range(folder_count):
-            if version >= 105:
-                _h, cnt, _unk, _off = struct.unpack('<QIIq', fh.read(24))
-            else:
-                _h, cnt, _off = struct.unpack('<QII', fh.read(16))
-            folder_counts.append(cnt)
-
-        records = []   # [folder, size, offset]
-        for cnt in folder_counts:
-            name_len = fh.read(1)[0]
-            folder = fh.read(name_len).rstrip(b'\x00').decode('latin-1')
-            for _ in range(cnt):
-                _h, size, offset = struct.unpack('<QII', fh.read(16))
-                records.append([folder, size, offset])
-
-        names = fh.read(total_fname_len).split(b'\x00')
-        for folder, size, offset in records:
-            if not names:
-                break
-            fname = names.pop(0).decode('latin-1')
-            path = (folder + '\\' + fname if folder else fname).lower()
-            if path not in wanted:
-                continue
-            fh.seek(offset)
-            compressed = bool(size & 0x40000000) ^ compress_default
-            size &= ~0x40000000
-            if embedded_names:
-                nlen = fh.read(1)[0]
-                fh.read(nlen)
-                size -= 1 + nlen
-            data = fh.read(size)
-            if compressed:
-                if version >= 105:
-                    import lz4.frame   # only needed for SSE archives
-                    data = lz4.frame.decompress(data[4:])
-                else:
-                    data = zlib.decompress(data[4:])
-            found[path] = data
-            if len(found) == len(wanted):
-                break
-    return found
-
-
 #: Extra archive bases per stem, in probe order. See: docs/commentary/asset_convert_mod_ingest.md#update-bsa
 _EXTRA_BSA_BASES = {
     "nehrim": ["N", "L"],
     "falloutnv": ["Fallout", "Update"],
+    "fallout3": ["Fallout"],
+    "Arktwend_English": ["Morrowind", "Bloodmoon", "Tribunal"],
+    "Arktwend 2.0.0 (DE)": ["Morrowind", "Bloodmoon", "Tribunal"]
 }
 
 # GOTY Oblivion.esm has Shivering Isles MERGED INTO IT: every SI record lives
@@ -176,6 +111,7 @@ def get_bsa_files(data_path, source_file):
     for base in bases:
         # Split BSAs (Oblivion - Meshes.bsa, N - Textures1.bsa, etc.)
         for pattern in [
+            f"{base} - Main.bsa",  # Fallout 3 DLC (Anchorage - Main.bsa)
             f"{base} - Meshes.bsa",
             f"{base} - Meshes2.bsa",
             f"{base} - Textures - Compressed.bsa",
@@ -189,6 +125,7 @@ def get_bsa_files(data_path, source_file):
             f"{base} - Voices.bsa",
             f"{base} - Voices1.bsa",  # Oblivion splits voices across two BSAs
             f"{base} - Voices2.bsa",
+            f"{base} - MenuVoices.bsa",
         ]:
             _try(pattern)
 
@@ -246,7 +183,11 @@ def categorize(filepath):
     return '/'.join([category] + parts)
 
 
-# Manifest file tracks what BSAs have been extracted
+# ---------------------------------------------------------------------------
+# Extraction manifest
+# ---------------------------------------------------------------------------
+
+#: Records each extracted BSA's path, size and file count in the folder it filled.
 MANIFEST_NAME = '.bsa_extract_manifest.json'
 
 
@@ -267,105 +208,106 @@ def save_manifest(extract_dir, manifest):
         json.dump(manifest, f, indent=2)
 
 
+def extracted_from(base_dir, bsa_files) -> list:
+    """Where `base_dir`'s earlier archives came from, when not among `bsa_files`.
+
+    An entry written before paths were recorded is named by its archive alone.
+    """
+    current = {os.path.normcase(str(b)) for b in bsa_files}
+    names = {Path(b).name for b in bsa_files}
+    out = set()
+    for name, row in load_manifest(base_dir)['extracted_bsas'].items():
+        path = row.get('path')
+        if path and os.path.normcase(path) not in current:
+            out.add(str(Path(path).parent))
+        elif not path and name not in names:
+            out.add(f'{name} (folder not recorded)')
+    return sorted(out)
+
+
+def _warn_mixed_sources(base_dir, data_path, bsa_files) -> None:
+    """Say where extraction reads from, and warn when `base_dir` already holds other archives' files."""
+    print(f"Extracting from {data_path} into {base_dir}")
+    for other in extracted_from(base_dir, bsa_files):
+        print(f"  WARNING: {base_dir} also holds files extracted from {other}; "
+              f"clear it for a clean extraction from {data_path}")
+
+
 # ---------------------------------------------------------------------------
 # BSA archive reading
 # ---------------------------------------------------------------------------
-def _read_bsa_directory(data, dir_offset, folder_count, compressed_by_default,
-                        file_compress_flag):
-    """Every file record in a BSA directory, and the offset the name block starts at.
+#: Archive flag: files are compressed unless their size carries `_FILE_COMPRESS`.
+_ARCH_COMPRESS = 0x0004
 
-    Returns ([(folder_name, size, offset, is_compressed)], name_block_offset).
-    A record's size carries the per-file compress flag, which INVERTS the
-    archive default rather than setting it.
+#: Archive flag (v104+): each file's data starts with its own bstring path.
+_ARCH_EMBED_NAME = 0x0100
+
+#: File size bit that INVERTS the archive's compression default for that file.
+_FILE_COMPRESS = 0x40000000
+
+
+def read_bsa_directory(fh):
+    """Parse the directory of an open TES4/FO3/Skyrim LE/SE BSA (v103/104/105).
+
+    Returns (version, archive_flags, [(path, size, offset, compressed)]).
+    Folder records are 24 bytes in v105 (64-bit offset) and 16 before it; file
+    records are 16 in every version (xEdit wbBSArchive.pas).
     """
-    folders = []
-    pos = dir_offset
-    for _ in range(folder_count):
-        _, f_count, f_offset = struct.unpack_from('<QII', data, pos)
-        folders.append((f_count, f_offset))
-        pos += 16
-
-    file_records = []
-    pos = dir_offset + folder_count * 16
-    for f_count, _ in folders:
-        name_len = data[pos]
-        folder_name = data[pos + 1: pos + name_len].rstrip(b'\x00').decode('latin-1')
-        pos += 1 + name_len
-        for _ in range(f_count):
-            _, f_size, f_offset = struct.unpack_from('<QII', data, pos)
-            pos += 16
-            is_comp = compressed_by_default ^ bool(f_size & file_compress_flag)
-            file_records.append((folder_name, f_size & ~file_compress_flag,
-                                 f_offset, is_comp))
-    return file_records, pos
+    head = fh.read(36)
+    if head[:4] != b'BSA\x00':
+        raise ValueError(f'Not a BSA file: {fh.name}')
+    version, dir_offset, flags, folder_count, _, _, names_len, _ = struct.unpack_from('<8I', head, 4)
+    fh.seek(dir_offset)
+    record_size = 24 if version >= 105 else 16
+    counts = [struct.unpack_from('<I', fh.read(record_size), 8)[0] for _ in range(folder_count)]
+    records = []
+    for count in counts:
+        folder = fh.read(fh.read(1)[0]).rstrip(b'\x00').decode('latin-1')
+        records += [(folder, *struct.unpack('<8xII', fh.read(16))) for _ in range(count)]
+    names = fh.read(names_len).decode('latin-1').split('\x00')
+    default = bool(flags & _ARCH_COMPRESS)
+    return version, flags, [
+        ('\\'.join(filter(None, (folder, name))), size & ~_FILE_COMPRESS, offset,
+         default ^ bool(size & _FILE_COMPRESS))
+        for (folder, size, offset), name in zip(records, names)]
 
 
-def _iter_bsa(bsa_path):
-    """Yield (filepath_str, data_bytes) for every file in an Oblivion BSA.
+def iter_bsa(bsa_path, wanted=None):
+    """Yield (path, bytes) for every entry, or those whose lowercase path is in `wanted`.
 
-    Handles both uncompressed and zlib-compressed BSAs natively.
-
-    BSA layout (Oblivion, version 0x67):
-      Header (36 bytes):
-        magic(4) version(4) dirOffset(4) archiveFlags(4)
-        folderCount(4) fileCount(4) totalFolderNameLen(4)
-        totalFileNameLen(4) fileFlags(4)
-      Folder records (folderCount × 16):  hash(8) fileCount(4) dataOffset(4)
-      Per-folder data block:
-        nameLen(1) folderName(nameLen)  [null-terminated, nameLen includes null]
-        File records (fileCount × 16):  hash(8) size(4) offset(4)
-      File name block:  null-terminated strings, one per file in folder order
+    Reads v103/104 (zlib) and v105 (LZ4 frame) archives; an entry whose
+    compressed payload is corrupt is skipped.
     """
-    BSA_MAGIC      = b'BSA\x00'
-    ARCH_COMPRESS  = 0x0004
-    ARCH_EMBED_NAME = 0x0100
-    FILE_COMPRESS  = 0x40000000  # per-file size flag that inverts default
-
-    data = Path(bsa_path).read_bytes()
-    if data[:4] != BSA_MAGIC:
-        raise ValueError(f"Not a BSA file: {bsa_path}")
-
-    (version, dir_offset, archive_flags,
-     folder_count, _, _, total_file_name_len, _
-    ) = struct.unpack_from('<IIIIIIII', data, 4)
-
-    compressed_by_default = bool(archive_flags & ARCH_COMPRESS)
-    embedded_names = version >= 104 and bool(archive_flags & ARCH_EMBED_NAME)
-
-    file_records, pos = _read_bsa_directory(
-        data, dir_offset, folder_count, compressed_by_default, FILE_COMPRESS)
-    file_names = data[pos: pos + total_file_name_len].split(b'\x00')
-
-    # --- Yield files ---
-    for idx, (folder_name, f_size, f_offset, is_comp) in enumerate(file_records):
-        if idx >= len(file_names):
-            break
-        file_name = file_names[idx].decode('latin-1')
-        filepath   = folder_name + '\\' + file_name if folder_name else file_name
-
-        start, size = f_offset, f_size
-        if embedded_names:
-            start += 1 + data[f_offset]
-            size -= 1 + data[f_offset]
-        raw = data[start: start + size]
-        if is_comp:
+    with open(bsa_path, 'rb') as fh:
+        version, flags, entries = read_bsa_directory(fh)
+        embedded = version >= 104 and flags & _ARCH_EMBED_NAME
+        decompress = lz4.frame.decompress if version >= 105 else zlib.decompress
+        for path, size, offset, compressed in entries:
+            if wanted is not None and path.lower() not in wanted:
+                continue
+            fh.seek(offset)
+            if embedded:
+                name_len = fh.read(1)[0]
+                fh.seek(name_len, 1)
+                size -= 1 + name_len
+            data = fh.read(size)
             try:
-                raw = zlib.decompress(raw[4:])   # first 4 bytes = uncompressed size
-            except zlib.error:
-                continue   # skip corrupt/unsupported compressed entry
+                yield path, decompress(data[4:]) if compressed else data
+            except (zlib.error, RuntimeError):
+                continue
 
-        yield filepath, raw
+
+def read_bsa_files(bsa_path, wanted_names):
+    """{lowercase path: bytes} for the named entries (any case or slashes) found."""
+    wanted = {w.lower().replace('/', '\\') for w in wanted_names}
+    return {path.lower(): data for path, data in iter_bsa(bsa_path, wanted)}
 
 
 def _open_archive(bsa_path):
-    """An iterator of (path, bytes) for a BSA of any supported generation.
-
-    Morrowind's archive shares no structure with Oblivion's, so it is read by
-    its own module rather than by a branch inside this one.
-    """
+    """An iterator of (path, bytes) for a BSA of any supported generation."""
     if is_morrowind_bsa(bsa_path):
         return iter_morrowind_bsa(bsa_path)
-    return _iter_bsa(bsa_path)
+    return iter_bsa(bsa_path)
 
 
 def extract_bsa(bsa_path, extract_dir, force=False, source_name=None):
@@ -393,7 +335,7 @@ def extract_bsa(bsa_path, extract_dir, force=False, source_name=None):
 
     if not force and bsa_key in manifest['extracted_bsas']:
         prev = manifest['extracted_bsas'][bsa_key]
-        if prev.get('size') == bsa_size:
+        if prev.get('size') == bsa_size and prev.get('path', str(bsa_path)) == str(bsa_path):
             print(f"  Skipping {bsa_key} (already extracted, {prev['file_count']} files)")
             return {'total_files': 0, 'extracted': 0, 'skipped_cached': True,
                     'skipped': 0, 'errors': 0}
@@ -447,6 +389,7 @@ def extract_bsa(bsa_path, extract_dir, force=False, source_name=None):
                 print(f"    ERROR writing {filepath}: {e}")
 
     manifest['extracted_bsas'][bsa_key] = {
+        'path': str(bsa_path),
         'size': bsa_size,
         'file_count': stats['extracted'],
         'total_in_bsa': stats['total_files'],
@@ -484,7 +427,7 @@ def extract_assets_for_file(source_file, data_path, extract_dir, force=False):
         print(f"No BSA files found for {source_file} in {data_path}")
         return {'bsas_found': 0}
 
-    print(f"Found {len(bsa_files)} BSA(s) for {source_file}:")
+    print(f"Found {len(bsa_files)} BSA(s) for {source_file} in {data_path}:")
     for b in bsa_files:
         print(f"  {b.name} ({b.stat().st_size / 1024 / 1024:.1f} MB)")
 
@@ -499,6 +442,7 @@ def extract_assets_for_file(source_file, data_path, extract_dir, force=False):
         asset_dir_name = asset_root(extract_dir, source_file).name
     except ImportError:
         asset_dir_name = source_file
+    _warn_mixed_sources(Path(extract_dir) / asset_dir_name, data_path, bsa_files)
 
     for bsa_file in bsa_files:
         stats = extract_bsa(bsa_file, extract_dir, force=force,
@@ -516,11 +460,9 @@ def extract_assets_for_file(source_file, data_path, extract_dir, force=False):
 
     totals['music'] = extract_loose_music(source_file, data_path, extract_dir,
                                           asset_dir_name, force=force)
-    if (any(is_morrowind_bsa(b) for b in bsa_files)
-            and _is_masterless(extract_dir, source_file)):
-        totals['sounds'] = copy_loose_sounds(
-            data_path, Path(extract_dir) / asset_dir_name)
-        print(f"Loose Morrowind sounds: {totals['sounds']} files copied")
+    if any(is_morrowind_bsa(b) for b in bsa_files):
+        totals.update(extract_loose_audio(data_path, extract_dir,
+                                          asset_dir_name, source_file))
     return totals
 
 
@@ -548,8 +490,9 @@ def _is_masterless(extract_dir, source_file) -> bool:
     """
     try:
         from output_layout import record_dir
-        from asset_convert.lod.terrain_lod import master_names
-        return not master_names(record_dir(str(extract_dir), source_file))
+        from core.plugin_masters import masters_from_export_header
+        return not masters_from_export_header(
+            str(record_dir(str(extract_dir), source_file)))
     except Exception:
         return False
 

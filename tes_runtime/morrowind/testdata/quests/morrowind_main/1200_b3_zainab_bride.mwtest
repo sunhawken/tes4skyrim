@@ -1,0 +1,140 @@
+# B3 "Zainab Nerevarine": Ashkhan Kaushad names the player Nerevarine only for
+# a high-born Telvanni bride, so the wise woman Sonummu Zabamat's plan passes a
+# slave, Falura Llervu, off as one: dressed, perfumed and bought from Savile
+# Imayn at Tel Aruhn, she is escorted to the ashkhan's yurt.
+# PositionCell and Position stand in for the player's travel until Falura
+# follows; the escort back is steered at the controls in straight runs along
+# the navmesh, swimming off Tel Aruhn's island, with the creatures on the way
+# killed first and any that attacks fought off, so she does not stop to fight
+# them; AddItem buys # the clothes, perfume and her price, and the console's damageav for the fight
+# with Calvario; ref FormIDs carry Morrowind.esm's slot 05.
+# Run: python -m tools.live.test_instance mwtest --cases <this folder> --fast --checkpoints --stop-on-fail --from b3_task
+# See docs/commentary/headless_testing.md#quest-runs
+
+# Kaushad laughs at an outlander's claim; once well disposed (70, bribed) he
+# sets a task: the vampire Calvario in Nerano Ancestral Tomb. With Calvario
+# dead he wants a bride.
+case b3_task
+run
+player->AddItem gold_001 2000
+player->PositionCell -7 393 -174 0 "Zainab Camp, Ashkhan's Yurt"
+until 600 GetPCCell "Zainab Camp, Ashkhan's Yurt" == 1
+talk kaushad
+ask Nerevarine
+expect GetJournalIndex B3_ZainabBride == 1
+persuade bribe1000
+persuade bribe100
+persuade bribe100
+persuade bribe100
+expect "kaushad"->GetDisposition >= 70
+ask Nerevarine
+choose 2
+choose 5
+expect GetJournalIndex B3_ZainabBride == 5
+bye
+run
+player->PositionCell -1100 1196 -682 180 "Nerano Ancestral Tomb"
+until 600 GetPCCell "Nerano Ancestral Tomb" == 1
+console 05389FF4.damageav health 10000
+until 300 "calvario"->GetHealth <= 0
+run
+player->PositionCell -7 393 -174 0 "Zainab Camp, Ashkhan's Yurt"
+until 600 GetPCCell "Zainab Camp, Ashkhan's Yurt" == 1
+talk kaushad
+ask Nerevarine
+choose 3
+expect GetJournalIndex B3_ZainabBride == 22
+bye
+end
+
+# Sonummu sends the player to Tel Aruhn; Savile Imayn names the clothes and
+# the perfume, then sells Falura for 1200 drakes and hands over the cage key.
+case b3_savile
+run
+player->PositionCell -22 385 -261 0 "Zainab Camp, Wise Woman's Yurt"
+until 600 GetPCCell "Zainab Camp, Wise Woman's Yurt" == 1
+talk sonummu zabamat
+ask Counsel
+expect GetJournalIndex B3_ZainabBride == 25
+bye
+run
+player->AddItem exquisite_shirt_01 1
+player->AddItem exquisite_skirt_01 1
+player->AddItem exquisite_shoes_01 1
+player->AddItem potion_t_bug_musk_01 1
+player->AddItem gold_001 1500
+player->Position 123900 48097 745 90
+until 300 "savile imayn"->GetDistance player < 300
+talk savile imayn
+ask something special
+expect GetJournalIndex B3_ZainabBride == 30
+ask something special
+expect GetJournalIndex B3_ZainabBride == 35
+ask something special
+choose 2
+expect GetJournalIndex B3_ZainabBride == 40
+expect player->GetItemCount Key_SavileCageKey == 1
+bye
+end
+
+# The key opens her cage; given the clothes and perfume she follows the player
+# to the ashkhan's yurt, where Kaushad weds her and names the player Nerevarine.
+case b3_bride
+run
+player->Position 124400 48300 700 180
+until 300 "falura llervu"->GetDistance player < 400
+activate 055FA5D7
+talk falura llervu
+ask Falura Llervu
+choose 1
+ask some presents
+expect GetJournalIndex B3_ZainabBride == 45
+ask travel together
+choose 5
+bye
+until 300 "falura llervu"->GetCurrentAiPackage == 3
+run
+console 05AC6B55.kill
+console 05CDE7CD.kill
+console 053BAE90.kill
+console 05D74070.kill
+console 05D92CDB.kill
+console 053629A6.kill
+console 05E97020.kill
+console 05883A77.kill
+console 05B26D65.kill
+console 05A4D854.kill
+console 054E7794.kill
+console 05428D4A.kill
+console 0541440D.kill
+console 056C59A3.kill
+console 0575BD2D.kill
+defend
+# The player stands on the open ground north of the slave pods (hers at 124220 48084 and another at
+# 124552 48121 hang from root hooks over rocks, an invisible collision wall behind hers): placed at
+# her pod's door, the player perched on the rocks 250 above the ground, off the navmesh, and every
+# leg away jammed.
+steer 124554 49596 868
+until 3000 "falura llervu"->GetDistance player < 600
+# One walk to the yurt door; she follows (rule 17: the old 60-leg steer chain flaked).
+walk 76766 83714 776
+until 3000 "falura llervu"->GetDistance player < 500
+activate 05AB7B01
+until 600 GetPCCell "Zainab Camp, Ashkhan's Yurt" == 1
+until 900 GetJournalIndex B3_ZainabBride == 47
+until 600 MenuMode == 1
+bye
+talk kaushad
+ask Telvanni bride
+expect GetJournalIndex B3_ZainabBride == 50
+expect player->GetItemCount Thong == 1
+bye
+talk falura llervu
+ask my bridegroom
+expect GetJournalIndex B3_ZainabBride == 55
+bye
+talk kaushad
+ask Telvanni bride
+expect GetJournalIndex B3_ZainabBride == 60
+bye
+end

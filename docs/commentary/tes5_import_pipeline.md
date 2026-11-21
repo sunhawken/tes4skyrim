@@ -18,13 +18,16 @@ The layer rules and the decision procedure are in
 - [Phase 0 — a dependent plugin does not re-create support records](#phase-0-dependent-skips-support-records)
 - [Phase 0 — the voice map reads the MASTERS' races and actors](#phase-0-voice-map-reads-masters)
 - [Phase 0 — chargen menus sit at fixed ids in the reserved gap](#phase-0-chargen-menu-ids)
+- [Phase 0 — a Morrowind source binds no Papyrus object scripts](#phase-0-tes3-no-papyrus-scripts)
 - [Phase 0 — a master's id must be keyed on its export KEY](#phase-0-master-key-not-formid)
 - [Phase 0 — the cross-ref graph mirrors the CLI scan](#phase-0-xref-mirrors-cli-scan)
 - [Phase 0 — magic effects, and what must exist before items convert](#phase-0-magic-effect-prerequisites)
 - [Phase 0 — a stale bounds cache reads as all-zeroes](#phase-0-stale-bounds-cache)
+- [A cache bump strands the MASTERS, not the plugin](#stale-master-asset-caches)
 - [Phase 0 — hunt chains and script-forced packages](#phase-0-hunt-chains-and-script-packages)
 - [Phase 0 — hair lengths and race skin tones index the masters](#phase-0-hair-and-skin-index-masters)
 - [Phase 0c — combat music is reachable only through DOBJ BTMS](#phase-0c-dobj-btms)
+- [Work the export shows is unneeded is skipped](#skip-what-the-export-does-not-need)
 - [Phase 1 is serial on purpose](#phase-1-is-serial-on-purpose)
 - [A master-dependent plugin may own an entire world](#master-dependent-plugin-owns-a-world)
 - [Phase 3c — LCTN, and why a pure patch plugin skips it](#phase-3c-locations)
@@ -35,6 +38,7 @@ The layer rules and the decision procedure are in
 - [Why the patch pass runs after the records are written](#patch-pass-runs-last)
 - [Sound-slot records carry TES4 SOUN ids until patched](#sound-slot-patching)
 - [The manifest names the PLUGIN, not the export folder](#manifest-names-the-plugin)
+- [The ESM flag comes from the source header, not the extension](#the-esm-flag-comes-from-the-source-header)
 
 ## <a id="speak-as-needs-a-voiced-standin"></a>Phase 0 — speak-as topics need gates dropped AND a voiced stand-in
 
@@ -90,6 +94,8 @@ constraint. Each of these must run **before** the phase named:
 | 0f objective text | the short NNAM table | QUST | Skyrim's objective HUD shows a SHORT imperative line, not TES4's long journal entry. The curated table ships with the repo rather than being derived from the export, so this is a plain load. |
 | 0g package plan | alias indices | **both** QUST and PACK | A quest-owned package must hang off a QUST reference alias (ALPC) to outrank the actor's standing schedule, so the alias indices must be decided before either record is written — both read this one plan. |
 | 0h leveled actors | shell NPC_ per placed LVLC | the CELL/WRLD builders | Skyrim only spawns actors from ACHR→NPC_, so each placed LVLC becomes an ACHR aimed at a generated shell NPC_ whose TPLT points at the LVLN. Needs the generated creature races from 0f, and the builders read `by_type['REFR']`/`['ACHR']`. |
+| effect families | the MGEF index and one `TES4FX_*` KYWD per effect | the object/quest script plans | A converted `HasMagicEffect` binds the effect's family keyword through `WELL_KNOWN_PROPERTIES`; a script plan built first leaves the property unbound ([effect families](tes5_import_magic.md#effect-families)). |
+| crime realms | one crime FACT per realm and the `TES4CrimeFactions` FLST | the object/quest script plans | Every converted bounty/`SetPlayerInSEWorld` call reads the realm list through `WELL_KNOWN_PROPERTIES`. Planned after the scripts, the Dark Brotherhood quest's `TES4CrimeFactions` stayed unbound and `GetCrimeGoldViolent` threw every tick. |
 | 0i item index | record type + biped slot per item | Phase 1 actors | A TES4 actor equips out of one mixed CNTO inventory; TES5 needs wearables moved to a DOFT outfit and the rest left in CNTO. **A dependent plugin dresses its actors out of its MASTER's wardrobe**, so the master's item records must be in the index too, or every master-owned wearable classifies as non-wearable and the actor gets no outfit at all. |
 
 Phase 0h indexes **every LVLC reachable from here — this plugin's and its
@@ -112,6 +118,33 @@ a dependent plugin duplicates master content — **27 spurious VTYP, 35 GLOB, 27
 FACT** — and the duplicates then compete with the originals the overrides use.
 So creation is gated on `not ctx`, and a dependent plugin ADOPTS the master's
 FormIDs into the well-known registry instead (`_adopt_master_special_records`).
+Vendor and trainer factions are adopted per EditorID, and a dependent creates
+the ones its masters lack, since its merchants use service combos theirs don't
+([vendor factions in a dependent](tes5_import_actors.md#vendor-factions-in-a-dependent)).
+
+**Adoption reaches every depth of the master chain.** A header lists only the
+masters a plugin was authored against, so the plugin that OWNS the support set
+can sit one or more levels down: Grass_Aes_TRv25_05_mowed.esp lists Morrowind_ob,
+the compat patch and TR_Mainland, while the set lives in Oblivion.esm (the
+master behind Morrowind_ob and the patch). Looking only at listed masters found
+nothing, so the plugin created its own ~139 records and Tamriel_Data.esm (whose
+header also lacks Oblivion.esm) shipped 156 duplicates of Oblivion.esm's.
+`nested.inherited_masters` walks `core.plugin_masters.master_chain` and keeps each
+converted master the header omits; `reconcile_masters` lists them right after
+Skyrim.esm, so every export index still shifts by ONE amount
+(`set_formid_index_offset`), and `OverrideContext` indexes them for adoption
+only — they are never diffed against. The engine resolves a FormID's master by
+name through the file's own list (`TESFile::refModInfo`), so their place in the
+list is immaterial.
+
+🛑 Growing the master list renumbers every generated record whose
+`derive_formid` key carries a REMAPPED FormID (its index byte moves with the
+list). Tamriel_Data.esm's first build with Oblivion.esm inherited moved 4,818
+such records (2,175 ARMA, 1,077 STAT, 449 SNDR, 363 MGEF, 358 TXST, 123 OTFT,
+116 PROJ, 77 IPCT/IPDS) besides dropping its 156 duplicates, and TR_Mainland.esm's
+moved 15,246 (4,255 NAVM, 8,535 OTFT, 1,068 LCTN, ...); accepted as a one-off
+save break on 2026-09-30. See
+[FormID determinism](performance.md#formid-determinism-save-game-contract).
 
 Its own converted scripts still reference those records by name (Morroblivion's
 chargen writes `TES4ControlsDisabled`), and an unbound property is None, which
@@ -148,6 +181,20 @@ pass's `GetIsVoiceType` gates never plays its lines.
 shared-plan contract as the button menus. Their records live at FIXED ids in the
 reserved FormID gap (`writer.chargen_fid_base`) because the page/button block
 must be contiguous and ordered.
+
+## <a id="phase-0-tes3-no-papyrus-scripts"></a>Phase 0 — a Morrowind source binds no Papyrus object scripts
+
+The object-script plan (`build_object_script_plan`) attaches a VMAD naming
+`TES4_<script>` to every record whose `SCRI` resolves, masters' scripts
+included. A Morrowind export writes `SCRI` too, but its scripts run in the
+Morrowind runtime and no Papyrus is compiled for it, so each such VMAD names a
+script that never exists. On TR_Mainland and Tamriel_Data (the bedroll
+`T_Com_Furn_Bedroll_01` → the compat patch's `Bed_Standard`), Papyrus logged
+"Unable to bind script" and "missing file" for every placed one. The plan
+predates Morrowind support (f640f18, 2026-07-11, against 60a9334,
+2026-09-01), and nothing had excluded it since. `_prescan_script_plans` hands
+both builders nothing for a Morrowind source (`is_tes3_export`), which also
+clears the plan an earlier plugin in the same run left behind.
 
 ## <a id="phase-0-master-key-not-formid"></a>Phase 0 — a master's id must be keyed on its export KEY
 
@@ -201,6 +248,14 @@ missing exactly the properties the compiled script reads. `AIPackage` lists and
 `PKDT.Type` back the reconstruction of TES4's `GetCurrentAIPackage == <type>`
 (`cross_ref.pack_type`).
 
+The field-derived tables (`record_model`, `mgef_shaders`, `spell_effects`,
+`global_types`, `global_values`, `enchanted_books`) are filled by ONE function,
+`cross_ref.index_record_details`, which both the CLI scan and this graph call.
+Until 2026-09-25 this graph skipped all six. `IsSpellTarget VampDisease` then
+found no effects at import time and planned no property, while the scripts stage
+declared `TES4FX_drfa`. The Vampire quest's keyword stayed unbound, and
+`HasMagicEffectWithKeyword` rejected the None keyword every tick.
+
 **A master record's id FIELDS must be re-keyed too**, not just the outer key.
 The graph chains them: `record_scri[fid] -> script_formid_to_edid[scri]`,
 `record_base[fid] -> the base's own entry`. Re-keying only the outer key would
@@ -249,6 +304,35 @@ parses cleanly and reads as all-zeroes for that field — which is how Nehrim
 served flag-less entries for every mesh long after the HELD bit shipped, leaving
 breakaway planks and traps unreleased.
 
+`BOUNDS_SCHEMA_VERSION` (`collision_extract.py`) is bumped whenever an entry
+gains a field or a field changes meaning; a cache below it is regenerated, never
+trusted. The hole it closes: the HELD bit (bit 1) shipped 2026-08-05, but the scan
+then ran only when the cache file was ABSENT, so Nehrim kept its 2026-08-02 cache
+and 0 of its 11,946 meshes carried the bit. `needs_havok_release` answered False
+for every one and mwallplankbreakaway01's planks hung in mid-air. Oblivion's
+cache happened to be rebuilt an hour after that commit, so the bug looked
+Nehrim-only. Version 4 widened bit 0 from "constrained island" to "any simulated
+body" ([STAT → MSTT](asset_convert_collision.md#stat-simulated-mstt)).
+
+**The door axis cache is also stale when it measured a different set of door
+meshes.** `scan_door_axes` writes `__meshes__`, the sorted keys of the door
+meshes it found, and `door_axis_cache_is_current(path, export_dir)` compares it
+with the meshes there now. Bloodmoon's cache was written before its meshes were
+extracted: 0 of 0 doors, at the current schema, so it never rescanned. All 27 of
+its door models then fell back to the pivot (the hinge) and a 45-unit half-width.
+The abandoned shaft's `Ex_colony_door06` (193 units wide, its panel centered 60
+units off the hinge) put its threshold inside `BM_colony_cave_door01`'s wall,
+every candidate edge read as blocked, and the door got no Door Triangle.
+
+**A current cache still takes the mesh stage's pending fragments.** The mesh
+stage records each mesh it writes as a fragment, and only this function merges
+them. It used to return as soon as both caches were current, so a scoped
+`--meshes-only --mesh-subdirs` rebuild never reached the caches: the new
+ctrapcavein01/ctraplogs01 HELD bits stayed invisible to `--scripts-only`, and
+their scripts never gained `ReleaseBreakaway`. With both caches current, the
+fragments are now folded over them (`fold_mesh_entries`: no NIF parse, and
+meshes no longer on disk drop out).
+
 **Being current includes being READABLE, not just carrying the right magic.**
 `collision_cache_is_current` originally compared only the 8 magic bytes. A local
 `collision_cache.bin` written at a superseded header layout — magic, then a
@@ -266,6 +350,46 @@ floats. A cache that cannot be read is rescanned instead of silently half-read.
 The unit tests build their fixtures through `_serialize`, so a writer/reader pair
 that is self-consistent but disagrees with an on-disk file passes all of them —
 which is exactly how this shipped.
+
+**`TESCOL07` / schema 4.** Bumped when TREE bases began keying to their
+converted SpeedTree NIF (`<ns>/speedtrees/<name>.nif`) instead of the
+unresolvable `<name>.spt.nif`. Which meshes a cell carves changed, so every
+cache written before the bump is regenerated rather than trusted — the magic
+and `COLLISION_SCHEMA_VERSION` move together, and the old blob is
+byte-compatible, so nothing but the version distinguishes them.
+
+## <a id="stale-master-asset-caches"></a>A cache bump strands the MASTERS, not the plugin
+
+**Code:** `pipeline._refresh_master_mesh_caches`
+
+The rescan gate above only ever looked at the plugin's OWN caches, but
+`load_collision` is handed a masters-first CHAIN and skips an unreadable entry
+per-path rather than failing. So a format bump splits a load: re-run the
+plugin and its own cache is rewritten at the new magic, while every master not
+re-run since stays at the old one and is silently dropped.
+
+Measured after `TESCOL06 -> TESCOL07`, on `TR_Mainland.esm` (masters
+`Morrowind_ob.esm`, the Morroblivion compat patch, `Tamriel_Data.esm`):
+
+```
+Collision: could not load cache (bad collision cache magic)   x3
+Collision: loaded 95 entries from 1 cache(s)
+```
+
+95 meshes instead of 28,349 — the three rejects held 3,954 and 24,300 keys.
+`WrldMorrowind (-17,-51)` places 104 refs of which **103 are master-owned**, so
+every one resolved to no collision, nothing carved, and the cell came out as an
+unbroken terrain sheet. The symptom reads as "the navmesh ignores all collision
+objects", which points at the carver; the cause is one rejected file three
+directories away.
+
+The masters' meshes are already converted under `output/<master>/meshes`, so
+the fix rescans them in place before the chain loads rather than failing with a
+list of manual re-runs. The plugin's own rescan and the masters' share
+`rescan_mesh_caches`, so the staleness test cannot drift between them.
+`tools/navmesh/rescan_mesh_caches.py` runs the same rescan for named plugins
+without an import.
+See: [tes5_import_navmesh.md](tes5_import_navmesh.md#speedtree-model-keys).
 
 FURN MNAM/FNPR must index the converted NIF's clustered seat positions, and
 REFRs of re-origined furniture models need z compensation (shared algorithm in
@@ -303,6 +427,13 @@ returning soups through the pool pickle, because collision soups are large and
 most producers' workers return only small tuples today. The scan merges the
 fragments and parses **only** the meshes no producer claimed, so it stays correct
 whichever stages ran — `--import-only` on an older tree still scans everything.
+
+**A fragment's header carries `COLLISION_SCHEMA_VERSION` as well as its own
+version**, and one stamped with another collision schema is skipped. Before this,
+the header held only `FRAGMENT_VERSION`, so a collision-extraction fix (the
+[transparent layer](asset_convert_collision.md#transparent-layer)) bumped the
+cache but a rescan still merged the soups the mesh stage had extracted under
+the old rules — 618 of TR_Mainland's 1,431 meshes came from such fragments.
 
 Three in-scope writes never hold a parsed graph (the already-Skyrim `shutil.copy2`,
 the grass `landscape/grass` copy, the creature merge-failure copy); copies alias the
@@ -384,6 +515,31 @@ The engine reaches combat music **ONLY** through DOBJ's BTMS default object
 (hardcoded to vanilla `MUSCombat`), so a Battle MUSC that nothing points at can
 never play. The master's DOBJ is overridden, copying every other entry unchanged
 — the same full-array override each official DLC ships.
+
+## <a id="skip-what-the-export-does-not-need"></a>Work the export shows is unneeded is skipped
+
+**Code:** `pipeline.py` (`_prescan_package_plan`, `_prescan_vendor_trainer`),
+`pipeline_records.py` (`_phase4a_navmesh`), `morrowind_sidecar.py`
+(`stage_sound_table`), `overrides/master_index.py` (`ChainedMasterIndex.__bool__`).
+
+A plugin with masters indexes its masters' whole export, so a pass that runs
+regardless of what the plugin holds costs the master's size, not the plugin's.
+Measured on `Grass_Aes_TRv25_05_mowed.esp` (CELL/GRAS/LTEX/MGEF/STAT/WRLD only,
+over TR_Mainland; 1.77M master records), `--import-only` went from 11m26s to
+2m09s with a byte-identical ESP, manifest and SKSE sidecar:
+
+| Phase | Before | After | Cause | Fix |
+|---|---|---|---|---|
+| magic effect families | 101s | <1s | `if master_index` on a `ChainedMasterIndex` fell back to `__len__`, which builds the full 1.77M-id set: 0.40s per truth test | `__bool__` stops at the first own record |
+| simple records (702: MGEF/GRAS/STAT) | 383s | 52s | the same truth test, per record (`magic_art` alone tests twice per MGEF) | the same |
+| vendor/trainer | 38s | <1s | `chain_tables` re-read every TES3 binary of the chain | read only when the plugin has NPC_/CREA — the tables answer nothing but its own merchants and trainers |
+| package plan | 20s | 0s | indexed every master PACK/QUST/actor | skipped when the plugin exports none of NPC_/CREA/QUST/PACK/DIAL/INFO, the only readers of the plan, script vars and quest-package set |
+| DIAL/INFO groups | 55s | 0.1s | the sound table ran `gather` over the chain again | `gather` runs only when some master's rows are kept (`_sound_owners`); a plugin over TES3 masters keeps none |
+| navmesh generation | 33s | 18s | the master navmesh grid walked 18,408 master cells | built only when this run generated navmeshes — with none, `_master_neighbour_views` wants no neighbour |
+
+Each gated pass wrote nothing for a plugin without its readers. The gate for the navmesh grid sits in
+`pipeline_records.py`, not `navmesh/`, so the shared navmesh cache tag is
+untouched.
 
 ## <a id="phase-1-is-serial-on-purpose"></a>Phase 1 is serial on purpose
 
@@ -581,7 +737,7 @@ hole in the world.
 
 - **LAND FIRST** in a cell's temporary children group — vanilla puts the
   landscape at index 0. See
-  [project_land_first_in_type9_group](tes5_import_navmesh.md).
+  [LAND first in type 9](tes5_import_override.md#land-first-in-type-9).
 - Group contents accumulate in **lists joined at each wrap point** rather than
   `bytes +=`; Tamriel's children total enough bytes that repeated concatenation
   dominates the phase.
@@ -670,3 +826,47 @@ re-run.
 Derived-FormID collisions are expected to be a fraction of a percent; a spike
 means the derived region is filling up or a key has gone non-unique, both worth
 seeing before shipping.
+
+## <a id="the-esm-flag-comes-from-the-source-header"></a>The ESM flag comes from the source header, not the extension
+
+`convert.py` `phase_import` sets `is_esm` from bit 0 of the `Flags=` line in the
+export's `_HEADER.txt` (`core/plugin_masters.py:is_master_export`), never from
+the file name. It used to test `.endswith('.esm')`, which cleared the flag on
+`Morrowind-Morroblivion-Compatibility.esp` whenever the patch went through a
+normal `-f` import. The patch now builds only through that normal import
+(its export header carries `Flags=1`), so there is one place the flag comes
+from. An ESM-flagged
+`.esp` is legal and loads as a master (see `tools/esm/make_master.py`).
+
+Each exporter writes the real flag:
+
+- TES4/FO3/FNV: `export_header` copies the TES4 record flags.
+- Morrowind: `write_header` takes the HEDR `type` field (0 = esp, 1 = esm;
+  OpenMW `loadtes3.hpp`). Across the 32 plugins in a real Morrowind Data Files
+  folder, every `.esm` is 1 and every `.esp` is 0. Before this change the
+  exporter always wrote `Flags=1`, so any Morrowind `.esp` exported earlier must
+  be re-exported to lose the flag.
+- The compatibility patch always writes `Flags=1`.
+
+## <a id="stale-runtime-sidecars"></a>Stale runtime sidecars are swept after the write, never cleared first
+
+**Code:** `tes5_import/runtime_sidecars.py`; the creature fragment in
+`asset_convert/havok/creature_pipeline.py` (`_remove_stale_fragment`).
+
+A plugin's runtime sidecars are its `SKSE/Plugins/MorrowindRuntime/<plugin>/`
+folder and its `<plugin>.<kind>.json` files under `TESRuntime/` and
+`FalloutRuntime/`. Several writers skip a table they have no rows for (guns,
+body parts, the sound table, copied dialogue), so a table an earlier build
+wrote would otherwise outlive the data it came from and keep driving the
+runtime.
+
+`_open_import_run` notes when the import began; the end of
+`run_finalize_phases` deletes every sidecar of that plugin older than that,
+then any Morrowind folder left empty. Nothing is deleted up front, so an
+import that fails partway leaves the previous build's sidecars whole. The
+Morrowind restage tool
+(`tools/dialog/mw_sidecar.py`) does not sweep: it leaves the journal and sound
+tables alone by design.
+
+The creature stage owns `CreatureRuntime/animation/<plugin>.json`; a full run
+that registers nothing deletes it; a run limited to named creatures never does.

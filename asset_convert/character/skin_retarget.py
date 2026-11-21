@@ -49,7 +49,7 @@ from asset_convert.character.skyrim_overrides import (
     SBP_33_HANDS,
     SBP_37_FEET,
     SBP_38_CALVES,
-    SBP_44_LOWERBODY,
+    SBP_49_LOWER_BODY,
     SBP_32_BODY,
     SBP_131_HAIR,
 )
@@ -236,7 +236,7 @@ _BONE_REGION_RULES = [
     (('finger', 'hand'), SBP_33_HANDS),
     (('toe', 'foot'), SBP_37_FEET),
     (('calf',), SBP_38_CALVES),
-    (('thigh', 'pelvis'), SBP_44_LOWERBODY),
+    (('thigh', 'pelvis'), SBP_49_LOWER_BODY),
     (('head',), SBP_131_HAIR),
     (('spine', 'clavicle', 'neck', 'upperarm', 'forearm'), SBP_32_BODY),
 ]
@@ -507,157 +507,6 @@ def regen_skin_partition(block, skin, geom_name: str, bone_name: str | None = No
 
 
 # ---------------------------------------------------------------------------
-# Skin bone-count reduction (SSE 80-bone-matrix render buffer)
-# ---------------------------------------------------------------------------
-
-# SSE's renderer memcpys one 3x4 matrix (48 bytes) per skin bone into a
-# fixed 80-matrix buffer when drawing a skinned shape (observed in the
-# BSUtilityShader shadow pass). A NiSkinInstance with more than 80 bones
-# overflows it -> CTD (vmovdqa AV in VCRUNTIME memcpy; imp crash log
-# registers showed copy size 85*48 into an 80*48 allocation). Vanilla's
-# biggest rig (dragon) uses 77 bones per shape. In-game verified fix
-# (2026-07-10): merge the lightest leaf bones' weights into their parents —
-# bind pose is exact (B_i @ W_i = I at rest), only tip articulation is lost.
-# NOTE: splitting the shape instead does NOT work (tested: froze the game).
-SSE_MAX_SKIN_BONES = 80
-
-
-def merge_oversized_skin_bones(root, max_bones: int = SSE_MAX_SKIN_BONES):
-    """Reduce every skinned shape under `root` to <= max_bones skin bones by
-    merging the lowest-total-weight leaf bones into their parents.
-
-    Bone hierarchy is matched BY NAME (like merge_creature_body): during
-    part conversion the skin's bone pointers may not be members of the
-    current tree, but node names are stable across the whole pipeline.
-
-    Callers must regenerate the NiSkinPartition afterwards. Returns the
-    number of shapes reduced."""
-    def _nm(node):
-        return bytes(node.name).rstrip(b'\x00').decode('latin-1', 'replace')
-
-    parent_name = {}
-    for node in root.tree():
-        if isinstance(node, NifFormat.NiNode):
-            for ch in node.children:
-                if isinstance(ch, NifFormat.NiNode):
-                    parent_name[_nm(ch)] = _nm(node)
-
-    reduced = 0
-    for shape in list(root.tree()):
-        if not isinstance(shape, (NifFormat.NiTriShape, NifFormat.NiTriStrips)):
-            continue
-        skin = getattr(shape, 'skin_instance', None)
-        if skin is None or skin.data is None or skin.num_bones <= max_bones:
-            continue
-        sd = skin.data
-        bones = list(skin.bones)
-        n = len(bones)
-        names = [_nm(b) for b in bones]
-        name_idx = {nm: i for i, nm in enumerate(names)}
-
-        def parent_idx(i):
-            p = parent_name.get(names[i])
-            return name_idx.get(p, -1) if p is not None else -1
-
-        tot_w = [sum(vw.weight for vw in sd.bone_list[i].vertex_weights)
-                 for i in range(n)]
-
-        merge_set = set()
-        # Iterate: merging a leaf can expose its parent as a new leaf, so
-        # keep passing until under the cap (or no candidates remain).
-        while n - len(merge_set) > max_bones:
-            live_children = {i: 0 for i in range(n)}
-            for i in range(n):
-                if i in merge_set:
-                    continue
-                p = parent_idx(i)
-                if p >= 0 and p not in merge_set:
-                    live_children[p] += 1
-            cands = sorted(
-                (i for i in range(n)
-                 if i not in merge_set and live_children[i] == 0
-                 and parent_idx(i) >= 0 and parent_idx(i) not in merge_set),
-                key=lambda i: tot_w[i])
-            if not cands:
-                break
-            before = len(merge_set)
-            for i in cands:
-                if n - len(merge_set) <= max_bones:
-                    break
-                merge_set.add(i)
-            if len(merge_set) == before:
-                break
-
-        if n - len(merge_set) > max_bones:
-            print(f'      [SKIN-BONES] WARNING: "{_shape_name(shape)}" still '
-                  f'{n - len(merge_set)} bones (> {max_bones}) — not enough '
-                  f'mergeable leaf bones')
-        if not merge_set:
-            continue
-
-        # vert -> {surviving bone idx: weight}, tips rerouted to survivors
-        vert_w = {}
-        for i in range(n):
-            tgt = i
-            while tgt in merge_set:
-                tgt = parent_idx(tgt)
-            for vw in sd.bone_list[i].vertex_weights:
-                acc = vert_w.setdefault(vw.index, {})
-                acc[tgt] = acc.get(tgt, 0.0) + vw.weight
-
-        survivors = [i for i in range(n) if i not in merge_set]
-        new_index = {old: k for k, old in enumerate(survivors)}
-
-        skin.num_bones = len(survivors)
-        skin.bones.update_size()
-        for k, old in enumerate(survivors):
-            skin.bones[k] = bones[old]
-
-        old_entries = [sd.bone_list[i] for i in range(n)]
-        sd.num_bones = len(survivors)
-        sd.bone_list.update_size()
-        per_bone = {k: [] for k in range(len(survivors))}
-        for vi, wmap in vert_w.items():
-            tot = sum(wmap.values())
-            for old, w in wmap.items():
-                per_bone[new_index[old]].append((vi, w / tot))
-        for k, old in enumerate(survivors):
-            src, dst = old_entries[old], sd.bone_list[k]
-            for m in ('m_11', 'm_12', 'm_13', 'm_21', 'm_22', 'm_23',
-                      'm_31', 'm_32', 'm_33'):
-                setattr(dst.skin_transform.rotation, m,
-                        getattr(src.skin_transform.rotation, m))
-            dst.skin_transform.translation.x = src.skin_transform.translation.x
-            dst.skin_transform.translation.y = src.skin_transform.translation.y
-            dst.skin_transform.translation.z = src.skin_transform.translation.z
-            dst.skin_transform.scale = src.skin_transform.scale
-            dst.bounding_sphere_offset.x = src.bounding_sphere_offset.x
-            dst.bounding_sphere_offset.y = src.bounding_sphere_offset.y
-            dst.bounding_sphere_offset.z = src.bounding_sphere_offset.z
-            dst.bounding_sphere_radius = src.bounding_sphere_radius
-            ws = sorted(per_bone[k])
-            dst.num_vertices = len(ws)
-            dst.vertex_weights.update_size()
-            for wi, (vi, w) in enumerate(ws):
-                dst.vertex_weights[wi].index = vi
-                dst.vertex_weights[wi].weight = w
-
-        merged_names = [
-            bytes(bones[i].name).rstrip(b'\x00').decode('latin-1')
-            for i in sorted(merge_set)]
-        print(f'      [SKIN-BONES] "{_shape_name(shape)}": {n} -> '
-              f'{len(survivors)} bones (merged {merged_names})')
-        reduced += 1
-    return reduced
-
-
-def _shape_name(shape) -> str:
-    return bytes(shape.name).rstrip(b'\x00').decode('latin-1', 'replace')
-
-
-
-
-# ---------------------------------------------------------------------------
 # Quaternion and rotation utilities
 # ---------------------------------------------------------------------------
 
@@ -709,19 +558,43 @@ _ANIM_POSE_PATH = _GENERATED_DIR / 'best_animation_pose.json'
 _ANIM_POSE_FALLOUT = _GENERATED_DIR / 'best_animation_pose_falloutnv.json'
 _anim_delta_cache: dict = {}
 
+#: female -> Morrowind rest skeleton. See: docs/commentary/asset_convert_armor.md#morrowind-pose-cache
+SKEL_MORROWIND = {False: _GENERATED_DIR / 'skeleton_bones_morrowind.json',
+                  True: _GENERATED_DIR / 'skeleton_bones_morrowind_female.json'}
+
+#: female -> the pose cache built over that Morrowind skeleton.
+_ANIM_POSE_MORROWIND = {False: _GENERATED_DIR / 'best_animation_pose_morrowind.json',
+                        True: _GENERATED_DIR / 'best_animation_pose_morrowind_female.json'}
+
+
+def _pose_path(src_skel) -> Path:
+    """The pose cache built for `src_skel`.
+
+    A Morrowind skeleton shares Oblivion's bone names, so it is recognized as
+    the very (cached) object `load_skeleton` returned for its JSON; FO3/FNV by
+    its own bone names; anything else is Oblivion.
+    See: docs/commentary/asset_convert_armor.md#morrowind-pose-cache
+    """
+    if src_skel is None:
+        return _ANIM_POSE_PATH
+    for female, skel_path in SKEL_MORROWIND.items():
+        if src_skel is load_skeleton(skel_path) and _ANIM_POSE_MORROWIND[female].exists():
+            return _ANIM_POSE_MORROWIND[female]
+    if is_fallout_skeleton(src_skel) and _ANIM_POSE_FALLOUT.exists():
+        return _ANIM_POSE_FALLOUT
+    return _ANIM_POSE_PATH
+
 
 def load_animation_deltas(src_skel: dict = None):
     """Pre-computed delta matrices (inv(rest_world) @ anim_world) per bone.
 
     Built by tools/generators/kf_animation_explorer.py --build-cache over the
     source game's own .kf corpus and skeleton; each delta moves a vertex from
-    its rest pose to the best-matching animation pose.  FO3/FNV bind poses
-    differ from Oblivion's, so the source skeleton selects the cache.
+    its rest pose to the best-matching animation pose. The source skeleton
+    selects the cache (`_pose_path`).
     See: docs/commentary/asset_convert_falloutnv.md#fnv-animation-pose
     """
-    path = _ANIM_POSE_PATH
-    if src_skel is not None and is_fallout_skeleton(src_skel)             and _ANIM_POSE_FALLOUT.exists():
-        path = _ANIM_POSE_FALLOUT
+    path = _pose_path(src_skel)
     key = str(path)
     if key in _anim_delta_cache:
         return _anim_delta_cache[key]
@@ -739,138 +612,97 @@ def load_animation_deltas(src_skel: dict = None):
     return result
 
 
-def _bake_geoms_to_bind_pose(skinned_geoms, skel_root):
-    """Rewrite skinned geometry so stored vertices sit in skeleton space.
+def bake_geoms_to_bind_pose(skinned_geoms, skel_root) -> int:
+    """Rewrite skinned geometry so stored vertices sit in skeleton space; how many shapes moved.
 
-    For each vertex the bind pose is the weighted blend of
-    ``skin_transform_i @ bone_world_i`` (the standard skinning contract, cf.
-    NifSkope ``glmesh.cpp``).  When that blend already equals the stored
-    coordinates the mesh is left byte-identical; otherwise vertices and
-    normals are moved onto it and the per-bone ``skin_transform`` matrices are
-    reset to ``inv(bone_world)`` so the mesh still binds to the same pose.
-
-    Returns the number of geometries actually rewritten.
+    A shape already there is left byte-identical; a moved one keeps binding
+    to the same pose. `skinned_geoms` holds (shape, is Prn, Prn bone); Prn
+    shapes are skipped.
+    See: docs/commentary/asset_convert_armor.md#skin-bind-pose-bake
     """
     baked = 0
     for block, is_prn, _prn_bone in skinned_geoms:
-        if is_prn:
-            continue
-        skin = getattr(block, 'skin_instance', None)
-        geom_data = getattr(block, 'data', None)
-        if skin is None or skin.data is None or geom_data is None:
-            continue
-        num_verts = geom_data.num_vertices
-        if not num_verts:
-            continue
-
-        try:
-            G = m44_to_np(block.get_transform(skel_root))
-        except (ValueError, RuntimeError):
-            G = np.eye(4)
-        G_is_identity = np.allclose(G, np.eye(4), atol=1e-6)
-
-        verts = np.array([[v.x, v.y, v.z] for v in geom_data.vertices],
-                         dtype=np.float64)
-        verts_world = verts if G_is_identity else verts @ G[:3, :3] + G[3, :3]
-
-        # Per-vertex blended bind matrix (full 4x4 so normals get the same
-        # rotation the positions received).  The engine chain is
-        # S @ B_i @ W_i applied to the G-transformed vertex, where the overall
-        # S is normally inv(G) — so G cancels and the bind pose is driven by
-        # the RAW stored coordinates.  S must therefore be part of the blend.
-        skin_data = skin.data
-        S = np.eye(4, dtype=np.float64)
-        _s = skin_data.skin_transform
-        _sr = _s.rotation
-        S[:3, :3] = [[_sr.m_11, _sr.m_12, _sr.m_13],
-                     [_sr.m_21, _sr.m_22, _sr.m_23],
-                     [_sr.m_31, _sr.m_32, _sr.m_33]]
-        S[3, :3] = [_s.translation.x, _s.translation.y, _s.translation.z]
-        acc = np.zeros((num_verts, 4, 4), dtype=np.float64)
-        wsum = np.zeros(num_verts, dtype=np.float64)
-        bone_worlds = {}
-        for bi in range(min(skin_data.num_bones, skin.num_bones)):
-            bone_node = skin.bones[bi]
-            if bone_node is None:
-                continue
-            bone_data = skin_data.bone_list[bi]
-            st = bone_data.skin_transform
-            r = st.rotation
-            B = np.eye(4, dtype=np.float64)
-            B[:3, :3] = [[r.m_11, r.m_12, r.m_13],
-                         [r.m_21, r.m_22, r.m_23],
-                         [r.m_31, r.m_32, r.m_33]]
-            B[3, :3] = [st.translation.x, st.translation.y, st.translation.z]
-            try:
-                W = m44_to_np(bone_node.get_transform(skel_root))
-            except (ValueError, RuntimeError):
-                continue
-            bone_worlds[bi] = W
-            M = S @ B @ W
-            n = bone_data.num_vertices
-            if not n:
-                continue
-            idx = np.fromiter((vw.index for vw in bone_data.vertex_weights),
-                              dtype=np.int64, count=n)
-            wts = np.fromiter((vw.weight for vw in bone_data.vertex_weights),
-                              dtype=np.float64, count=n)
-            keep = (idx >= 0) & (idx < num_verts) & (wts > 0.0)
-            if not keep.any():
-                continue
-            idx = idx[keep]; wts = wts[keep]
-            np.add.at(acc, idx, wts[:, None, None] * M[None, :, :])
-            np.add.at(wsum, idx, wts)
-
-        ok = wsum > 1e-6
-        if not ok.any():
-            continue
-        Mv = acc[ok] / wsum[ok, None, None]
-        bind_world = verts_world.copy()
-        bind_world[ok] = np.einsum('vi,vij->vj', verts_world[ok], Mv[:, :3, :3]) \
-            + Mv[:, 3, :3]
-
-        if np.allclose(bind_world[ok], verts_world[ok], atol=1e-3):
-            continue    # already skeleton space — leave byte-identical
-
-        # bind_world is SKELETON space.  Store it as-is and neutralise the
-        # geometry node, rather than pushing it back through inv(G) — the
-        # renderer would otherwise re-apply G on top of coordinates that
-        # already contain it.
-        new_verts = bind_world
-        for vi in range(num_verts):
-            geom_data.vertices[vi].x = float(new_verts[vi, 0])
-            geom_data.vertices[vi].y = float(new_verts[vi, 1])
-            geom_data.vertices[vi].z = float(new_verts[vi, 2])
-
-        if getattr(geom_data, 'has_normals', False) and geom_data.normals:
-            norms = np.array([[n.x, n.y, n.z] for n in geom_data.normals],
-                             dtype=np.float64)
-            nw = norms if G_is_identity else norms @ G[:3, :3]
-            new_nw = nw.copy()
-            new_nw[ok] = np.einsum('vi,vij->vj', nw[ok], Mv[:, :3, :3])
-            ln = np.linalg.norm(new_nw, axis=1, keepdims=True)
-            ln[ln < 1e-6] = 1.0
-            new_nw /= ln
-            for vi in range(num_verts):
-                geom_data.normals[vi].x = float(new_nw[vi, 0])
-                geom_data.normals[vi].y = float(new_nw[vi, 1])
-                geom_data.normals[vi].z = float(new_nw[vi, 2])
-
-        # Vertices are now skeleton-space, so the geometry node must no longer
-        # contribute anything — otherwise the renderer applies it a second time
-        # (observed as a rest pose shifted by exactly the node translation,
-        # 102.45 / 71.58 units, on meshes whose nodes are off the origin).
-        # With G neutralised the chain S @ B_i @ W_i reduces to S = identity
-        # and B_i = inv(W_i).
-        if not G_is_identity:
-            write_node_transform(block, np.eye(4))
-        write_skin_transform(skin_data.skin_transform, np.eye(4))
-        for bi, W in bone_worlds.items():
-            write_skin_transform(skin_data.bone_list[bi].skin_transform,
-                                  np.linalg.inv(W))
-        baked += 1
-
+        if not is_prn and _bake_to_bind_pose(block, skel_root):
+            baked += 1
     return baked
+
+
+def _bake_to_bind_pose(block, skel_root) -> bool:
+    """Move one skinned shape's vertices and normals onto its bind pose; False when it has none or is already there."""
+    skin = getattr(block, 'skin_instance', None)
+    geom_data = getattr(block, 'data', None)
+    if skin is None or skin.data is None or geom_data is None or not geom_data.num_vertices:
+        return False
+    try:
+        node = m44_to_np(block.get_transform(skel_root))
+    except (ValueError, RuntimeError):
+        node = np.eye(4)
+    moved_node = not np.allclose(node, np.eye(4), atol=1e-6)
+    node = node if moved_node else np.eye(4)
+    verts = np.array([[v.x, v.y, v.z] for v in geom_data.vertices], dtype=np.float64)
+    verts = verts @ node[:3, :3] + node[3, :3]
+    blend, ok, bone_worlds = _bind_blend(skin, skel_root, geom_data.num_vertices)
+    bind = verts.copy()
+    bind[ok] = np.einsum('vi,vij->vj', verts[ok], blend[:, :3, :3]) + blend[:, 3, :3]
+    if not ok.any() or np.allclose(bind[ok], verts[ok], atol=1e-3):
+        return False
+    for vert, row in zip(geom_data.vertices, bind.tolist()):
+        vert.x, vert.y, vert.z = row
+    if getattr(geom_data, 'has_normals', False) and geom_data.normals:
+        _bake_normals(geom_data, node, blend, ok)
+    if moved_node:
+        write_node_transform(block, np.eye(4))
+    write_skin_transform(skin.data.skin_transform, np.eye(4))
+    for bi, world in bone_worlds.items():
+        write_skin_transform(skin.data.bone_list[bi].skin_transform, np.linalg.inv(world))
+    return True
+
+
+def _bind_blend(skin, skel_root, num_verts) -> tuple:
+    """(blended bind matrix per weighted vertex, which vertices are weighted, {bone index: bone world})."""
+    skin_data = skin.data
+    overall = _skin_matrix(skin_data.skin_transform)
+    acc = np.zeros((num_verts, 4, 4), dtype=np.float64)
+    wsum = np.zeros(num_verts, dtype=np.float64)
+    bone_worlds = {}
+    for bi in range(min(skin_data.num_bones, skin.num_bones)):
+        bone_node, bone_data = skin.bones[bi], skin_data.bone_list[bi]
+        if bone_node is None:
+            continue
+        try:
+            world = m44_to_np(bone_node.get_transform(skel_root))
+        except (ValueError, RuntimeError):
+            continue
+        bone_worlds[bi] = world
+        idx = np.fromiter((vw.index for vw in bone_data.vertex_weights), dtype=np.int64,
+                          count=bone_data.num_vertices)
+        wts = np.fromiter((vw.weight for vw in bone_data.vertex_weights), dtype=np.float64,
+                          count=bone_data.num_vertices)
+        keep = (idx >= 0) & (idx < num_verts) & (wts > 0.0)
+        matrix = overall @ _skin_matrix(bone_data.skin_transform) @ world
+        np.add.at(acc, idx[keep], wts[keep, None, None] * matrix[None, :, :])
+        np.add.at(wsum, idx[keep], wts[keep])
+    ok = wsum > 1e-6
+    return acc[ok] / wsum[ok, None, None], ok, bone_worlds
+
+
+def _skin_matrix(st) -> np.ndarray:
+    """A NiSkinData transform as a row-vector 4x4."""
+    r = st.rotation
+    out = np.eye(4, dtype=np.float64)
+    out[:3, :3] = [[r.m_11, r.m_12, r.m_13], [r.m_21, r.m_22, r.m_23], [r.m_31, r.m_32, r.m_33]]
+    out[3, :3] = [st.translation.x, st.translation.y, st.translation.z]
+    return out
+
+
+def _bake_normals(geom_data, node, blend, ok) -> None:
+    """Carry the shape's normals through its node transform and the bind blend, renormalized."""
+    normals = np.array([[n.x, n.y, n.z] for n in geom_data.normals], dtype=np.float64) @ node[:3, :3]
+    normals[ok] = np.einsum('vi,vij->vj', normals[ok], blend[:, :3, :3])
+    length = np.linalg.norm(normals, axis=1, keepdims=True)
+    normals /= np.where(length < 1e-6, 1.0, length)
+    for normal, row in zip(geom_data.normals, normals.tolist()):
+        normal.x, normal.y, normal.z = row
 
 
 def deform_vertices_animation_fk(skinned_geoms, skel_root, bone_deltas):
@@ -1135,63 +967,28 @@ def _bake_shape_into_bone_frame(block, W_sk):
     block.translation.z = float(bone_pos[2])
 
 
-def retarget_skin_to_skyrim(data, src_path: str = '', prn_out: set | None = None,
-                            allow_wrap: bool = True, weight: int = 0,
-                            authored_body_part: int | None = None,
-                            authored_allowed=None, race=None) -> int:
-    """Retarget skinned armor from Oblivion skeleton to Skyrim skeleton.
+def _rig_skeleton(data, morrowind: bool, female: bool) -> dict:
+    """The source rest skeleton: Morrowind's when `morrowind`, else by bone names."""
+    if morrowind:
+        return load_skeleton(SKEL_MORROWIND[female]) or load_skeleton(SKEL_OBLIVION)
+    return _source_skeleton(data)
 
-    Called BEFORE remap_bone_names() — bones still have Oblivion names.
-    Uses OB→SK name mapping to find target Skyrim skeleton positions.
-    AFTER NiTriStrips → NiTriShape conversion, and AFTER version upgrade.
 
-    Runs Phase 0 (bake into skeleton space), B (deform vertices), A
-    (reposition bone nodes) and C+D (rebuild bind data and partitions).
-    The order is fixed and each constraint cost a real defect.
-    See: docs/commentary/asset_convert_armor.md#retarget-phase-order
+def _deform_vertices(skinned_geoms, skel_root, ob_skel, female, morrowind, wrap) -> None:
+    """Phase B: the body wrap when its field loads, else the plain FK pose.
 
-    PRN-attached rigid pieces (single bone, identity bind — built by
-    nif_converter._add_prn_skin) skip the FK deformation entirely; when
-    ``prn_out`` is given, ``id(block)`` of each such geometry is added to it
-    so the caller can exempt them from the FK-tuned armor offsets.
-
-    Returns the number of geometries retargeted.
+    `wrap` is (allowed, weight, race). body_wrap is imported here because it
+    imports this module (through wrap_mesh).
     """
-    female = mesh_is_female(src_path)
-
-    sk_skel = load_skeleton(SKEL_SKYRIM_FEMALE if female else SKEL_SKYRIM_MALE)
-    ob_skel = _source_skeleton(data)
-    if not sk_skel or not ob_skel:
-        return 0
-    src_map = bone_map_for(ob_skel)
-
-    skel_root, bone_nodes, skinned_geoms = _collect_skin_targets(data)
-    if not skel_root or not skinned_geoms:
-        return 0
-
-    # --- Phase 0: bake geometry into skeleton space ---
-    _bake_geoms_to_bind_pose(skinned_geoms, skel_root)
-
-    # --- Capture old bone world transforms BEFORE repositioning ---
-    old_bone_worlds = {}
-    for bone in bone_nodes:
-        name = get_block_name(bone)
-        try:
-            old_bone_worlds[name] = m44_to_np(bone.get_transform(skel_root))
-        except (ValueError, RuntimeError):
-            pass
-
-    # --- Phase B: vertex deformation (before bone repositioning) ---
+    allowed, weight, race = wrap
     wrapped = 0
-    if allow_wrap:
+    if allowed:
         try:
-            from asset_convert.character.body_wrap import get_field, deform_geoms_wrap
-            _wrap_field = get_field(female)
-            if _wrap_field is not None:
-                wrapped = deform_geoms_wrap(skinned_geoms, skel_root,
-                                            _wrap_field, female,
-                                            weight=weight, race=race,
-                                            src_skel=ob_skel)
+            from asset_convert.character.body_wrap import deform_geoms_wrap, get_field
+            field = get_field(female, morrowind)
+            if field is not None:
+                wrapped = deform_geoms_wrap(skinned_geoms, skel_root, field, female,
+                                            weight=weight, race=race, src_skel=ob_skel)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -1202,71 +999,126 @@ def retarget_skin_to_skyrim(data, src_path: str = '', prn_out: set | None = None
         if bone_deltas:
             deform_vertices_animation_fk(skinned_geoms, skel_root, bone_deltas)
 
-    # --- Phase A: move bone NiNodes to Skyrim positions ---
-    for block, is_prn, prn_bone_name in skinned_geoms:
-        if is_prn and prn_bone_name:
-            skin = block.skin_instance
-            bone_node = skin.bones[0]
-            if bone_node is not None:
-                sk_name, W_sk = _resolve_sk_target(prn_bone_name, sk_skel, src_map)
-                if sk_name is not None:
-                    write_node_transform(bone_node, W_sk)
 
-    parent_map = _build_parent_map(skel_root)
+def _node_depth(node, parent_map) -> int:
+    """How many parents `node` has, capped at 101."""
+    d, cur = 0, node
+    while id(cur) in parent_map:
+        cur = parent_map[id(cur)]
+        d += 1
+        if d > 100:
+            break
+    return d
 
-    def _depth(node):
-        d, cur = 0, node
-        while id(cur) in parent_map:
-            cur = parent_map[id(cur)]
-            d += 1
-            if d > 100:
-                break
-        return d
 
-    for bone in sorted(bone_nodes, key=_depth):
-        name = get_block_name(bone)
-        sk_name, W_sk = _resolve_sk_target(name, sk_skel, src_map)
-        if sk_name is None:
-            continue
-
-        parent_node = parent_map.get(id(bone))
-        if parent_node is None or parent_node is skel_root:
+def _place_bone(bone, parent_map, skel_root, sk_skel, src_map) -> None:
+    """Move one bone node onto its Skyrim bone's world frame, keeping its parent."""
+    sk_name, W_sk = _resolve_sk_target(get_block_name(bone), sk_skel, src_map)
+    if sk_name is None:
+        return
+    parent_node = parent_map.get(id(bone))
+    new_local = W_sk
+    if parent_node is not None and parent_node is not skel_root:
+        try:
+            new_local = local_for_world(W_sk, m44_to_np(parent_node.get_transform(skel_root)))
+        except (ValueError, RuntimeError):
             new_local = W_sk
-        else:
-            try:
-                parent_W = m44_to_np(parent_node.get_transform(skel_root))
-                new_local = local_for_world(W_sk, parent_W)
-            except (ValueError, RuntimeError):
-                new_local = W_sk
-
-        write_node_transform(bone, new_local)
+    write_node_transform(bone, new_local)
 
 
-    # --- Phase C+D: Recompute skin data and regenerate partitions ---
-    count = 0
+def _place_bones(skinned_geoms, bone_nodes, skel_root, sk_skel, src_map) -> None:
+    """Phase A: every PRN bone, skin bone and mapped tree node onto the Skyrim skeleton, root first.
+
+    Ancestor-only nodes are placed too: the body splice later binds fill skin
+    to them by name, and an unplaced one tears that skin away.
+    See: docs/commentary/asset_convert_armor.md#distorted-worn-clothing-nested-bones
+    """
     for block, is_prn, prn_bone_name in skinned_geoms:
+        bone_node = block.skin_instance.bones[0] if is_prn and prn_bone_name else None
+        if bone_node is not None:
+            sk_name, W_sk = _resolve_sk_target(prn_bone_name, sk_skel, src_map)
+            if sk_name is not None:
+                write_node_transform(bone_node, W_sk)
+    parent_map = _build_parent_map(skel_root)
+    tree = {n for n in skel_root.tree() if isinstance(n, NifFormat.NiNode) and n is not skel_root}
+    for bone in sorted(set(bone_nodes) | tree, key=lambda node: _node_depth(node, parent_map)):
+        _place_bone(bone, parent_map, skel_root, sk_skel, src_map)
+
+
+def _rebind(skinned_geoms, skel_root, targets, prn_out, authored) -> int:
+    """Phase C+D: bind matrices from the moved bones, then fresh partitions; how many shapes.
+
+    `targets` is (Skyrim skeleton, source bone map); `authored` is
+    (authored body part, allowed body parts).
+    """
+    sk_skel, src_map = targets
+    for block, is_prn, prn_bone_name in skinned_geoms:
+        if is_prn and prn_out is not None:
+            prn_out.add(id(block))
+        if is_prn and prn_bone_name:
+            sk_name, W_sk = _resolve_sk_target(prn_bone_name, sk_skel, src_map)
+            if sk_name is not None:
+                _bake_shape_into_bone_frame(block, W_sk)
         skin = block.skin_instance
-        geom_name = get_block_name(block)
-
-        if is_prn:
-            if prn_out is not None:
-                prn_out.add(id(block))
-            if prn_bone_name:
-                sk_name, W_sk = _resolve_sk_target(prn_bone_name, sk_skel, src_map)
-                if sk_name is not None:
-                    _bake_shape_into_bone_frame(block, W_sk)
-            manual_update_bind_position(block, skin, skel_root)
-            regen_skin_partition(block, skin, geom_name,
-                                  bone_name=prn_bone_name,
-                                  authored_body_part=authored_body_part,
-                                  authored_allowed=authored_allowed)
-            count += 1
-            continue
-
         manual_update_bind_position(block, skin, skel_root)
-        regen_skin_partition(block, skin, geom_name,
-                              authored_body_part=authored_body_part,
-                              authored_allowed=authored_allowed)
-        count += 1
+        regen_skin_partition(block, skin, get_block_name(block), bone_name=prn_bone_name,
+                             authored_body_part=authored[0], authored_allowed=authored[1])
+    return len(skinned_geoms)
 
-    return count
+
+def _morrowind_arm_fit():
+    """The morrowind_arm_fit module; imported late as it imports this module."""
+    from asset_convert.character import morrowind_arm_fit
+    return morrowind_arm_fit
+
+
+def _reweight_morrowind_arms(skinned_geoms, skel_root, sk_skel, female, weight) -> None:
+    """Phase B2, morrowind_weights; imported late as it imports this module."""
+    from asset_convert.character.morrowind_weights import reweight_arms
+    reweight_arms(skinned_geoms, skel_root, sk_skel, female, weight)
+
+
+def retarget_skin_to_skyrim(data, src_path: str = '', prn_out: set | None = None,
+                            allow_wrap: bool = True, weight: int = 0,
+                            authored_body_part: int | None = None,
+                            authored_allowed=None, race=None,
+                            morrowind: bool = False) -> int:
+    """Retarget skinned armor from its source skeleton to the Skyrim skeleton.
+
+    Called BEFORE remap_bone_names() — bones still have source names — and
+    AFTER the strips-to-shapes pass and the version upgrade. `morrowind`
+    (the source file was Morrowind's version) selects Morrowind's skeleton,
+    pose cache and wrap field.
+
+    Runs Phase 0 (bake into skeleton space), B (deform vertices), A
+    (reposition bone nodes) and C+D (rebuild bind data and partitions).
+    The order is fixed and each constraint cost a real defect.
+    See: docs/commentary/asset_convert_armor.md#retarget-phase-order
+
+    PRN-attached rigid pieces (single bone, identity bind) skip the FK
+    deformation; with ``prn_out`` each one's ``id(block)`` is added to it so
+    the caller can exempt them from the FK-tuned armor offsets.
+
+    Returns the number of geometries retargeted.
+    """
+    female = mesh_is_female(src_path)
+    sk_skel = load_skeleton(SKEL_SKYRIM_FEMALE if female else SKEL_SKYRIM_MALE)
+    ob_skel = _rig_skeleton(data, morrowind, female)
+    if not sk_skel or not ob_skel:
+        return 0
+    src_map = bone_map_for(ob_skel)
+    skel_root, bone_nodes, skinned_geoms = _collect_skin_targets(data)
+    if not skel_root or not skinned_geoms:
+        return 0
+    bake_geoms_to_bind_pose(skinned_geoms, skel_root)
+    bind = _morrowind_arm_fit().bind_vertices(skinned_geoms, skel_root) if morrowind else None
+    _deform_vertices(skinned_geoms, skel_root, ob_skel, female, morrowind,
+                     (allow_wrap, weight, race))
+    if morrowind:
+        _morrowind_arm_fit().seat_arms(skinned_geoms, skel_root, bind, (ob_skel, sk_skel),
+                                       load_animation_deltas(ob_skel))
+    _place_bones(skinned_geoms, bone_nodes, skel_root, sk_skel, src_map)
+    if morrowind:
+        _reweight_morrowind_arms(skinned_geoms, skel_root, sk_skel, female, weight)
+    return _rebind(skinned_geoms, skel_root, (sk_skel, src_map), prn_out,
+                   (authored_body_part, authored_allowed))

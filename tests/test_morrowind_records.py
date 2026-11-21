@@ -8,6 +8,8 @@ The invariants are recorded in docs/commentary/tes4_export_morrowind.md.
 import os
 import struct
 
+from asset_convert.sources import source_registry
+from core.plugin_masters import is_master_export
 from tes4_export import tes3_reader as reader
 from tes4_export.export_morrowind import (MorrowindContext, convert_plugin,
                                           converted_master_dirs, load_context,
@@ -17,12 +19,14 @@ from tes4_export.record_types.morrowind import (export_ARMO, export_DOOR,
                                                 export_LIGH,
                                                 export_SOUN, export_WEAP,
                                                 tes4_signature)
-from tes4_export.record_types.morrowind_actors import export_LEVI, export_NPC_
+from tes4_export.record_types.morrowind_actors import (RaceTable, export_BSGN, export_CLAS,
+                                                       export_LEVI, export_NPC_)
 from tes4_export.record_types.morrowind_scripts import export_SCPT
 from tes4_export.morroblivion import MorroblivionModels
 from tes4_export.morrowind_cell import parse_cell as _parse
 from tes4_export.morrowind_pathgrid import pathgrid_records
-from tes4_export.morrowind_patch import PATCH_NAME, build_patch, patch_formid
+from tes4_export.morrowind_patch import (PATCH_NAME, collect_gap_records, export_patch,
+                                         patch_formid, register_source)
 
 #: Struct layouts of the fixed subrecords the tests author.
 _WPDT = '<fihHffH6Bi'
@@ -69,6 +73,23 @@ def _value(lines: list, key: str) -> str:
     return next(line for line in lines if line.startswith(key + '=')).split('=', 1)[1]
 
 
+def test_class_and_birthsign_carry_what_the_chargen_menus_show():
+    """A class keeps its two favored attributes; a sign its picture and spells, by TES3 id too.
+
+    See: docs/commentary/morrowind_runtime.md#chargen-menus
+    """
+    ctx = MorrowindContext()
+    cldt = struct.pack('<2ii10iii', 3, 5, 2, *range(10), 1, 0)
+    lines = export_CLAS(_rec('CLAS', 'Acrobat', _text('FNAM', 'Acrobat'), _sub('CLDT', cldt)), ctx)
+    assert 'DATA.PrimaryAttribute1=3' in lines and 'DATA.PrimaryAttribute2=5' in lines
+    ctx.register_own('lady\'s favor', 'SPEL')
+    sign = _rec('BSGN', 'Lady', _text('FNAM', 'The Lady'), _text('TNAM', 'birthsigns\\tx_birth_lady.tga'),
+                _sub('NPCS', b'lady\'s favor'.ljust(32, b'\0')))
+    lines = export_BSGN(sign, ctx)
+    assert _value(lines, 'Spell[0]') == ctx.resolve('lady\'s favor', 'SPEL')
+    assert _value(lines, 'SpellId[0]') == 'lady\'s favor' and _value(lines, 'FULL') == 'The Lady'
+
+
 def test_item_exporters_speak_the_tes4_vocabulary():
     """Stats reach the importer only under TES4's own key names.
 
@@ -83,6 +104,12 @@ def test_item_exporters_speak_the_tes4_vocabulary():
     assert 'DATA.Type=2' in lines and 'DATA.Damage=14' in lines
     assert 'DATA.Weight=12.0' in lines and 'DATA.Health=1800' in lines
     assert tes4_signature(mace) == 'WEAP'
+
+    ctx.register_own('fire bite', 'ENCH')
+    flaming = _rec('WEAP', 'flame mace', _sub('WPDT', wpdt), _text('ENAM', 'fire bite'))
+    shield = _rec('ARMO', 'fins shield', _text('ENAM', 'fire bite'))
+    for item in (export_WEAP(flaming, ctx), export_ARMO(shield, ctx)):
+        assert _value(item, 'ENAM') == ctx.resolve('fire bite', 'ENCH')
 
     arrow = _rec('WEAP', 'iron arrow', _sub('WPDT', struct.pack(
         _WPDT, 0.1, 1, 12, 0, 1.0, 0.0, 0, 1, 3, 1, 3, 1, 3, 0)))
@@ -171,6 +198,52 @@ def test_npc_exports_in_the_tes4_actor_vocabulary():
     assert 'AIDT.Services=1' in lines and 'AIPackageCount=0' in lines
 
 
+def _body(body_id: str, race: str, mesh: str, part: int = 0) -> reader.Tes3Record:
+    """A skin BODY part of `race` (part 0 head, 1 hair) using `mesh`."""
+    return _rec('BODY', body_id, _text('FNAM', race), _text('MODL', mesh),
+                _sub('BYDT', bytes([part, 0, 0, 0])))
+
+
+def test_custom_race_takes_the_vanilla_race_it_names_or_shares_meshes_with():
+    """A custom race converts as the vanilla race it is named after, else the one whose head/hair meshes
+    it shares most; with neither, or a tie, it stays Imperial."""
+    races = RaceTable()
+    races.add([_rec('RACE', 'Khajiit', _text('FNAM', 'Khajiit')),
+               _rec('RACE', 'Nord', _text('FNAM', 'Nord')),
+               _rec('RACE', 'Argonian', _text('FNAM', 'Argonian')),
+               _rec('RACE', 'T_Els_Ohmes', _text('FNAM', 'Khajiit')),
+               _rec('RACE', 'Normanen', _text('FNAM', 'Normanne')),
+               _rec('RACE', 'Mixed', _text('FNAM', 'Mixed')),
+               _rec('RACE', 'T_Val_Imga', _text('FNAM', 'Imga')),
+               _body('b_nord_head', 'Nord', 'b\\nord_head.nif'),
+               _body('b_nord_hair', 'Nord', 'b\\nord_hair.nif', 1),
+               _body('b_arg_head', 'Argonian', 'b\\arg_head.nif'),
+               _body('norm_head', 'Normanen', 'b\\nord_head.nif'),
+               _body('norm_hair', 'Normanen', 'b\\nord_hair.nif', 1),
+               _body('norm_own', 'Normanen', 'ark\\own.nif'),
+               _body('mix_a', 'Mixed', 'b\\nord_head.nif'),
+               _body('mix_b', 'Mixed', 'b\\arg_head.nif')])
+    ctx = MorrowindContext()
+    ctx.race_formids = races.formids()
+
+    def race_of(race_id):
+        """The RNAM.Race line an NPC of `race_id` exports."""
+        lines = export_NPC_(_rec('NPC_', 'npc', _text('RNAM', race_id)), ctx)
+        return next(line for line in lines if line.startswith('RNAM.Race='))
+    assert race_of('T_Els_Ohmes') == 'RNAM.Race=000223C7'
+    assert race_of('Normanen') == 'RNAM.Race=000224FD'
+    assert race_of('Mixed') == race_of('T_Val_Imga') == 'RNAM.Race=00000907'
+
+
+def test_enchant_keeps_its_own_skill():
+    """Morrowind Enchant exports as DATA.Enchant, never folded onto Mysticism."""
+    skills = [10] * 27
+    skills[9], skills[14] = 60, 25
+    npdt = struct.pack(_NPDT_FULL, 5, *([50] * 8), *skills, 40, 40, 40, 50, 0, 0, 0)
+    lines = export_NPC_(_rec('NPC_', 'enchanter', _sub('NPDT', npdt)), MorrowindContext())
+    assert 'DATA.Enchant=60' in lines and 'DATA.Mysticism=25' in lines
+
+
 def test_actor_placements_are_achr_and_acre():
     """A placed NPC is an ACHR, a creature an ACRE, a static a REFR.
 
@@ -223,8 +296,71 @@ def _export(tmp_path, name: str, records, master_dirs=()) -> str:
     ctx = load_context(str(tmp_path), masters)
     out_dir = os.path.join(str(tmp_path), name)
     counts = write_export(convert_plugin(records, ctx), out_dir)
-    write_header(out_dir, [n for n, _d in masters], sum(counts.values()))
+    write_header(out_dir, [n for n, _d in masters], sum(counts.values()),
+                 'fixture', flags=1)
     return out_dir
+
+
+def test_a_tes3_export_without_dialogue_is_still_tes3(tmp_path):
+    """The header, not a dialogue file, marks the source; the patch opts out.
+
+    See: docs/commentary/tes5_import_world.md#tes3-dont-havok-settle
+    """
+    from tes5_import.dialogue.morrowind_sidecar import is_tes3_export
+    plugin = _export(tmp_path, 'Groundcover.esp', [_rec('STAT', 'grass')])
+    assert not os.path.isfile(os.path.join(plugin, 'MWDI.txt'))
+    assert is_tes3_export(plugin)
+    patch = tmp_path / 'Patch'
+    patch.mkdir()
+    write_header(str(patch), [], 0, 'fixture', flags=1, source='')
+    assert not is_tes3_export(str(patch))
+
+
+class _ExtendsOnly:
+    """The one CrossRefGraph question the object-script plan asks first."""
+
+    def get_extends_class(self, _fid):
+        """Every script extends ObjectReference."""
+        return 'ObjectReference'
+
+
+def test_a_tes3_export_binds_no_papyrus_object_scripts(tmp_path):
+    """Its scripts run in the Morrowind runtime; a VMAD names a script never compiled.
+
+    See: docs/commentary/tes5_import_pipeline.md#phase-0-tes3-no-papyrus-scripts
+    """
+    from tes5_import.base.object_scripts import get_object_vmad
+    from tes5_import.pipeline import _prescan_script_plans
+    by_type = {'SCPT': [{'FormID': '00000800', 'EditorID': 'Bed_Standard',
+                         'SCTX': 'begin Bed_Standard\nShowRestMenu\nend'}],
+               'ACTI': [{'FormID': '00000801', 'SCRI': '00000800'}]}
+    oblivion = tmp_path / 'Oblivion'
+    oblivion.mkdir()
+    write_header(str(oblivion), [], 2, 'fixture', flags=1, source='')
+    _prescan_script_plans(by_type, None, _ExtendsOnly(), {}, str(oblivion), print)
+    assert get_object_vmad(0x801)
+    morrowind = _export(tmp_path, 'Beds.esp', [_rec('STAT', 'bed')])
+    _prescan_script_plans(by_type, None, _ExtendsOnly(), {}, morrowind, print)
+    assert get_object_vmad(0x801) == b''
+
+
+def test_a_plugin_ships_only_the_sounds_no_master_names(tmp_path):
+    """The shared Data folder means ownership is per FILE, not per plugin.
+
+    See: docs/commentary/tes4_export_morrowind.md#which-sounds-a-plugin-ships
+    """
+    from asset_convert.sources.morrowind_sound_scope import owned_files
+    shared = _rec('SOUN', 'Door Open', _text('FNAM', 'Fx/door.wav'))
+    master = _export(tmp_path, 'Master.esm', [shared])
+    mine = _rec('SOUN', 'Bell', _text('FNAM', 'Fx/bell.wav'))
+    plugin = _export(tmp_path, 'Mine.esp', [shared, mine], [master])
+    door, bell = 'fx' + chr(92) + 'door.wav', 'fx' + chr(92) + 'bell.wav'
+
+    assert owned_files(master, []) == {door}
+    assert owned_files(plugin, [master]) == {bell},         'the master already ships the door, so this plugin must not'
+
+    alone = _export(tmp_path, 'Alone.esp', [shared, mine])
+    assert owned_files(alone, []) == {door, bell},         'with no converted master a plugin ships every sound it names'
 
 
 def _form_ids(path: str) -> set:
@@ -262,8 +398,9 @@ def test_dependent_plugin_borrows_its_masters_records(tmp_path):
 
 
 def test_wearable_names_its_body_parts():
-    """A slotted piece names a synthetic worn model and lists its BODY parts.
+    """A piece with parts names a synthetic worn model, lists its BODY parts and its type.
 
+    A pauldron has no Oblivion slot but is worn all the same.
     See: docs/commentary/tes4_export_morrowind.md#worn-models
     """
     ctx = MorrowindContext()
@@ -277,10 +414,26 @@ def test_wearable_names_its_body_parts():
         + chr(92) * 2 + '0ironscuirass.nif')
     assert 'MorrowindPartCount=1' in lines and 'MorrowindPart[0].Slot=3' in lines
     assert 'Female.BipedModel.MODL' not in ''.join(lines)
+    assert 'MorrowindWearableType=1' in lines
     pauldron = _rec('ARMO', 'iron pauldron', _sub('AODT', struct.pack(
         '<ifiiii', 2, 5.0, 10, 100, 0, 5)), _sub('INDX', b'\x0d'),
         _text('BNAM', 'a_iron_cuirass'))
-    assert not any(l.startswith('Male.BipedModel') for l in export_ARMO(pauldron, ctx))
+    lines = export_ARMO(pauldron, ctx)
+    assert any(l.startswith('Male.BipedModel') for l in lines)
+    assert 'BMDT.BipedFlags=0' in lines and 'MorrowindWearableType=2' in lines
+
+
+def test_helmet_hides_the_head_only_when_it_fills_the_head_part():
+    """An open helm (Hair part only) keeps the face; a closed helm (Head part) hides it.
+
+    See: docs/commentary/tes4_export_morrowind.md#equipment-slots
+    """
+    ctx = MorrowindContext()
+    ctx.body_models = {'helm': 'a' + chr(92) + 'helm.nif'}
+    aodt = _sub('AODT', struct.pack('<ifiiii', 0, 5.0, 10, 100, 0, 5))
+    for part, flags in ((b'\x01', '2'), (b'\x00', '3')):
+        helm = _rec('ARMO', 'helm', aodt, _sub('INDX', part), _text('BNAM', 'helm'))
+        assert _value(export_ARMO(helm, ctx), 'BMDT.BipedFlags') == flags
 
 
 def test_ai_packages_become_pack_records():
@@ -350,6 +503,31 @@ def test_creature_names_its_split_folder_and_sounds(tmp_path):
     assert _value(lines, 'MorrowindModel') == 'r' + chr(92) * 2 + 'Guar.NIF'
     assert 'SoundType[0].Type=6' in lines
     assert _value(lines, 'SoundType[0].Sound') == ctx.resolve('guar roar')
+
+
+def test_moan_becomes_aware_not_idle(tmp_path):
+    """Moan is the vocal the graph annotates; CSDT 4 is deliberately silent.
+
+    See: docs/commentary/tes4_export_morrowind.md#creature-sound-generators
+    """
+    moan = _rec('SOUN', 'guar moan', _text('FNAM', 'Cr/guar/moan.wav'))
+    land = _rec('SOUN', 'guar land', _text('FNAM', 'Cr/guar/land.wav'))
+    gens = [_rec('SNDG', 'guar moan gen', _sub('DATA', struct.pack('<i', 4)),
+                 _text('SNAM', 'guar moan'), _text('CNAM', 'guar')),
+            _rec('SNDG', 'guar land gen', _sub('DATA', struct.pack('<i', 7)),
+                 _text('SNAM', 'guar land'), _text('CNAM', 'guar'))]
+    guar = _rec('CREA', 'guar', _text('MODL', 'r/Guar.NIF'),
+                _sub('FLAG', struct.pack('<I', 0)))
+    ctx = MorrowindContext()
+    meshes = tmp_path / 'meshes'
+    (meshes / 'r').mkdir(parents=True)
+    (meshes / 'r' / 'Guar.NIF').write_bytes(b'')
+    ctx.morroblivion = MorroblivionModels(str(tmp_path), [],
+                                          str(tmp_path / 'none.esm'), meshes)
+    lines = convert_plugin([moan, land] + gens + [guar], ctx)['CREA'][0][1]
+    slots = {_value(lines, f'SoundType[{i}].Type') for i in range(2)}
+    assert slots == {'5', '8'}, 'Moan lands on Aware (5), Land on Death (8)'
+    assert '4' not in slots, 'CSDT 4 loops the idle clip and is never annotated'
 
 
 def test_creature_on_a_vanilla_mesh_binds_to_morroblivions(tmp_path):
@@ -429,9 +607,12 @@ def test_export_refuses_a_master_that_is_not_converted(tmp_path, capsys):
     assert load_context(str(export), found).own_index == 2
 
 
-def _tes3_records(path, records, masters=()) -> str:
+def _tes3_records(path, records, masters=(), file_type=None) -> str:
     """Write `records` as a real TES3 file declaring `masters`; its path."""
     subs = b''
+    if file_type is not None:
+        hedr = struct.pack('<fi32s256si', 1.3, file_type, b'', b'', 0)
+        subs += b'HEDR' + struct.pack('<I', len(hedr)) + hedr
     for name in masters:
         payload = name.encode('cp1252') + b'\x00'
         subs += b'MAST' + struct.pack('<I', len(payload)) + payload
@@ -446,6 +627,31 @@ def _tes3_records(path, records, masters=()) -> str:
                  + b'\x00' * 8 + body)
     path.write_bytes(blob)
     return str(path)
+
+
+def test_export_carries_the_source_esm_flag_not_the_extension(tmp_path):
+    """HEDR type 1 exports as a master and 0 as a plugin, whatever the name."""
+    export = tmp_path / 'export'
+    export.mkdir()
+    for name, file_type in (('Flagged.esp', 1), ('Plain.esm', 0)):
+        source = _tes3_records(tmp_path / name, [_rec('STAT', 'rock')],
+                               file_type=file_type)
+        assert run_export(name, source, str(export)) is True
+        assert is_master_export(str(export / name)) == bool(file_type)
+
+
+#: A Morroblivion stand-in named so no stage resolves the REAL converted plugin.
+_FIXTURE_MASTER = 'Morrowind_ob_fixture.esm'
+
+
+def _convert_morroblivion(export, out_root) -> None:
+    """Import the stand-in Morroblivion export, which the patch masters."""
+    from tes5_import.pipeline import import_plugin
+    dest = out_root / _FIXTURE_MASTER / _FIXTURE_MASTER
+    dest.parent.mkdir(parents=True)
+    import_plugin(export_dir=str(export / _FIXTURE_MASTER),
+                  output_path=str(dest), masters=['Skyrim.esm'],
+                  output_root=str(out_root))
 
 
 def test_gap_patch_holds_what_morroblivion_lacks(tmp_path):
@@ -464,34 +670,105 @@ def test_gap_patch_holds_what_morroblivion_lacks(tmp_path):
     for name in ('Morrowind.esm', 'Tribunal.esm', 'Bloodmoon.esm'):
         _tes3_records(data / name, [_rec('STAT', 'ex_scrapwood01'),
                                     _rec('STAT', 'covered_rock')])
-    _export(export, 'Morrowind_ob.esm', [_rec('STAT', 'covered_rock')])
+    _export(export, _FIXTURE_MASTER, [_rec('STAT', 'covered_rock')])
+    _convert_morroblivion(export, tmp_path / 'output')
 
-    result = build_patch(str(data), str(export), ['Morrowind_ob.esm'],
-                         progress=lambda *_: None,
-                         out_root=tmp_path / 'output')
+    assert register_source(str(export), str(data)) == ''
+    result = export_patch(str(data), str(export), [_FIXTURE_MASTER],
+                          progress=lambda *_: None)
 
     assert result['ok'], result.get('error')
     assert result['records'] == 1, 'only the object Morroblivion lacks'
+    assert source_registry.directory_for(str(export), 'Morrowind.esm') == str(data), (
+        'the Data folder is registered so dependents find base_anim.nif')
     body = (export / PATCH_NAME / 'STAT.txt').read_text(encoding='utf-8')
     assert 'EditorID=ex_scrapwood01' in body
-    fid = patch_formid(('STAT', 'ex_scrapwood01'))
+    fid = patch_formid(('STAT', 'ex_scrapwood01'), 1)
     assert f'FormID={fid}' in body
-    assert fid.startswith('00'), 'a shared fill never sits in a plugin id space'
-    assert patch_formid(('STAT', 'EX_ScrapWood01')) == fid, (
+    assert fid.startswith('01'), 'the byte after its one Morroblivion master'
+    assert fid[2:] == patch_formid(('STAT', 'ex_scrapwood01'))[2:], (
+        'the master count moves the index byte and never the hashed id')
+    assert patch_formid(('STAT', 'EX_ScrapWood01'), 1) == fid, (
         'ids are case-insensitive')
-    assert patch_formid(('SOUN', 'ex_scrapwood01')) != fid, (
+    assert patch_formid(('SOUN', 'ex_scrapwood01'), 1) != fid, (
         'one id under two types is two records')
 
 
-def test_gap_patch_builds_the_plugin_itself(tmp_path):
-    """A build reports success only when the installable plugin EXISTS.
+def test_gap_patch_always_carries_the_birthsigns(tmp_path):
+    """A birthsign is read by the one birthsign menu, never placed, and
+    Morroblivion's signs are Oblivion's: the patch carries Morrowind's even
+    where Morroblivion's index knows the id, as it does every GLOB.
+    See: docs/commentary/tes4_export_morrowind.md#globals-are-always-filled
+    """
+    source = _tes3_records(tmp_path / 'Morrowind.esm',
+                           [_rec('STAT', 'covered_rock'), _rec('BSGN', 'lady')])
 
-    The build wrote an export and an asset tree, reported success, and never
-    ran the import -- so `output/` held meshes and textures but no plugin,
-    while every Morroblivion-mode conversion still declared it as a master.
+    class Supplied:
+        """An index that supplies every id."""
+
+        def lookup(self, _record_id):
+            """Every id resolves."""
+            return '01000800'
+
+    found = collect_gap_records([source], Supplied())
+    assert sorted(found) == [('BSGN', 'lady')]
+
+
+def _mgef(index: int, school: int, base_cost: float) -> reader.Tes3Record:
+    """A TES3 MGEF, addressed by INDX rather than a record id."""
+    rec = reader.Tes3Record(type='MGEF', flags=0)
+    medt = struct.pack('<ifiiiifff', school, base_cost, 0x7C0, 0, 0, 0,
+                       1.0, 1.0, 1.0)
+    rec.subrecords = [_sub('INDX', struct.pack('<i', index)),
+                      _sub('MEDT', medt)]
+    return rec
+
+
+def test_gap_patch_carries_vanillas_authored_magic_effects(tmp_path):
+    """Every Morroblivion-mode spell names the patch's effects, so they carry
+    vanilla's school and cost; a later master's copy wins, and no stub is
+    written over an effect a master already supplies.
+
+    See: docs/commentary/tes4_export_morrowind.md#effects-come-from-the-patch
+    """
+    export = tmp_path / 'export'
+    export.mkdir()
+    data = tmp_path / 'Data Files'
+    data.mkdir()
+    for name, cost in (('Morrowind.esm', 5.0), ('Tribunal.esm', 7.0),
+                       ('Bloodmoon.esm', None)):
+        records = [_rec('STAT', 'ex_scrapwood01')]
+        if cost is not None:
+            records.append(_mgef(75, 5, cost))
+        _tes3_records(data / name, records)
+    _export(export, _FIXTURE_MASTER, [_rec('STAT', 'covered_rock')])
+    _convert_morroblivion(export, tmp_path / 'output')
+
+    assert register_source(str(export), str(data)) == ''
+    result = export_patch(str(data), str(export), [_FIXTURE_MASTER],
+                          progress=lambda *_: None)
+
+    assert result['ok'], result.get('error')
+    body = (export / PATCH_NAME / 'MGEF.txt').read_text(encoding='utf-8')
+    blocks = {b.split('EditorID=')[1].split('\n')[0]: b
+              for b in body.split('---RECORD_BEGIN---') if 'EditorID=' in b}
+    assert 'DATA.School=5' in blocks['MW075RestoreHealth']
+    assert 'DATA.BaseCost=7.0' in blocks['MW075RestoreHealth'], 'Tribunal wins'
+    assert f"FormID={patch_formid(('MGEF', 'MW075RestoreHealth'), 1)}" in \
+        blocks['MW075RestoreHealth'], 'the id every dependent already names'
+    assert set(blocks) == {'MW075RestoreHealth'}, (
+        'the stand-in master, a TES3 export, already supplies the other 142')
+
+
+def test_gap_patch_imports_like_any_plugin(tmp_path):
+    """The patch's export builds an installable ESM through the ordinary Import step.
+
+    `phase_import` finds no source binary for the patch, so it passes only
+    Skyrim.esm and reads the ESM bit from the export header.
     See: docs/commentary/tes4_export_morrowind.md#the-patch-builds-its-own-plugin
     """
     from asset_convert.lod.sibling_lod import converted_plugins
+    from tes5_import.pipeline import import_plugin
     from tools.esm.make_master import read_header
 
     export = tmp_path / 'export'
@@ -501,20 +778,27 @@ def test_gap_patch_builds_the_plugin_itself(tmp_path):
     for name in ('Morrowind.esm', 'Tribunal.esm', 'Bloodmoon.esm'):
         _tes3_records(data / name, [_rec('STAT', 'ex_scrapwood01'),
                                     _rec('STAT', 'covered_rock')])
-    _export(export, 'Morrowind_ob.esm', [_rec('STAT', 'covered_rock')])
+    _export(export, _FIXTURE_MASTER, [_rec('STAT', 'covered_rock')])
     out_root = tmp_path / 'output'
+    _convert_morroblivion(export, out_root)
 
-    result = build_patch(str(data), str(export), ['Morrowind_ob.esm'],
-                         progress=lambda *_: None, out_root=out_root)
+    result = export_patch(str(data), str(export), [_FIXTURE_MASTER],
+                          progress=lambda *_: None)
 
     assert result['ok'], result.get('error')
+    assert is_master_export(str(export / PATCH_NAME)), (
+        'the -f import of the patch must keep the ESM flag')
     plugin = out_root / PATCH_NAME / PATCH_NAME
-    assert plugin.is_file(), 'the build must leave an installable plugin'
-    assert result['plugin'] == str(plugin), 'the caller is told where it went'
+    plugin.parent.mkdir(parents=True)
+    _converted, errors = import_plugin(
+        export_dir=str(export / PATCH_NAME), output_path=str(plugin),
+        masters=['Skyrim.esm'], is_esm=True, output_root=str(out_root))
+    assert errors == 0
     assert plugin.read_bytes()[:4] == b'TES4', 'a real plugin, not a stub'
 
     flags, masters = read_header(str(plugin))
-    assert masters == ['Skyrim.esm'], 'a standalone patch masters nothing else'
+    assert masters == ['Skyrim.esm', _FIXTURE_MASTER], (
+        'it names what Morroblivion holds, so it masters Morroblivion')
     assert flags & 0x1, 'ESM-flagged: dependent plugins declare it a master'
     assert PATCH_NAME.lower().endswith('.esp'), 'the .esp extension is kept'
     assert PATCH_NAME in converted_plugins(out_root), (
@@ -546,6 +830,25 @@ def test_morroblivion_mode_refuses_without_the_patch(tmp_path):
                                            str(child), SOURCE_MORROBLIVION)
     assert not missing
     assert any(n == PATCH_NAME for n, _d in found), 'the patch is borrowed from'
+
+
+def test_morroblivion_mode_refuses_vanilla_and_standalone_plugins(tmp_path):
+    """Vanilla masters and masterless games never build in Morroblivion mode.
+
+    See: docs/commentary/tes4_export_morrowind.md#masters
+    """
+    from tes4_export.export_morrowind import MORROWIND_SOURCE_KEY, SOURCE_MORROBLIVION
+
+    export = tmp_path / 'export'
+    export.mkdir()
+    config = {MORROWIND_SOURCE_KEY: SOURCE_MORROBLIVION}
+    cases = (('Arktwend_English.esm', ()), ('Morrowind.esm', ()),
+             ('Tribunal.esm', ['Morrowind.esm']))
+    for name, masters in cases:
+        source = _tes3_records(tmp_path / name, [_rec('STAT', 'rock')],
+                               masters=masters)
+        assert run_export(name, source, str(export), config) is False, name
+        assert not (export / name).exists(), name
 
 
 def test_actor_drops_the_reference_to_a_package_that_never_emitted():

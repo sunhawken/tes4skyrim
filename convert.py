@@ -10,7 +10,7 @@ Pipeline steps (each runnable via --<step>-only):
   sounds          Convert sound files to XWM
   scripts         Convert TES4 scripts to Papyrus .psc and compile to .pex
   lod             Generate object & terrain LOD meshes
-  modify-body-meshes  Add greaves partition to character body NIFs
+  modify-body-meshes  Write the body-slot patch over a Skyrim load order
   pack            Pack assets into Skyrim SE BSA archives (textures nothing
                   references are left out of the archive, never deleted)
   pack-zip        Zip converted plugin/BSA files for distribution
@@ -33,7 +33,6 @@ Usage:
   python convert.py --output-dir /path/to/output -f Oblivion.esm
 """
 
-import argparse
 import io
 import os
 import shutil
@@ -41,6 +40,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 # Ensure stdout/stderr can handle Unicode on Windows consoles (cp1252 → utf-8)
 # Ensure stdout/stderr can handle Unicode on Windows consoles (cp1252 → utf-8)
@@ -61,16 +61,16 @@ if sys.stderr and hasattr(sys.stderr, "buffer"):
 SCRIPT_DIR = Path(__file__).parent.resolve()  # TESConversion root
 
 
-# Shared-folder resolution. Plugins imported together from one mod archive
-# share ONE asset tree, so a plugin name maps to a folder through these
-# resolvers and never by joining a name onto a root by hand -- that is the only
-# reason export/ and output/ agree. `output_layout` imports nothing but
-# pathlib, so this is safe at module scope despite convert.py being the entry
-# point every package imports from.
-from output_layout import record_dir, plugin_out_root
+from output_layout import (BODY_SLOTS_PATCH, configured_output, finished_dir,
+                           plugin_out_root, record_dir, tree_members,
+                           write_mod_zip)
 from papyrus_compile import phase_compile
 from tes4_export.tes3_reader import is_tes3
-from core.plugin_masters import get_masters_from_binary, topological_order
+from tes4_export.morrowind_patch import (
+    PATCH_NAME, register_source as register_patch_source, run_patch_export,
+    stage_pair_scripts)
+from core.plugin_masters import (binary_master_chain, get_masters_from_binary,
+                                 is_master_export, topological_order)
 import core.run_log as run_log
 
 
@@ -82,11 +82,9 @@ import core.run_log as run_log
 from core.subprocess_flags import (POPEN_FLAGS as _POPEN_FLAGS,
                               configure_multiprocessing)
 from core.process_job import create_pool_job, describe_limit
-from core.collision_options import (
-    WINDING_FIX_DEFAULT_PLUGINS,
-    WINDING_FIX_ENV_VAR,
-    default_for_plugin,
-)
+from core.heavy_lock import SUPERVISED_ENV_VAR, hold_heavy_lock
+from core.collision_options import WINDING_FIX_ENV_VAR, default_for_plugin
+from core.navmesh_options import set_navmesh_generator, set_navmesh_pins_dir
 
 # multiprocessing.Pool workers (nif/lod conversion) must also inherit a hidden
 # console — configure before any pool is created.
@@ -102,45 +100,82 @@ create_pool_job()
 
 from source_paths import (get_paths, is_asset_only,
                           load_config, resolve_plugin_path)
+from asset_convert.sources import source_registry
+from asset_convert import video
+from convert_cli import (SCOPED_STEPS, apply_config_overrides, build_parser,
+                         selected_steps, unscoped_steps)
+import preflight
+import version as _version
+
+
+# ---------------------------------------------------------------------------
+#  Source management: --list-mods, --import-mod, --remove-mod
+# ---------------------------------------------------------------------------
+
+def _list_sources(export_dir: str) -> int:
+    """--list-mods: Data folders, every plugin with several copies, then imported mods.
+
+    See: docs/commentary/asset_convert_mod_ingest.md#same-named-plugins
+    """
+    _list_directories(export_dir)
+    groups = source_registry.groups(export_dir)
+    if not groups:
+        print("No imported mods. Add one with:\n"
+              "  python convert.py --import-mod <archive|folder>")
+        return 0
+    print(f"Imported mods ({len(groups)}):")
+    for _gid, label, plugs in groups:
+        first = source_registry.get(export_dir, plugs[0]) if plugs else {}
+        total = sum((first or {}).get("counts", {}).values())
+        print(f"  {label}" + (f"  ({total} files)" if total else ""))
+        for name in plugs:
+            print(f"    - {name}{_mod_plugin_note(export_dir, name)}")
+    return 0
+
+
+def _list_directories(export_dir: str) -> None:
+    """Each registered Data folder, then each plugin found in more than one of them."""
+    dirs = source_registry.directories(export_dir)
+    print(f"Data folders ({len(dirs)}):")
+    names = set()
+    for row in dirs:
+        print(f"  {row['label']}: {row['path']}")
+        if os.path.isdir(row['path']):
+            names.update(n for n in os.listdir(row['path'])
+                         if n.lower().endswith((".esm", ".esp", ".esl")))
+    shared = [(n, source_registry.copies(export_dir, n))
+              for n in sorted(names, key=str.lower)]
+    shared = [(n, rows) for n, rows in shared if len(rows) > 1]
+    if shared:
+        print("Plugins in more than one Data folder "
+              "(pass --data-dir to convert a copy):")
+    for name, rows in shared:
+        print(f"  {name}")
+        for path, folder in rows:
+            print(f"    {path} -> export/{folder}")
+    print()
+
+
+def _mod_plugin_note(export_dir: str, name: str) -> str:
+    """What --list-mods adds after an imported plugin: its kinds, or a missing binary."""
+    entry = source_registry.get(export_dir, name) or {}
+    if not entry.get("plugin"):
+        kinds = ", ".join(k for k in ("meshes", "textures", "sound", "trees")
+                          if (entry.get("capabilities") or {}).get(k))
+        return "  (no plugin" + (f"; {kinds}" if kinds else "") + ")"
+    if source_registry.plugin_binary(export_dir, name):
+        return ""
+    return "   [binary MISSING]"
 
 
 def _mod_commands(args, export_dir: str, tes4_data: str) -> int:
-    """Handle --list-mods / --import-mod / --remove-mod, then exit.
+    """Handle --import-mod / --remove-mod, then exit.
 
-    These manage conversion SOURCES rather than converting anything, so they
-    never touch the pipeline.
+    Several sources import IN ORDER into one asset tree, later ones winning,
+    as a mod manager resolves them. A source may also name an existing export
+    tree, which is how the base game joins the stack.
     """
     from asset_convert.sources import mod_ingest
-    from asset_convert.sources import source_registry
-
-    if args.list_mods:
-        groups = source_registry.groups(export_dir)
-        if not groups:
-            print("No imported mods. Add one with:\n"
-                  "  python convert.py --import-mod <archive|folder>")
-            return 0
-        print(f"Imported mods ({len(groups)}):")
-        for _gid, label, plugs in groups:
-            # One shared asset tree per mod, so the file count belongs on the
-            # mod's line -- printing it per plugin implied three payloads.
-            _first = source_registry.get(export_dir, plugs[0]) if plugs else {}
-            _total = sum((_first or {}).get("counts", {}).values())
-            print(f"  {label}" + (f"  ({_total} files)" if _total else ""))
-            for name in plugs:
-                entry = source_registry.get(export_dir, name) or {}
-                if not entry.get("plugin"):
-                    # Asset-only mod: no plugin is the normal state, not a
-                    # missing file.
-                    kinds = ", ".join(
-                        k for k in ("meshes", "textures", "sound", "trees")
-                        if (entry.get("capabilities") or {}).get(k))
-                    print(f"    - {name}  (no plugin"
-                          + (f"; {kinds}" if kinds else "") + ")")
-                    continue
-                binary = source_registry.plugin_binary(export_dir, name)
-                mark = "" if binary else "   [binary MISSING]"
-                print(f"    - {name}" + mark)
-        return 0
 
     if args.remove_mod:
         if mod_ingest.remove(args.remove_mod, export_dir):
@@ -150,16 +185,9 @@ def _mod_commands(args, export_dir: str, tes4_data: str) -> int:
               f"See --list-mods.")
         return 1
 
-    # --import-mod.  One or more sources, applied IN ORDER: later sources
-    # overwrite earlier ones in the shared asset tree, exactly as a mod manager
-    # would resolve them.  Doing it here rather than at convert time means every
-    # later stage keeps seeing a single coherent tree and needs no changes.
     sources = args.import_mod
     if isinstance(sources, str):
         sources = [sources]
-    # A source may be an archive, a mod folder, or the NAME of an export tree
-    # that already exists -- which is how the base game joins the stack rather
-    # than sitting beside it.
     missing_src = [x for x in sources
                    if not os.path.exists(x)
                    and not (Path(export_dir) / x).is_dir()]
@@ -176,14 +204,33 @@ def _mod_commands(args, export_dir: str, tes4_data: str) -> int:
     if len(sources) > 1:
         return _import_ordered(sources, args, export_dir, tes4_data,
                                mod_ingest)
+    return _import_single(sources[0], args, export_dir, tes4_data, mod_ingest)
 
-    src = sources[0]
+
+def _import_single(src, args, export_dir: str, tes4_data: str, mod_ingest) -> int:
+    """Import one archive or mod folder, then say how to convert it."""
     try:
         manifest = mod_ingest.inspect(src)
+        _print_manifest(manifest, mod_ingest)
+        results = mod_ingest.ingest(
+            src, export_dir,
+            plugin_members=args.plugin_member,
+            keep_archive=not args.no_keep_archive,
+            manifest=manifest)
     except mod_ingest.IngestError as exc:
         print(f"ERROR: {exc}")
         return 1
+    _warn_missing_masters(_missing_master_exports(results, export_dir, tes4_data))
+    first = sorted(results)[0]
+    _write_base_plugins(export_dir,
+                        source_registry.asset_root_name(export_dir, first),
+                        args.base)
+    _print_next_step(first, results, mod_ingest)
+    return 0
 
+
+def _print_manifest(manifest, mod_ingest) -> None:
+    """What an import found in the archive before it is ingested."""
     print(f"Archive : {manifest.path.name}")
     print(f"Layout  : {mod_ingest.layout_description(manifest.payload_root)}")
     print(f"Contents: {manifest.summary()}")
@@ -196,58 +243,35 @@ def _mod_commands(args, export_dir: str, tes4_data: str) -> int:
         print(f"Nested  : {len(manifest.nested)} archive(s)")
     print(f"Plugins : {', '.join(manifest.plugins)}")
 
-    try:
-        results = mod_ingest.ingest(
-            src, export_dir,
-            plugin_members=args.plugin_member,
-            keep_archive=not args.no_keep_archive,
-            manifest=manifest)
-    except mod_ingest.IngestError as exc:
-        print(f"ERROR: {exc}")
-        return 1
 
-    # Masters must already be converted or the import silently produces a
-    # broken plugin -- warn loudly rather than letting it fail deep in import.
-    missing = _missing_master_exports(results, export_dir, tes4_data)
-    if missing:
-        print()
-        print("WARNING: these masters have no export yet:")
-        for master, users in sorted(missing.items()):
-            print(f"  {master}  (needed by {', '.join(sorted(users))})")
-        print("Convert them FIRST, or the import will resolve their records "
-              "to nothing:")
-        print(f"  python convert.py -f {sorted(missing)[0]}")
+def _warn_missing_masters(missing) -> None:
+    """Name every master with no export yet; importing before them resolves to nothing."""
+    if not missing:
+        return
+    print()
+    print("WARNING: these masters have no export yet:")
+    for master, users in sorted(missing.items()):
+        print(f"  {master}  (needed by {', '.join(sorted(users))})")
+    print("Convert them FIRST, or the import will resolve their records "
+          "to nothing:")
+    print(f"  python convert.py -f {sorted(missing)[0]}")
 
-    first = sorted(results)[0]
+
+def _print_next_step(first, results, mod_ingest) -> None:
+    """The command that converts what was just imported; an asset-only mod gets only its asset steps."""
     quoted = f'"{first}"' if ' ' in first else first
     caps = (results[first] or {}).get('capabilities') or {}
-    # The ASSET tree, not the plugin name.  `results` is keyed by plugin,
-    # but a mod's assets land in its GROUP folder (named for the mod's
-    # label), and those differ whenever the archive is not named for the
-    # esp inside -- the normal case.  Writing `.base_plugins` under the
-    # plugin name put it in a directory holding no meshes, so the texture
-    # fallback never saw it and --base silently did nothing for any mod
-    # that ships a plugin.  asset_root_name reads the registry entry the
-    # ingest above just wrote, so it is right on the cached path too.
-    from asset_convert.sources import source_registry as _sr
-    _asset_tree = _sr.asset_root_name(export_dir, first)
-    _write_base_plugins(export_dir, _asset_tree, args.base)
     print()
     if caps.get('plugin', True):
         print("Imported. Convert it with:")
         print(f"  python convert.py -f {quoted}")
     else:
-        # No plugin means no export/import/scripts -- naming those steps here
-        # would send the user straight into a no-op run.
         steps = sorted(mod_ingest.available_steps(caps)
                        & {'meshes', 'speedtrees', 'sounds'})
         flags = ' '.join(f'--{s.replace("_", "-")}-only' for s in steps)
         print("Imported (asset-only mod -- no plugin to export or import).")
         print("Convert its assets with:")
         print(f"  python convert.py -f {quoted} {flags}".rstrip())
-    return 0
-
-
 
 
 def _import_ordered(sources, args, export_dir, tes4_data, mod_ingest):
@@ -380,7 +404,6 @@ def _missing_master_exports(results, export_dir: str, tes4_data: str) -> dict:
 
     See: docs/commentary/tes5_import_mod_merge.md#master-export-resolution
     """
-    from asset_convert.sources import source_registry
 
     missing = {}
     for name in results:
@@ -395,37 +418,6 @@ def _missing_master_exports(results, export_dir: str, tes4_data: str) -> dict:
 
 
 # ===========================================================================
-# Morroblivion compatibility patch
-# ===========================================================================
-
-def _build_morrowind_patch(data_dir: str, export_dir: str,
-                           output_dir: str) -> int:
-    """Build the Morroblivion compatibility patch, then exit.
-
-    The same one action the GUI menu runs. It is the ONLY way to produce a
-    plugin every Morroblivion-mode conversion declares as a master, so a
-    GUI-only door left CLI users with a refusal naming a menu they never open.
-    See: docs/commentary/tes4_export_morrowind.md#the-patch-builds-its-own-plugin
-    """
-    from tes4_export.export_morrowind import morroblivion_exports
-    from tes4_export.morrowind_patch import build_patch
-
-    exports = morroblivion_exports(export_dir)
-    print("Building the Morroblivion compatibility patch")
-    print(f"  Source : {data_dir}")
-    if exports:
-        print(f"  Against: {', '.join(exports)}")
-    result = build_patch(data_dir, export_dir, exports, out_root=output_dir)
-    if not result["ok"]:
-        print(f"ERROR: {result['error']}")
-        return 1
-    print(f"Done in {result['seconds']:.1f}s -- {result['records']} records, "
-          f"{result['assets']} assets.")
-    print(f"  {result['plugin']}")
-    return 0
-
-
-# ===========================================================================
 # Phase 1: Export TES4 RECORDS
 # ===========================================================================
 
@@ -434,19 +426,31 @@ def _plugins_to_convert(args, config: dict, tes4_data: str,
     """The plugins to convert, masters first.
 
     Files always come from -f/--files, which is also how the GUI passes the
-    selected plugins; `config["files"]` is a legacy fallback only.
+    selected plugins; `config["files"]` is a legacy fallback only. A mod's
+    folder or label is refused when the mod ships plugins.
+
+    See: docs/reference/pipeline.md#-f-takes-the-plugin
     """
+    files = ([PATCH_NAME] if args.build_morrowind_patch
+             else args.files or config.get("files", []))
+    for name in files:
+        shipped = source_registry.mod_plugins(export_dir, name)
+        if shipped:
+            raise SystemExit(
+                f'ERROR: "{name}" is a mod, not a plugin. Convert its '
+                f'plugin(s) instead: -f {" ".join(shipped)}')
     return topological_order(
-        args.files or config.get("files", []),
-        lambda name: resolve_plugin_path(name, tes4_data, export_dir))
+        files, lambda name: resolve_plugin_path(name, tes4_data, export_dir))
 
 
 def phase_export(file_name: str, tes4_data: str, export_dir: str,
                  config: dict):
     """Export TES4 records using the Python binary reader."""
     from tes4_export.tes4_reader import read_file
-    from tes4_export.export import export_file, export_header
+    from tes4_export.export import export_file, export_header, use_source_codec
 
+    if file_name == PATCH_NAME:
+        return run_patch_export(export_dir)
     out_dir = str(record_dir(export_dir, file_name))
 
     # Find the source file -- the Oblivion Data directory, or an imported mod's
@@ -471,6 +475,7 @@ def phase_export(file_name: str, tes4_data: str, export_dir: str,
     print(f"  Scanned {len(all_records)} records in {t1-t0:.2f}s")
 
     os.makedirs(out_dir, exist_ok=True)
+    use_source_codec(source, all_records)
     export_header(header, out_dir)
 
     # Export EVERY record in the file. Records carrying a master's load-order
@@ -494,6 +499,26 @@ def phase_export(file_name: str, tes4_data: str, export_dir: str,
 # Phase 2: EXTRACT TES4 ARCHIVES
 # ===========================================================================
 
+def _stage_morrowind_voices(file_name: str, extract_dir: str) -> None:
+    """Copy each exported bark's voice file into the TES4 voice layout.
+
+    Runs for BOTH extract paths: a mod archive carries no Sound tree of its
+    own, but its barks still play Morrowind's audio.
+    See: docs/commentary/asset_convert_audio.md#morrowind-barks
+    """
+    from asset_convert.audio.morrowind_voice import find_sound_dir
+    from asset_convert.sources.bsa_extract_morrowind_sounds import (
+        stage_voices)
+    from output_layout import asset_root, record_dir
+    own = os.path.join(str(record_dir(extract_dir, file_name)), 'INFO.txt')
+    sound_dir = find_sound_dir(extract_dir) if os.path.isfile(own) else None
+    if not sound_dir:
+        return
+    staged = stage_voices(extract_dir, file_name, sound_dir,
+                          asset_root(extract_dir, file_name))
+    print(f"[{file_name}] Bark and Say recordings staged: {staged}")
+
+
 def phase_extract(file_name: str, tes4_data: str, config: dict,
                   output_dir: str = None):
     """Get a plugin's assets into export/<name>/.
@@ -505,8 +530,10 @@ def phase_extract(file_name: str, tes4_data: str, config: dict,
         whichever registered Data directory holds it.
     """
     extract_dir = str(SCRIPT_DIR / "export")
+    if file_name == PATCH_NAME:
+        print(f"[{file_name}] Its Export step extracts the assets it ships")
+        return True
 
-    from asset_convert.sources import source_registry
     if source_registry.get(extract_dir, file_name):
         from asset_convert.sources import mod_ingest
         print(f"[{file_name}] Re-importing mod archive...")
@@ -515,6 +542,7 @@ def phase_extract(file_name: str, tes4_data: str, config: dict,
         except mod_ingest.IngestError as exc:
             print(f"[{file_name}] ERROR: {exc}")
             return False
+        _stage_morrowind_voices(file_name, extract_dir)
         return True
 
     from asset_convert.asset_pipeline import extract_bsas
@@ -544,12 +572,16 @@ def _use_plugin_namespace(file_name: str) -> str:
 
     Every phase runs in its own process, and only the ones calling into
     asset_pipeline set this, so the rest wrote the default namespace whatever
-    plugin they were handed.
+    plugin they were handed. The Morroblivion texture map rides along, since
+    it rewrites the same texture paths.
     See: docs/commentary/asset_convert_texture.md#per-game-asset-namespace
     """
     from asset_convert.game_paths import namespace_for, set_namespace
-    ns = namespace_for(record_dir(str(SCRIPT_DIR / "export"), file_name))
+    from asset_convert.nif import morroblivion_textures
+    rec_dir = record_dir(str(SCRIPT_DIR / "export"), file_name)
+    ns = namespace_for(rec_dir)
     set_namespace(ns)
+    morroblivion_textures.activate(rec_dir)
     return ns
 
 
@@ -559,7 +591,7 @@ def _use_plugin_namespace(file_name: str) -> str:
 
 def phase_assets(file_name: str, config: dict, output_dir: str = None,
                  mesh_subdirs=None, winding_fix=None, parallax=False,
-                 textures_only=False):
+                 textures_only=False, skip_hair=False):
     """Convert extracted NIF assets and copy textures to output (meshes only).
 
     `winding_fix` tri-states the collision winding repair: True/False force it,
@@ -590,6 +622,7 @@ def phase_assets(file_name: str, config: dict, output_dir: str = None,
         mesh_subdirs=mesh_subdirs,
         parallax=parallax,
         textures_only=textures_only,
+        skip_hair=skip_hair,
     )
     total = sum(v for v in stats.values() if isinstance(v, int))
     print(f"[{file_name}] Meshes complete ({total} items processed)")
@@ -601,26 +634,21 @@ def phase_assets(file_name: str, config: dict, output_dir: str = None,
         print(f"[{file_name}] Textures only: no meshes, no book art "
               f"(PGPatcher patches the meshes in the load order)")
         return True
+    if mesh_subdirs:
+        return True
 
     from asset_convert.ui.book_inam import generate_book_inams
 
     _, tes5_data = get_paths(config)
     print(f"[{file_name}] Generating book inventory-art meshes...")
-    # A plugin places its MASTERS' book models too, and those meshes/textures
-    # were extracted into the master's export dir only.
-    # base_plugins, not terrain_lod's master_names: the latter reads only
-    # _HEADER.txt, which an asset-only merge does not have, so its books
-    # would find no BOOK records and ship no inventory art at all.
-    from asset_convert.sources import base_plugins as _bp
     bstats = generate_book_inams(
         source_file=file_name,
         extract_dir=extract_dir,
         output_dir=out_dir,
         skyrim_data=tes5_data or None,
-        master_names=_bp.names_for(record_dir(extract_dir, file_name)),
     )
     print(f"[{file_name}] Book INAM complete: ok={bstats['ok']} "
-          f"skip={bstats['skip']} fail={bstats['fail']}")
+          f"note={bstats['note']} skip={bstats['skip']} fail={bstats['fail']}")
     return True
 
 # ===========================================================================
@@ -661,10 +689,11 @@ def phase_speedtrees(file_name: str, config: dict, output_dir: str = None):
 # ===========================================================================
 
 def phase_creatures(file_name: str, tes5_data: str, config: dict,
-                    output_dir: str = None):
+                    output_dir: str = None, only: list = None):
     """Convert creatures: generated behavior projects (skeleton.hkx,
     animations, behavior graph), skeleton/body NIF conversion, and
-    registration in the merged animation singlefiles.
+    registration in the merged animation singlefiles. `only` names the
+    creature folders to rebuild; the rest stay registered as they are.
 
     Must run BEFORE import: Phase 0f of the importer reads
     export/<name>/creature_projects.json to generate RACE/ARMA/ARMO chains.
@@ -682,8 +711,9 @@ def phase_creatures(file_name: str, tes5_data: str, config: dict,
     out_meshes = str(plugin_out_root(out_root, file_name, export_root)
                      / "meshes")
 
-    print(f"[{file_name}] Converting creatures (behavior projects + meshes)...")
-    res = convert_creatures(export_subdir, out_meshes)
+    scope = f" (only {', '.join(only)})" if only else ""
+    print(f"[{file_name}] Converting creatures (behavior projects + meshes){scope}...")
+    res = convert_creatures(export_subdir, out_meshes, names=only)
     print(f"[{file_name}] Creatures complete "
           f"({len(res['projects'])} projects, {len(res['errors'])} errors)")
     return not res['errors']
@@ -691,6 +721,15 @@ def phase_creatures(file_name: str, tes5_data: str, config: dict,
 # ===========================================================================
 # Phase 6: BUILD TES5 PLUGIN
 # ===========================================================================
+
+def _install_navmesh_cache(file_name: str, config: dict) -> None:
+    """Install the prebuilt navmesh cache (drop-in, else download if allowed); never fatal."""
+    try:
+        from tools.navmesh.navmesh_cache import auto_install, download_allowed
+        auto_install(file_name, allow_download=download_allowed(config))
+    except Exception as exc:
+        print(f"  Navmesh cache: unavailable ({exc}); generating normally.")
+
 
 def phase_import(file_name: str, tes4_data: str, tes5_data: str,
                  export_dir: str, config: dict, output_dir: str = None):
@@ -705,24 +744,7 @@ def phase_import(file_name: str, tes4_data: str, tes5_data: str,
         print(f"[{file_name}] No export directory, skipping import")
         return False
 
-    # Navmesh generation is the slowest part of this phase, and a prebuilt
-    # cache is published with each release.  Pick it up automatically -- from
-    # navmesh_cache/ if the user dropped a zip there, else by downloading the
-    # matching asset -- so nobody has to know a command exists.  Never fatal:
-    # on any problem the navmesh just regenerates as it always did.
-    # Opt out with TESCONV_NO_CACHE_DOWNLOAD=1 (metered connections).
-    try:
-        from tools.navmesh.navmesh_cache import auto_install, NO_DOWNLOAD_ENV_VAR
-        auto_install(file_name,
-                     allow_download=os.environ.get(
-                         NO_DOWNLOAD_ENV_VAR, '').strip().lower()
-                     not in ('1', 'true'))
-    except Exception as exc:
-        # Never fatal -- but never silent either.  A bare `pass` here meant an
-        # import error or a broken tools/ path made the cache vanish with no
-        # trace, which is exactly what "the download does not work" looked like
-        # from the user's side.
-        print(f"  Navmesh cache: unavailable ({exc}); generating normally.")
+    _install_navmesh_cache(file_name, config)
 
     out_root = output_dir or str(SCRIPT_DIR / "output")
     os.makedirs(out_root, exist_ok=True)
@@ -738,12 +760,11 @@ def phase_import(file_name: str, tes4_data: str, tes5_data: str,
     os.makedirs(plugin_dir, exist_ok=True)
     output_path = os.path.join(plugin_dir, file_name)
 
-    # Auto-detect masters from binary, prepend Skyrim.esm
-    source = os.path.join(tes4_data, file_name)
+    source = resolve_plugin_path(file_name, tes4_data, export_dir)
     tes4_masters = get_masters_from_binary(source) if os.path.isfile(source) else []
     masters = ['Skyrim.esm'] + tes4_masters
 
-    is_esm = file_name.lower().endswith('.esm')
+    is_esm = is_master_export(export_subdir)
 
     print(f"[{file_name}] Importing...")
     print(f"  Masters: {', '.join(masters)}")
@@ -765,8 +786,12 @@ def phase_import(file_name: str, tes4_data: str, tes5_data: str,
 # Phase 7: CONVERT SOUNDS
 # ===========================================================================
 
-def phase_sounds(file_name: str, config: dict, output_dir: str = None):
-    """Convert extracted sound files from BSA to XWM format in output."""
+def phase_sounds(file_name: str, config: dict, output_dir: str = None,
+                 tes4_data: str = None):
+    """Convert extracted sound files from BSA to XWM format in output.
+
+    Music and the videos the plugin's scripts play ride this stage too.
+    """
     _use_plugin_namespace(file_name)
     from asset_convert.asset_pipeline import convert_sounds
 
@@ -801,6 +826,9 @@ def phase_sounds(file_name: str, config: dict, output_dir: str = None):
           f"{mstats.get('cached', 0)} cached, "
           f"{mstats.get('failed', 0)} failed, "
           f"{mstats.get('tracks', 0)} tracks)")
+    video.report(file_name, video.convert_videos(
+        file_name, extract_dir, out_dir,
+        _plugin_data_dir(file_name, tes4_data, extract_dir)))
     return True
 
 
@@ -821,6 +849,10 @@ def phase_scripts(file_name: str, config: dict, output_dir: str = None):
         return False
 
     out_root = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
+    if file_name == PATCH_NAME:
+        staged = stage_pair_scripts(export_root, out_root)
+        print(f"[{file_name}] Staged {staged} split-pair child script(s)")
+        return True
     script_dir = (plugin_out_root(out_root, file_name, export_root)
                   / "scripts" / "source")
 
@@ -839,63 +871,45 @@ def phase_scripts(file_name: str, config: dict, output_dir: str = None):
 
 
 # ===========================================================================
-# Phase 10: PATCH SKYRIM (SLOT 44 BODY MESHES)
+# Phase 10: PATCH SKYRIM (BODY SLOTS)
 # ===========================================================================
 
 def phase_modify_body_meshes(tes5_data: str = None, plugins: list = None,
                              output_dir: str = None):
-    """Add greaves partition to vanilla Skyrim character body NIFs, then
-    generate ONE merged companion slot-44 patch covering `plugins`.
+    """Write the body-slot patch over the selected Skyrim load order, as one zip.
 
-    The patch (tools/creature/patch_body_slots.py) is mandatory alongside the split
-    body meshes: without slot 44 on the NakedTorso ARMA the new lower-body
-    skin partition never renders and naked thighs are invisible.
-
-    `plugins` defaults to just Skyrim.esm; the GUI passes the user's whole
-    selected load order (Skyrim.esm + DLCs + Update.esm + any chosen mods)
-    so every installed armor mod is folded into the same "Slot44 Patch.esp",
-    with unused masters cleaned once across the merged result. Each plugin
-    not present in tes5_data is skipped with a warning rather than failing
-    the whole step.
+    The zip holds the patch plugin (tools/creature/patch_body_slots.py) and
+    the split skin meshes it points the vanilla skin addons at. `plugins`
+    defaults to Skyrim.esm; the GUI passes the whole selected load order, and
+    a plugin missing from tes5_data is skipped with a warning. It patches the
+    load order, not a conversion, so the zip goes into Finished Mods.
+    See: docs/commentary/asset_convert_armor.md#body-slot-layout
     """
     if not tes5_data:
-        print("WARNING: Skyrim data path not found - slot-44 patch not "
-              "generated (run tools/creature/patch_body_slots.py manually)")
+        print("WARNING: Skyrim data path not found - body-slot patch not generated")
         return True
-
-    plugins = plugins or ["Skyrim.esm"]
-    out_root = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
-    # Into "Finished Mods", NOT a per-plugin folder. This step takes no `-f` and
-    # patches the vanilla Skyrim body records for the whole load order, so it
-    # belongs to no single conversion. Hardcoding "Oblivion.esm" put it
-    # somewhere `--pack-only -f <other plugin>` never looks: converting Nehrim
-    # created an otherwise-empty output/Oblivion.esm/ holding just this file,
-    # and it shipped with nothing. It is installed loose rather than zipped —
-    # one plugin with no assets is not worth an archive — so it sits beside the
-    # zips as a finished artefact in its own right.
-    from output_layout import finished_dir
-    out_path = finished_dir(out_root) / "Slot44 Patch.esp"
-
     plugin_paths = []
-    for name in plugins:
-        plugin_path = Path(tes5_data) / name
-        if not plugin_path.exists():
+    for name in plugins or ["Skyrim.esm"]:
+        if (Path(tes5_data) / name).exists():
+            plugin_paths.append(str(Path(tes5_data) / name))
+        else:
             print(f"WARNING: {name} not found - skipping")
-            continue
-        plugin_paths.append(str(plugin_path))
     if not plugin_paths:
-        print("WARNING: none of the selected plugins were found - slot-44 "
-              "patch not generated")
+        print("WARNING: none of the selected plugins were found - body-slot patch not generated")
         return True
-
-    patch_script = SCRIPT_DIR / "tools" / "creature" / "patch_body_slots.py"
+    out_root = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
+    stage = out_root / f"_{BODY_SLOTS_PATCH}"
+    shutil.rmtree(stage, ignore_errors=True)
     ret = subprocess.run(
-        [sys.executable, str(patch_script), *plugin_paths, "-o", str(out_path)],
+        [sys.executable, str(SCRIPT_DIR / "tools" / "creature" / "patch_body_slots.py"),
+         *plugin_paths, "-o", str(stage / f"{BODY_SLOTS_PATCH}.esp"),
+         "--meshes-root", str(stage / "meshes")],
         cwd=str(SCRIPT_DIR), capture_output=True, text=True, **_POPEN_FLAGS)
-    if ret.stdout:
-        print(ret.stdout, end="")
-    if ret.stderr:
-        print(ret.stderr, end="")
+    print(ret.stdout + ret.stderr, end="")
+    if ret.returncode == 0:
+        write_mod_zip(finished_dir(out_root) / f"{BODY_SLOTS_PATCH}.zip",
+                      tree_members(stage))
+    shutil.rmtree(stage, ignore_errors=True)
     return ret.returncode == 0
 
 
@@ -946,9 +960,7 @@ def phase_pack_zip(file_name: str, config: dict, output_dir: str = None):
     kept loose in the archive, at their paths relative to the mod root.
     See: docs/reference/tes_runtime_fragments.md#never-packed
     """
-    import zipfile
     from asset_convert.sources.bsa_pack import LOOSE_ONLY_DIRS
-    from output_layout import finished_dir
 
     out_root = Path(output_dir) if output_dir else SCRIPT_DIR / "output"
     src_root = plugin_out_root(out_root, file_name,
@@ -975,21 +987,17 @@ def phase_pack_zip(file_name: str, config: dict, output_dir: str = None):
     # three different names for a three-plugin pack.
     zip_path = finished_dir(out_root) / f"{src_root.name}.zip"
 
-    packed = 0
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for ext in ("*.esm", "*.esl", "*.esp", "*.bsa"):
-            for src in sorted(src_root.glob(ext)):
-                zf.write(src, arcname=src.name)
-                packed += 1
-        for src in _loose_files():
-            zf.write(src, arcname=str(src.relative_to(src_root)))
-            packed += 1
-
-    if packed == 0:
+    members = [(src.name, src)
+               for ext in ("*.esm", "*.esl", "*.esp", "*.bsa")
+               for src in sorted(src_root.glob(ext))]
+    members += [(str(src.relative_to(src_root)), src)
+                for src in _loose_files()]
+    if not members:
         zip_path.unlink(missing_ok=True)
         print(f"[{file_name}] No plugin/BSA files found, skipping zip pack")
         return False
 
+    packed = write_mod_zip(zip_path, members)
     print(f"[{file_name}] Zip pack complete -> {zip_path} ({packed} files)")
     return True
 
@@ -999,462 +1007,228 @@ def phase_pack_zip(file_name: str, config: dict, output_dir: str = None):
 # ===========================================================================
 
 def _run_pipeline():
-    parser = argparse.ArgumentParser(
-        description="TES4-to-TES5 Conversion Pipeline",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Default pipeline (no --*-only): export + import + extract + assets\n"
-            "Each --*-only flag runs exactly that step and nothing else."
-        ),
-    )
-    parser.add_argument("-f", "--files", nargs="+", metavar="FILE",
-                        help="Plugin filename(s) to process (default: all from config)")
-    parser.add_argument("--config", metavar="PATH",
-                        help="Path to conversion_config.json")
-    parser.add_argument("--output-dir", metavar="PATH",
-                        help="Output directory (default: output/ in project root)")
-    parser.add_argument("--no-engine-branches", action="store_true",
-                        help="Force the pure-Python SpeedTree generator. "
-                             "Engine branches (from the game's own code) are "
-                             "the DEFAULT and already fall back to Python per "
-                             "tree when no Oblivion.exe is configured or the "
-                             "native harness is missing.")
-    parser.add_argument("--export-only",         action="store_true",
-                        help="Parse TES4 binary -> key/value text cache")
-    parser.add_argument("--import-only",         action="store_true",
-                        help="Convert text cache -> TES5 binary ESM/ESP")
-    parser.add_argument("--extract-only",        action="store_true",
-                        help="Extract BSA archives into export/<name>/")
-    parser.add_argument("--meshes-only",         action="store_true",
-                        help="Convert NIFs and copy textures only")
-    parser.add_argument("--speedtrees-only",     action="store_true",
-                        help="Convert SPT (SpeedTree) files only")
-    parser.add_argument("--creatures-only",      action="store_true",
-                        help="Convert creatures (behavior projects, "
-                             "skeleton/body meshes, animation registration)")
-    parser.add_argument("--sounds-only",         action="store_true",
-                        help="Copy extracted sound files to output")
-    parser.add_argument("--lod-only",            action="store_true",
-                        help="Generate object & terrain LOD meshes")
-    parser.add_argument("--modify-body-meshes",  action="store_true",
-                        help="Add greaves partition to character body NIFs")
-    parser.add_argument("--scripts-only",        action="store_true",
-                        help="Convert TES4 scripts to Papyrus .psc source")
-    parser.add_argument("--pack-only",           action="store_true",
-                        help="Pack output assets into Skyrim SE BSA archives")
-    parser.add_argument("--pack-zip-only",       action="store_true",
-                        help="Zip converted plugin/BSA files for distribution")
-    # ── Mod archive import ───────────────────────────────────────────────────
-    # Importing is not a pipeline phase: it registers a NEW conversion source
-    # and exits, after which `-f <plugin>` converts it like any other plugin.
-    parser.add_argument("--import-mod",          metavar="ARCHIVE",
-                        nargs="+",
-                        help="Import a mod archive (.zip/.7z/.rar) or an "
-                             "already-extracted mod folder as a conversion "
-                             "source, then exit")
-    # Several sources import IN ORDER into one asset tree, later ones
-    # overwriting earlier -- the precedence a mod manager applies, resolved
-    # once at import time so the converter sees one coherent stack. Without
-    # it each mod converts blind to the others: a mesh-fix mod cannot see
-    # the retexture that will win beside it, and decides specular and
-    # parallax against the wrong textures.
-    # An asset-only mod declares no master -- it has no plugin and so no
-    # _HEADER.txt -- but its meshes still reference the base game's
-    # textures. Recording the base here is what lets the converter resolve
-    # them; see nif_converter.master_texture_roots.
-    parser.add_argument("--fresh",                action="store_true",
-                        help="With several --import-mod sources: clear the "
-                             "target asset tree first. A merge is defined "
-                             "by its FULL source list, so re-importing a "
-                             "different list without this leaves the "
-                             "dropped mod's files behind and the index "
-                             "reports something that is no longer true.")
-    parser.add_argument("--base",                nargs="+", metavar="PLUGIN",
-                        help="With --import-mod: the plugin(s) this mod "
-                             "builds on (e.g. Nehrim.esm), so its meshes "
-                             "can resolve textures it does not ship.")
-    parser.add_argument("--as",                  dest="merge_as",
-                        metavar="NAME",
-                        help="With several --import-mod sources: the name "
-                             "of the merged asset tree. Required for a "
-                             "multi-source import.")
-    parser.add_argument("--plugin-member",       nargs="+", metavar="PATH",
-                        help="With --import-mod: which plugin(s) inside the "
-                             "archive to register (default: all found)")
-    parser.add_argument("--no-keep-archive",     action="store_true",
-                        help="With --import-mod: do not retain a copy of the "
-                             "archive (re-importing then needs the original)")
-    parser.add_argument("--list-mods",           action="store_true",
-                        help="List imported mod archives and exit")
-    parser.add_argument("--build-morrowind-patch", metavar="DATA_FILES",
-                        help="Build the Morroblivion compatibility patch from "
-                             "a Morrowind 'Data Files' folder, then exit")
-    parser.add_argument("--remove-mod",          metavar="PLUGIN",
-                        help="Remove an imported mod (deletes its export "
-                             "folder and registry entry), then exit")
-    parser.add_argument("--mesh-subdirs",        nargs="+", metavar="SUBDIR",
-                        help="Limit mesh conversion to these root subfolders "
-                             "(e.g. architecture clutter). Default: all.")
-    parser.add_argument("--patch-plugins",       nargs="+", metavar="PLUGIN",
-                        help="Skyrim plugin filenames to generate a slot-44 "
-                             "patch for (e.g. Skyrim.esm Dawnguard.esm). "
-                             "Default: Skyrim.esm only.")
-    # The INFERRED collision winding steps (asset_convert/collision/collision.py steps
-    # 1-3). The authored-normal repair (step 0) is always on and this flag does
-    # not touch it. Tri-state: the flag forces the inferred steps on, --no-
-    # forces them off, and unspecified (None) defers to the per-plugin default
-    # in collision_options, resolved separately for each file.
-    winding = parser.add_mutually_exclusive_group()
-    winding.add_argument("--collision-winding-fix", dest="collision_winding_fix",
-                         action="store_true", default=None,
-                         help="Also INFER collision winding from adjacency, "
-                              "enclosed volume and the render mesh, on top of "
-                              "the always-on authored-normal repair. Guesses, "
-                              "so it can invert correct geometry -- only for "
-                              "plugins whose exporter destroyed the normals. "
-                              "Default: on only for "
-                              + ", ".join(sorted(WINDING_FIX_DEFAULT_PLUGINS)))
-    winding.add_argument("--no-collision-winding-fix", dest="collision_winding_fix",
-                         action="store_false", default=None,
-                         help="Disable the inferred winding steps (the "
-                              "authored-normal repair still runs).")
-    # Parallax (asset_convert/texture/parallax.py). Deliberately opt-in and NOT a
-    # per-plugin default: a correct parallax shape renders wrong under vanilla
-    # SSE, and the converter cannot tell what the player will run it under.
-    parser.add_argument("--parallax", action="store_true",
-                        help="Carry Oblivion's parallax across as Skyrim "
-                             "height maps. REQUIRES Community Shaders or ENB "
-                             "in the player's setup -- under vanilla SSE the "
-                             "affected surfaces render wrong. Off by default.")
-    # Meant to pair with --parallax: PGPatcher (ParallaxGen) patches meshes
-    # across the player's whole load order and can also upgrade them to ENB's
-    # complex-material system, which we cannot see from here. Then the only
-    # thing left for us is recovering the height field out of Oblivion's
-    # diffuse alpha -- so analyse every mesh, ship none of them.
-    parser.add_argument("--textures-only", action="store_true",
-                        help="Mesh stage: read and analyse every NIF but write "
-                             "none. Ships textures only (with their _p height "
-                             "maps), for use with PGPatcher. Pair with "
-                             "--parallax.")
-
-    args = parser.parse_args()
-
-    config       = load_config(args.config)
-    # CLI flag overrides the config key; without it the config value stands.
-    if args.no_engine_branches:
-        config["speedtreeEngineBranches"] = False
+    """Parse the command line, then run each selected step over every plugin."""
+    args = build_parser().parse_args()
+    set_navmesh_generator(args.navmesh_generator)
+    set_navmesh_pins_dir(args.navmesh_pins)
+    config = load_config(args.config)
+    apply_config_overrides(args, config)
     tes4_data, tes5_data = get_paths(config)
-    output_dir   = args.output_dir or config.get("outputDir") or str(SCRIPT_DIR / "output")
-    export_dir   = str(SCRIPT_DIR / "export")
-
+    tes4_data = args.data_dir or tes4_data
+    source_registry.select_directory(tes4_data)
+    output_dir = args.output_dir or str(configured_output(config.get("outputDir")))
+    export_dir = str(SCRIPT_DIR / "export")
     os.makedirs(export_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
 
-    if args.build_morrowind_patch:
-        return _build_morrowind_patch(args.build_morrowind_patch,
-                                      export_dir, output_dir)
-
-    # ── Mod-archive management ───────────────────────────────────────────────
-    # These register/inspect conversion SOURCES and exit; they convert nothing,
-    # so they run before any pipeline setup.
-    if args.list_mods or args.import_mod or args.remove_mod:
+    refusal = (register_patch_source(export_dir, args.build_morrowind_patch)
+               if args.build_morrowind_patch else '')
+    if refusal:
+        print(f"ERROR: {refusal}")
+        return 1
+    if args.list_mods:
+        return _list_sources(export_dir)
+    if args.import_mod or args.remove_mod:
         return _mod_commands(args, export_dir, tes4_data)
 
     _print_run_banner(tes4_data, tes5_data, output_dir)
-
     order = _plugins_to_convert(args, config, tes4_data, export_dir)
     if not order and not args.modify_body_meshes:
-        # "10. Patch Skyrim" is the one step that converts no plugin: it patches
-        # the user's SKYRIM load order and writes a single shared
-        # `Slot44 Patch.esp`, so the GUI runs it with no `-f` at all.  Bailing
-        # here left it silently not running -- and therefore never recorded --
-        # for anyone whose config lacks the legacy "files" list, which is every
-        # end user (nothing writes that key any more; this repo only still has
-        # one by hand).  The GUI then re-ticked the box on every check.
         print("No files to process.")
         return 0
-    if not _owned_by_a_parent_run():
-        print(f"  Files: {', '.join(order) if order else '(none needed)'}")
-        print()
+    _announce(order, export_dir)
+    steps = selected_steps(args)
+    missing = _refused(args, steps)
+    if missing is not None:
+        return missing
+    run = SimpleNamespace(args=args, config=config, tes4_data=tes4_data,
+                          tes5_data=tes5_data, export_dir=export_dir,
+                          output_dir=output_dir)
+    step_ok, success = _run_steps(steps, order, run)
+    _record_versions(step_ok, tes4_data)
+    return _report(step_ok, success)
 
-    # ── Determine which steps to run ──────────────────────────────────────
-    _any_only = any([
-        args.export_only, args.import_only, args.extract_only,
-        args.meshes_only, args.speedtrees_only, args.creatures_only,
-        args.sounds_only,
-        args.lod_only, args.modify_body_meshes, args.scripts_only,
-        args.pack_only, args.pack_zip_only,
-    ])
-    if _any_only:
-        do_export       = args.export_only
-        do_import       = args.import_only
-        do_extract      = args.extract_only
-        do_meshes       = args.meshes_only
-        do_speedtrees   = args.speedtrees_only
-        do_creatures    = args.creatures_only
-        do_sounds       = args.sounds_only
-        do_lod          = args.lod_only
-        do_skyrim_patch = args.modify_body_meshes
-        do_scripts      = args.scripts_only
-        do_pack_bsa     = args.pack_only
-        do_pack_zip     = args.pack_zip_only
-    else:
-        # Default
-        do_export = do_extract = do_meshes = do_speedtrees = True
-        do_creatures = do_import = do_sounds = do_scripts = True
-        do_lod = do_skyrim_patch = do_pack_bsa = True
-        do_pack_zip = False
 
-    # ── Dependency preflight ─────────────────────────────────────────────────
-    # Check every selected phase BEFORE running any of them.  A phase whose
-    # tool is missing does not fail loudly on its own -- Sounds without ffmpeg
-    # just ships a mute plugin -- so the run stops at the first gap and prints
-    # what to install at the very bottom of the console, where the GUI log
-    # leaves it on screen.
-    import preflight
-    # A version mismatch is a warning, not a gate: the pipeline does run on
-    # another 3.x once the navmesh extension is rebuilt.  Printed before the
-    # dependency check so the two do not interleave.
-    _pywarn = preflight.python_version_warning()
-    if _pywarn:
-        print(preflight.format_python_warning(_pywarn))
-    _selected = [name for name, on in (
-        ('export',       do_export),
-        ('extract',      do_extract),
-        ('meshes',       do_meshes),
-        ('speedtrees',   do_speedtrees),
-        ('creatures',    do_creatures),
-        ('import',       do_import),
-        ('sounds',       do_sounds),
-        ('scripts',      do_scripts),
-        ('lod',          do_lod),
-        ('skyrim_patch', do_skyrim_patch),
-        ('pack_bsa',     do_pack_bsa),
-        ('pack_zip',     do_pack_zip),
-    ) if on]
-    _failed = preflight.check_phases(_selected)
-    if _failed is not None:
-        _phase, _missing = _failed
-        _skipped = _selected[_selected.index(_phase) + 1:]
-        print(preflight.format_report(_phase, _missing, _skipped))
-        return preflight.RC_MISSING_DEP
+def _refused(args, steps) -> int | None:
+    """The exit code refusing this run, or None: `--only` on a step that
+    cannot narrow, then whatever `_preflight` finds missing."""
+    unscoped = unscoped_steps(args, steps)
+    if unscoped:
+        print(f"ERROR: --only scopes only {', '.join(sorted(SCOPED_STEPS))}; "
+              f"these steps would rebuild everything: {', '.join(unscoped)}")
+        return 2
+    return _preflight(steps)
 
-    success = True
 
-    # Per-step, per-plugin outcome, so a version stamp is only recorded for
-    # what actually completed.  Marking a failed step "run at 0.59" would make
-    # the next upgrade check report it clean and quietly ship stale output, so
-    # a step is recorded only when every plugin in `order` succeeded.
-    import version as _version
-    _step_ok: dict[str, dict[str, bool]] = {}
+def _announce(order, export_dir) -> None:
+    """Pin each plugin's home Data folder, then name the plugins and where each is read from.
 
-    def _mark(step_key: str, fn: str, ok: bool) -> None:
-        _step_ok.setdefault(step_key, {})[fn] = (
-            _step_ok.get(step_key, {}).get(fn, True) and ok)
+    See: docs/commentary/asset_convert_mod_ingest.md#same-named-plugins
+    """
+    for fn in order:
+        source_registry.claim_home(export_dir, fn)
+    if _owned_by_a_parent_run():
+        return
+    print(f"  Files: {', '.join(order) if order else '(none needed)'}")
+    for fn in order:
+        here = source_registry.directory_for(export_dir, fn)
+        if here:
+            print(f"    {fn}: {here} -> export/"
+                  f"{source_registry.asset_root_name(export_dir, fn)}")
+    print()
 
-    _asset_only = {fn for fn in order if is_asset_only(fn, export_dir)}
-    order_with_plugin = [fn for fn in order if fn not in _asset_only]
-    if _asset_only:
-        print(f"  Asset-only (no plugin): {', '.join(sorted(_asset_only))}")
+
+def _preflight(steps):
+    """RC_MISSING_DEP after reporting the first step whose tool is missing, else None.
+
+    Every step is checked before any runs: a missing tool does not fail loudly
+    on its own (Sounds without ffmpeg ships a mute plugin).
+    """
+    warning = preflight.python_version_warning()
+    if warning:
+        print(preflight.format_python_warning(warning))
+    failed = preflight.check_phases(steps)
+    if failed is None:
+        return None
+    phase, missing = failed
+    print(preflight.format_report(phase, missing, steps[steps.index(phase) + 1:]))
+    return preflight.RC_MISSING_DEP
+
+
+#: step -> (banner, version-record key, scope). 'plugin' skips asset-only mods; 'global' runs once.
+_PHASE_INFO = {
+    'export': ("Phase 1: EXPORT TES4 RECORDS", 'export', 'plugin'),
+    'extract': ("Phase 2: EXTRACT TES4 ARCHIVES", 'extract', 'all'),
+    'meshes': ("Phase 3: CONVERT MESHES AND TEXTURES", 'meshes', 'all'),
+    'speedtrees': ("Phase 4: CONVERT SPEEDTREES", 'speedtrees', 'all'),
+    'creatures': ("Phase 5: CONVERT CREATURES", 'creatures', 'plugin'),
+    'import': ("Phase 6: BUILD TES5 PLUGIN", 'import_', 'plugin'),
+    'sounds': ("Phase 7: CONVERT SOUNDS", 'sounds', 'all'),
+    'scripts': ("Phase 8: CONVERT SCRIPTS", 'scripts', 'plugin'),
+    'lod': ("GENERATE LOD", 'create_lod', 'global'),
+    'skyrim_patch': ("Phase 10: PATCH SKYRIM (BODY SLOTS)", 'modify_body_meshes',
+                     'global'),
+    'pack_bsa': ("Phase 11: PACK BSA ARCHIVES", 'pack', 'all'),
+    'pack_zip': ("Phase 12: PACK ZIP ARCHIVES", 'pack_zip', 'all'),
+}
+
+
+def _phase_runners(run) -> dict:
+    """step -> callable(plugin) -> ok, bound to this run's paths and options."""
+    a, cfg, out = run.args, run.config, run.output_dir
+    return {
+        'export': lambda fn: phase_export(fn, run.tes4_data, run.export_dir, cfg),
+        'extract': lambda fn: phase_extract(fn, run.tes4_data, cfg),
+        'meshes': lambda fn: phase_assets(
+            fn, cfg, output_dir=out, mesh_subdirs=a.mesh_subdirs,
+            winding_fix=a.collision_winding_fix, parallax=a.parallax,
+            textures_only=a.textures_only, skip_hair=a.skip_hair),
+        'speedtrees': lambda fn: phase_speedtrees(fn, cfg, output_dir=out),
+        'creatures': lambda fn: phase_creatures(fn, run.tes5_data, cfg,
+                                                output_dir=out,
+                                                only=run.args.only),
+        'import': lambda fn: phase_import(fn, run.tes4_data, run.tes5_data,
+                                          run.export_dir, cfg, output_dir=out),
+        'sounds': lambda fn: phase_sounds(fn, cfg, output_dir=out,
+                                          tes4_data=run.tes4_data),
+        'scripts': lambda fn: (phase_scripts(fn, cfg, output_dir=out)
+                               and phase_compile(fn, cfg, output_dir=out)),
+        'lod': lambda _fn: _create_lod(out),
+        'skyrim_patch': lambda _fn: phase_modify_body_meshes(
+            run.tes5_data, plugins=a.patch_plugins, output_dir=out),
+        'pack_bsa': lambda fn: phase_pack(fn, cfg, output_dir=out),
+        'pack_zip': lambda fn: phase_pack_zip(fn, cfg, output_dir=out),
+    }
+
+
+def _phase_targets(scope, order, asset_only) -> list:
+    """The plugins one step runs over; a global step runs once under the shared key."""
+    if scope == 'global':
+        return [_version.GLOBAL_PLUGIN_KEY]
+    if scope == 'plugin':
+        return [fn for fn in order if fn not in asset_only]
+    return list(order)
+
+
+def _work(steps, order, run) -> dict:
+    """What this run will do, as the heavy-job queue compares it (`heavy_lock.covers`).
+
+    See: docs/commentary/performance.md#one-heavy-job-at-a-time
+    """
+    a = run.args
+    masters = binary_master_chain(order, lambda name: resolve_plugin_path(
+        name, run.tes4_data, run.export_dir))
+    return {'plugins': list(order), 'steps': list(steps), 'masters': masters,
+            'scope': {'only': a.only, 'mesh_subdirs': a.mesh_subdirs},
+            'same': [run.output_dir, run.tes4_data, a.config, a.textures_only,
+                     a.parallax, a.skip_hair, a.collision_winding_fix,
+                     a.no_engine_branches, a.patch_plugins]}
+
+
+def _run_steps(steps, order, run) -> tuple:
+    """Run each step over its plugins: ({record key: {plugin: ok}}, all succeeded),
+    once any other heavy job on the machine has finished.
+
+    A filtered mesh run converts only some subfolders, so it never certifies
+    the Meshes step as rebuilt at this version.
+    """
+    hold_heavy_lock(" ".join(["convert.py"] + sys.argv[1:]),
+                    _work(steps, order, run))
+    asset_only = {fn for fn in order if is_asset_only(fn, run.export_dir)}
+    if asset_only:
+        print(f"  Asset-only (no plugin): {', '.join(sorted(asset_only))}")
         print("    -> skipping Export/Import/Scripts/Creatures for these")
         print()
-
-    if do_export and order_with_plugin:
-        print("=" * 54)
-        print("  Phase 1: EXPORT TES4 RECORDS")
-        print("=" * 54)
-        for fn in order_with_plugin:
-            ok = phase_export(fn, tes4_data, export_dir, config)
-            _mark('export', fn, ok)
-            if not ok:
-                success = False
+    runners = _phase_runners(run)
+    step_ok, success = {}, True
+    for step in steps:
+        title, key, scope = _PHASE_INFO[step]
+        targets = _phase_targets(scope, order, asset_only)
+        if not targets:
+            continue
+        print("=" * 54 + f"\n  {title}\n" + "=" * 54)
+        for fn in targets:
+            ok = bool(runners[step](fn))
+            success = success and ok
+            if not (step == 'meshes' and run.args.mesh_subdirs):
+                slot = step_ok.setdefault(key, {})
+                slot[fn] = slot.get(fn, True) and ok
         print()
+    return step_ok, success
 
-    if do_extract:
-        print("=" * 54)
-        print("  Phase 2: EXTRACT TES4 ARCHIVES")
-        print("=" * 54)
-        for fn in order:
-            ok = phase_extract(fn, tes4_data, config)
-            _mark('extract', fn, ok)
-            if not ok:
-                success = False
-        print()
 
-    if do_meshes:
-        print("=" * 54)
-        print("  Phase 3: CONVERT MESHES AND TEXTURES")
-        print("=" * 54)
-        for fn in order:
-            ok = phase_assets(fn, config, output_dir=output_dir,
-                              mesh_subdirs=getattr(args, 'mesh_subdirs', None),
-                              winding_fix=args.collision_winding_fix,
-                              parallax=args.parallax,
-                              textures_only=args.textures_only)
-            # A filtered mesh run converts only some subfolders, so it must not
-            # certify the Meshes step as fully rebuilt at this version.
-            if not getattr(args, 'mesh_subdirs', None):
-                _mark('meshes', fn, ok)
-            if not ok:
-                success = False
-        print()
+def _create_lod(output_dir) -> bool:
+    """Bake LOD ONCE for the whole load order into AutoConvertLOD, never per plugin.
 
-    if do_speedtrees:
-        print("=" * 54)
-        print("  Phase 4: CONVERT SPEEDTREES")
-        print("=" * 54)
-        for fn in order:
-            ok = phase_speedtrees(fn, config, output_dir=output_dir)
-            _mark('speedtrees', fn, ok)
-            if not ok:
-                success = False
-        print()
+    Tiles sit on a fixed grid keyed by worldspace and coordinate, so `-f`
+    cannot narrow the bake to one plugin.
+    """
+    cmd = [sys.executable, "-u",
+           str(SCRIPT_DIR / "tools" / "release" / "create_lod.py")]
+    if output_dir:
+        cmd += ["--output-dir", str(output_dir)]
+    return subprocess.call(cmd, **_POPEN_FLAGS) == 0
 
-    if do_creatures and order_with_plugin:
-        print("=" * 54)
-        print("  Phase 5: CONVERT CREATURES")
-        print("=" * 54)
-        for fn in order_with_plugin:
-            ok = phase_creatures(fn, tes5_data, config, output_dir=output_dir)
-            _mark('creatures', fn, ok)
-            if not ok:
-                success = False
-        print()
 
-    if do_import and order_with_plugin:
-        print("=" * 54)
-        print("  Phase 6: BUILD TES5 PLUGIN")
-        print("=" * 54)
-        for fn in order_with_plugin:
-            ok = phase_import(fn, tes4_data, tes5_data, export_dir, config,
-                              output_dir=output_dir)
-            _mark('import_', fn, ok)
-            if not ok:
-                success = False
-        print()
-
-    if do_sounds:
-        print("=" * 54)
-        print("  Phase 7: CONVERT SOUNDS")
-        print("=" * 54)
-        for fn in order:
-            ok = phase_sounds(fn, config, output_dir=output_dir)
-            _mark('sounds', fn, ok)
-            if not ok:
-                success = False
-        print()
-
-    if do_scripts and order_with_plugin:
-        print("=" * 54)
-        print("  Phase 8: CONVERT SCRIPTS")
-        print("=" * 54)
-        for fn in order_with_plugin:
-            ok = phase_scripts(fn, config, output_dir=output_dir)
-            # Compile only when THIS plugin transpiled cleanly.  This used to
-            # gate on the global `success`, so one earlier plugin's failure
-            # silently skipped compilation for every plugin after it -- and
-            # then marked their `scripts` step not-run, though it had never
-            # been attempted.  The step counts as run only when transpile AND
-            # compile both land for this plugin.
-            compiled = False
-            if ok:
-                compiled = phase_compile(fn, config, output_dir=output_dir)
-            if not (ok and compiled):
-                success = False
-            _mark('scripts', fn, ok and compiled)
-        print()
-
-    if do_lod:
-        print("=" * 54)
-        print("  GENERATE LOD")
-        print("=" * 54)
-        # Delegated to tools/release/create_lod.py, NOT looped per plugin.
-        #
-        # LOD tiles are files on a fixed grid keyed only by worldspace and
-        # coordinate, so every plugin editing a worldspace writes the same
-        # paths. Baking once per plugin into output/<plugin>/ produced rival
-        # copies of each shared tile whose winner the mod manager picked by
-        # install order. The bake now happens ONCE for the whole load order,
-        # into the standalone AutoConvertLOD mod. `-f` therefore does not
-        # narrow it to one plugin: there is one shared artefact, and building
-        # it from a single plugin would be building it wrong.
-        _cmd = [sys.executable, "-u",
-                str(SCRIPT_DIR / "tools" / "release" / "create_lod.py")]
-        if output_dir:
-            _cmd += ["--output-dir", str(output_dir)]
-        ok = subprocess.call(_cmd, **_POPEN_FLAGS) == 0
-        if not ok:
-            success = False
-        # Recorded once, under the shared key: one artefact covers every
-        # plugin, so stamping it per plugin would mark the step outstanding
-        # for whichever plugins this run did not name.
-        _mark('create_lod', _version.GLOBAL_PLUGIN_KEY, ok)
-        print()
-
-    if do_skyrim_patch:
-        print("=" * 54)
-        print("  Phase 10: PATCH SKYRIM (SLOT 44 BODY MESHES)")
-        print("=" * 54)
-        ok = phase_modify_body_meshes(
-            tes5_data, plugins=getattr(args, 'patch_plugins', None),
-            output_dir=output_dir)
-        # Patches the user's load order, not a converted plugin, so it is
-        # recorded ONCE under the shared key rather than stamped onto whichever
-        # plugins this run happened to include.  Recording it per-plugin left
-        # every other plugin looking like it had never run the step, so the GUI
-        # re-ticked "10. Patch Skyrim" forever even though the one shared
-        # `Slot44 Patch.esp` already existed.
-        _mark('modify_body_meshes', _version.GLOBAL_PLUGIN_KEY, ok)
-        if not ok:
-            success = False
-        print()
-
-    if do_pack_bsa:
-        print("=" * 54)
-        print("  Phase 11: PACK BSA ARCHIVES")
-        print("=" * 54)
-        for fn in order:
-            ok = phase_pack(fn, config, output_dir=output_dir)
-            _mark('pack', fn, ok)
-            if not ok:
-                success = False
-        print()
-
-    if do_pack_zip:
-        print("=" * 54)
-        print("  Phase 12: PACK ZIP ARCHIVES")
-        print("=" * 54)
-        for fn in order:
-            ok = phase_pack_zip(fn, config, output_dir=output_dir)
-            _mark('pack_zip', fn, ok)
-            if not ok:
-                success = False
-        print()
-
-    # Stamp the version onto every step that completed for every plugin it ran
-    # for.  This is what lets the next paste-over-the-top install work out that
-    # e.g. only Meshes and Import are stale.  Never let bookkeeping fail a run
-    # that otherwise succeeded.
+def _record_versions(step_ok, tes4_data) -> None:
+    """Stamp the version on every step that completed; bookkeeping never fails a run."""
     try:
-        for step_key, per_file in _step_ok.items():
+        for step_key, per_file in step_ok.items():
             for fn, ok in per_file.items():
                 if ok:
-                    _version.record_step_run(step_key, fn,
-                                             data_path=tes4_data)
+                    _version.record_step_run(step_key, fn, data_path=tes4_data)
     except Exception as exc:
         print(f"Note: could not record conversion state ({exc}).")
 
+
+def _report(step_ok, success) -> int:
+    """Print the verdict, restating each failed step beside it; the exit code."""
     if success:
         if not _owned_by_a_parent_run():
             print("Pipeline complete.")
         return 0
-
-    # A failed run ends with thousands of lines of stage output above it, so
-    # restate WHICH steps failed right next to the verdict.  `_step_ok` is the
-    # authoritative record -- every phase stamps it -- so this reports what
-    # actually failed rather than scraping the log for the word "error".
     failed = [(step_key, fn)
-              for step_key, per_file in _step_ok.items()
+              for step_key, per_file in step_ok.items()
               for fn, ok in per_file.items() if not ok]
     print()
     print("-" * 54)
@@ -1462,13 +1236,9 @@ def _run_pipeline():
         print(f"  ERROR SUMMARY ({len(failed)} failed step"
               f"{'' if len(failed) == 1 else 's'}):")
         for step_key, fn in failed:
-            where = ("all plugins" if fn == _version.GLOBAL_PLUGIN_KEY
-                     else fn)
+            where = "all plugins" if fn == _version.GLOBAL_PLUGIN_KEY else fn
             print(f"    - {step_key}: FAILED for {where}")
     else:
-        # A step that returned False without being stamped, or a failure
-        # raised outside the per-step marks.  Say so rather than printing an
-        # empty summary that reads like nothing went wrong.
         print("  ERROR SUMMARY: a stage reported failure; see the stage "
               "output above for details.")
     print("-" * 54)
@@ -1506,7 +1276,8 @@ def main():
     opened one for the whole run (several convert.py invocations, one per step)
     and set TESCONV_RUN_LOG, so `start_cli_run` returns None here and we
     neither prune nor write -- otherwise a 7-step run would leave seven logs
-    holding one step each.
+    holding one step each.  The heavy lock's supervised child likewise leaves
+    the log to the holder, which prints its output.
     """
     try:
         config = load_config(_config_path_from_argv())
@@ -1516,7 +1287,7 @@ def main():
         "Version": _version_string(),
         "Command": " ".join(["convert.py"] + sys.argv[1:]),
     }
-    log = (None if _is_informational_argv()
+    log = (None if _is_informational_argv() or os.environ.get(SUPERVISED_ENV_VAR)
            else run_log.start_cli_run(SCRIPT_DIR / "logs", config, header))
     code = 1
     try:

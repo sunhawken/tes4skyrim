@@ -1,64 +1,72 @@
-# TESRuntime
+# TESRuntime — the engine add-ons that make converted games play right
 
-The converter's SKSE plugin. Four jobs (gun routing, `guns.cpp`, is the third:
-[docs/commentary/asset_convert_falloutnv.md#gun-graph](../docs/commentary/asset_convert_falloutnv.md#gun-graph);
-the gun shot, reload key and ammo restriction, `fire.cpp`, the fourth:
-[docs/commentary/tes_runtime_guns.md](../docs/commentary/tes_runtime_guns.md)),
-all done on engine contracts measured
-in `SkyrimSE.exe` and resolved through the Address Library (no raw RVAs):
+Skyrim can load a converted Oblivion, Morrowind or Fallout world, but some of
+what made those games work has no Skyrim equivalent: Morrowind's dialogue
+window, jails that pick the nearest prison, creatures with their own
+animation sets, Fallout's guns. These small SKSE plugins fill those gaps. They
+run quietly in the background, touch nothing in your save that removing them
+would break, and only do anything when the plugin they serve is installed.
 
-1. **Animation cache composition.** The converter writes one fragment per
-   plugin (`SKSE\Plugins\TESRuntime\animation\<plugin>.json`) and this DLL composes
-   `vanilla base + every fragment` in memory when the engine parses
-   `animationdatasinglefile.txt` / `animationsetdatasinglefile.txt`.
-   Schema and rules: [docs/reference/tes_runtime_fragments.md](../docs/reference/tes_runtime_fragments.md);
-   why: [docs/commentary/asset_convert_creature.md#runtime-animation-cache-composition](../docs/commentary/asset_convert_creature.md#runtime-animation-cache-composition).
-2. **FO3/FNV limb severing.** On a fatal projectile hit the DLL hides the
-   struck limb's FO3-numbered partitions and reveals its gore caps, from the
-   sidecars the importer writes to `SKSE\Plugins\TESRuntime\`:
-   [docs/commentary/asset_convert_falloutnv.md#dismemberment](../docs/commentary/asset_convert_falloutnv.md#dismemberment).
+All five come in one download, `TESRuntime.zip`. Install it like any other
+mod (it needs [SKSE](https://skse.silverlock.org/) and the
+[Address Library](https://www.nexusmods.com/skyrimspecialedition/mods/32444)),
+and keep it enabled for as long as you play any converted game.
 
-## HavokWorldSize.dll
+| Plugin | In one line | Keep it if you play… |
+|---|---|---|
+| [TESRuntime](tes/README.md) | Jails, quest journals and alchemy apparatus that behave like the original games | any converted game |
+| [CreatureRuntime](creature/README.md) | Lets converted creatures move and fight with their own animations | anything with converted creatures (Oblivion, Nehrim, Morrowind, Fallout) |
+| [FalloutRuntime](fallout/README.md) | Makes Fallout 3 / New Vegas guns shoot, reload and aim like guns | Fallout 3 or New Vegas |
+| [HavokWorldSize](havok_world_size/README.md) | Keeps physics working in huge worldspaces | big worlds such as Tamriel Rebuilt — or any large mod world |
+| [MorrowindRuntime](morrowind/README.md) | Brings back Morrowind's own dialogue, scripts and services | Morrowind or Tamriel Rebuilt |
 
-Source in `havok_world_size/`. Built by the same `build.bat` and packaged in
-the same archive, but its own source folder and a **separate DLL** — it shares
-no code with `plugin/` and needs no Address Library, so a fault in it cannot
-take TESRuntime down.
+Each plugin is independent: if one ever misbehaves it cannot take the others
+down with it, and you can disable any one of them without touching the rest.
+Each writes a log to `Documents\My Games\Skyrim Special Edition\SKSE\<name>.log`,
+which is the first thing to attach to a bug report.
 
-It widens Skyrim's Havok broad-phase world AABB past its vanilla ±64 cells,
-which is what breaks physics and interactions far from the world origin. The
-limit is a single `.rdata` float (`3745.38232421875` havok m = 262,144 game
-units = 64 × 4096) that the `hkpWorldCinfo` setup loads as the broad-phase
-extent; objects outside it clamp to `hkpBroadPhaseBorder`.
+---
 
-It finds that constant **by value** (a 16-byte-aligned broadcast quad), not by
-address, so no Address Library is needed and no build is hardcoded — verified
-to occur exactly once in SSE GOG/AE, SSE Steam and the **unpacked** Skyrim VR
-binary. Exports `SKSEPlugin_Query` as well as `SKSEPlugin_Version`, matching
-TESRuntime, so one DLL is discoverable on SE, AE and VR.
+## For developers
 
-`HavokWorldSize.ini` sets `fWorldCells` (default 128; use the SMALLEST value
-covering your worldspace — the broad-phase key step doubles with it) and
-`bDryRun=1` to log the site without writing. Log:
-`Documents\My Games\Skyrim Special Edition\SKSE\HavokWorldSize.log`.
-Runtime-only: no record data, no FormIDs, so removing it fully reverts.
-Analysis: [docs/audits/worldspace_havok_range.md](../docs/audits/worldspace_havok_range.md).
+Each plugin is its own DLL built from its own folder; [common/](common/README.md)
+holds the MIT source they all compile in (SKSE ABI, Address Library
+resolution, call patching, logging, paths, JSON, shared engine services, menu
+messages, the crafting-bench API). It is not a DLL. MorrowindRuntime and
+TESRuntime are GPL-3.0 binaries (OpenMW code and an OpenMW-ported formula);
+the other three are MIT.
 
-## Building
+### Data folders
 
-Build with `build.bat` (MSVC x64 only). `build.bat cache-only` builds
-`TESRuntime_CacheOnly.dll` instead: job 1 alone, with `engine.cpp`, `guns.cpp`
-and `sever.cpp` not compiled in, so the cache composition can be tested with
-nothing else patched into the game. It resolves three Address Library ids and
-touches no form, native or co-save; it registers as `TESRuntimeCacheOnly` and
-logs to `TESRuntimeCacheOnly.log`, so it never collides with the full plugin.
-Install one or the other, never both.
+Each plugin reads its sidecars from `Data\SKSE\Plugins\<its name>\`, written
+there by the converter for each converted plugin:
 
-Verify the version struct landed in
-`.data` with `python tools/misc/skse_version_data.py tes_runtime/TESRuntime.dll`.
-`compose_test.exe <base_dir> <fragment_dir> <out_dir>` runs the composer
-offline; `tests/test_creature_anim.py` diffs it against the Python reference.
+| Folder | Holds |
+|---|---|
+| `SKSE\Plugins\TESRuntime\` | `<plugin>.crime.json`, `<plugin>.apparatus.json` |
+| `SKSE\Plugins\CreatureRuntime\animation\` | `<plugin>.json` animation cache fragments |
+| `SKSE\Plugins\FalloutRuntime\` | `<plugin>.guns.json`, `<plugin>.bodyparts.json`, optional `FalloutRuntime.ini` |
+| `SKSE\Plugins\MorrowindRuntime\` | each Morrowind plugin's dialogue and script tables, and the shipped `MorrowindRuntime.ini` |
 
-The converter copies `TESRuntime.dll` into `output\<plugin>\SKSE\Plugins\`
-whenever a plugin generates a creature project. Log:
-`Documents\My Games\Skyrim Special Edition\SKSE\TESRuntime.log`.
+### Building
+
+`build.bat` builds every project into [dist/](dist/) and lists any that failed;
+each project's own `build.bat` builds it alone. MSVC x64 only (Build Tools 18),
+no SKSE source tree, no CMake: everything from the game is resolved at runtime
+through the Address Library. `dist/` holds only the finished DLLs and is
+committed.
+
+Verify a DLL's SKSE version struct with
+`python tools/misc/skse_version_data.py tes_runtime/dist/<name>.dll`, and every
+Address Library id against every installed build with
+`python tools/validate/stable_id_check.py`.
+
+### Packaging
+
+`python tools/release/package_runtime_dll.py` (GUI: Build > Package SKSE Mod)
+zips every DLL in `dist/` and `havok_world_size/HavokWorldSize.ini` into one
+`output/Finished Mods/TESRuntime.zip`, rooted at the Data folder. It also
+composes MorrowindRuntime's dialogue menu (`Interface/morrowind_dialogue.swf`)
+from the Morrowind install registered on this machine and adds it to the
+archive; the menu holds Bethesda's art, so the repo never carries a built copy,
+and without a registered install it is skipped.

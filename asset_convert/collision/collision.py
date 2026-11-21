@@ -1,6 +1,8 @@
 import math
 import sys
+from bisect import bisect_right
 from collections import deque
+from itertools import accumulate, groupby
 from pathlib import Path
 
 # Apply all PyFFI patches (time.clock fix, nif.xml condition fixes) before import
@@ -10,6 +12,7 @@ apply_patches()
 from pyffi.formats.nif import NifFormat
 
 from asset_convert.collision.cms_builder import build_cms_collision
+from asset_convert.collision.collision_anim import clip_moves_node, mesh_has_sequence
 from asset_convert.collision.collision_falloutnv import fo3_layer, is_fallout_source
 from asset_convert.collision.collision_hulls import decompose_clutter_hull
 from asset_convert.collision.collision_material import (
@@ -22,19 +25,22 @@ from asset_convert.collision.collision_winding import (
     INVERTED_FLOOR_FLIPS,
     repair_inverted_floors,
 )
+from asset_convert.collision.collision_original import (
+    original_tris,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 _HAVOK_SCALE = 0.1
-#: Skyrim: one Havok unit is this many game units.
-GAME_UNITS_PER_HAVOK = 69.9904
 # Oblivion->game unit scale, used to divide authored ragdoll MASS on creature
 # blend bodies.  Must stay equal to hkx_ragdoll._OB_MASS_DIV: skeleton.nif and
 # skeleton.hkx describe the SAME bodies and vanilla ships identical masses in
 # both (dog total 74.00 either side).  See _convert_blend_collision.
 _OB_MASS_DIV = 7.0
+#: Vanilla's velocity ceiling for every engine-driven keyframed door and gate.
+_KEYFRAMED_VELOCITY_CAP = 1000002.0
 NIF_FLAGS = 14  # Standard Skyrim NiAVObject flags (SelectiveUpdate bits 1-3)
 
 # ---------------------------------------------------------------------------
@@ -200,52 +206,41 @@ def shape_tri_groups(shape):
         return [len(list(_triangulate_strips(sd)))
                 for sd in shape.strips_data if sd is not None]
 
-    if isinstance(shape, NifFormat.bhkPackedNiTriStripsShape):
-        data = getattr(shape, 'data', None)
-        if data is None:
-            return []
-        subs = getattr(shape, 'sub_shapes', None) or []
-        if len(subs) < 2:
-            return []
-        # Sub-shapes partition the VERTEX array; a triangle belongs to the
-        # sub-shape owning its vertices.  Walk the triangles in order and cut
-        # whenever the owning sub-shape changes.
-        bounds, run = [], 0
-        for s in subs:
-            run += s.num_vertices
-            bounds.append(run)
-
-        def owner(vi):
-            for gi, hi in enumerate(bounds):
-                if vi < hi:
-                    return gi
-            return len(bounds) - 1
-
-        groups, cur, prev = [], 0, None
-        for t in data.triangles:
-            a, b, c = t.triangle.v_1, t.triangle.v_2, t.triangle.v_3
-            if a == b or b == c or a == c:
-                continue
-            g = owner(a)
-            if prev is not None and g != prev:
-                groups.append(cur)
-                cur = 0
-            prev = g
-            cur += 1
-        if cur:
-            groups.append(cur)
-        return groups
+    if (isinstance(shape, NifFormat.bhkPackedNiTriStripsShape)
+            and getattr(shape, 'data', None) is not None
+            and len(getattr(shape, 'sub_shapes', None) or []) >= 2):
+        return [len(list(run)) for _owner, run in groupby(_packed_tri_owners(shape))]
 
     return []
 
 
+def _packed_tri_owners(shape):
+    """Sub-shape index owning each non-degenerate triangle of a
+    bhkPackedNiTriStripsShape, in _shape_tri_soup order.  Sub-shapes
+    partition the VERTEX array; a triangle belongs to the sub-shape owning
+    its first vertex (the last one past the end, 0 when there are none)."""
+    bounds = list(accumulate(s.num_vertices for s in getattr(shape, 'sub_shapes', None) or []))
+    last = max(len(bounds) - 1, 0)
+    return [min(bisect_right(bounds, t.triangle.v_1), last)
+            for t in shape.data.triangles
+            if len({t.triangle.v_1, t.triangle.v_2, t.triangle.v_3}) == 3]
+
+
+def _sk_material(hm):
+    """Skyrim material CRC of HavokMaterial `hm`, mapping a TES4 enum index (<= 31)."""
+    cur = get_havok_material(hm)
+    return OB_TO_SK_MATERIAL.get(cur, 3741512247) if 0 <= cur <= 31 else cur
+
+
 def _shape_tri_soup(shape):
-    """Extract (triangles_hu, sk_material) from a mesh collision shape.
+    """Extract (triangles_hu, sk_materials) from a mesh collision shape:
+    one Skyrim material CRC per triangle, from its own packed sub-shape.
 
     bhkNiTriStripsShape data is at game-unit scale (÷7 → Oblivion havok,
     ×_HAVOK_SCALE → Skyrim havok).  hkPackedNiTriStripsData is at 1/7
     game-unit scale already (×_HAVOK_SCALE only).  Returns None for
     non-mesh shapes (caller uses the primitive conversion path).
+    See: docs/commentary/asset_convert_collision.md#stairs-material
     """
     if isinstance(shape, NifFormat.bhkNiTriStripsShape):
         scale = _HAVOK_SCALE / 7.0
@@ -259,10 +254,7 @@ def _shape_tri_soup(shape):
                         for a, b, c in _triangulate_strips(sd))
         if not tris:
             return None
-        material = get_havok_material(shape.material)
-        if 0 <= material <= 31:
-            material = OB_TO_SK_MATERIAL.get(material, 3741512247)
-        return tris, material
+        return tris, [_sk_material(shape.material)] * len(tris)
 
     if isinstance(shape, NifFormat.bhkPackedNiTriStripsShape):
         data = getattr(shape, 'data', None)
@@ -278,12 +270,8 @@ def _shape_tri_soup(shape):
             tris.append((verts[a], verts[b], verts[c]))
         if not tris:
             return None
-        material = 3741512247  # stone default
-        if shape.num_sub_shapes > 0:
-            material = get_havok_material(shape.sub_shapes[0].material)
-            if 0 <= material <= 31:
-                material = OB_TO_SK_MATERIAL.get(material, 3741512247)
-        return tris, material
+        materials = [_sk_material(s.material) for s in shape.sub_shapes] or [3741512247]
+        return tris, [materials[o] for o in _packed_tri_owners(shape)]
 
     return None
 
@@ -570,84 +558,76 @@ def _rebuild_mesh_collision(rb, target_node):
     bhkRigidBody).
 
     Returns True when handled, False → caller uses the primitive-shape
-    conversion path, or 'drop' → caller removes the collision object
-    entirely.  'drop' covers a sub-viable hull (see _MIN_HULL_EXTENT) and a
-    MOPP build that failed outright: the old fallback shipped a
-    bhkPackedNiTriStripsShape in that case, which Skyrim cannot load at all.
+    conversion path, or 'drop' → caller removes the collision object: a
+    sub-viable hull (_MIN_HULL_EXTENT) or a failed MOPP build, since a
+    packed-shape fallback crashes Skyrim on load.
+    See: docs/commentary/asset_convert_nif.md#bhkpackednitristripsshape-reaching-output-2-gb
     """
     shape = rb.shape
     inner = shape.shape if isinstance(shape, NifFormat.bhkMoppBvTreeShape) else shape
-    soup = _shape_tri_soup(inner)
+    soup = _finite_soup(inner)
     if soup is None:
         return False
-    tris, sk_material = soup
+    tris, materials, groups, authored_normals = soup
+    lo = [min(v[i] for t in tris for v in t) for i in range(3)]
+    hi = [max(v[i] for t in tris for v in t) for i in range(3)]
+    if max(hi[i] - lo[i] for i in range(3)) < _MIN_HULL_EXTENT:
+        _DEGENERATE_HULLS_DROPPED[0] += 1
+        return 'drop'
+    authored_normals = _normals_in_body_frame(rb, authored_normals)
+    tris = _bake_body_transform_into_tris(rb, tris)
+    tris, n_flipped = repair_inverted_floors(
+        tris, _visual_tri_soup(target_node), groups, authored_normals,
+        original_tris(_visual_tri_soup))
+    if n_flipped:
+        INVERTED_FLOOR_FLIPS[0] += n_flipped
+    mopp = build_cms_collision(tris, materials, NifFormat)
+    if mopp is not None:
+        mopp.shape.target = target_node
+        rb.shape = mopp
+        return True
+    _DEGENERATE_HULLS_DROPPED[0] += 1
+    return 'drop'
+
+
+def _finite_soup(inner):
+    """(tris, materials, groups, authored_normals) of mesh shape `inner` with
+    every non-finite triangle removed and the parallel lists cut to match;
+    None when it is not a mesh shape or nothing finite is left.  `groups`
+    and `authored_normals` are [] / None when they do not line up with the soup."""
+    soup = _shape_tri_soup(inner)
+    if soup is None:
+        return None
+    tris, materials = soup
     groups = shape_tri_groups(inner)
     authored_normals = _shape_tri_normals(inner)
     if authored_normals is not None and len(authored_normals) != len(tris):
         authored_normals = None
     keep = [all(math.isfinite(c) for v in t for c in v) for t in tris]
     if groups and sum(groups) == len(tris) and not all(keep):
-        adj, base = [], 0
-        for g in groups:
-            adj.append(sum(1 for i in range(base, base + g) if keep[i]))
-            base += g
-        groups = adj
-    if authored_normals is not None and not all(keep):
+        bounds = [0, *accumulate(groups)]
+        groups = [sum(keep[bounds[g]:bounds[g + 1]]) for g in range(len(groups))]
+    if authored_normals is not None:
         authored_normals = [n for n, k in zip(authored_normals, keep) if k]
     tris = [t for t, k in zip(tris, keep) if k]
-    if not tris:
-        return False
+    materials = [m for m, k in zip(materials, keep) if k]
+    return (tris, materials, groups, authored_normals) if tris else None
 
-    # Degenerate hull: too small for Havok to build a MOPP over, and far too
-    # small to collide with anything.  Drop it instead of shipping a shape
-    # that crashes the MOPP builder and lands on the packed fallback.
-    lo = [min(v[i] for t in tris for v in t) for i in range(3)]
-    hi = [max(v[i] for t in tris for v in t) for i in range(3)]
-    if max(hi[i] - lo[i] for i in range(3)) < _MIN_HULL_EXTENT:
-        _DEGENERATE_HULLS_DROPPED[0] += 1
-        return 'drop'
 
-    # The authored normals live in the SHAPE's frame; _bake_body_transform
-    # rotates the triangles into the node's.  Rotate the normals by the same
-    # matrix first or every comparison is made across two different frames --
-    # a 180-degree body would then read every face as reversed.  (The rotation
-    # comes from a quaternion, so it never mirrors and never itself changes
-    # which way a triangle winds.)
-    if authored_normals and isinstance(rb, NifFormat.bhkRigidBodyT):
-        q = rb.rotation
-        R = _m3_from_quat_xyzw(q.x, q.y, q.z, q.w)
-        authored_normals = [
-            None if n is None else
+def _normals_in_body_frame(rb, authored_normals):
+    """`authored_normals` (shape frame) rotated by a bhkRigidBodyT's rotation,
+    the same rotation _bake_body_transform_into_tris applies to the triangles,
+    so both are compared in the node's frame.  A quaternion never mirrors, so
+    the rotation never itself changes which way a triangle winds."""
+    if not authored_normals or not isinstance(rb, NifFormat.bhkRigidBodyT):
+        return authored_normals
+    q = rb.rotation
+    R = _m3_from_quat_xyzw(q.x, q.y, q.z, q.w)
+    return [None if n is None else
             (R[0][0]*n[0] + R[0][1]*n[1] + R[0][2]*n[2],
              R[1][0]*n[0] + R[1][1]*n[1] + R[1][2]*n[2],
              R[2][0]*n[0] + R[2][1]*n[1] + R[2][2]*n[2])
-            for n in authored_normals
-        ]
-    tris = _bake_body_transform_into_tris(rb, tris)
-    tris, n_flipped = repair_inverted_floors(
-        tris, _visual_tri_soup(target_node), groups, authored_normals)
-    if n_flipped:
-        INVERTED_FLOOR_FLIPS[0] += n_flipped
-    mopp = build_cms_collision(tris, sk_material, NifFormat)
-    if mopp is not None:
-        mopp.shape.target = target_node
-        rb.shape = mopp
-        return True
-    # MOPP failed.  Shipping _packed_from_tris here was a LOAD CRASH: Skyrim
-    # does not support bhkPackedNiTriStripsShape (0 of 17,216 vanilla meshes
-    # carry it or hkPackedNiTriStripsData), so the engine mis-sizes its
-    # sub-part allocation and memcpys the payload with a garbage 32-bit
-    # length -- measured live at 2.03 GB out of a 2.25 GB tbbmalloc block,
-    # with 49.2 GB committed and the resulting 0x0000000100000001 fill
-    # crashing whatever allocated next.  An unsupported shape is never a
-    # safer outcome than no collision, so the collision is dropped instead.
-    #
-    # In practice MOPP only fails on geometry that is not a surface at all:
-    # romanhanginglamp01.nif's collision is 8 vertices with X=Y=0 -- a bare
-    # line segment on the Z axis, zero area, which quantises to two distinct
-    # points and yields no chunk.  Dropping it costs nothing real.
-    _DEGENERATE_HULLS_DROPPED[0] += 1
-    return 'drop'
+            for n in authored_normals]
 
 
 # ---------------------------------------------------------------------------
@@ -938,16 +918,16 @@ def _convert_shape(shape, root_node):
         # memcpy the payload over unmapped memory (crash on load).
         soup = _shape_tri_soup(shape)
         if soup is not None:
-            tris, sk_material = soup
-            tris = [t for t in tris
-                    if all(math.isfinite(c) for v in t for c in v)]
-            if tris:
-                lo = [min(v[i] for t in tris for v in t) for i in range(3)]
-                hi = [max(v[i] for t in tris for v in t) for i in range(3)]
+            tris, materials = soup
+            finite = [t for t in tris
+                      if all(math.isfinite(c) for v in t for c in v)]
+            if finite:
+                lo = [min(v[i] for t in finite for v in t) for i in range(3)]
+                hi = [max(v[i] for t in finite for v in t) for i in range(3)]
                 if max(hi[i] - lo[i] for i in range(3)) < _MIN_HULL_EXTENT:
                     _DEGENERATE_HULLS_DROPPED[0] += 1
                     return None
-                mopp = build_cms_collision(tris, sk_material, NifFormat)
+                mopp = build_cms_collision(tris, materials, NifFormat)
                 if mopp is not None:
                     mopp.shape.target = root_node
                     return mopp
@@ -1024,43 +1004,44 @@ def _node_is_animated(node, actual_root):
     return _name_of(node) in names
 
 
-# Oblivion collision layer 10 = OL_PROPS, the DYNAMIC clutter layer (barrels,
-# cups -- everything Havok simulates and lets fall).  It is the authored
-# indicator that separates a piece meant to break off and drop from one whose
-# animation performs the whole motion: the artist picks the layer in the
-# exporter, so this is a statement of intent, not a measurement.
-#
-# Census of every ms=6 + animated + mass>0 body across both plugins (44 meshes):
-#   layer 10 OL_PROPS   -> falls: mwallplankbreakaway01, idcrumblewall01,
-#                          cpbrick01-15, cpgenericbrick01-03, cplog01/02,
-#                          artrapbridgecrumble, roperock01, rfpitbridgetrap
-#   layer 2/3           -> self-actuating, MUST stay keyframed: prisoncellgate01,
-#                          cgprisoncellgate01, icbastioncellgate01, argate01,
-#                          rfwportcullis01(+door), arpitstairs01/03,
-#                          arenclosedcircle01, dreamstairs01
-#   layer 14 OL_TRAP    -> swinging traps, keyframed: ctrapcavein01,
-#                          ctraplogs01, cprollingrock01, artrapchannelspikes01
-# Gates swing and portcullises slide precisely because they are NOT on the
-# props layer; nothing on layer 10 is expected to hold a pose against gravity.
+#: Oblivion OL_PROPS: dynamic clutter, the layer of breakaway planks and bricks.
 _OL_PROPS = 10
+#: Oblivion OL_TRAP: trap parts, held (cave-in rocks) or clip-driven (spikes).
+_OL_TRAP = 14
 
 
 def _node_is_breakaway(node, actual_root, rb):
-    """True if this animated node is a piece that breaks off and falls.
+    """True if this body is a loose piece held until a script releases it.
 
-    Oblivion authors breakaway props (mwallplankbreakaway01's planks,
-    IDCrumbleWall01's bricks) as ms=6 bodies with real mass on OL_PROPS: the
-    sequence only creaks them off their mounting and Havok does the rest.
-    Converting them to keyframed/mass-0 pins them in the half-broken pose
-    forever.  Gates and portcullises are also ms=6 with mass, but they sit on
-    the anim-static/clutter layers and must keep following their clip exactly.
+    In a mesh with a clip, an OL_PROPS body (breakaway planks, crumble-wall
+    bricks) or an OL_TRAP body no clip moves (cave-in rocks, trap logs) is
+    held rigid and only falls once released.  An OL_TRAP body its clip moves
+    is a self-actuating trap and stays keyframed; gates and portcullises sit
+    on the anim-static layers and never qualify.
+    See: docs/commentary/asset_convert_collision.md#held-bodies
     """
-    if not _node_is_animated(node, actual_root):
+    root = actual_root if actual_root is not None else node
+    if not mesh_has_sequence(root):
         return False
-    for attr in ('havok_col_filter', 'havok_col_filter_copy'):
-        hf = getattr(rb, attr, None)
-        if hf is not None and int(getattr(hf, 'layer', -1)) == _OL_PROPS:
+    layers = {int(getattr(hf, 'layer', -1))
+              for hf in (getattr(rb, 'havok_col_filter', None),
+                         getattr(rb, 'havok_col_filter_copy', None))
+              if hf is not None}
+    if _OL_PROPS in layers:
+        return True
+    return _OL_TRAP in layers and not clip_moves_node(root, node)
+
+
+def mesh_has_held_body(root) -> bool:
+    """True if any Oblivion-format body in `root`'s tree is held (see _body_is_held)."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        body = getattr(getattr(node, 'collision_object', None), 'body', None)
+        if hasattr(body, 'motion_system') and _body_is_held(node, root, body):
             return True
+        stack.extend(c for c in (getattr(node, 'children', None) or [])
+                     if c is not None)
     return False
 
 
@@ -1068,10 +1049,9 @@ def _node_is_held_trap(node, actual_root, rb):
     """True if this body is part of a trap island Oblivion holds until scripted.
 
     Oblivion authors a whole swinging trap (ctrapswingmacelong01's chain links
-    + mace head, ctraplogs01's logs) as ms=6 KEYFRAMED bodies with real mass
+    + mace head, ctrapswingloglong01) as ms=6 KEYFRAMED bodies with real mass
     and `Unyielding = 1`, wired together by constraints.  ITS engine keeps the
-    island rigid until the trap script runs `playgroup` -- the script header
-    says so outright: "On activation havok will turn on and logs will roll".
+    island rigid until the trap script runs `playgroup`.
 
     Shipping them dynamic (the old "mass>0 and owns a constraint" rule) made
     every trap swing freely on cell load.  Shipping them mass-0 keyframed
@@ -1092,6 +1072,13 @@ def _node_is_held_trap(node, actual_root, rb):
         if body is not None and getattr(body, 'num_constraints', 0) > 0:
             return True
     return False
+
+
+def _body_is_held(node, actual_root, rb):
+    """True for an ms=6 body with mass held keyframed until a script releases it."""
+    return (rb.motion_system == 6 and rb.mass > 0
+            and (_node_is_breakaway(node, actual_root, rb)
+                 or _node_is_held_trap(node, actual_root, rb)))
 
 
 def _convert_blend_collision(node, coll_obj):
@@ -1266,59 +1253,7 @@ def _convert_collision(node, actual_root=None, keep_blend=False):
     # Unscaled it lets contacts sink an entire chain-link deep.
     rb.penetration_depth *= _HAVOK_SCALE
 
-    # Oblivion MO_SYS_KEYFRAMED (6) semantics are context-dependent.  Three
-    # cases, discriminated per body (vanilla Skyrim census):
-    #  1. Node driven by animation (gate leaves targeted by Open/Close
-    #     sequences, animated display-case lids) → Skyrim KEYFRAMED, like
-    #     vanilla farmhouseanimdoor01.  Keyframed is ONLY valid for animated
-    #     nodes: a keyframed body with anim flags (137/142) on a non-animated
-    #     object flips the engine into the baked/anim-static path and the
-    #     whole compound acts welded solid.
-    #  2. mass>0 AND owns a constraint (mace-trap chain links: Oblivion holds
-    #     whole traps keyframed until the trap script enables havok) →
-    #     DYNAMIC, like vanilla trapmace01's links (ms=3, quality 4).
-    #  3. Everything else (constrained-island anchors: cellchain01 root,
-    #     cellChainMiddle, mass=100 "Unyielding"; unyielding props) →
-    #     STATIC with mass 0.  Vanilla chain/noose/trap anchors are ALWAYS
-    #     static mass-0 bodies (NooseRopePiece01 root, trapmace Base01),
-    #     never keyframed.
-    #  4. BREAKAWAY pieces (mwallplankbreakaway01's 8 planks, IDCrumbleWall01's
-    #     bricks): ms=6 bodies with real mass whose clip only creaks them off
-    #     their mounting -- 15.19 deg and ZERO translation keys for the planks
-    #     -- because the visible break is HAVOK taking over and letting the
-    #     pieces detach and FALL.  Forcing those onto the plain keyframed path
-    #     (which also zeroes the mass) pinned them forever: the clip played, the
-    #     planks tilted, and then hung in the half-broken pose as a solid wall.
-    #     Gates/portcullises are also ms=6 with mass but sit on the anim-static
-    #     layers, so the authored OL_PROPS layer separates the two.
-    #
-    #     A breakaway piece still ships KEYFRAMED, exactly like Oblivion's
-    #     `Unyielding = 1` (all 8 planks; the root is Unyielding 0 / mass 0):
-    #     the body is HELD, following the clip, and only becomes dynamic when
-    #     the animation ends.  Shipping it dynamic instead made the planks drop
-    #     the instant the cell loaded, before the clip ever played.  What the
-    #     breakaway flag changes is that the piece KEEPS ITS MASS, so the
-    #     script-side release (ObjectReference.SetMotionType(Motion_Dynamic))
-    #     hands Havok a body that can actually fall -- a mass-0 body would just
-    #     hang there.  See script_convert PlayGroup handling.
-    #  5. HELD TRAP islands (ctrapswingmacelong01's chain + mace,
-    #     ctraplogs01's logs, cprollingrock01): ms=6 bodies with real mass
-    #     that belong to a CONSTRAINED island.  Case 2 shipped these DYNAMIC,
-    #     which is what made every swinging trap swing freely the moment the
-    #     cell loaded, before anything tripped it.  Oblivion's own trap script
-    #     states the contract in its header comment -- "On activation havok
-    #     will turn on and logs will roll" (CTrapLogs01SCRIPT) -- and authors
-    #     the whole island `Unyielding = 1`: the trap is HELD rigid until the
-    #     trap script fires, exactly like a breakaway piece.
-    #
-    #     So a constrained trap island is a breakaway: ship it KEYFRAMED (held,
-    #     not simulating) but KEEP the authored mass, and let the script-side
-    #     SetMotionType(Motion_Dynamic) release start the swing.  Skyrim's own
-    #     trapmace01 ships its links dynamic because a Skyrim trap has no
-    #     script-held phase; ours must reproduce Oblivion's held phase instead.
-    breakaway_body = (rb.motion_system == 6 and rb.mass > 0
-                      and (_node_is_breakaway(node, actual_root, rb)
-                           or _node_is_held_trap(node, actual_root, rb)))
+    breakaway_body = _body_is_held(node, actual_root, rb)
     keyframed_body = (rb.motion_system == 6
                       and (_node_is_animated(node, actual_root)
                            or breakaway_body))
@@ -1408,8 +1343,8 @@ def _convert_collision(node, actual_root=None, keep_blend=False):
         rb.restitution      = 0.40
         rb.linear_damping   = 0.0996
         rb.angular_damping  = 0.0498
-        rb.max_linear_velocity  = 104.4
-        rb.max_angular_velocity = 31.57
+        rb.max_linear_velocity  = _KEYFRAMED_VELOCITY_CAP
+        rb.max_angular_velocity = _KEYFRAMED_VELOCITY_CAP
         # Scripts can switch keyframed trap bodies to dynamic at runtime
         # (swinging traps activate that way), so inertia must be in Skyrim
         # units even though keyframed motion ignores it.  ×0.01, same as the
@@ -1779,89 +1714,66 @@ def bake_node_transform_into_body(coll_obj, node, extra_z=0.0):
     return True
 
 
-def hoist_collision(root):
-    """Find a collision object on any descendant NiNode and move it to root.
+def collision_owner(root):
+    """The descendant whose collision hoist_collision takes: first found depth-first, or None.
 
-    Skyrim requires bhkCollisionObject to be on the root BSFadeNode.
-    Oblivion meshes sometimes put it on a child NiNode (e.g. 'CollisionXxx').
-    We take the first one found, assign it to root, and null it on the child.
-
-    The child's FULL local transform (R, T, s) must follow the collision to the
-    root, which sits at the origin with an identity rotation.  Two mechanisms:
-
-      * bhkRigidBody(T) → bake_node_transform_into_body composes L into the
-        body transform (promoting to bhkRigidBodyT).  Shape-agnostic, so it
-        works for convex hulls, list shapes and primitives, none of which have
-        a vertex array _offset_collision_shape_verts could rewrite.  Mesh
-        collision later folds that bodyT back into the triangles in
-        _bake_body_transform_into_tris and demotes the body to plain identity,
-        matching all 6341 vanilla CMS meshes (a bhkRigidBodyT paired with
-        MOPP/CMS makes the engine emit HK_INVALID_SHAPE_KEY and CTD).
-
-      * bhkSimpleShapePhantom (trigger volumes / trap damage zones) has no
-        body transform field at all and cannot be promoted, so its transform
-        is composed into the inner shape via a bhkTransformShape wrapper.
-
-    Previously only the child's TRANSLATION was applied, and only for the two
-    strips shape types — so a rotated collision node silently lost its
-    rotation.  citadelballconystandardendleft02 is the case in point: a
-    180-degree flip about X put its collision at Y +508..+1035 while the
-    balcony it belongs to sits at Y -957..-494, i.e. no collision at all where
-    the player walks.  Its sibling citadelballconystandardendleft has the same
-    geometry with an identity collision node and always converted correctly —
-    the pair is the A/B that isolates the node rotation as the discriminator.
-
-    Returns True if a collision was hoisted.
+    The one search both the hoist and its animation gate use.
+    See: docs/commentary/asset_convert_collision.md#every-collision-owner
     """
-    def _find_and_clear(node):
-        """Return (collision_object, child_node) or None."""
-        if not isinstance(node, NifFormat.NiNode):
-            return None
-        for child in node.children:
-            if child is None:
-                continue
-            if (hasattr(child, 'collision_object') and
-                    child.collision_object is not None):
-                co = child.collision_object
-                child.collision_object = None
-                return co, child
-            result = _find_and_clear(child)
-            if result is not None:
-                return result
-        return None
+    for child in getattr(root, 'children', None) or []:
+        if child is None:
+            continue
+        if getattr(child, 'collision_object', None) is not None:
+            return child
+        found = collision_owner(child)
+        if found is not None:
+            return found
+    return None
 
-    found = _find_and_clear(root)
-    if found is None:
+
+def _frame_in_root(root, node):
+    """`node` itself when a direct child of `root`, else a stand-in carrying its transform relative to `root`.
+
+    See: docs/commentary/asset_convert_collision.md#nested-owner-transform
+    """
+    if any(c is node for c in root.children):
+        return node
+    frame = NifFormat.NiNode()
+    frame.set_transform(node.get_transform(root))
+    return frame
+
+
+def hoist_collision(root):
+    """Move collision_owner's collision object onto the root; True if one moved.
+
+    The owner's whole transform relative to the root (R, T, s) follows it:
+    baked into the rigid body (promoted to bhkRigidBodyT, which mesh collision
+    later folds into its triangles); for a bhkSimpleShapePhantom, which has no
+    body transform, wrapped around its shape in a bhkTransformShape; for an
+    unknown body, its translation alone baked into the shape's vertices.
+    See: docs/commentary/asset_convert_collision.md#hoisted-collision-dropped-child-nodes
+    """
+    child = collision_owner(root)
+    if child is None:
         return False
 
-    co, child = found
+    co = child.collision_object
+    child.collision_object = None
     root.collision_object = co
     co.target = root
 
-    t = child.translation
-    ox, oy, oz = t.x, t.y, t.z
-    has_translation = (ox != 0.0 or oy != 0.0 or oz != 0.0)
-    has_rotation = not _is_identity(child.rotation)
-    has_scale = abs(float(child.scale) - 1.0) > 1e-4
-
-    if not (has_translation or has_rotation or has_scale):
+    frame = _frame_in_root(root, child)
+    t = frame.translation
+    has_translation = (t.x != 0.0 or t.y != 0.0 or t.z != 0.0)
+    if not (has_translation or not _is_identity(frame.rotation)
+            or abs(float(frame.scale) - 1.0) > 1e-4):
         return True
 
     body = getattr(co, 'body', None)
-
     if isinstance(body, NifFormat.bhkSimpleShapePhantom):
-        # No body transform field — compose L into the shape instead.
-        _wrap_shape_in_node_transform(body, child)
-        return True
-
-    if bake_node_transform_into_body(co, child):
-        return True
-
-    # No rigid body to carry the transform (unknown body type): fall back to
-    # the translation-only vertex bake, which is still better than dropping
-    # the offset entirely.  Rotation/scale cannot be represented here.
-    if has_translation:
-        _offset_collision_shape_verts(co, ox, oy, oz)
+        _wrap_shape_in_node_transform(body, frame)
+    elif not bake_node_transform_into_body(co, frame) and has_translation:
+        _offset_collision_shape_verts(co, t.x, t.y, t.z)
     return True
 
 

@@ -4,6 +4,7 @@
 
 ## Contents
 
+- [Quest EditorIDs that clash with Skyrim](#quest-editorids-that-clash-with-skyrim)
 - [Quest conversion: bugs found and fixed](#quest-conversion-bugs)
 - [Bugs found and FIXED on this branch](#bugs)
 - [Quest script conversion: defects found and fixed](#quest-script-conversion-defects)
@@ -76,21 +77,81 @@ Vanilla does exactly this split: instance-identified logic lives on the ACHR
 (masterAmbushScript, 464 placements), while generic per-actor behaviour stays on
 the base (WIDeadBodyCleanupScript, defaultGhostScript).
 
-The script is moved (base entry removed) rather than duplicated so there is
-exactly ONE instance — both the fragment write (via the ACHR-typed self
-property) and the condition read resolve to it.
+The script is COPIED onto the reference; the base keeps its entry. A reference
+whose VMAD names the same script as its base gets ONE merged instance, not two
+(measured in a Nehrim save: `NQRatte02`'s base and its two placed rats all carry
+`NQ00Ratte02Script`, and each rat has exactly one instance). Removing the base
+entry — the old "single placement" rule — stripped the script from every actor
+spawned from that base at runtime: Nehrim's rat holes `PlaceAtMe` the rat
+bases, and a spawned `NQRatte01`/`NQRatte03` had no `OnDeath`, so the respawn
+ring died after one spawn. Vanilla keeps `Actor` scripts with `OnDeath` on the
+base (`WIDeadBodyCleanupScript`: 210 NPC_, 0 ACHR), so reason 2 above does not
+hold for `OnDeath`.
 
-### Which scripts qualify, and the single-placement rule
+### Which scripts qualify
 
 The MASTERS' scripts are indexed alongside this plugin's (keyed on the
 `master_export` key, this plugin's space — see `_collect_scpts`): a dependent
 plugin's actor can carry one of its master's scripts, and missing it means the
 relocation never happens, so every reason above silently applies.
 
-A script may be moved OFF the base only when that base has a single placement,
-else siblings would lose it. Shared bases (rare: SI victims, Sheogorath's sheep)
-keep the base attachment and gain a per-ref one, matching Oblivion's
-per-instance variables.
+## <a id="qust-vmad-strict-parse"></a>The QUST VMAD is parsed strictly, and a script property bound to a base must be typed to the base
+
+A QUST VMAD is `Version, ObjectFormat, Scripts, ScriptFragmentsQuest, Aliases`,
+the last an array with an S16 count prefix (xEdit `wbVMADFragmentedQUST`).
+`build_vmad_quest_fragments` (`script_convert/pipeline.py`) must write that
+trailing count: the engine abandons a record's WHOLE script and alias binding if
+the buffer ends where it expects it. Vanilla `DBSideContract03`'s 643-byte VMAD
+parses 643/643 only once the trailing S16 is read;
+`test_vmad_quest_parses_to_exactly_its_length` demands every byte be consumed,
+because a truncated tail is invisible to every other check. When a record's
+scripts AND aliases are both empty at runtime but its fields look perfect,
+suspect a truncated or misparsed tail; the console `sqv <quest>` prints alias
+fill state and script variables directly.
+
+A property bound to a BASE record (NPC_/CREA) must be typed `ActorBase` (a base
+form is not an `Actor`, so an Actor-script-typed property is unbindable and
+aborts that script's whole init). `SetEssential X 0` on a base is therefore a
+direct `X.SetEssential(v)`; only genuine ACHR/ACRE/REFR args take the
+`(x as Actor).GetActorBase()` cast, and `converter.get_property_refs` coerces any
+actor-base-bound property typed Actor/ObjectReference/TES4_* to `ActorBase`
+(141 scripts). Item bases (ARMO/MISC) typed `ObjectReference` are equally
+unbindable but the right type depends on body usage (inventory `Form` vs placed
+reference), so they are NOT coerced; a base ITEM can carry its own object script,
+so an item-script-typed property on an item base is valid (59 vanilla cases).
+Further quest-target facts: vanilla objective targets are UNCONDITIONAL
+(`_target_live_at_stage()` resolves Oblivion's GetStage gates at build time),
+reference aliases carry `VTCK` (2,687 of 2,687 vanilla forced-ref aliases) and
+FNAM `0x0292`. The quest-alias-fill hunt's final cause was the top-level group
+order, see `ck_reference_init_hang.md#qust-after-cell-wrld-dial`.
+
+## Quest EditorIDs that clash with Skyrim
+<a id="quest-editorids-that-clash-with-skyrim"></a>
+
+**Code:** `tes5_import/base/vanilla_quests.py:engine_quest_edid`, used by
+`convert_QUST` (the EDID subrecord) and `groups._record_voice_entry` (the voice
+prefix).
+
+Oblivion reuses 12 quest EditorIDs that a vanilla Skyrim master also uses:
+`MQ00`, `MS02`, `MS04`–`MS06`, `MS08`–`MS14`. A user reported Blood on the Ice
+(Skyrim `MS11`, `0001F7A3`) reading as A Brotherhood Betrayed (Oblivion `MS11`,
+ours `01017839`). The two records share nothing but the name: no converted
+plugin references `0001F7A3`, and the vanilla journal text loader
+(1.6.1170 `0x3dac10`) seeks the stage's owning quest by FormID in its last
+overriding file. So whatever mixed them up looks quests up by EditorID: the
+console, or an SKSE mod that indexes forms by EditorID. Which one is unconfirmed.
+
+Only a clashing EditorID is renamed (`TES4` + name), read from the installed
+`VANILLA_MASTERS` (2,274 QUST names, 0.11 s). Everything a save binds stays put:
+FormIDs, fragment and script names (`TES4_QF_MS11`), and the Papyrus property
+names. The authored name is still used for every internal lookup (conditions,
+scripts, unlock globals). The engine builds the voice path from the quest
+EditorID, so the voice prefix follows the rename (`tes4ms11_…`), and the sound
+stage prunes the files left under the old names. A dependent plugin's override
+patches the master's converted record, so it inherits the rename.
+
+This supersedes the "no behaviour change" verdict for QUST in
+[ck_warnings.md](ck_warnings.md#7-duplicate-editorids-duplicate001-deferred).
 
 ## Quest conversion: bugs found and fixed
 <a id="quest-conversion-bugs"></a>
@@ -1496,8 +1557,8 @@ be "fixed". Split out of the audit so they are not read as stale.
 * **`Activate X 1` dropping the trailing `1`** (`SE03AScript`). TES4's flag
   means "activate even if blocked"; the handler maps run-flag 1 to
   `Activate(x)` (full processing) and everything else to `Activate(x, true)`,
-  which is what stops the OnActivate storm recorded in
-  `project_activate_conversion`.
+  which is what stops the OnActivate storm described in
+  [script_convert.md](script_convert.md) (Activate conversions).
 * **`PickIdle` → `Debug.SendAnimationEvent(ref, "IdleForceDefaultState")`**
   (`SE03AScript`). TES4 `PickIdle` (opcode `0x1064`, 0 params) forces an idle
   re-selection; the default-state reset is the standard Skyrim idiom.
@@ -1659,7 +1720,9 @@ be "fixed". Split out of the audit so they are not read as stale.
   fires.
 * **`StartConversation` → `Say(topic)`** is a deliberate, documented decision
   with recorded history (discarding the topic silenced every scripted NPC-NPC
-  conversation). Not a defect.
+  conversation). Not a defect. The one exception is a Player target, which is a
+  force greet
+  ([tes5_import_dialogue.md](tes5_import_dialogue.md#startconversation-player-force-greet)).
 
 ## Verified-correct behaviours from round 1 (do NOT "fix" these)
 <a id="section-2-2-2-2-2-2-2-2"></a>
@@ -1820,6 +1883,28 @@ One converter runs for all stages: `convert_fragment` deliberately accumulates
 `_property_refs` across calls, which is how the QF_ generator collects the union
 of every fragment's references.
 
+### <a id="global-default-overrides"></a>Global default overrides
+
+**Code:** `tes5_import/record_types/common.py` `_GLOBAL_DEFAULTS`
+
+Nehrim's `VarDistantBlur` (default 1) turns on a fake depth-of-field effect.
+`DistantBlurSphereQuestScript` moves `NDistantBlur.nif`, an inward-facing
+`refractF` sphere with a 5,700-unit radius (0.4 scale indoors), onto the player
+every tick. Converted to Skyrim refraction (fire bit, strength 0.25, one 512²
+normal map stretched over the whole sphere), it draws as a vertical band that
+slides everything behind it right to left. Skyrim's weather imagespaces already
+carry vanilla depth of field, so the global ships as -1, Nehrim's own "off"
+value: the quest does nothing and `DistantBlurSphereScript` disables the sphere.
+The diary item (`GlobaltagebuchScript`) can still switch it back on.
+
+Census of the ~100 `refractF` shapes in the Oblivion, Nehrim and Morroblivion
+exports: this sphere is the only one with every normal inward (others 0.00–0.75)
+and the largest by far (next is the 722-unit Oblivion gate). That geometry test
+was the non-hardcoded alternative considered.
+
+The override changes only the record's default. A save that already stored the
+global keeps its value.
+
 ### Quest-state conditions
 
 TES4 CTDA functions expressing quest TIMING (56 `GetQuestRunning`, 58
@@ -1837,19 +1922,17 @@ The CTDA operator is the top 3 bits of the type byte.
 
 ### Quest targets become per-objective aliases
 
-Oblivion `QSTA` is QUEST-level: one entry per (target ref, condition set), where
-the conditions are `GetStage` bounds saying WHEN that target's compass marker is
-live. Skyrim `QSTA` is per-OBJECTIVE and vanilla leaves it UNCONDITIONAL -- the
-objective being Displayed is what selects the marker. Checked across
-Skyrim.esm: objectives read `QOBJ FNAM NNAM QSTA [QSTA?]`, CTDAs are the rare
-exception, and the right target simply sits on the right objective.
+Oblivion `QSTA` is QUEST-level: one entry per (target ref, condition set), the
+conditions saying WHEN that target's compass marker is live. Skyrim `QSTA` is
+per-OBJECTIVE and carries its own CTDAs: "all of its targets that pass their
+conditions will be displayed" (CK wiki, Quest Objectives Tab). Skyrim.esm uses
+this at scale -- 711 of 1,808 QSTAs carry CTDAs, and 178 objectives hold several
+conditioned targets of which typically one passes (`CW01A` objective 1 has 25).
 
-So the faithful mapping RESOLVES Oblivion's `GetStage` gates at build time
-rather than replaying them at runtime: each objective (= stage) emits only the
-targets whose TES4 conditions hold AT THAT STAGE, with no CTDAs. Carrying every
-target on every objective -- the previous design -- makes the engine face a list
-whose leading entries are false, and it renders no marker at all: the objective
-shows in the journal while compass and map stay empty.
+Each objective (= stage) therefore carries every target that can be live at
+that stage, each with the conditions that remain to be tested at runtime (see
+below). The one QSTA-per-alias rule gives way only where the same ref has two
+different runtime gates; an unconditional entry makes later ones redundant.
 
 An objective with no live target keeps its journal text and marks nothing, the
 same as vanilla's marker-less objectives ("Return when you're ready"). If
@@ -2060,18 +2143,39 @@ omitted, never bound to zero.
 
 ### <a id="resolving-target-markers-per-stage"></a>Resolving target markers per stage
 
-Oblivion gates each `QSTA` with conditions -- overwhelmingly `GetStage <op> N` on
-the quest's own FormID, which is exactly "show this marker during this part of
-the quest". Skyrim has no equivalent, its objective targets being unconditional,
-so the gate is resolved at build time: evaluate the chain with
-`GetStage == stage_idx` and put the target only on the objectives where it holds.
+**Code:** `target_runtime_conditions` / `quest_objectives` in
+`tes5_import/dialogue/quest.py`; the override builder regenerates the same run.
 
-OR semantics follow the CTDA chain rule: bit 0 of the type byte ORs a condition
-with the NEXT one, so the chain is an AND of OR-groups. A condition that cannot
-be evaluated (any function other than `GetStage`/`GetStageDone` --
-`GetQuestVariable`, `GetDeadCount`, ...) is treated as PASSING: it is a runtime
-fact we cannot know, and dropping the target on a maybe would lose a marker
-Oblivion did show. A target with no conditions at all is always live.
+Oblivion gates each `QSTA` with conditions, mostly `GetStage <op> N` on the
+quest's own FormID -- "show this marker during this part of the quest". Those are
+settled at build time with `GetStage == stage_idx` (`GetStageDone N` as
+`stage_idx >= N`), since in Skyrim the displayed objective already stands for the
+stage. The chain is an AND of OR-groups (type-byte bit 0 ORs with the NEXT
+condition): a group one settled gate satisfies is dropped, a group left with
+nothing to test kills the target on that objective, and every other condition
+becomes a CTDA on the `QSTA`.
+
+Those runtime conditions are not rare: 433 of Oblivion.esm's 2,115 target
+conditions (`GetQuestVariable` 154, `GetDeadCount` 105, `GetInCellParam` 69,
+`GetInCell` 67, `GetScriptVariable` 16, others 22) and 35 of Nehrim.esm's 242.
+They are what picks one of SE02's eight Gatekeeper refs (quest variable 26) and
+switches the Jayred/Relmyna markers between the arrows and tears branches.
+Treating them as passing -- the previous design -- lit every candidate at once:
+twelve markers on SE02 objective 7, seven of them on disabled refs.
+
+`GetStage` on ANOTHER quest is a runtime fact too, and stays a CTDA.
+
+Oblivion evaluated target conditions on the player: SE11b's tree target, placed
+in `XPMilchar03`, is gated `GetInCell XPMilchar03 == 1`, which is only meaningful
+of the player. A Skyrim target condition's subject is the target itself, and
+vanilla writes player tests as Run On = Reference `PlayerRef` (GetInCell 131,
+GetItemCount 60, GetInWorldspace 30 of the Skyrim.esm QSTA CTDAs), so every
+converted Subject condition is retargeted there. Oblivion's own target
+conditions never set Run On Target (0 of 2,115; 0 of 242).
+
+Known gap: the override builder has no `script_vars`, so a translation plugin
+that changes a variable-gated target reads the variable through the
+unresolved-name sentinel (value 0).
 
 ### <a id="timing-ctdas-a-promoted-target-inherits"></a>Timing CTDAs a promoted target inherits
 
@@ -2085,6 +2189,18 @@ OR flag so the returned list is a standalone AND-group.
 Identity and voice conditions are deliberately excluded: the response topic
 already carries its own `GetIsID`, and only the missing TIMING gate is inherited.
 An always-available greeting has no timing conditions and yields an empty list.
+
+A greeting's own `GetInCell` (where the SPEAKER is, not run on target) is inherited too, but
+only by a choice ONE greeting offers and only beside a timing condition. With several revealers the
+flat gate keeps the first revealer's AND group, so a place condition narrowed the choice to that
+greeting's place: the first version changed 30 of 17,471 INFOs and cut `0008DC57` from
+"stage < 10" to "not in cell X and stage < 10". Martin's
+"I have everything in place for the ritual ..." (INFO 00027E38) needs him in
+`CloudRulerTempleGreatHall` and offers "Yes, open the portal to Paradise."; outside the hall he
+gives another greeting with no choices. With only `GetStage MQ15 == 10` inherited the choice was
+listed on the Bruma battlefield, and taking it there ran his ritual package off screen: its latch
+closed, the ritual drawing was never activated and the portal never opened (headless run 30e,
+2026-11-14; NOT yet confirmed in game by the user).
 
 ### <a id="authored-objectives"></a>Authored objectives (FO3/FNV)
 

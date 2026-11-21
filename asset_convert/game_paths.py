@@ -17,10 +17,14 @@ grass and _far.nif code can share one implementation without importing a heavy
 sibling module for a three-line path helper.
 """
 import os
+import unicodedata
 from pathlib import Path
 
-__all__ = ["win_join", "DEFAULT_NAMESPACE", "namespace_for",
-           "set_namespace", "current_namespace", "owns_namespace"]
+from core.plugin_masters import master_dir, masters_from_export_header
+
+__all__ = ["win_join", "find_nocase", "folder_names", "DEFAULT_NAMESPACE",
+           "namespace_for", "set_namespace", "current_namespace",
+           "owns_namespace", "ascii_path"]
 
 #: Namespace for Oblivion and everything mastered on it, and the fallback.
 DEFAULT_NAMESPACE = 'tes4'
@@ -34,41 +38,19 @@ NAMESPACE_ENV = 'TESCONV_ASSET_NAMESPACE'
 _ACTIVE = {'ns': (os.environ.get(NAMESPACE_ENV) or DEFAULT_NAMESPACE).lower()}
 
 
-def _export_root(export_dir: Path) -> Path:
-    """The export ROOT above `export_dir`, found by its `sources.json` marker.
-
-    An imported mod nests its plugins as `export/<mod>/<plugin>/`, so the
-    parent of an export dir is the MOD folder, not the root every master is
-    resolved against. Walk up to the marker instead; without one, fall back to
-    the parent, which is correct for a plain `export/<plugin>/`.
-    See: docs/commentary/asset_convert_texture.md#per-game-asset-namespace
-    """
-    from output_layout import REGISTRY_FILENAME
-    for cand in export_dir.parents:
-        if (cand / REGISTRY_FILENAME).is_file():
-            return cand
-    return export_dir.parent
-
-
 def _chain_root(export_dir: Path) -> Path:
     """The masterless plugin at the root of this plugin's master chain.
 
-    A master is resolved through `record_dir`, never by joining its name onto
-    the export root: an imported mod's plugins share ONE folder named for the
-    MOD, so the plain join misses them and the walk stops at the wrong plugin.
-    Both imports are local because each module reaches back into this package.
+    See: docs/reference/pipeline.md#master-resolution
     """
-    from asset_convert.lod.terrain_lod import master_names
-    from output_layout import record_dir
-    root = _export_root(export_dir)
     seen = set()
     cur = export_dir
     while cur is not None and cur.name.lower() not in seen:
         seen.add(cur.name.lower())
-        masters = [m for m in master_names(cur) if m]
+        masters = masters_from_export_header(str(cur))
         if not masters:
             break
-        dirs = [Path(record_dir(str(root), m)) for m in masters]
+        dirs = [Path(master_dir(cur, m)) for m in masters]
         nxt = next((d for d in dirs
                     if d.is_dir() and d.name.lower() not in seen), None)
         if nxt is None:
@@ -121,13 +103,89 @@ def current_namespace() -> str:
     return _ACTIVE['ns']
 
 
+def ascii_path(path: str) -> str:
+    """`path` as the plain-ASCII name every converted asset ships under.
+
+    Accents drop to their base letter; any other non-ASCII character becomes
+    `_xx` (its code point in hex).
+    See: docs/commentary/asset_convert_texture.md#ascii-asset-paths
+    """
+    if path.isascii():
+        return path
+    out = []
+    for ch in unicodedata.normalize('NFKD', path):
+        if ch.isascii():
+            out.append(ch)
+        elif not unicodedata.combining(ch):
+            out.append(f'_{ord(ch):02x}')
+    return ''.join(out)
+
+
+def ascii_dest(root, rel) -> Path:
+    """Where output for `rel` is written under `root`: its `ascii_path`."""
+    return Path(root) / ascii_path(str(rel))
+
+
+def remove_non_ascii(root) -> int:
+    """Delete every non-ASCII-named file under `root`, an older build's spelling; the count."""
+    gone = 0
+    for folder, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.isascii():
+                os.remove(os.path.join(folder, name))
+                gone += 1
+    return gone
+
+
 def win_join(root, rel: str) -> Path:
     """Join a backslash-form (game-format) relative path onto `root`.
 
     Accepts either separator in `rel` and treats both as path separators, which
     is what the game's own loaders do.  Empty segments (a leading separator, or
     a doubled one) are dropped, so `rel` can never escape `root` the way
-    `Path(root) / '\\abs.nif'` would.
+    `Path(root) / '\\abs.nif'` would.  A path that does not exist as spelled
+    resolves to its `ascii_path` form, the name converted output ships under.
     """
-    parts = [p for p in str(rel).replace('/', '\\').split('\\') if p]
-    return Path(root).joinpath(*parts)
+    exact = Path(root).joinpath(*_segments(rel))
+    if str(rel).isascii() or exact.exists():
+        return exact
+    return Path(root).joinpath(*_segments(ascii_path(str(rel))))
+
+
+def _segments(rel) -> list:
+    """`rel` split on either separator, empty segments dropped."""
+    return [p for p in str(rel).replace('/', '\\').split('\\') if p]
+
+
+def folder_names(folder) -> dict:
+    """`{lowercase name: [names]}` for `folder`'s entries; empty when unreadable."""
+    found = {}
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError:
+        return found
+    for name in names:
+        found.setdefault(name.lower(), []).append(name)
+    return found
+
+
+def find_nocase(root, *parts, kind=os.path.isfile, listing=folder_names):
+    """The file `win_join(root, parts)` names, matched ignoring case, or None.
+
+    The exact join is probed first and returned as is: an exact hit lists
+    nothing, so where the filesystem ignores case a file that exists is found
+    as it always was. After a miss each segment is matched ignoring case,
+    through every folder that spells it, one listing per folder. `kind` is the
+    probe: `os.path.isdir` finds a folder. A `listing` that remembers must
+    forget a folder the run writes into.
+    See: docs/commentary/asset_convert_texture.md#case-blind-lookups
+    """
+    segs = _segments('\\'.join(parts))
+    exact = Path(root).joinpath(*segs)
+    if kind(exact):
+        return exact
+    found = [str(Path(root))]
+    for seg in segs:
+        found = [os.path.join(folder, name) for folder in found
+                 for name in listing(folder).get(seg.lower(), ())]
+    return next((Path(p) for p in found if kind(p)), None)

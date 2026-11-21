@@ -18,10 +18,11 @@ each statement's trailing source comment.
 
 from __future__ import annotations
 
-from script_convert.constants import safe_property_name
+from script_convert.constants import HALTED_VAR, safe_property_name
 from script_convert.stage_latch import guard_stage_timer
 from script_convert.emit import stmt as S
 from script_convert.tes4 import nodes as N
+from script_convert.tes5.blocks import hoist_quest_start_above_writes
 
 #: Papyrus indents with two spaces per level, matching the emitted events.
 INDENT = '  '
@@ -46,7 +47,9 @@ def emit_body(conv, body, extends: str, depth: int = 0) -> list[str]:
 
     Recurses through `If`/`While` rather than tracking a running depth counter,
     so a body cannot come out unbalanced and a `Return` cannot strand the lines
-    that follow it inside the wrong block.
+    that follow it inside the wrong block.  Every body is returned with each
+    `Q.Start()` above the writes to `Q` it would reset.
+    See: docs/commentary/script_convert.md#stopquest-converts-stop-run-bit
     """
     body = _drop_duplicate_say(conv, body)
     animated = _animated_targets(body)
@@ -54,19 +57,7 @@ def emit_body(conv, body, extends: str, depth: int = 0) -> list[str]:
     open_walk = conv.sc.refwalk_var
     conv.sc.refwalk_var = ''
     for st in body:
-        lines = emit_stmt(conv, st, extends, depth)
-        # An OBSE `forEach <it> <- <container> ... loop` body is INERT: Papyrus
-        # has no equivalent of OBSE's dynamic containers, the iterator carries
-        # no value, and the body reads it element-by-element.  The opener
-        # converts to a `;TODO:` and everything up to the `loop` follows it
-        # into a comment rather than running against an unassigned iterator.
-        if conv.sc.in_foreach:
-            lines = [_comment(l) for l in lines]
-        if _opens_foreach(st):
-            conv.sc.in_foreach += 1
-        elif conv.sc.in_foreach and _closes_foreach(st):
-            conv.sc.in_foreach -= 1
-        out += _deferred_destroy(lines, animated)
+        out += _deferred_destroy(emit_stmt(conv, st, extends, depth), animated)
     # An OBSE ref-walk's `While` is opened by a `Label` mid-body and its `Goto`
     # cannot close it in place (the Goto sits inside the loop's own `if` nest,
     # and `EndWhile` there would cross those blocks).  The walk therefore ends
@@ -75,18 +66,22 @@ def emit_body(conv, body, extends: str, depth: int = 0) -> list[str]:
         out.append(INDENT * depth + 'EndWhile')
         conv.sc.refwalk_labels = set()
     conv.sc.refwalk_var = open_walk
-    return out
+    return hoist_quest_start_above_writes(out)
 
 
 def emit_stmt(conv, st: N.Stmt, extends: str, depth: int) -> list[str]:
     """Papyrus lines for ONE statement, including any body it owns."""
     pad = INDENT * depth
+    if _evaluates_missing(st):
+        return _halt(conv, extends, pad)
     if isinstance(st, N.If):
         return _if(conv, st, extends, depth)
     if isinstance(st, N.While):
         return ([pad + _text(conv, st, extends)]
                 + emit_body(conv, st.body, extends, depth + 1)
                 + [pad + 'EndWhile'])
+    if isinstance(st, N.ForEach):
+        return _foreach(conv, st, extends, depth)
     conv.sc.block_depth = depth
     text = _text(conv, st, extends)
     if not text:
@@ -117,12 +112,34 @@ def _indent(text: str, pad: str) -> list[str]:
     return out
 
 
+def _evaluates_missing(st: N.Stmt) -> bool:
+    """Does this statement's own expression (not a nested body's) lack an operand?"""
+    return any(N.has_missing(getattr(st, attr, None))
+               for attr in ('expr', 'cond', 'value', 'target'))
+
+
+def _halt(conv, extends: str, pad: str) -> list[str]:
+    """A failed evaluation: TES4 ends the pass and disables a standalone script.
+
+    See: docs/commentary/script_convert.md#missing-operand-halts
+    """
+    conv.sc.halts = conv.sc.halts or conv.sc.can_halt
+    head = [pad + f'{HALTED_VAR} = True'] if conv.sc.can_halt else []
+    return head + _indent(conv.emit_return(N.Return(), extends), pad)
+
+
 def _if(conv, st: N.If, extends: str, depth: int) -> list[str]:
-    """`If` with its elseif chain and else, each body owning its own nesting."""
+    """`If` with its elseif chain and else, each body owning its own nesting.
+
+    An elseif whose condition lacks an operand halts there; nothing after it can run.
+    """
     pad = INDENT * depth
     out = [pad + _text(conv, st, extends)]
     out += emit_body(conv, st.body, extends, depth + 1)
     for cond, body, _line in st.elifs:
+        if N.has_missing(cond):
+            return (out + [pad + 'Else'] + _halt(conv, extends, pad + INDENT)
+                    + [pad + 'EndIf'])
         out.append(pad + 'ElseIf ' + S.emit_condition(conv, cond, extends))
         out += emit_body(conv, body, extends, depth + 1)
     if st.orelse:
@@ -165,14 +182,16 @@ def _comment(line: str) -> str:
     return line[:len(line) - len(stripped)] + ';' + stripped
 
 
-def _opens_foreach(st) -> bool:
-    """Does this statement open an OBSE `forEach` block?"""
-    return isinstance(st, N.ExprStmt) and st.expr.called == 'foreach'
+def _foreach(conv, st: N.ForEach, extends: str, depth: int) -> list[str]:
+    """An OBSE `forEach ... loop` block, kept whole but commented out.
 
-
-def _closes_foreach(st) -> bool:
-    """Does this statement close one with `loop`?"""
-    return isinstance(st, N.ExprStmt) and st.expr.called == 'loop'
+    Papyrus has no OBSE container iterator, so the body cannot run; commenting
+    the BLOCK (not a running span) leaves every statement after it live.
+    """
+    pad = INDENT * depth
+    lines = ([pad + _text(conv, st, extends)]
+             + emit_body(conv, st.body, extends, depth + 1) + [pad + 'loop'])
+    return [_comment(line) for line in lines]
 
 
 # ---------------------------------------------------------------------------

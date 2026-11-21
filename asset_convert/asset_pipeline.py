@@ -19,19 +19,28 @@ import os
 import shutil
 from pathlib import Path
 
-from asset_convert.game_paths import (namespace_for, owns_namespace,
+from core.plugin_masters import masters_from_export_header
+from asset_convert.game_paths import (ascii_dest, namespace_for,
+                                       owns_namespace, remove_non_ascii,
                                        set_namespace)
-from asset_convert.sources import bsa_extract
+from asset_convert.sources import bsa_extract, source_registry
 from asset_convert.nif import grass_profile
+from asset_convert.nif import morroblivion_textures
 from asset_convert.character import hair_pipeline
 from asset_convert.texture import landscape_normals
+from asset_convert.texture import image_transcode
 from asset_convert.texture import luminance_textures
 from asset_convert.collision import mesh_scan_fragments
-from asset_convert.nif import nif_batch
+from asset_convert.nif import magic_art, nif_batch
 from asset_convert.speedtree import spt_converter
 from asset_convert.texture import texture_prune
 from asset_convert.character.morrowind_armor import assemble_armor
 from asset_convert.character import wearable_plan
+from asset_convert.collision import clutter_plan
+from asset_convert.collision import resting_items_plan
+from asset_convert.nif import door_plan
+from asset_convert.nif import fixture_plan
+from asset_convert.nif import furniture_travel
 
 
 # Shared-folder resolution lives in output_layout (one module, three
@@ -120,10 +129,14 @@ def _write_parallax_notice(plugin_dir):
 def _activate_namespace(rec_dir) -> str:
     """Install this plugin's asset namespace before any path is rewritten.
 
+    The Morroblivion texture map is armed here too: it rewrites the same paths,
+    and like the namespace it must reach every spawned worker.
     See: docs/commentary/asset_convert_texture.md#per-game-asset-namespace
+    See: docs/commentary/asset_convert_texture.md#morroblivion-texture-substitution
     """
     ns = namespace_for(rec_dir)
     set_namespace(ns)
+    morroblivion_textures.activate(rec_dir)
     return ns
 
 
@@ -150,8 +163,48 @@ def _persist_mesh_manifests(mesh_stats, manifest_dir, partial: bool) -> None:
         texture_prune.write_manifest(manifest_dir, refs, name)
 
 
-def _convert_mesh_tree(mesh_src, mesh_dst, asset_dir, rec_dir, mesh_subdirs,
-                       parallax, textures_only):
+def _exported_members(export_root, plugin) -> list:
+    """The exported plugins of `plugin`'s mod, which share one mesh tree.
+
+    See: docs/commentary/asset_convert_nif.md#one-plan-per-mod
+    """
+    members = [m for m in source_registry.group_members(export_root, plugin)
+               if (record_dir(export_root, m) / '_HEADER.txt').is_file()]
+    return members or [plugin]
+
+
+def _mesh_plan(rec_dirs: list) -> dict:
+    """The per-mesh conversion plan the records in `rec_dirs` call for, together."""
+    plan = {}
+    for d in rec_dirs:
+        wearable_plan.merge_sibling(plan, wearable_plan.build_plan(d))
+    print(f"  Wearable variant plan: {len(plan)} meshes referenced by ARMO/CLOT")
+    masses = {}
+    for d in rec_dirs:
+        for path, kg in clutter_plan.build_clutter_masses(d).items():
+            masses[path] = max(masses.get(path, kg), kg)
+    plan[clutter_plan.CLUTTER_KEY] = masses
+    print(f"  Dynamic clutter plan: {len(masses)} item models")
+    plan[door_plan.DOOR_KEY] = set().union(*map(door_plan.build_door_models, rec_dirs))
+    plan[door_plan.REACH_KEY] = any(map(door_plan.places_morrowind_doors, rec_dirs))
+    print(f"  Door animation plan: {len(plan[door_plan.DOOR_KEY])} door models"
+          f"{', Morrowind-placed' if plan[door_plan.REACH_KEY] else ''}")
+    plan[fixture_plan.FIXTURE_KEY] = set().union(
+        *map(fixture_plan.build_fixture_models, rec_dirs))
+    plan[fixture_plan.ANIMATED_KEY] = set().union(
+        *map(fixture_plan.build_animated_models, rec_dirs))
+    print(f"  Placed fixture plan: {len(plan[fixture_plan.FIXTURE_KEY])} scenery models")
+    travels = {}
+    for d in rec_dirs:
+        for marker, travel in furniture_travel.sit_travels(d).items():
+            travels.setdefault(marker, travel)
+    plan[furniture_travel.SIT_TRAVEL_KEY] = travels
+    print(f"  Sit travel plan: {len(travels)} marker ids with an authored enter animation")
+    return plan
+
+
+def _convert_mesh_tree(mesh_src, mesh_dst, asset_dir, export_root, plugin,
+                       mesh_subdirs, parallax, textures_only):
     """Run the NIF batch over `mesh_src`; return its stats dict.
 
     The wearable plan names which _0/_1/plain variants each mesh is actually
@@ -162,9 +215,14 @@ def _convert_mesh_tree(mesh_src, mesh_dst, asset_dir, rec_dir, mesh_subdirs,
     cleared first.
     See: docs/commentary/tes5_import_pipeline.md#producer-emitted-mesh-entries
     """
-    plan = wearable_plan.build_plan(rec_dir)
-    print(f"  Wearable variant plan: {len(plan)} meshes referenced by "
-          f"ARMO/CLOT")
+    members = _exported_members(export_root, plugin)
+    if len(members) > 1:
+        print(f"  Mesh plan from every member of the mod: {', '.join(members)}")
+    plan = _mesh_plan([record_dir(export_root, m) for m in members])
+    resting, stocked = resting_items_plan.write_index(export_root, members)
+    plan[resting_items_plan.RESTING_KEY] = resting
+    print(f"  Resting items plan: {stocked} fixture models share a cell "
+          f"with an item")
     mesh_scan_fragments.clear_fragments(asset_dir)
     return nif_batch.batch_convert(
         str(mesh_src), output_dir=str(mesh_dst),
@@ -178,32 +236,20 @@ def _convert_mesh_tree(mesh_src, mesh_dst, asset_dir, rec_dir, mesh_subdirs,
 
 
 def convert_meshes(source_file, extract_dir='export', output_dir='output',
-                   mesh_subdirs=None, parallax=False, textures_only=False):
+                   mesh_subdirs=None, parallax=False, textures_only=False,
+                   skip_hair=False):
     """Convert extracted NIFs and copy textures into `output_dir/<source_name>/`.
-    Assumes BSA extraction has already been run (extract_bsas).
 
-    Args:
-        source_file:  Plugin filename (e.g. 'Oblivion.esm').
-        extract_dir:  Root extraction directory (default: export).
-        output_dir:   Final output root (files placed under output_dir/<source_name>/).
-        mesh_subdirs: Optional list of root mesh subfolders to include (e.g.
-                      ['architecture', 'clutter']). None means all subfolders.
-        parallax:     Carry Oblivion's parallax across as Skyrim height maps.
-                      Off by default — see asset_convert/texture/parallax.py; the
-                      output needs Community Shaders or ENB.
-        textures_only: Read and analyse the meshes, ship none of them; only the
-                      textures (with their `_p` height maps) go to output.  For
-                      PGPatcher, which patches meshes across the player's whole
-                      load order — see nif_batch.batch_convert.
-
-    Returns a dict with keys: 'mesh_conversion', 'textures_copied', 'other_copied'.
+    Needs extract_bsas run first. `mesh_subdirs` converts ONLY the NIFs under
+    those meshes/ prefixes and skips every whole-tree pass and the texture
+    copy. `parallax` ships height maps; `textures_only` ships only textures;
+    `skip_hair` skips the hair pass. Assets come from the shared group tree,
+    records from the plugin's own dump. Returns stats keyed
+    'mesh_conversion', 'textures_copied', 'other_copied'.
     """
     extract_dir = Path(extract_dir)
     output_dir = Path(output_dir)
     source_name = Path(source_file).name
-    # Plugins imported together from one archive share ONE asset tree, so the
-    # meshes/textures come from the group folder while the record dump stays
-    # per plugin (source_registry.asset_root / record_dir).
     asset_dir = _asset_root(extract_dir, source_name)
     rec_dir = record_dir(extract_dir, source_name)
     plugin_dir = _out_root(output_dir, source_name, extract_dir)
@@ -215,10 +261,6 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
         'other_copied': 0,
     }
 
-    # Build bookkeeping, not a shipped asset -- see texture_prune.MANIFEST_NAME.
-    # Tracks the SHARED asset tree, so it belongs beside the assets.
-    mesh_manifest_dir = asset_dir
-
     # -----------------------------------------------------------------------
     # NIF Mesh Conversion
     # -----------------------------------------------------------------------
@@ -229,18 +271,24 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
     assemble_armor(rec_dir, mesh_src)
     if mesh_src.exists():
         stats['mesh_conversion'] = _convert_mesh_tree(
-            mesh_src, plugin_dir / 'meshes' / ns, asset_dir, rec_dir,
-            mesh_subdirs, parallax, textures_only)
+            mesh_src, plugin_dir / 'meshes' / ns, asset_dir, extract_dir,
+            source_name, mesh_subdirs, parallax, textures_only)
         if parallax:
             _write_parallax_notice(plugin_dir)
-        _persist_mesh_manifests(stats['mesh_conversion'], mesh_manifest_dir,
+        _persist_mesh_manifests(stats['mesh_conversion'], asset_dir,
                                 bool(mesh_subdirs))
     else:
         print(f"  No meshes found at {mesh_src}")
         stats['mesh_conversion'] = {'converted': 0, 'skipped': 0, 'errors': 0}
+    if mesh_subdirs:
+        return stats
 
+    if not textures_only:
+        _profile_hair_and_grass(
+            rec_dir, plugin_dir, stats, skip_hair or not mesh_src.exists(),
+            _master_meshes(rec_dir, output_dir, extract_dir))
     if mesh_src.exists() and not textures_only:
-        _profile_hair_and_grass(rec_dir, plugin_dir, stats)
+        _split_magic_art(rec_dir, mesh_src, plugin_dir / 'meshes' / ns, stats)
 
     # -----------------------------------------------------------------------
     # Copy Textures
@@ -250,23 +298,50 @@ def convert_meshes(source_file, extract_dir='export', output_dir='output',
     print("=" * 60)
 
     _copy_and_fix_textures(asset_dir, plugin_dir, ns, stats, rec_dir)
+    _finish_output(rec_dir, plugin_dir, output_dir, ns, stats)
+    return stats
+
+
+def _finish_output(rec_dir, plugin_dir, output_dir, ns, stats):
+    """Write the missing LTEX normals, then drop files an older build named non-ASCII."""
     checked, written = landscape_normals.ensure_ltex_normals(
         rec_dir, plugin_dir / 'textures', output_dir)
     stats['ltex_normals_written'] = written
     print(f"  LTEX normals: {checked} land textures, {written} flat normals "
           f"written for textures shipping none")
-    return stats
+    stale = sum(remove_non_ascii(plugin_dir / sub / ns)
+                for sub in ('meshes', 'textures'))
+    print(f"  Non-ASCII names from an older build removed: {stale}")
 
 
-def _profile_hair_and_grass(rec_dir, plugin_dir, stats):
-    """Run the hair and grass post-passes over the converted mesh tree."""
-    stats['hair'] = hair_pipeline.run(rec_dir, plugin_dir / 'meshes')
+def _master_meshes(rec_dir, output_dir, extract_dir) -> list:
+    """Each direct master's converted meshes root, in header order."""
+    return [_out_root(output_dir, name, extract_dir) / 'meshes'
+            for name in masters_from_export_header(str(rec_dir))]
+
+
+def _profile_hair_and_grass(rec_dir, plugin_dir, stats, skip_hair,
+                            master_meshes=()):
+    """Run the hair (unless `skip_hair`) and grass post-passes over the converted mesh tree.
+
+    A grass model may be a master's converted mesh, found under `master_meshes`.
+    """
+    if not skip_hair:
+        stats['hair'] = hair_pipeline.run(rec_dir, plugin_dir / 'meshes')
     processed, modified, missing = grass_profile.run(
-        rec_dir, plugin_dir / 'meshes')
+        rec_dir, plugin_dir / 'meshes', master_meshes)
     stats['grass_profile'] = {
         'processed': processed, 'modified': modified, 'missing': missing}
     print(f"  Grass models: {processed} placed under landscape\\grass"
           + (f", {missing} missing" if missing else ""))
+
+
+def _split_magic_art(rec_dir, mesh_src, mesh_dst, stats):
+    """Derive the per-phase magic-effect meshes beside the converted tree."""
+    stats['magic_art'] = magic_art.split_effect_meshes(rec_dir, mesh_src, mesh_dst)
+    print(f"  Magic effect phase meshes: {stats['magic_art']['written']} written "
+          f"from {stats['magic_art']['sources']} models "
+          f"({stats['magic_art']['missing']} not converted)")
 
 
 def _copy_and_fix_textures(asset_dir, plugin_dir, ns, stats, rec_dir):
@@ -287,6 +362,13 @@ def _copy_and_fix_textures(asset_dir, plugin_dir, ns, stats, rec_dir):
     tex_dst = plugin_dir / 'textures' / ns
     stats['textures_copied'] = _copy_tree(tex_src, tex_dst)
     print(f"  Textures: {stats['textures_copied']} files -> {tex_dst}")
+
+    tc_found, tc_written, tc_failed = image_transcode.run(tex_dst)
+    stats['tga_transcoded'] = tc_written
+    if tc_found:
+        print(f"  Loose TGA/BMP: {tc_found} found, {tc_written} "
+              f"transcoded to DDS"
+              + (f", {tc_failed} failed" if tc_failed else ""))
 
     lum_checked, lum_fixed = luminance_textures.run(tex_dst)
     stats['luminance_textures_fixed'] = lum_fixed
@@ -338,19 +420,11 @@ def convert_speedtrees(source_file, extract_dir='export', output_dir='output',
 
     spt_stats = {'spt_conversion': {'ok': 0, 'fail': 0, 'skip': 0}}
     spt_src = _asset_root(extract_dir, source_name) / 'trees'
-    # A dependent plugin authors TREE records for art its MASTER ships, so the
-    # masters' trees/ dirs are searched for any .spt this export lacks. Read
-    # from the export header rather than a fixed list -- the chain differs per
-    # plugin (Valenwood: Oblivion, Tamriel, Anequina).
-    master_tree_dirs = []
-    header = record_dir(extract_dir, source_name) / '_HEADER.txt'
-    if header.is_file():
-        for line in open(header, encoding='utf-8', errors='replace'):
-            if line.startswith('Master['):
-                name = line.partition('=')[2].strip()
-                d = _asset_root(extract_dir, name) / 'trees'
-                if d.is_dir():
-                    master_tree_dirs.append(d)
+    master_tree_dirs = [
+        d for d in (_asset_root(extract_dir, name) / 'trees'
+                    for name in masters_from_export_header(
+                        str(record_dir(extract_dir, source_name))))
+        if d.is_dir()]
     if spt_src.exists():
         ns = _activate_namespace(record_dir(extract_dir, source_name))
         spt_dst = plugin_dir / 'meshes' / ns / 'speedtrees'
@@ -388,8 +462,7 @@ def _copy_tree(src, dst):
     for root, _dirs, files in os.walk(src):
         for fname in files:
             src_file = Path(root) / fname
-            rel = src_file.relative_to(src)
-            dst_file = dst / rel
+            dst_file = ascii_dest(dst, src_file.relative_to(src))
             os.makedirs(dst_file.parent, exist_ok=True)
             shutil.copy2(str(src_file), str(dst_file))
             count += 1

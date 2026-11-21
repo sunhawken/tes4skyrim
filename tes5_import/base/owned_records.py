@@ -9,74 +9,149 @@ these call nothing else in that file, and only import_plugin calls them.
 """
 
 import struct
+import textwrap
 
-from .constants import AMBIENT_GMST_OVERRIDES
-from .equivalents import CUSTOM_VTYP_EDIDS, VTYP_EDID_BY_FID, set_voice_type
+from .master_export import values_of
+from ..overrides.adoption import adopted_formid, generated_formid
+from ..packages.ambush_near import AMBUSH_NEAR_EDID, ambush_root_record, set_ambush_template_fid
+from ..packages.sit_at import SIT_AT_EDID, set_sit_at_template_fid, sit_at_root_record
+from ..packages.escort_when_near import (ESCORT_HOLD_EDID, ESCORT_WHEN_NEAR_EDID,
+                                         escort_root_record,
+                                         set_escort_template_fid)
+from .constants import AMBIENT_GMST_OVERRIDES, ENGINE_GLOBAL_FORMIDS
+from .equivalents import (CUSTOM_VTYP_EDIDS, SPELL_EQUIP_EITHER_HAND,
+                          VTYP_EDID_BY_FID, set_voice_type)
 from .text_reader import get_str
 from .writer import (
     PluginWriter,
+    pack_obnd,
     pack_record,
     pack_string_subrecord,
     pack_subrecord,
+    pack_uint32_subrecord,
 )
 
 #: EditorID -> FormID for VMAD name binding; a SINGLE shared instance.
 WELL_KNOWN_PROPERTIES: dict[str, int] = {}
 
+#: Output MGEF FormID -> the family KYWD it and every copy of it carry.
+MGEF_FAMILY_KEYWORDS: dict[int, int] = {}
 
-#: Conversion-owned globals: EditorID -> FNAM type char ('f' float, 's' short).
+#: VTYP DNAM Female bit; Allow Default Dialogue (bit 0) stays clear so vanilla lines never reach converted NPCs.
+_VTYP_FEMALE = 0x02
+
+
+#: The eight attributes in TES3/TES4 order, as TES4 records and scripts name them.
+TES4_ATTRIBUTE_NAMES = ('Strength', 'Intelligence', 'Willpower', 'Agility', 'Speed',
+                        'Endurance', 'Personality', 'Luck')
+
+#: The player's attributes, each a global MorrowindRuntime keeps current, in that order.
+PLAYER_ATTRIBUTE_GLOBALS = tuple(f'TES4Player{name}' for name in TES4_ATTRIBUTE_NAMES)
+
+#: What an attribute global holds until the runtime writes it: the old stub, so a gate falls open.
+PLAYER_ATTRIBUTE_DEFAULT = 100.0
+
+#: Conversion-owned globals: (EditorID, FNAM type char 'f' float / 's' short, starting value).
 _OWNED_GLOBALS = (
-    ('TES4Fame', 'f'),
-    ('TES4Infamy', 'f'),
-    ('TES4GoldFenced', 'f'),
-    ('TES4ControlsDisabled', 's'),
-)
+    ('TES4Fame', 'f', 0.0),
+    ('TES4Infamy', 'f', 0.0),
+    ('TES4GoldFenced', 'f', 0.0),
+    ('TES4ControlsDisabled', 's', 0.0),
+) + tuple((edid, 'f', PLAYER_ATTRIBUTE_DEFAULT) for edid in PLAYER_ATTRIBUTE_GLOBALS)
 
-#: DATA flags on the stand-in crime faction: Can Be Owner | Track Crime.
-_CRIME_FACTION_FLAGS = 0x8000 | 0x0040
-
-#: CRVA crime values shared by all 14 real Skyrim crime factions.
-_CRIME_VALUES = (1, 1, 1000, 40, 5, 25, 0, 1.0, 100, 0)
+#: FACT DATA flag Hidden From PC.
+FACTION_HIDDEN = 0x1
 
 
-def _emit_global(writer: PluginWriter, edid: str, type_char: str) -> int:
+def clamp_rank(value: float) -> int:
+    """`value` rounded into a faction rank's signed byte."""
+    return max(-128, min(127, round(value)))
+
+
+def hidden_faction(fid: int, edid: str, relations: bytes = b'') -> bytes:
+    """A hidden, rankless FACT with these XNAM `relations`."""
+    subs = pack_string_subrecord('EDID', edid) + relations
+    subs += pack_subrecord('DATA', struct.pack('<I', FACTION_HIDDEN))
+    return pack_record('FACT', fid, 0, subs)
+
+
+def one_rank_faction(fid: int, edid: str, rank_name: str) -> bytes:
+    """A hidden FACT with one rank (0), so a script or the runtime can add an actor to it."""
+    subs = pack_string_subrecord('EDID', edid) + pack_subrecord('DATA', struct.pack('<I', FACTION_HIDDEN))
+    subs += pack_uint32_subrecord('RNAM', 0) + pack_string_subrecord('MNAM', rank_name)
+    subs += pack_string_subrecord('FNAM', rank_name)
+    return pack_record('FACT', fid, 0, subs)
+
+
+def adopted_or_derived(writer, master_index, sig: str, edid: str) -> tuple:
+    """(FormID, own): a master's record of `edid`, else this plugin's derived id."""
+    fid = master_index.find_by_edid(sig.encode(), edid) if master_index else 0
+    return (fid, False) if fid else (writer.derive_formid(sig, edid), True)
+
+
+def adopt_or_write(writer, master_index, sig: str, edid: str, build) -> tuple:
+    """(FormID, written): a master's record of `edid`, else ``build(fid)`` written as this plugin's."""
+    fid, own = adopted_or_derived(writer, master_index, sig, edid)
+    if own:
+        writer.add_record(sig, build(fid))
+    return fid, own
+
+
+def owner_row(name: str, fid: int, plugin: str, masters: list) -> str:
+    """`name=Owner.esm|FormID`, the owner read off `fid`'s master slot."""
+    slot = fid >> 24
+    owner = masters[slot] if slot < len(masters) else plugin
+    return f'{name}={owner}|{fid:08X}'
+
+
+def _emit_global(writer: PluginWriter, edid: str, type_char: str, value: float = 0.0) -> int:
     """Write one GlobalVariable, register it by name, and return its FormID."""
     fid = writer.derive_formid('GLOB', edid)
     subs = pack_string_subrecord('EDID', edid)
     subs += pack_subrecord('FNAM', struct.pack('<B', ord(type_char)))
-    subs += pack_subrecord('FLTV', struct.pack('<f', 0.0))
+    subs += pack_subrecord('FLTV', struct.pack('<f', value))
     writer.add_record('GLOB', pack_record('GLOB', fid, 0, subs))
     WELL_KNOWN_PROPERTIES[edid] = fid
     return fid
 
 
-def _emit_crime_faction(writer: PluginWriter) -> int:
-    """Write the stand-in Cyrodiil crime faction and return its FormID."""
-    edid = 'TES4CyrodiilCrimeFaction'
-    fid = writer.derive_formid('FACT', edid)
-    subs = pack_string_subrecord('EDID', edid)
-    subs += pack_string_subrecord('FULL', 'Cyrodiil Crime Faction')
-    subs += pack_subrecord('DATA', struct.pack('<I', _CRIME_FACTION_FLAGS))
-    subs += pack_subrecord('CRVA', struct.pack('<BBHHHHHfHH', *_CRIME_VALUES))
-    writer.add_record('FACT', pack_record('FACT', fid, 0, subs))
-    WELL_KNOWN_PROPERTIES[edid] = fid
+def _emit_template_root(writer: PluginWriter, edid: str, build, install) -> int:
+    """Write one of the converter's package template roots and point its converted packages at it."""
+    fid = writer.derive_formid('PACK_TEMPLATE', edid)
+    writer.add_record('PACK', build(fid))
+    install(fid)
     return fid
 
 
 def create_tes4_special_records(writer: PluginWriter):
-    """Create the globals and crime faction converted Papyrus scripts need.
-
-    Each replaces Oblivion state Skyrim exposes no way to read. FormIDs land in
-    WELL_KNOWN_PROPERTIES so VMAD builders inject them as property values,
-    eliminating the "fill in CK" step.
+    """Create the globals converted Papyrus scripts need, bound by name, and the package template roots.
 
     See: docs/commentary/tes5_import_dialogue.md#the-conversion-owned-globals
     """
-    made = {edid: _emit_global(writer, edid, ch)
-            for (edid, ch) in _OWNED_GLOBALS}
-    made['TES4CyrodiilCrimeFaction'] = _emit_crime_faction(writer)
+    made = {edid: _emit_global(writer, edid, ch, value)
+            for (edid, ch, value) in _OWNED_GLOBALS}
+    hold = made[ESCORT_HOLD_EDID] = WELL_KNOWN_PROPERTIES[ESCORT_HOLD_EDID] = writer.derive_formid(
+        'FACT', ESCORT_HOLD_EDID)
+    writer.add_record('FACT', one_rank_faction(hold, ESCORT_HOLD_EDID, 'Held'))
+    made[ESCORT_WHEN_NEAR_EDID] = _emit_template_root(writer, ESCORT_WHEN_NEAR_EDID,
+                                                      escort_root_record,
+                                                      set_escort_template_fid)
+    made[AMBUSH_NEAR_EDID] = _emit_template_root(writer, AMBUSH_NEAR_EDID, ambush_root_record,
+                                                 set_ambush_template_fid)
+    made[SIT_AT_EDID] = _emit_template_root(writer, SIT_AT_EDID, sit_at_root_record, set_sit_at_template_fid)
     print('  Created TES4 special records: '
           + ', '.join(f'{k}={v:08X}' for k, v in made.items()))
+
+
+def create_missing_globals(writer: PluginWriter) -> int:
+    """Each conversion-owned global no master supplied (one built before it existed); how many."""
+    missing = [row for row in _OWNED_GLOBALS if row[0] not in WELL_KNOWN_PROPERTIES]
+    for edid, ch, value in missing:
+        _emit_global(writer, edid, ch, value)
+    if missing:
+        print(f'  Created {len(missing)} global(s) the masters lack: '
+              + ', '.join(row[0] for row in missing))
+    return len(missing)
 
 
 def create_message_menu_records(writer: PluginWriter, plan: dict) -> dict:
@@ -92,23 +167,50 @@ def create_message_menu_records(writer: PluginWriter, plan: dict) -> dict:
         for name, text, buttons in plan[edid_low]:
             if text is None:
                 continue
-            fid = writer.derive_formid('SCRIPT_MESG', name)
-            subs = pack_string_subrecord('EDID', name)
-            subs += pack_string_subrecord('DESC', text)
-            subs += pack_subrecord('INAM', struct.pack('<I', 0))
-            subs += pack_subrecord('DNAM', struct.pack('<I', 1))
-            for button in buttons:
-                subs += pack_string_subrecord('ITXT', button)
-            writer.add_record('MESG', pack_record('MESG', fid, 0, subs))
+            fid = generated_formid(writer, 'MESG', name, 'SCRIPT_MESG', name)
+            writer.add_record('MESG', message_record(fid, name, text, buttons))
             name_to_fid[name] = fid
     return name_to_fid
 
 
+#: The global a converted chargen call asks MorrowindRuntime's menu through: each plugin its own.
+CHARGEN_REQUEST_GLOBAL = 'TES4ChargenRequest'
+
+
+#: A message box button's widest line, in characters; Skyrim sets buttons side by side (MorrowindRuntime's kAnswerLine).
+BUTTON_LINE = 34
+
+
+def message_record(fid: int, name: str, text: str, buttons: list) -> bytes:
+    """One modal MESG: its text, then each button, a long one wrapped onto lines of BUTTON_LINE.
+
+    See: docs/commentary/morrowind_runtime.md#class-choice
+    """
+    subs = pack_string_subrecord('EDID', name)
+    subs += pack_string_subrecord('DESC', text)
+    subs += pack_subrecord('INAM', struct.pack('<I', 0))
+    subs += pack_subrecord('DNAM', struct.pack('<I', 1))
+    for button in buttons:
+        subs += pack_string_subrecord('ITXT', '\n'.join(textwrap.wrap(button, BUTTON_LINE)) or button)
+    return pack_record('MESG', fid, 0, subs)
+
+
+def _short_global(fid: int, edid: str) -> bytes:
+    """A short GLOB at 0."""
+    subs = pack_string_subrecord('EDID', edid)
+    subs += pack_subrecord('FNAM', struct.pack('<B', ord('s')))
+    subs += pack_subrecord('FLTV', struct.pack('<f', 0.0))
+    return pack_record('GLOB', fid, 0, subs)
+
+
 def create_chargen_menu_records(writer: PluginWriter, plan: dict) -> dict:
-    """MESG pages for the TES4 chargen menus (ShowBirthsignMenu/ShowClassMenu).
+    """MESG pages for the TES4 chargen menus (ShowBirthsignMenu/ShowClassMenu),
+    their choice globals, and this plugin's own request global.
 
     Allocates FIXED ids from a reserved window, not derive_formid(): the pages
-    are a contiguous, order-significant block.
+    are a contiguous, order-significant block.  A page or global a master
+    already defines keeps the master's FormID, and is not written again for a
+    menu built only from the masters' records (`own` false).
 
     See: docs/commentary/tes5_import_dialogue.md#synthesized-menus-factions-and-formlists
     """
@@ -116,16 +218,11 @@ def create_chargen_menu_records(writer: PluginWriter, plan: dict) -> dict:
     k = 0
     for key in sorted(plan):
         for name, title, buttons in plan[key]['pages']:
-            fid = writer.chargen_fid_base + k
+            adopted = adopted_formid(writer, 'MESG', name)
+            name_to_fid[name] = adopted or writer.chargen_fid_base + k
             k += 1
-            subs = pack_string_subrecord('EDID', name)
-            subs += pack_string_subrecord('DESC', title)
-            subs += pack_subrecord('INAM', struct.pack('<I', 0))
-            subs += pack_subrecord('DNAM', struct.pack('<I', 1))
-            for button in buttons:
-                subs += pack_string_subrecord('ITXT', button)
-            writer.add_record('MESG', pack_record('MESG', fid, 0, subs))
-            name_to_fid[name] = fid
+            if not adopted or plan[key].get('own', True):
+                writer.add_record('MESG', message_record(name_to_fid[name], name, title, buttons))
 
     assert k <= 0x40, f'chargen menu pages overflow the fixed-id window ({k})'
     for slot, key in ((0x40, 'birthsign'), (0x41, 'class')):
@@ -133,44 +230,248 @@ def create_chargen_menu_records(writer: PluginWriter, plan: dict) -> dict:
         if not menu:
             continue
         gname = menu['choice_global']
-        fid = writer.chargen_fid_base + slot
-        subs = pack_string_subrecord('EDID', gname)
-        subs += pack_subrecord('FNAM', struct.pack('<B', ord('s')))
-        subs += pack_subrecord('FLTV', struct.pack('<f', 0.0))
-        writer.add_record('GLOB', pack_record('GLOB', fid, 0, subs))
-        name_to_fid[gname] = fid
+        adopted = adopted_formid(writer, 'GLOB', gname)
+        name_to_fid[gname] = adopted or writer.chargen_fid_base + slot
+        if not adopted or menu.get('own', True):
+            writer.add_record('GLOB', _short_global(name_to_fid[gname], gname))
+    if plan:
+        fid = writer.derive_formid('GLOB', CHARGEN_REQUEST_GLOBAL)
+        writer.add_record('GLOB', _short_global(fid, CHARGEN_REQUEST_GLOBAL))
+        name_to_fid[CHARGEN_REQUEST_GLOBAL] = fid
     return name_to_fid
 
 
-def create_force_combat_factions(writer: PluginWriter) -> dict:
+#: The global MorrowindRuntime holds at 1 while Skyrim's dialogue menu is up; force-greet packages wait on it.
+DIALOGUE_OPEN_GLOBAL = 'TES4DialogueOpen'
+
+
+def create_dialogue_open_global(writer: PluginWriter, master_index=None) -> dict:
+    """The dialogue-menu global by name; a master's is adopted."""
+    fid, _ = adopt_or_write(writer, master_index, 'GLOB', DIALOGUE_OPEN_GLOBAL,
+                            lambda fid: _short_global(fid, DIALOGUE_OPEN_GLOBAL))
+    return {DIALOGUE_OPEN_GLOBAL: fid}
+
+
+#: The ForceCombat faction pair's EditorIDs: (attackers, victims).
+_FORCE_COMBAT_EDIDS = ('TES4ForceCombatAttackers', 'TES4ForceCombatVictims')
+
+
+def _adopted(master_index, sig: bytes, edids: tuple) -> dict:
+    """{edid: FormID} when the masters define every one of `edids`, else {}."""
+    found = {edid: master_index.find_by_edid(sig, edid) for edid in edids
+             } if master_index is not None else {}
+    return found if found and all(found.values()) else {}
+
+
+def create_force_combat_factions(writer: PluginWriter, master_index=None) -> dict:
     """The conversion-owned enemy-faction pair TES4Polyfill.ForceCombat uses.
 
     ForceCombat puts the attacker in one and the victim in the other; the
-    mutual XNAM Enemy reaction is what makes StartCombat stick. Fixed ids.
+    mutual XNAM Enemy reaction is what makes StartCombat stick. Fixed ids;
+    a master's pair is adopted whole, since each names the other.
 
     See: docs/commentary/tes5_import_dialogue.md#synthesized-menus-factions-and-formlists
     """
+    adopted = _adopted(master_index, b'FACT', _FORCE_COMBAT_EDIDS)
+    if adopted:
+        return adopted
     atk_fid = writer.chargen_fid_base + 0x42
     vic_fid = writer.chargen_fid_base + 0x43
-    for fid, edid, other in ((atk_fid, 'TES4ForceCombatAttackers', vic_fid),
-                             (vic_fid, 'TES4ForceCombatVictims', atk_fid)):
+    attackers, victims = _FORCE_COMBAT_EDIDS
+    for fid, edid, other in ((atk_fid, attackers, vic_fid),
+                             (vic_fid, victims, atk_fid)):
         subs = pack_string_subrecord('EDID', edid)
         subs += pack_subrecord('XNAM', struct.pack('<IiI', other, 0, 1))
         subs += pack_subrecord('DATA', struct.pack('<I', 0x1))
         writer.add_record('FACT', pack_record('FACT', fid, 0, subs))
-    return {'TES4ForceCombatAttackers': atk_fid,
-            'TES4ForceCombatVictims': vic_fid}
+    return {attackers: atk_fid, victims: vic_fid}
 
 
-def create_destroyed_formlist(writer: PluginWriter) -> dict:
-    """The FormList backing TES4 GetDestroyed, which Skyrim has no reader for.
+def create_destroyed_formlist(writer: PluginWriter, master_index=None) -> dict:
+    """The FormList backing TES4 GetDestroyed, which Skyrim has no reader for; a master's is adopted.
 
     See: docs/commentary/tes5_import_dialogue.md#synthesized-menus-factions-and-formlists
     """
+    adopted = _adopted(master_index, b'FLST', ('TES4DestroyedRefs',))
+    if adopted:
+        return adopted
     fid = writer.chargen_fid_base + 0x44
     subs = pack_string_subrecord('EDID', 'TES4DestroyedRefs')
     writer.add_record('FLST', pack_record('FLST', fid, 0, subs))
     return {'TES4DestroyedRefs': fid}
+
+
+#: derive_formid site and EditorID of the list of references a script has just activated by its own call.
+_SCRIPTED_USE_SITE, SCRIPTED_USES = 'SCRIPTED_USE_FLST', 'TES4ScriptedUses'
+#: derive_formid site and EditorID of the list of actors a script has restrained.
+_RESTRAINED_SITE, RESTRAINED = 'RESTRAINED_FLST', 'TES4Restrained'
+
+
+def create_runtime_formlists(writer: PluginWriter, master_index=None) -> dict:
+    """The empty FormLists the polyfill fills at run time; a master's are adopted.
+
+    TES4ScriptedUses: a scripted `Activate ref 1` marks its target. TES4Restrained:
+    the actors a script restrained, held again after a MoveTo.
+    See: docs/commentary/script_convert.md#a-scripted-activation-runs-the-door-script
+    See: docs/commentary/script_convert.md#setrestrained-is-restrained
+    """
+    out = {}
+    for site, edid in ((_SCRIPTED_USE_SITE, SCRIPTED_USES), (_RESTRAINED_SITE, RESTRAINED)):
+        adopted = _adopted(master_index, b'FLST', (edid,))
+        if adopted:
+            out.update(adopted)
+            continue
+        fid = writer.derive_formid(site, edid)
+        writer.add_record('FLST', pack_record('FLST', fid, 0, pack_string_subrecord('EDID', edid)))
+        out[edid] = fid
+    return out
+
+
+#: Seconds one ResetFallDamageTimer protects for; a caller polling every tick keeps renewing it.
+_FALL_WINDOW_SECONDS = 10
+
+#: PERK entry point 58 Mod Falling Damage, function 3 Multiply Value, 1 condition tab (vanilla Cushioned).
+_FALL_ENTRY_POINT = bytes((58, 3, 1))
+
+#: MGEF DATA flags: Hide in UI only; No Magnitude would make a Value Modifier heal 1 HP/s per cast.
+_MGEF_FALL_FLAGS = 0x8000
+
+#: MGEF archetype 0 Value Modifier on actor value 24 Health, at magnitude 0 (vanilla NN01PerkEffect).
+_MGEF_ARCHETYPE_VALUE_MOD, _AV_HEALTH = 0, 24
+
+#: Casting type 0 Constant Effect, 1 Fire and Forget; delivery 0 Self.
+_CONSTANT_EFFECT, _FIRE_AND_FORGET, _DELIVERY_SELF = 0, 1, 0
+
+#: SPIT spell type 4 Ability (vanilla RaceKhajiitClaws).
+_SPELL_TYPE_ABILITY = 4
+
+
+def multiply_entry(entry_point: bytes, conditions=b'') -> bytes:
+    """One rank-0 PERK entry multiplying its value by 0 while `conditions` hold.
+
+    `conditions` is packed CTDAs on tab 0 (the owner), or {tab: CTDAs}.
+    """
+    tabs = conditions if isinstance(conditions, dict) else {0: conditions}
+    subs = pack_subrecord('PRKE', bytes((2, 0, 0)))
+    subs += pack_subrecord('DATA', entry_point)
+    for tab, ctdas in sorted(tabs.items()):
+        subs += pack_subrecord('PRKC', bytes((tab,))) + ctdas if ctdas else b''
+    subs += pack_subrecord('EPFT', bytes((1,)))
+    subs += pack_subrecord('EPFD', struct.pack('<f', 0.0))
+    return subs + pack_subrecord('PRKF', b'')
+
+
+#: The entry that zeroes all of the owner's falling damage.
+FALL_DAMAGE_ENTRY = multiply_entry(_FALL_ENTRY_POINT)
+
+
+def hidden_perk(fid: int, edid: str, entries: bytes) -> bytes:
+    """Hidden, unplayable one-rank PERK carrying the packed `entries`."""
+    subs = pack_string_subrecord('EDID', edid)
+    subs += pack_string_subrecord('DESC', '')
+    subs += pack_subrecord('DATA', bytes((0, 0, 1, 0, 1)))
+    return pack_record('PERK', fid, 0, subs + entries)
+
+
+def perk_effect(fid: int, edid: str, perk: int, ability: bool = False) -> bytes:
+    """MGEF whose only job is PerkToApply, which the engine applies to the player only; Constant for an `ability`."""
+    data = bytearray(152)
+    struct.pack_into('<I', data, 0, _MGEF_FALL_FLAGS)
+    struct.pack_into('<ii', data, 12, -1, -1)
+    struct.pack_into('<Ii', data, 64, _MGEF_ARCHETYPE_VALUE_MOD, _AV_HEALTH)
+    casting = _CONSTANT_EFFECT if ability else _FIRE_AND_FORGET
+    struct.pack_into('<II', data, 80, casting, _DELIVERY_SELF)
+    struct.pack_into('<i', data, 88, -1)
+    struct.pack_into('<f', data, 104, 1.0)
+    struct.pack_into('<I', data, 136, perk)
+    subs = pack_string_subrecord('EDID', edid)
+    subs += pack_subrecord('DATA', bytes(data))
+    return pack_record('MGEF', fid, 0, subs)
+
+
+def perk_spell(fid: int, edid: str, effect: int, ability: bool = False) -> bytes:
+    """Self SPEL holding `effect`: an `ability` for good, else a fire-and-forget spell for the fall window."""
+    kind, casting = ((_SPELL_TYPE_ABILITY, _CONSTANT_EFFECT) if ability
+                     else (0, _FIRE_AND_FORGET))
+    subs = pack_string_subrecord('EDID', edid)
+    subs += pack_obnd()
+    subs += pack_subrecord('ETYP', struct.pack('<I', SPELL_EQUIP_EITHER_HAND))
+    subs += pack_subrecord('SPIT', struct.pack(
+        '<IIIfII12x', 0, 0, kind, 0.0, casting, _DELIVERY_SELF))
+    subs += pack_subrecord('EFID', struct.pack('<I', effect))
+    duration = 0 if ability else _FALL_WINDOW_SECONDS
+    subs += pack_subrecord('EFIT', struct.pack('<fII', 0.0, 0, duration))
+    return pack_record('SPEL', fid, 0, subs)
+
+
+def create_fall_damage_spell(writer: PluginWriter, master_index=None) -> dict:
+    """`TES4NoFallDamage`, the spell converted ResetFallDamageTimer casts; a master's is adopted.
+
+    Skyrim reaches falling damage only through perk entry point Mod Falling
+    Damage, which a magic effect's PerkToApply gives the player (never an NPC).
+    The name is imported here, not at module scope, to break the cycle
+    owned_records -> script_convert (package __init__) -> tes5_import.dialogue
+    -> base.conditions -> owned_records.
+    See: docs/commentary/script_convert.md#fall-damage-is-a-perk
+    """
+    from script_convert.constants import FALL_DAMAGE_SPELL as name
+    spel = (master_index.find_by_edid(b'SPEL', name)
+            if master_index is not None else 0)
+    if not spel:
+        perk = writer.derive_formid('PERK', name + 'Perk')
+        mgef = writer.derive_formid('MGEF', name + 'Effect')
+        spel = writer.derive_formid('SPEL', name)
+        writer.add_record('PERK', hidden_perk(perk, name + 'Perk', FALL_DAMAGE_ENTRY))
+        writer.add_record('MGEF', perk_effect(mgef, name + 'Effect', perk))
+        writer.add_record('SPEL', perk_spell(spel, name, mgef))
+    return {name: spel}
+
+
+#: The whole-day GameDaysPassed global and the start-game quest whose script keeps it current.
+DAY_CLOCK_GLOBAL, DAY_CLOCK_QUEST, DAY_CLOCK_SCRIPT = (
+    'TES4GameDaysPassed', 'TES4DayClock', 'TES4_DayClock')
+
+
+def _source_counts_whole_days(by_type: dict, ctx) -> bool:
+    """True when the source game declares GameDaysPassed Short (Oblivion), not Float (FO3/FNV)."""
+    records = list(by_type.get('GLOB', []))
+    records += values_of(getattr(ctx, 'master_export', None), 'GLOB')
+    return any(get_str(r, 'EditorID', '').lower() == 'gamedayspassed'
+               and get_str(r, 'FNAM.Type') == 's' for r in records)
+
+
+def create_day_clock(writer: PluginWriter, by_type: dict, ctx=None) -> int:
+    """The TES4GameDaysPassed global plus its TES4DayClock quest; a master's are adopted.
+
+    Returns the global's FormID, 0 when the source's GameDaysPassed is already
+    fractional. The TES4_DayClock script holds the global at the whole part of
+    Skyrim's. The script-pipeline import is function-scoped to break the cycle
+    owned_records -> script_convert (package __init__) -> tes5_import.dialogue
+    -> base.conditions -> owned_records.
+    See: docs/commentary/tes5_import_conditions.md#whole-days
+    """
+    from script_convert.pipeline import build_vmad_quest_fragments
+    if not _source_counts_whole_days(by_type, ctx):
+        return 0
+    master_index = getattr(ctx, 'master_index', None)
+    glob = (master_index.find_by_edid(b'GLOB', DAY_CLOCK_GLOBAL)
+            if master_index is not None else 0)
+    if glob:
+        return glob
+    glob = _emit_global(writer, DAY_CLOCK_GLOBAL, 's')
+    quest = writer.derive_formid('SYNTH_QUST', DAY_CLOCK_QUEST)
+    props = {'GameDaysPassed': ENGINE_GLOBAL_FORMIDS['gamedayspassed'],
+             DAY_CLOCK_GLOBAL: glob}
+    subs = pack_string_subrecord('EDID', DAY_CLOCK_QUEST)
+    subs += pack_subrecord('VMAD', build_vmad_quest_fragments(
+        DAY_CLOCK_QUEST, [], None,
+        attached_script=(DAY_CLOCK_SCRIPT, props), quest_fid=quest))
+    subs += pack_string_subrecord('FULL', 'TES4 Day Clock')
+    subs += pack_subrecord('DNAM', struct.pack('<HBBII', 0x0011, 0, 0, 0, 0))
+    subs += pack_subrecord('NEXT', b'')
+    subs += pack_subrecord('ANAM', struct.pack('<I', 0))
+    writer.add_record('QUST', pack_record('QUST', quest, 0, subs))
+    return glob
 
 
 def create_ambient_gmst_overrides(writer: PluginWriter, by_type: dict):
@@ -270,7 +571,7 @@ def create_vtyp_records(writer: PluginWriter, export_dir: str = None,
         if fid is not None:
             return fid
         fid = writer.derive_formid('VTYP', vtyp_edid)
-        dnam = 3 if gender == 'Female' else 1
+        dnam = _VTYP_FEMALE if gender == 'Female' else 0
         subs = pack_string_subrecord('EDID', vtyp_edid)
         subs += pack_subrecord('DNAM', struct.pack('<B', dnam))
         writer.add_record('VTYP', pack_record('VTYP', fid, 0, subs))

@@ -10,32 +10,46 @@ A phase reads the `ScriptContext` and returns lines; it never reaches into a
 later phase's state.
 """
 
-from script_convert.blocks_morrowind import (TES3_BLOCK_TYPE,
-                                             is_implicit_block)
-from script_convert.blocks import (BLOCK_MAP, COMBAT_STATE_GUARDS,
+import re
+from dataclasses import replace
+
+from script_convert.blocks import (BLOCK_MAP, BLOCK_TYPE_GUARDS,
                                    block_filter_guard)
 from script_convert.constants import (
-    MENU_ID_NAMES,
-    POLL_BLOCKS, REF_SPECIFICITY, TYPE_MAP, is_generated_script_type,
+    CONV_WALK_VAR, HALTED_VAR, LAST_ACTIVATOR_VAR, MENU_ID_NAMES, UDF_CALLER_PARAM, UDF_RESULT_VAR,
+    POLL_BLOCKS, REF_SPECIFICITY, REMOTE_ADD_PREFIX, REMOTE_HOLD, REMOTE_RELEASE, TYPE_MAP,
+    is_generated_script_type,
     safe_property_name, papyrus_script_name
 )
 from script_convert.command_rows import (
     COMMAND_ROWS, ACTOR_ONLY_FUNCTIONS, OBJREF_SHARED_FUNCTIONS
 )
 from script_convert import symbols as _symbols
+from script_convert.conversation_sequence import hold_runs
+from script_convert.poll_motion import relative_sets
+from script_convert.movie_last import movie_last
+from script_convert.redress import armor_names, redress_runs
+from script_convert.release_order import release_into_package
 from script_convert.emit import script as _script
 from script_convert.tes4 import nodes as N
+from script_convert.unequip_guard import unequip_guard
+from tes5_import.base.owned_records import DIALOGUE_OPEN_GLOBAL
 
+
+# ---------------------------------------------------------------------------
+# Assembly order
+# ---------------------------------------------------------------------------
 
 def build(conv, name: str, source: str, extends: str, editor_id: str) -> str:
-    """Convert one standalone SCPT record to a full `.psc` file."""
+    """Convert one standalone SCPT record to a full `.psc` file.
+
+    The body converts before the declarations: resolving a name registers its
+    property. Each run of writes into a holding script sits inside its hold, and
+    an actor released and then given a script package gets both in one call.
+    See: docs/commentary/script_convert.md#remote-write-runs
+    """
     tree = _prepare(conv, name, source, extends, editor_id)
     extends = conv._script_extends
-
-    # The BODY converts FIRST: resolving a name is what registers the property
-    # for it, so the property table is only complete once every statement has
-    # been emitted.  Declarations are spliced in afterwards, at the top where
-    # Papyrus wants them.
     body = udf(conv, tree, extends)
     body += poll(conv, tree, extends)
     body += events(conv, tree, extends, skip_poll=True)
@@ -45,10 +59,17 @@ def build(conv, name: str, source: str, extends: str, editor_id: str) -> str:
     body += door_relock(conv, tree, extends)
     body += lifecycle(conv, tree, extends)
     body = block_activation(conv, tree, extends, body)
-    body = fall_damage(conv, extends, body)
+    body = unequip_guard(conv, fall_damage(conv, extends, body))
     body += helpers(conv)
     body += chargen_latch(conv)
     body += stage_latches(conv)
+    body += quest_restart(conv, tree, extends, name)
+    body = halt_guards(conv, body)
+    body = movie_last(release_into_package('\n'.join(body).split('\n')))
+    body = redress_runs(body, armor_names(conv.sc.property_refs))
+    if conv.xref:
+        body = hold_runs(body, conv.xref.holds)
+    body += remote_adders(conv, tree, editor_id)
 
     out = list(header(conv, name, extends, editor_id))
     out += properties(conv, tree)
@@ -56,9 +77,14 @@ def build(conv, name: str, source: str, extends: str, editor_id: str) -> str:
     return '\n'.join(out)
 
 
+# ---------------------------------------------------------------------------
+# Loading: symbols and facts
+# ---------------------------------------------------------------------------
+
 def _prepare(conv, name: str, source: str, extends: str, editor_id: str):
     """Parse the script and load the context: symbols, then facts."""
     conv.sc.edid = editor_id or name
+    conv.sc.can_halt = True
     # A script calling Actor-only functions on a bare Self is an ACTOR script,
     # whatever the record said.
     if extends == 'ObjectReference':
@@ -67,7 +93,6 @@ def _prepare(conv, name: str, source: str, extends: str, editor_id: str):
 
     conv._parse_source(source)
     tree = conv._tree
-    _retype_implicit_blocks(tree, editor_id or name)
     _load_symbols(conv, tree, editor_id)
     _load_facts(conv, tree)
     _promote_actor_locals(conv, tree)
@@ -201,8 +226,12 @@ def _narrow_ref_types(conv, tree) -> None:
     if not refs or tree is None:
         return
     stmts = [st for block in tree.blocks for st in N.walk_stmts(block.body)]
+    usage = _symbols.scan_var_usage(stmts, refs, conv.type_of)
+    iterators = _symbols.foreach_iterators(stmts)
+    sc.ref_sources = {k: v for k, v in _symbols.assignment_sources(usage).items()
+                      if k not in iterators}
     narrowed = _symbols.resolve_ref_types(
-        stmts, refs, conv.type_of, conv._base_record_type)
+        stmts, refs, conv.type_of, conv._base_record_type, usage)
     for low, ptype in narrowed.items():
         for spelling in (low, safe_property_name(low).lower()):
             sc.var_types[spelling] = ptype
@@ -230,20 +259,10 @@ def _load_facts(conv, tree) -> None:
     btypes = {b.btype.lower() for b in tree.blocks} if tree else set()
 
     sc.suppressed_fall_damage = 'resetfalldamagetimer' in called
-    sc.uses_getsecondspassed = 'getsecondspassed' in called
-    sc.gsp_realtime = bool(
-        (called & {'getsecondspassed', 'scripteffectelapsedseconds'})
-        and (btypes & {'gamemode', 'scripteffectupdate'}))
-    if sc.gsp_realtime:
-        # The synthesised elapsed-time variable must be TYPED for the
-        # Float->Int coercion: TES4 `short` timers decremented by
-        # getSecondsPassed (`damage = -50 * TES4_SecondsPassed`) need the
-        # `as Int` cast the old float literal got via its own path.
-        sc.var_types['tes4_secondspassed'] = 'Float'
-        sc.var_types['tes4_lasttick'] = 'Float'
-
+    _load_time_facts(sc, tree, called, btypes)
     sc.uses_timer = 'timer' in names
     sc.uses_say = bool(called & {'say', 'sayto'})
+    sc.shows_box = 'messagebox' in called
     sc.uses_say_timer = any(
         isinstance(st, N.Assign)
         and any(e.called in ('say', 'sayto')
@@ -269,12 +288,37 @@ def _load_facts(conv, tree) -> None:
         b.btype.lower() == 'scripteffectupdate' for b in blocks)
 
 
+def _load_time_facts(sc, tree, called: set, btypes: set) -> None:
+    """Does the poll measure real elapsed time, and does it move references?
+
+    A poll that moves glides each step over the MEASURED gap between passes,
+    so it measures one too.  The elapsed variable is typed so a TES4 `short`
+    timer decremented by it gets its `as Int` cast.
+    """
+    sc.uses_getsecondspassed = 'getsecondspassed' in called
+    polls = [b for b in (tree.blocks if tree else ())
+             if b.btype.lower() in POLL_BLOCKS]
+    sc.moves_in_poll = any(e.called in ('setpos', 'setangle', 'rotate')
+                           for b in polls for e in N.walk_exprs_in(b.body))
+    sc.relative_sets = relative_sets(polls) if sc.moves_in_poll else {}
+    sc.gsp_realtime = sc.moves_in_poll or bool(
+        (called & {'getsecondspassed', 'scripteffectelapsedseconds'})
+        and (btypes & {'gamemode', 'scripteffectupdate'}))
+    if sc.gsp_realtime:
+        sc.var_types['tes4_secondspassed'] = 'Float'
+        sc.var_types['tes4_lasttick'] = 'Float'
+
+
 def _reads_sleep_state(body) -> bool:
     """Does this block body test the player's sleep state?"""
     return any(e.called in ('getpcissleeping', 'ispcsleeping',
                             'isplayersleeping')
                for e in N.walk_exprs_in(body) if e.called)
 
+
+# ---------------------------------------------------------------------------
+# Declarations
+# ---------------------------------------------------------------------------
 
 def header(conv, name: str, extends: str, editor_id: str) -> list:
     """The ScriptName line and the conversion docstring.
@@ -294,21 +338,26 @@ def header(conv, name: str, extends: str, editor_id: str) -> list:
             '']
 
 
-def properties(conv, tree) -> list:
-    """The script's variables, as auto-properties.
-
-    An OBSE `begin Function{a, b}` declares its parameters as ordinary script
-    variables.  They become the Papyrus Function's parameters, so they must NOT
-    also be auto-properties: the parameter would shadow the property inside the
-    body while callers write neither, leaving the body reading a permanent 0.
-    """
+def _udf_param_names(tree) -> set:
+    """Lowercased names an OBSE `begin Function{a, b}` takes as parameters."""
     params = set()
     for block in (tree.blocks if tree else ()):
         if block.btype.lower() == 'function':
             for name in _udf_params(block.filter):
                 params.add(name.lower())
                 params.add(safe_property_name(name).lower())
+    return params
 
+
+def variable_properties(conv, tree) -> list:
+    """(property, Papyrus type) of every TES4 variable, as its script declares it.
+
+    A UDF's parameters are not properties: the parameter would shadow the
+    property while callers write neither.  Of the two type tables the MORE
+    SPECIFIC wins -- `_resolve_self_ref` upgrades the property, the pre-pass
+    the variable, and either can be the one that knows.
+    """
+    params = _udf_param_names(tree)
     out, seen = [], set()
     for var in (tree.variables if tree else ()):
         safe = safe_property_name(var.name)
@@ -316,31 +365,114 @@ def properties(conv, tree) -> list:
         if low in seen or low in params:
             continue
         seen.add(low)
-        # The MORE SPECIFIC of the two tables wins.  Converting the body is
-        # what discovers a variable's real type, and each table learns it by a
-        # different route: `_resolve_self_ref` upgrades the PROPERTY when a
-        # call resolves its receiver as an actor, while the pre-pass upgrades
-        # the VARIABLE from the parse tree.  Either can be the one that knows,
-        # so preferring a fixed one left `ObjectReference Property replacement`
-        # under a `replacement.IsDead()` the compiler rejected.
-        ptype = _specific(conv.sc.property_refs.get(safe),
-                          conv.sc.var_types.get(low, 'Int'))
-        out.append(_declare(safe, ptype))
+        out.append((safe, _specific(conv.sc.property_refs.get(safe),
+                                    conv.sc.var_types.get(low, 'Int'))))
+    return out
 
-    # Every EXTERNAL record the body named -- a quest, a faction, a sound -- is
-    # reached through a property too, and those are discovered WHILE the body
-    # converts rather than from the declarations.  Missing them left the
-    # emitted name undefined and failed the whole script to compile.
+
+def remote_adders(conv, tree, editor_id: str) -> list:
+    """An add function per variable another script adds to: the read and the write as one step."""
+    out = []
+    for safe, ptype in _remote_added(conv, tree, editor_id):
+        total = f'{safe} + amount' if ptype == 'Float' else f'({safe} + amount) as Int'
+        out += ['', f'Function {REMOTE_ADD_PREFIX}{safe}(Float amount)', f'  {safe} = {total}', 'EndFunction']
+    return out + _HOLD_PAIR if out else out
+
+
+def _remote_added(conv, tree, editor_id: str) -> list:
+    """(property name, type) of each number variable another script adds to; any of them = the hold pair."""
+    adds = conv.xref.remote_adds if conv.xref else ()
+    out = []
+    for var in (tree.variables if tree else ()):
+        safe = safe_property_name(var.name)
+        ptype = conv.sc.var_types.get(safe.lower(), 'Int')
+        if ptype in ('Int', 'Float') and ((editor_id or '').lower(), var.name.lower()) in adds:
+            out.append((safe, ptype))
+    return out
+
+
+#: One writer at a time for a run of writes from another script; a lost release frees itself after 100 waits.
+_HOLD_PAIR = ['', 'Bool TES4_held', 'Float TES4_heldAt', '', f'Function {REMOTE_HOLD}()', '  Int TES4_tries = 0',
+              '  While TES4_held && TES4_tries < 100', '    Utility.WaitMenuMode(0.01)', '    TES4_tries += 1',
+              '  EndWhile', '  TES4_held = True', '  TES4_heldAt = Utility.GetCurrentRealTime()', 'EndFunction', '',
+              f'Function {REMOTE_RELEASE}()', '  TES4_held = False', 'EndFunction']
+
+
+def properties(conv, tree) -> list:
+    """The script's variables, then every external record the body named, as auto-properties.
+
+    The external ones -- a quest, a faction, a sound -- are discovered WHILE
+    the body converts rather than from the declarations; missing them left the
+    emitted name undefined and failed the whole script to compile.
+    """
+    kept = variable_properties(conv, tree)
+    out = [_declare(name, ptype) for name, ptype in kept]
+    seen = {name.lower() for name, _t in kept} | _udf_param_names(tree)
     for prop, ptype in sorted(conv.sc.property_refs.items()):
         low = prop.lower()
-        if low in seen or low in params or not prop.isidentifier():
+        if low in seen or not prop.isidentifier():
             continue
         seen.add(low)
         out.append(_declare(prop, ptype))
-
     if out:
         out.append('')
     return out
+
+
+def _repeats_stages(conv, script: str) -> bool:
+    """Whether a quest on Papyrus script `script` allows repeated stages."""
+    return any(conv.xref.get_quest_script_type(quest) == script for quest in conv.xref.repeat_stage_quests)
+
+
+def quest_restart(conv, tree, extends: str, name: str) -> list:
+    """`TES4Start(quest)` and `TES4SetStage(quest, stage)`, keeping TES4 variables.
+
+    Skyrim's `Start()` on a stopped quest re-initialises its scripts, as does a
+    `SetStage` that starts it; TES4 kept its variables. The stage re-checks the
+    alias packages. A stopped quest is not started for a done stage unless it
+    allows repeated stages.
+    See: docs/commentary/script_convert.md#stopquest-converts-stop-run-bit
+    See: docs/commentary/script_convert.md#setstage-start-keeps-variables
+    See: docs/commentary/script_convert.md#setstage-re-evaluates-alias-packages
+    """
+    if extends != 'Quest':
+        return []
+    kept = variable_properties(conv, tree)
+    script = papyrus_script_name(name)
+    out = ['', f'Function TES4Start({script} akQuest) Global']
+    out += [f'  {ptype} v{i} = akQuest.{prop}' for i, (prop, ptype) in enumerate(kept)]
+    out.append('  akQuest.Start()')
+    out += [f'  akQuest.{prop} = v{i}' for i, (prop, _t) in enumerate(kept)]
+    out += ['EndFunction', '',
+            f'Bool Function TES4SetStage({script} akQuest, Int aiStage) Global',
+            '  If !akQuest.IsRunning()']
+    out += [] if _repeats_stages(conv, script) else ['    If akQuest.GetStageDone(aiStage)',
+                                                     '      Return False',
+                                                     '    EndIf']
+    out += ['    TES4Start(akQuest)', '  EndIf'] + _settling(conv, script)
+    return out + ['EndFunction'] + (_SETTLE_PAIR if conv.xref.fragment_stages_of(script) else [])
+
+
+#: A quest script's record of the stage fragment it has asked for and not yet seen finish.
+_SETTLE_PAIR = ['', 'Int TES4_settling = -1', 'Float TES4_settlingAt', '',
+                'Function TES4StagePending(Int aiStage)', '  TES4_settling = aiStage',
+                '  TES4_settlingAt = Utility.GetCurrentRealTime()', 'EndFunction', '',
+                'Function TES4StageRan(Int aiStage)', '  If TES4_settling == aiStage', '    TES4_settling = -1',
+                '  EndIf', 'EndFunction']
+
+
+def _settling(conv, script: str) -> list:
+    """TES4SetStage's SetStage, noting a stage whose fragment its own poll must wait for.
+
+    See: docs/commentary/script_convert.md#a-stage-fragment-runs-before-its-poll
+    """
+    stages = conv.xref.fragment_stages_of(script)
+    set_stage = ['  Bool done = akQuest.SetStage(aiStage)', '  TES4Polyfill.StageSet(akQuest)', '  Return done']
+    if not stages:
+        return set_stage
+    test = ' || '.join(f'aiStage == {stage}' for stage in stages)
+    return ([f'  If {test}', '    akQuest.TES4StagePending(aiStage)', '  EndIf'] + set_stage[:2]
+            + ['  If !done', '    akQuest.TES4StageRan(aiStage)', '  EndIf', set_stage[2]])
 
 
 def _declare(name: str, ptype: str) -> str:
@@ -358,6 +490,10 @@ def _declare(name: str, ptype: str) -> str:
     init = ' = 0.0' if ptype == 'Float' else ''
     return f'{ptype} Property {name}{init} Auto{flag}'
 
+
+# ---------------------------------------------------------------------------
+# Blocks
+# ---------------------------------------------------------------------------
 
 def udf(conv, tree, extends: str) -> list:
     """The `TES4Call` function an OBSE `begin Function{a, b}` script exposes.
@@ -380,6 +516,7 @@ def udf(conv, tree, extends: str) -> list:
         return []
     params = _udf_params(block.filter)
     conv.sc.udf_params = {p.lower() for p in params}
+    conv.sc.in_udf = True
     _script.emit_body(conv, block.body, extends, 1)
     # Record each parameter's final type BEFORE rendering the body's casts:
     # the widening to `Form` happens here, and a `type_of` that still answered
@@ -388,13 +525,32 @@ def udf(conv, tree, extends: str) -> list:
     for name, ptype in zip(params, types):
         for spelling in (name.lower(), safe_property_name(name).lower()):
             conv.sc.var_types[spelling] = ptype
-    lines = _script.emit_body(conv, block.body, extends, 1)
-    sig = ', '.join('%s %s' % (ptype, safe_property_name(name))
-                    for name, ptype in zip(params, types))
-    conv.sc.udf_signature = types
-    rtype = 'Int ' if conv.sc.udf_returns else ''
-    return ['%sFunction TES4Call(%s)' % (rtype, sig)] + lines + ['EndFunction',
-                                                                 '']
+    lines = [_SELF_RE.sub(UDF_CALLER_PARAM, line)
+             for line in _script.emit_body(conv, block.body, extends, 1)]
+    conv.sc.in_udf = False
+    sig = ', '.join([f'ObjectReference {UDF_CALLER_PARAM}']
+                    + ['%s %s' % (ptype, safe_property_name(name))
+                       for name, ptype in zip(params, types)])
+    conv.sc.udf_signature = ['ObjectReference'] + types
+    if not conv.sc.udf_returns:
+        return ['Function TES4Call(%s)' % sig] + lines + ['EndFunction', '']
+    return _returning_udf(conv.sc.udf_return_type, sig, lines)
+
+
+#: `Self` as a whole word, which in a user function's body is its calling reference.
+_SELF_RE = re.compile(r'\bSelf\b')
+
+
+def _returning_udf(rtype: str, sig: str, lines: list) -> list:
+    """`TES4Call` returning the `SetFunctionValue` result, at its end and every `return`.
+
+    See: docs/commentary/script_convert.md#set-function-value
+    """
+    init = {'Int': '0', 'Float': '0.0', 'String': '""', 'Bool': 'False'}.get(rtype, 'None')
+    tail = [] if lines and lines[-1].strip().startswith('Return') \
+        else [f'  Return {UDF_RESULT_VAR}']
+    return ([f'{rtype} Function TES4Call({sig})', f'  {rtype} {UDF_RESULT_VAR} = {init}']
+            + lines + tail + ['EndFunction', ''])
 
 
 def _param_type(conv, name: str) -> str:
@@ -462,21 +618,23 @@ def events(conv, tree, extends: str, skip_poll: bool = False) -> list:
             continue
         body = _guarded(conv, block, body)
         if consumes:
-            body = door_preamble(conv, extends) + body
+            body = door_preamble(conv, extends, _names_npc_user(body)) + body + user_rethinks(extends)
         if block.btype.lower() == 'onactivate':
-            body = gate_capture(tree, extends) + body
+            body = gate_capture(conv, tree, extends) + body
         if header not in merged:
             merged[header] = []
             order.append(header)
         merged[header] += body
 
-    out = []
+    out = (_carried_read(conv, tree, extends, merged, order)
+           + _record_last_activator(conv, merged, order)
+           + _track_holder(conv, tree, merged, order))
     for header in order:
         opener, closer = header
-        out.append(opener)
-        out += merged[header]
-        out.append(closer)
-        out.append('')
+        if opener == BLOCK_MAP['ontrigger'][0]:
+            out += _one_trigger_at_a_time(opener, closer, merged[header])
+        else:
+            out += [opener] + merged[header] + [closer, '']
         # TES4's `begin OnTrigger` runs EVERY FRAME an object is inside the
         # volume.  Skyrim splits that: OnTriggerEnter is the entry frame and
         # OnTrigger the repeat, so a converted OnTrigger body alone never runs
@@ -496,12 +654,175 @@ def events(conv, tree, extends: str, skip_poll: bool = False) -> list:
     return out
 
 
+def _one_trigger_at_a_time(opener: str, closer: str, body: list) -> list:
+    """OnTrigger that skips an event while the previous one still runs.
+
+    TES4 finished each frame's OnTrigger before the next began.  Papyrus runs
+    every event on its own thread, and a thread waiting on a game call lets
+    the next one in, so a one-time block that sets its flag at the end ran
+    once per overlapping event.  The body is a function so a TES4 `return`
+    inside it still clears the busy flag.
+
+    See: docs/commentary/script_convert.md#one-trigger-at-a-time
+    """
+    return (['Bool TES4_TriggerBusy = False', '', opener,
+             '  If TES4_TriggerBusy', '    Return', '  EndIf',
+             '  TES4_TriggerBusy = True', '  TES4_OnTriggerBody(akActionRef)',
+             '  TES4_TriggerBusy = False', closer, '',
+             'Function TES4_OnTriggerBody(ObjectReference akActionRef)']
+            + body + ['EndFunction', ''])
+
+
+def _record_last_activator(conv, merged: dict, order: list) -> list:
+    """Declare the last-activator variable and record it first thing in OnActivate.
+
+    Only when another event read it (`sc.uses_last_activator`).
+    See: docs/commentary/script_convert.md#last-activator
+    """
+    if not conv.sc.uses_last_activator:
+        return []
+    header = BLOCK_MAP['onactivate']
+    if header not in merged:
+        merged[header] = []
+        order.append(header)
+    merged[header][:0] = [f'  {LAST_ACTIVATOR_VAR} = akActionRef']
+    return [f'ObjectReference {LAST_ACTIVATOR_VAR}', '']
+
+
+#: Container holding a carried object, None while it lies in the world.
+_HOLDER_VAR = 'TES4_Holder'
+
+#: Skyrim's "this book was opened" event, wherever the book is.
+_ON_READ = ('Event OnRead()', 'EndEvent')
+
+#: Set by OnActivate, consumed by the OnRead that activation's own book-open raises.
+_READ_BY_ACTIVATE_VAR = 'TES4_ReadByActivate'
+
+#: Events that reach a carried object, each with the lines recording its holder.
+_HOLDER_EVENTS = (
+    (BLOCK_MAP['onadd'], (f'  {_HOLDER_VAR} = akNewContainer',)),
+    (BLOCK_MAP['onequip'], (f'  {_HOLDER_VAR} = akActor',)),
+)
+
+
+def is_self_activate(stmt) -> bool:
+    """Is this statement a bare `Activate` -- the object activating itself?"""
+    return (isinstance(stmt, N.ExprStmt) and stmt.expr.called == 'activate'
+            and stmt.expr.receiver is None)
+
+
+def _without_self_activate(stmts: list) -> list:
+    """`stmts` with every bare `Activate` removed, nested bodies included."""
+    out = []
+    for st in stmts:
+        if is_self_activate(st):
+            continue
+        if isinstance(st, N.If):
+            st = replace(st, body=_without_self_activate(st.body),
+                         elifs=[(c, _without_self_activate(b), ln)
+                                for c, b, ln in st.elifs],
+                         orelse=_without_self_activate(st.orelse))
+        elif isinstance(st, N.While):
+            st = replace(st, body=_without_self_activate(st.body))
+        out.append(st)
+    return out
+
+
+def _carried_read(conv, tree, extends: str, merged: dict, order: list) -> list:
+    """Run a book's reading OnActivate from OnRead when no world activation opened it.
+
+    A book OnActivate with a bare `Activate` means "the player read this" but
+    misses an inventory read or perk take; OnRead sees every read.  A flag
+    skips the read OnActivate's own book-open raises.  The opening `Activate`
+    is dropped; a polling script then waits out the menu and runs one poll
+    pass, as TES4 GameMode ran on the first frame after it.
+    """
+    blocks = [b for b in (tree.blocks if tree else ())
+              if b.btype.lower() == 'onactivate'
+              and any(is_self_activate(st) for st in N.walk_stmts(b.body))]
+    if not conv.sc.on_book or not blocks:
+        return []
+    body = []
+    conv._current_event = _ON_READ[0]
+    for block in blocks:
+        body += _guarded(conv, block, _script.emit_body(
+            conv, _without_self_activate(block.body), extends, 1))
+    conv._current_event = ''
+    merged[BLOCK_MAP['onactivate']][:0] = [
+        f'  {_READ_BY_ACTIVATE_VAR} = akActionRef == Game.GetPlayer()']
+    held, after = [], []
+    if _carried(conv):
+        held = [f'    {_HOLDER_VAR} = Game.GetPlayer()']
+        after = ['    Utility.Wait(0.001)', '    OnUpdate()']
+    merged[_ON_READ] = ([f'  If {_READ_BY_ACTIVATE_VAR}',
+                         f'    {_READ_BY_ACTIVATE_VAR} = False', '  Else']
+                        + held
+                        + ['    ObjectReference akActionRef = Game.GetPlayer()']
+                        + [f'  {line}' for line in body] + after + ['  EndIf'])
+    order.append(_ON_READ)
+    return [f'Bool {_READ_BY_ACTIVATE_VAR}', '']
+
+
+def _track_holder(conv, tree, merged: dict, order: list) -> list:
+    """Declare the holder variable; every `_HOLDER_EVENTS` event records it and re-arms the poll.
+
+    TES4 ran a carried item's GameMode block from the holder's inventory, so a
+    body that finishes only after pickup (read, then take) still runs, and a
+    poll that died while carried restarts on the next equip (a read: see
+    `_carried_read`).  A bare MenuMode block then runs in-event while the menu
+    stays open (`_menu_pass_loop`).
+
+    See: docs/commentary/script_convert.md#carried-items-and-read-books
+    """
+    if not _carried(conv):
+        return []
+    arm = _arm(conv, conv._get_update_interval(), True)
+    passes = [f'  {_MENU_PASSES}()'] if _menu_passes(conv, tree) else []
+    for header, holder in _HOLDER_EVENTS:
+        if header not in merged:
+            merged[header] = []
+            order.append(header)
+        merged[header][:0] = list(holder) + arm
+        merged[header] += passes
+    return [f'ObjectReference {_HOLDER_VAR}', '']
+
+
 def helpers(conv) -> list:
     """The synthesised helpers this script's own conversions asked for."""
     out = []
     out += conv.get_cell_family_helpers()
     out += conv._emit_button_helpers()
+    out += notify_helper(conv)
     return out
+
+
+#: Seconds a Skyrim notification stays up: hudmenu.swf's MessageText clip is 80 frames at 24 fps.
+NOTIFICATION_SECONDS = 80 / 24
+
+
+def notify_helper(conv) -> list:
+    """TES4_Notify: a `Message` re-sent while its text is still on screen is dropped.
+
+    TES4 `Message` rewrites the one HUD line; Skyrim queues every notification.
+
+    See: docs/commentary/script_convert.md#message-rewrites-one-line
+    """
+    if not conv.sc.uses_notify:
+        return []
+    return [
+        '',
+        'String TES4_NoteText',
+        'Float TES4_NoteAt',
+        '',
+        'Function TES4_Notify(String asText)',
+        '  Float TES4_since = Utility.GetCurrentRealTime() - TES4_NoteAt',
+        f'  If asText != TES4_NoteText || TES4_since >= {NOTIFICATION_SECONDS:.2f} || TES4_since < 0.0',
+        '    TES4_NoteText = asText',
+        '    TES4_NoteAt = Utility.GetCurrentRealTime()',
+        '    Debug.Notification(asText)',
+        '  EndIf',
+        'EndFunction',
+    ]
 
 
 #: The insurance arm's interval.  Long ON PURPOSE -- see `poll`.
@@ -554,12 +875,101 @@ def poll(conv, tree, extends: str) -> list:
     # finishes replaces it with the real interval.
     out += _arm(conv, _INSURANCE_SECS, load_gated)
 
-    # A TES4 `return` inside the polled body ends THIS pass only, so the
-    # converted `Return` must re-arm at the real interval itself: it skips the
-    # bottom arm and the top arm is the long one.
-    sc.poll_return_prefix = '\n'.join(
-        _arm(conv, interval, load_gated, indent='')) + '\n'
+    passes = _menu_passes(conv, tree)
+    sc.poll_return_prefix = _return_arm(conv, interval, load_gated, passes)
+    body = _poll_body(conv, tree, extends, interval, load_gated)
+    sc.poll_return_prefix = ''
+    sc.glide_secs = ''
+    out = _walk_guard(sc, out)
+    out, body, done = _pass_guard(out, body, passes, _pass_waits(conv, tree, extends))
+    arm = done + _arm(conv, interval, load_gated)
+    if not passes:
+        return out + body + ([] if _ends_in_return(body) else arm) + ['EndEvent', '']
+    return (out + [f'  {_POLL_PASS}()'] + arm + ['EndEvent', '', f'Function {_POLL_PASS}()']
+            + body + ['EndFunction', ''] + _menu_pass_loop(interval))
 
+
+#: When the pass now running started (real seconds), 0 between passes.
+_PASS_VAR = 'TES4_PassAt'
+
+#: Seconds after which a pass still marked running is taken for one an error aborted.
+_PASS_STALE_SECS = '60.0'
+
+
+def _pass_waits(conv, tree, extends: str) -> list:
+    """What a poll pass waits out besides its own last pass: a run of writes into it, its stage fragment.
+
+    See: docs/commentary/script_convert.md#a-stage-fragment-runs-before-its-poll
+    """
+    edid = conv.sc.edid
+    waits = ['(TES4_held && TES4_passNow - TES4_heldAt < 1.0)'] if _remote_added(conv, tree, edid) else []
+    if extends == 'Quest' and conv.xref.fragment_stages_of(papyrus_script_name(edid)):
+        waits.append('(TES4_settling >= 0 && TES4_passNow - TES4_settlingAt < 1.0)')
+    return waits
+
+
+def _pass_guard(head: list, body: list, passes: bool, waits: list) -> tuple:
+    """(head, body, end) of a poll whose insurance pass waits out a pass still running.
+
+    A pass parked in a latent call or behind a busy script let the insurance
+    arm start more passes on top of it; each one queued behind the same call.
+    It also skips while any of `waits` holds (another script's run of writes
+    into it, its own stage fragment), so it never reads half of one.
+    See: docs/commentary/script_convert.md#poll-pile-up
+    """
+    clear = f'{_PASS_VAR} = 0.0'
+    running = f'{_PASS_VAR} > 0.0 && TES4_passNow >= {_PASS_VAR} && TES4_passNow - {_PASS_VAR} < {_PASS_STALE_SECS}'
+    head = [f'Float {_PASS_VAR} = 0.0'] + head + [
+        '  Float TES4_passNow = Utility.GetCurrentRealTime()',
+        f'  If {" || ".join(waits + [f"({running})"])}',
+        '    Return', '  EndIf', f'  {_PASS_VAR} = TES4_passNow']
+    if not passes:
+        body = [_before_returns(line, [clear]) for line in body]
+    return head, body, [f'  {clear}']
+
+
+def _before_returns(text: str, stmts: list) -> str:
+    """`text` with `stmts` before each bare `Return` line, at that line's indent."""
+    lines = []
+    for line in text.split('\n'):
+        if line.partition(';')[0].strip() == 'Return':
+            indent = line[:len(line) - len(line.lstrip())]
+            lines += [indent + s for s in stmts]
+        lines.append(line)
+    return '\n'.join(lines)
+
+
+def _ends_in_return(body: list) -> bool:
+    """True when the body ends in a top-level bare `Return`; nothing after runs."""
+    code = [line.partition(';')[0].rstrip() for line in '\n'.join(body).split('\n')]
+    code = [line for line in code if line.strip()]
+    return bool(code) and code[-1] == '  Return'
+
+
+def _walk_guard(sc, head: list) -> list:
+    """`head` (declarations through the insurance arm) plus the walk-overlap guard when due.
+
+    A StartConversation walk in the poll waits out the whole conversation, so
+    an insurance pass skips while its deadline is live.
+    See: docs/commentary/tes5_import_dialogue.md#script-started-conversation-chains
+    """
+    if not sc.uses_conv_walk:
+        return head
+    return ([f'Float {CONV_WALK_VAR} = 0.0'] + head
+            + [f'  If TES4Polyfill.WalkPending({CONV_WALK_VAR})', '    Return', '  EndIf'])
+
+
+def _return_arm(conv, interval: str, load_gated: bool, passes: bool) -> str:
+    """A poll `return`'s re-arm; none when the pass is a function (OnUpdate re-arms)."""
+    if passes:
+        return ''
+    return '\n'.join(_arm(conv, interval, load_gated, indent='')) + '\n'
+
+
+def _poll_body(conv, tree, extends: str, interval: str, load_gated: bool) -> list:
+    """One poll pass: the quest and dialogue gates, the prologues, every polled block, then the stage latches."""
+    sc = conv.sc
+    out = []
     if extends == 'Quest':
         # Not running: skip the body, but the poll keeps ticking so the loop
         # resumes once the quest is started.
@@ -567,32 +977,82 @@ def poll(conv, tree, extends: str) -> list:
 
     out += _dialogue_gate(conv, extends, load_gated)
     out += _elapsed_prologue(conv, interval)
+    out += _glide_prologue(sc)
 
+    blocks = []
     for block in (tree.blocks if tree else ()):
         btype = block.btype.lower()
         if btype in POLL_BLOCKS or (btype == 'menumode'
                                      and _menumode_kind(block) == 'poll'):
-            out += _script.emit_body(conv, block.body, extends, 1)
+            blocks += _script.emit_body(conv, block.body, extends, 1)
+    return out + _latched(sc, blocks)
 
-    # Stage-arrival latches: record the stage each guarded quest is on NOW, so
-    # the next pass can tell "we have already seen this stage" from "it just
-    # arrived".  Emitted at the very END so every guard above compared against
-    # the PREVIOUS pass's value.
-    for _, var in sorted(sc.stage_latches.items()):
-        quest = var[len('TES4_LastStage_'):]
-        out.append(f'  {var} = {quest}.GetStage()')
 
-    sc.poll_return_prefix = ''
-    out += _arm(conv, interval, load_gated)
-    out += ['EndEvent', '']
-    return out
+def _latched(sc, blocks: list) -> list:
+    """`blocks`, then each stage-arrival latch, which also runs before every TES4 `return` in them.
+
+    The latch records the stage a pass ENDED on, so the guards above compare
+    against the previous pass; a pass that left by an early `return` still
+    saw the stage, or its `GetStage()==N && timer <= 0` guard never fires.
+    """
+    latches = [f'{var} = {var[len("TES4_LastStage_"):]}.GetStage()'
+               for _, var in sorted(sc.stage_latches.items())]
+    if not latches:
+        return blocks
+    return [_before_returns(line, latches) for line in blocks] + ['  ' + s for s in latches]
+
+
+#: The poll body as a function, for a script whose MenuMode must run in-event; see `_menu_passes`.
+_POLL_PASS = 'TES4_PollPass'
+
+#: Runs the poll body while a menu is open; a newer run ends an older one.
+_MENU_PASSES = 'TES4_MenuPasses'
+
+
+def _menu_passes(conv, tree) -> bool:
+    """Must a carried item's bare MenuMode block run from its own events?"""
+    return _carried(conv) and any(
+        b.btype.lower() == 'menumode' and _menumode_kind(b) == 'poll'
+        for b in (tree.blocks if tree else ()))
+
+
+def _menu_pass_loop(interval: str) -> list:
+    """TES4_MenuPasses: a poll pass every `interval` seconds while any menu is open.
+
+    A script on an item in a container has no native object, so it cannot
+    register for updates; TES4 ran MenuMode on those menu frames anyway.
+
+    See: docs/commentary/script_convert.md#carried-menumode-runs-in-event
+    """
+    return ['Int TES4_MenuPassRun', '',
+            f'Function {_MENU_PASSES}()',
+            '  TES4_MenuPassRun += 1',
+            '  Int TES4_mine = TES4_MenuPassRun',
+            '  While TES4_mine == TES4_MenuPassRun && Utility.IsInMenuMode()',
+            f'    {_POLL_PASS}()',
+            f'    Utility.WaitMenuMode({interval})',
+            '  EndWhile',
+            'EndFunction', '']
+
+
+def _carried(conv) -> bool:
+    """Can this script's object be picked up while its GameMode poll runs?"""
+    return conv._script_extends == 'ObjectReference' and conv.sc.has_gamemode
+
+
+def _gate(conv) -> str:
+    """The poll gate: the reference is live, or a carried one's holder is."""
+    if not _carried(conv):
+        return conv._GAMEMODE_GATE
+    return (f'{conv._GAMEMODE_GATE} || '
+            f'TES4Polyfill.SafeGameModeGate({_HOLDER_VAR})')
 
 
 def _arm(conv, secs: str, load_gated: bool, indent: str = '  ') -> list:
     """Re-arm the poll, gated on the script's reference being live."""
     if not load_gated:
         return [f'{indent}RegisterForSingleUpdate({secs})']
-    return [f'{indent}If ({conv._GAMEMODE_GATE})',
+    return [f'{indent}If ({_gate(conv)})',
             f'{indent}  RegisterForSingleUpdate({secs})',
             f'{indent}EndIf']
 
@@ -600,19 +1060,41 @@ def _arm(conv, secs: str, load_gated: bool, indent: str = '  ') -> list:
 def _dialogue_gate(conv, extends: str, load_gated: bool) -> list:
     """Skip this pass while the player is in a dialogue menu.
 
-    TES4 GameMode never ran while a menu was open.  Only scripts that SPEAK
-    carry the gate; a poll that never speaks cannot cut a line.
+    TES4 GameMode never ran while a menu was open.  Scripts that SPEAK carry
+    the gate, and so do those that raise a MessageBox (unless MenuMode work
+    shares the poll); a poll that does neither cannot cut a conversation.  The
+    runtime's DIALOGUE_OPEN_GLOBAL covers a dialogue whose lines carry no fragment.
 
     See: docs/commentary/script_convert.md#the-dialogue-poll-gate
     """
-    if not conv.sc.uses_say or extends not in ('Actor', 'Quest'):
+    sc = conv.sc
+    speaks = sc.uses_say and extends in ('Actor', 'Quest')
+    boxes = sc.shows_box and not sc.has_menumode and extends in ('Actor', 'Quest', 'ObjectReference')
+    if not (speaks or boxes):
         return []
-    test = ('IsInDialogueWithPlayer() || TES4Polyfill.PlayerIsInDialogue()'
-            if extends == 'Actor' else 'TES4Polyfill.PlayerIsInDialogue()')
+    held = _symbols.owned_global(conv, DIALOGUE_OPEN_GLOBAL)
+    test = f'TES4Polyfill.PlayerIsInDialogue() || ({held} && {held}.GetValue() > 0)'
+    if extends == 'Actor':
+        test = 'IsInDialogueWithPlayer() || ' + test
     return ([f'  If {test}  '
              '; TES4 GameMode did not run while a menu was open']
             + _arm(conv, '0.5', load_gated, indent='    ')
             + ['    Return', '  EndIf'])
+
+
+def _glide_prologue(sc) -> list:
+    """This pass's SetPos/SetAngle glide goals, and `sc.glide_secs` armed so the body emits glides.
+
+    A glide lasts the measured gap since the last pass, so it ends as the next
+    one starts however late the VM delivers it.
+
+    See: docs/commentary/morrowind_runtime.md#move-and-rotate-are-rates
+    """
+    if not sc.moves_in_poll:
+        return []
+    sc.glide_secs = 'TES4_SecondsPassed'
+    return ['  ObjectReference[] TES4_GlideRefs = new ObjectReference[8]',
+            '  Float[] TES4_GlideGoals = new Float[96]']
 
 
 def _elapsed_prologue(conv, interval: str) -> list:
@@ -641,10 +1123,12 @@ def lifecycle(conv, tree, extends: str) -> list:
     """The events that START the poll loop, the sleep listener and the menu
     listeners.
 
-    Four events arm them -- OnCellAttach, OnLoad and two OnInit shapes -- and
-    they arm identically, so `start` is one definition rather than four copies
-    that can drift apart. `OnMenuClose` is inert until its menu is registered
-    for, so a script with only menu blocks still needs this.
+    All arm identically from one `start`.  An object or actor arms on
+    OnCellAttach and OnLoad unconditionally and on OnInit behind the poll
+    gate; nothing unregisters on OnCellDetach.  A script with only menu blocks
+    still needs this, since `OnMenuClose` is inert until registered for.
+
+    See: docs/commentary/script_convert.md#poll-lifecycle
     """
     sc = conv.sc
     sleeps = any(b.btype.lower() == 'menumode' and _menumode_kind(b) == 'sleep'
@@ -656,8 +1140,6 @@ def lifecycle(conv, tree, extends: str) -> list:
         return []
     interval = conv._get_update_interval()
     declared = {b.btype.lower() for b in (tree.blocks if tree else ())}
-    # The sleep listener shares the poll's lifecycle: TES4 MenuMode also ran
-    # only while the script's owner was loaded / its quest instantiated.
     start = ([f'  RegisterForSingleUpdate({interval})']
              if (sc.has_gamemode or sc.has_scripteffectupdate) else [])
     if sleeps:
@@ -668,45 +1150,14 @@ def lifecycle(conv, tree, extends: str) -> list:
         return [] if 'oninit' in declared else (
             ['Event OnInit()'] + start + ['EndEvent', ''])
 
-    # Object/actor: run only while loaded.  OnCellAttach fires each time the
-    # reference streams into an active cell, which confines the loop to when
-    # the object is actually present, exactly like TES4 GameMode.
-    #
-    # NO UnregisterForUpdate on OnCellDetach.  Cell-transition events arrive in
-    # no guaranteed order, so the detach for the OLD cell could land after
-    # OnLoad/OnCellAttach had already re-armed the poll for the NEW one and
-    # silently kill a loaded actor's loop mid-scene (the CharacterGen escort
-    # NPCs went mute this way -- "sometimes they talk, sometimes nothing").
-    # The arm-first gate in OnUpdate stops the loop by itself one tick after
-    # the 3D goes away, so the unregister bought nothing but the race.
     out = ['Event OnCellAttach()'] + start + ['EndEvent', '']
     if sleeps:
         out += ['Event OnCellDetach()', '  UnregisterForSleep()',
                 'EndEvent', '']
-
-    # OnCellAttach only fires when a cell BECOMES attached.  A persistent actor
-    # standing in an already-attached cell when the script is first bound (new
-    # game, or the player is simply already there) never gets that event, so
-    # the poll would never start and a GameMode variable the rest of the quest
-    # depends on stays 0 forever.  That kept Arielle (MG04Restore) standing
-    # still: her package waits on `startconv == 1`, which only her GameMode
-    # body ever sets.
-    #
-    # OnInit ALONE is not enough once the script lives on the placed reference
-    # (which reference events like OnPackageEnd require): on a reference OnInit
-    # runs at load BEFORE the 3D exists, so the gate is false and the poll
-    # never starts -- that is what silenced Valen Dreth.  OnLoad means "this
-    # object is completely loaded ... fired every time this object is loaded"
-    # (vanilla ObjectReference.psc), so it starts the loop for an actor already
-    # standing in the player's current cell, which OnCellAttach cannot do.
     if 'onload' not in declared:
         out += ['Event OnLoad()'] + start + ['EndEvent', '']
     if 'oninit' not in declared:
-        # Gating keeps the anti-storm property: the gate is true ONLY for
-        # references that are actually loaded, so this cannot re-create the
-        # "every scripted object in the game starts ticking at load" failure
-        # an unconditional OnInit register caused.
-        out += (['Event OnInit()', f'  If ({conv._GAMEMODE_GATE})']
+        out += (['Event OnInit()', f'  If ({_gate(conv)})']
                 + [f'  {line}' for line in start]
                 + ['  EndIf', 'EndEvent', ''])
     return out
@@ -715,20 +1166,6 @@ def lifecycle(conv, tree, extends: str) -> list:
 # ---------------------------------------------------------------------------
 # Synthesised events
 # ---------------------------------------------------------------------------
-
-def _retype_implicit_blocks(tree, script_name: str) -> None:
-    """Give a TES3 script's one implicit block the type it behaves as.
-
-    TES3 names no event -- `begin <script name>` -- so the block matches no
-    entry in BLOCK_MAP and every phase downstream dropped it body and all.
-    The body runs every frame while loaded, which is `gamemode`.
-    See: docs/commentary/script_convert_morrowind.md#implicit-blocks
-    """
-    for block in (tree.blocks if tree else ()):
-        if is_implicit_block(block.btype, block.filter, script_name):
-            block.btype = TES3_BLOCK_TYPE
-            block.filter = ''
-
 
 def trap_hit(conv, tree, extends: str) -> list:
     """The contact-damage event TES4's ENGINE used to raise.
@@ -810,19 +1247,28 @@ def _consumes_activation(conv, tree) -> bool:
     return conv._onactivate_consumes(blocks)
 
 
-def gate_capture(tree, extends: str) -> list:
+def gate_capture(conv, tree, extends: str) -> list:
     """Remember the Oblivion gate the player just entered, before it is lost.
 
-    The authored line `set MQ00.nearOblivionGate to 0` marks the entry AND
-    discards the gate's identity, so the capture goes AHEAD of the body.  All
-    5 vanilla gate scripts use the idiom; nothing else writes that variable 0.
+    A gate is a script that clears `MQ00.nearOblivionGate`, or one on a door
+    flagged Oblivion Gate whose OnActivate passes the activation on. The
+    capture goes AHEAD of the body, which discards the gate's identity.
+    See: docs/commentary/script_convert.md#oblivion-gate-capture
     """
     if extends not in ('ObjectReference', 'Actor') \
-            or not _is_gate_entry(tree):
+            or not (_is_gate_entry(tree) or _gate_door_lets_in(conv, tree)):
         return []
     return ['  If akActionRef == Game.GetPlayer()',
             '    TES4Polyfill.EnterOblivionGate(Self)',
             '  EndIf']
+
+
+def _gate_door_lets_in(conv, tree) -> bool:
+    """Does this script sit on a door flagged Oblivion Gate and call `Activate` in its OnActivate?"""
+    if not conv.xref or not conv.xref.is_gate_script(conv.sc.edid):
+        return False
+    return any('activate' in {e.called for e in N.walk_exprs_in(block.body)}
+               for block in (tree.blocks if tree else ()) if block.btype.lower() == 'onactivate')
 
 
 def _is_gate_entry(tree) -> bool:
@@ -842,15 +1288,30 @@ def _is_gate_entry(tree) -> bool:
     return False
 
 
-def door_preamble(conv, extends: str) -> list:
-    """TES4 parity: AI door-use ignores this script AND the lock.
+#: Uses of the activator that tell nothing about an NPC user: the player test and the default activation.
+_PLAYER_ONLY_USE = re.compile(r'akActionRef [!=]= Game\.GetPlayer\(\)|Activate\(akActionRef, true\)')
 
-    An NPC opening a door does not run the door's script in Oblivion, and the
-    authored lock is restored when the door next closes (see `door_relock`).
+
+def _names_npc_user(body: list) -> bool:
+    """Whether an OnActivate body reads its activator for more than the player test."""
+    return any('akActionRef' in _PLAYER_ONLY_USE.sub('', line.partition(';')[0]) for line in body)
+
+
+def door_preamble(conv, extends: str, npc_runs: bool = False) -> list:
+    """An NPC walking through a scripted door gets the default open, lock lifted; `npc_runs` runs the block.
+
+    See: docs/commentary/script_convert.md#door-scripts-that-name-an-npc-user
     """
     if extends != 'ObjectReference':
         return []
-    return ['  If (GetBaseObject() as Door) && (akActionRef as Actor) && '
+    uses = _symbols.owned_formlist(conv, _symbols.SCRIPTED_USES)
+    listed = [f'  If {uses}.HasForm(Self)',
+              '    ; A script activated this door to run this block (TES4 `Activate ref 1`).',
+              f'    {uses}.RemoveAddedForm(Self)']
+    if npc_runs:
+        return listed + ['  EndIf']
+    return listed + [
+            '  ElseIf (GetBaseObject() as Door) && (akActionRef as Actor) && '
             'akActionRef != Game.GetPlayer()',
             '    ; TES4 parity: AI door-use ignores this script and the lock; '
             'the authored lock is restored when the door next closes.',
@@ -862,6 +1323,21 @@ def door_preamble(conv, extends: str) -> list:
             '      Activate(akActionRef, true)',
             '    EndIf',
             '    Return',
+            '  EndIf']
+
+
+def user_rethinks(extends: str) -> list:
+    """An NPC that has used a scripted object picks its package again.
+
+    Oblivion's UseItemAt ends on the activation; Skyrim's Activate procedure
+    does not end on an object whose script takes the activation, so the user
+    stood on the finished package.
+    See: docs/commentary/script_convert.md#an-npc-that-used-a-scripted-object-re-evaluates
+    """
+    if extends != 'ObjectReference':
+        return []
+    return ['  If (akActionRef as Actor) && akActionRef != Game.GetPlayer()',
+            '    (akActionRef as Actor).EvaluatePackage()',
             '  EndIf']
 
 
@@ -900,6 +1376,21 @@ def block_activation(conv, tree, extends: str, body: list) -> list:
 
 
 
+def halt_guards(conv, body: list) -> list:
+    """Declare the halted flag and make every event return at once while it is set.
+
+    See: docs/commentary/script_convert.md#missing-operand-halts
+    """
+    if not conv.sc.halts:
+        return body
+    out = [f'Bool {HALTED_VAR}', '']
+    for line in body:
+        out.append(line)
+        if line.startswith('Event '):
+            out += [f'  If {HALTED_VAR}', '    Return', '  EndIf']
+    return out
+
+
 def _guarded(conv, block, body: list) -> list:
     """Wrap a block body in the condition its TES4 FILTER stood for.
 
@@ -911,7 +1402,7 @@ def _guarded(conv, block, body: list) -> list:
     """
     btype = block.btype.lower()
     guard = block_filter_guard(conv, btype, block.filter or '')
-    state = COMBAT_STATE_GUARDS.get(btype)
+    state = BLOCK_TYPE_GUARDS.get(btype)
     if state and guard is not None:
         guard = f'{state} && {guard}' if guard else state
 

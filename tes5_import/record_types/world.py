@@ -3,7 +3,10 @@
 import math
 import struct
 
+from core.worldspace_names import converted_worldspace_edid
+
 from ..base.constants import (
+    EFSH_PARTICLES_PER_RATIO,
     MAP_MARKER_TYPE_MAP,
     MATT_MAP,
     SKYRIM_MAP_MARKER_LCRT,
@@ -13,8 +16,13 @@ from ..base.locations import WORLD_NAMES
 from ..base.equivalents import TES4_MARKER_FORMID_TO_SKYRIM
 from .world_falloutnv import (marker_substitute, parent_use_flags,
                               tes5_world_flags, world_map_offset)
+from .world_morrowind import actor_placement_z, is_tes3_source, lock_is_exit_only, tes3_refr_flags
+from .vendor_stock_morrowind import stock_owner
+from .npc_markers_morrowind import final_base, linked_ref_subrecord
 from .items import get_base_origin_shift
+from ..actors.starts_dead import STARTS_DEAD_FLAG, starts_dead
 from ..base.text_reader import remap_formid
+from .region import default_water
 from .common import (
     TES4_DEFAULT_MUSIC_ENUM,
     landscape_texture_path,
@@ -34,6 +42,63 @@ from .common import (
     music_for_enum,
     region_was_emitted,
 )
+
+
+#: TES4 WRLD has no DNAM; its land fallback plane sits far below the terrain.
+_TES4_DEFAULT_LAND_HEIGHT = -2048.0
+
+#: TES4 sea level: the default water plane for any worldspace with no DNAM.
+_TES4_DEFAULT_WATER_HEIGHT = 0.0
+
+#: XACT Use Default | Open | Open by Default: all 354 vanilla ONAM refs write it.
+_REFR_ACTION_OPEN_BY_DEFAULT = 0x0D
+
+
+# ---------------------------------------------------------------------------
+# WRLD water and fallback planes
+# ---------------------------------------------------------------------------
+def _wrld_edid(rec: dict) -> str:
+    """This WRLD's EditorID as the converted plugin names it.
+
+    See: docs/commentary/script_convert.md#worldspace-property-rename
+    """
+    return converted_worldspace_edid(get_str(rec, 'EditorID'))
+
+
+def _world_parent(rec: dict) -> bytes:
+    """WRLD WNAM, plus PNAM only when the source authored one.
+
+    See: docs/commentary/tes4_export_falloutnv.md#child-worldspaces
+    """
+    wnam = get_formid(rec, 'WNAM.Parent')
+    if not wnam:
+        return b''
+    pnam = parent_use_flags(rec)
+    subs = pack_formid_subrecord('WNAM', wnam)
+    if pnam is not None:
+        subs += pack_uint16_subrecord('PNAM', pnam)
+    return subs
+
+
+def _world_water_and_planes(rec: dict) -> bytes:
+    """WRLD NAM2/NAM3 water types and the NAM4/DNAM fallback planes.
+
+    DNAM/NAM4 are authored only by FO3/FNV. TES4 falls back to a land plane
+    far below the terrain and a water plane at sea level; equalizing them
+    sinks every unauthored water surface. NAM3 stays on DefaultWater always:
+    a null LOD water pointer CTDs as soon as a .btr carries a WATER
+    BSMultiBoundNode.
+    See: docs/commentary/tes5_import_world.md#wrld-land-and-water-defaults
+    """
+    subs = pack_formid_subrecord(
+        'NAM2', get_formid(rec, 'NAM2.Water') or default_water())
+    subs += pack_formid_subrecord('NAM3', 0x00000018)
+    subs += pack_float_subrecord('NAM4', get_float(rec, 'NAM4.LODWaterHeight'))
+    subs += pack_subrecord('DNAM', struct.pack(
+        '<ff',
+        get_float(rec, 'DNAM.DefaultLandHeight', _TES4_DEFAULT_LAND_HEIGHT),
+        get_float(rec, 'DNAM.DefaultWaterHeight', _TES4_DEFAULT_WATER_HEIGHT)))
+    return subs
 
 
 # TES4 'DefaultClimate' (Oblivion.esm 0x0000015F).  The engine hardcodes this
@@ -256,6 +321,19 @@ def set_cell_locations(cell_to_location: dict,
     _WORLD_LOCATION.update(world_to_location or {})
 
 
+def _direct_matt(rec: dict) -> int:
+    """A MATT FormID the source named outright, or 0.
+
+    A vanilla Skyrim FormID is a literal constant, so it must NOT go through
+    `get_formid`, whose load-order remapping would rewrite its index byte.
+    """
+    raw = rec.get('HNAM.MaterialFormID')
+    try:
+        return int(raw, 16) if raw else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def convert_LTEX(rec: dict, writer=None) -> tuple:
     """LTEX — needs companion TXST record in TES5.
     Returns (ltex_bytes, txst_bytes_or_None, txst_formid)."""
@@ -266,7 +344,7 @@ def convert_LTEX(rec: dict, writer=None) -> tuple:
 
     icon_path = get_str(rec, 'ICON')
     material = get_int(rec, 'HNAM.Material')
-    matt_fid = MATT_MAP.get(material, 0x00012F34)
+    matt_fid = _direct_matt(rec) or MATT_MAP.get(material, 0x00012F34)
 
     # Create TXST record
     txst_fid = 0
@@ -321,21 +399,38 @@ def convert_LTEX(rec: dict, writer=None) -> tuple:
     return ltex_bytes, txst_bytes, txst_fid
 
 
+#: Vanilla XCLL for an interior that authored none. See: docs/commentary/tes5_import_world.md#every-interior-gets-an-xcll
+_GENERIC_XCLL = bytes.fromhex(
+    '1e1e2800000000000000000000000000000000000000000000000000'
+    '00000000000000000000803f211e29001a1e26001e1f28001e1c2800'
+    '0e0e12002d2d3d00000000000000803f000000000000803f00000000'
+    '000000009f000000')
+
+
+def _cell_flags(rec: dict) -> int:
+    """TES5 CELL DATA flags: drop TES4 bits 3/6, add bit 8 to a Show Sky interior.
+
+    See: docs/commentary/tes5_import_world.md#every-interior-gets-an-xcll
+    """
+    flags = get_int(rec, 'DATA.Flags') & ~0x08 & ~0x40
+    if flags & 0x01 and flags & 0x80:
+        flags |= 0x100
+    return flags & 0xFFFF
+
+
 def build_cell_xcll(rec: dict):
     """TES5 XCLL payload (92 bytes) from a TES4 CELL record, or None.
 
-    Shared by convert_CELL and the override path (override_builder), so an
-    authored lighting change patches the exact bytes conversion writes.
+    Shared by convert_CELL and the override path.  No authored lighting:
+    `_GENERIC_XCLL` for an interior, None for an exterior.
 
-    TES5 XCLL layout (per xEdit wbDefinitionsTES5):
-     0 ambient, 4 directional, 8 fog near color, 12 fog near, 16 fog far,
-     20 dir rot XY, 24 dir rot Z, 28 dir fade, 32 fog clip, 36 fog power,
-     40 directional ambient X+/X-/Y+/Y-/Z+/Z- (6 colors), 64 specular,
-     68 scale, 72 fog far color, 76 fog max, 80/84 light fade begin/end,
-     88 inherit flags.
+    Layout (xEdit wbDefinitionsTES5): 0 ambient, 4 directional, 8 fog near
+    color, 12 fog near, 16 fog far, 20/24 dir rot XY/Z, 28 dir fade, 32 fog
+    clip, 36 fog power, 40 six directional-ambient colors, 64 specular, 68
+    scale, 72 fog far color, 76 fog max, 80/84 fade begin/end, 88 inherit.
     """
     if not get_str(rec, 'XCLL.AmbientR'):
-        return None
+        return _GENERIC_XCLL if get_int(rec, 'DATA.Flags') & 0x01 else None
     ar = get_int(rec, 'XCLL.AmbientR')
     ag = get_int(rec, 'XCLL.AmbientG')
     ab = get_int(rec, 'XCLL.AmbientB')
@@ -395,6 +490,14 @@ def build_cell_xclw(rec: dict):
     if not (-1e9 < whf < 1e9):
         return None
     return struct.pack('<f', whf)
+
+
+def cell_water_height(rec: dict, wrld_rec: dict = None) -> float:
+    """Where the engine puts a cell's water: its XCLW, else its worldspace's default."""
+    xclw = build_cell_xclw(rec)
+    if xclw is not None:
+        return struct.unpack('<f', xclw)[0]
+    return get_float(wrld_rec or {}, 'DNAM.DefaultWaterHeight', _TES4_DEFAULT_WATER_HEIGHT)
 
 
 def build_wrld_mnam(rec: dict):
@@ -482,9 +585,7 @@ def build_wrld_cloud_modl(rec: dict, edid: str = None):
     if not _CLOUD_BANK_ROOT:
         return None
     if edid is None:
-        edid = get_str(rec, 'EditorID')
-        if edid == 'Tamriel':
-            edid = 'TES4Tamriel'      # matches convert_WRLD's rename
+        edid = _wrld_edid(rec)
     if not edid or not get_str(rec, 'NAM0.MinX'):
         return None
     from asset_convert.lod.worldmap_clouds import (generate_cloud_bank,
@@ -520,18 +621,14 @@ def convert_CELL(rec: dict) -> bytes:
     See: docs/commentary/tes4_export_falloutnv.md#reference-only-types
     """
     subs = b''
-    edid = get_str(rec, 'EditorID')
+    edid = converted_worldspace_edid(get_str(rec, 'EditorID'))
     if edid:
         subs += pack_string_subrecord('EDID', edid)
     full = get_str(rec, 'FULL')
     if full:
         subs += pack_string_subrecord('FULL', full)
 
-    # DATA — TES5 uses uint16 flags (not uint8)
-    flags = get_int(rec, 'DATA.Flags')
-    flags &= ~0x08  # Remove Oblivion interior flag
-    flags &= ~0x40  # Remove Hand Changed flag
-    subs += pack_subrecord('DATA', struct.pack('<H', flags & 0xFFFF))
+    subs += pack_subrecord('DATA', struct.pack('<H', _cell_flags(rec)))
 
     # XCLC — grid coordinates (exterior cells)
     x = get_int(rec, 'XCLC.X', None)
@@ -540,10 +637,9 @@ def convert_CELL(rec: dict) -> bytes:
         land = get_int(rec, 'XCLC.LandFlags', 0)
         subs += pack_subrecord('XCLC', struct.pack('<iiI', x, y, land))
 
-    # Interior lighting (XCLL) — shared with the override path
-    xcll_payload = build_cell_xcll(rec)
-    if xcll_payload is not None:
-        subs += pack_subrecord('XCLL', xcll_payload)
+    xcll = build_cell_xcll(rec)
+    if xcll is not None:
+        subs += pack_subrecord('XCLL', xcll)
 
     subs += pack_formid_subrecord('LTMP', 0)
 
@@ -568,14 +664,7 @@ def convert_CELL(rec: dict) -> bytes:
 
 def convert_WRLD(rec: dict) -> bytes:
     subs = b''
-    edid = get_str(rec, 'EditorID')
-
-    # Oblivion's Tamriel (FormID 0x3C) conflicts with Skyrim's Tamriel.
-    # After load-order remapping it becomes 0x0100003C which overrides Skyrim's
-    # worldspace. Rename to avoid the override.
-    if edid == 'Tamriel':
-        edid = 'TES4Tamriel'
-
+    edid = _wrld_edid(rec)
     if edid:
         subs += pack_string_subrecord('EDID', edid)
 
@@ -605,33 +694,10 @@ def convert_WRLD(rec: dict) -> bytes:
     if world_lctn:
         subs += pack_formid_subrecord('XLCN', world_lctn)
 
-    wnam = get_formid(rec, 'WNAM.Parent')
-    if wnam:
-        subs += pack_formid_subrecord('WNAM', wnam)
-        subs += pack_uint16_subrecord('PNAM', parent_use_flags(rec))
-
+    subs += _world_parent(rec)
     subs += pack_formid_subrecord('CNAM', _world_climate(rec))
 
-    # Water: NAM2 (water type) and NAM3 (LOD water type).  WATR is converted
-    # (convert_WATR), so the authored TES4 pointer is honoured when there is
-    # one — 14 of Oblivion.esm's 84 worldspaces point NAM2 at lava, and
-    # hardcoding 0x18 here is what made every Oblivion realm render as
-    # ordinary blue water regardless of what its WATR said.  Worldspaces with
-    # no authored water fall back to Skyrim.esm's DefaultWater (0x18, master
-    # index 0), as vanilla Tamriel does.
-    #
-    # NAM3 stays on DefaultWater in all cases: it is the water drawn on
-    # distant terrain LOD, which vanilla always renders as ordinary water, and
-    # without a valid NAM3 the engine's terrain-LOD water codepath derefs a
-    # null WATR pointer and CTDs as soon as a .btr contains a WATER
-    # BSMultiBoundNode.  NAM4 = LOD water height; Oblivion's sea level is 0.
-    nam2 = get_formid(rec, 'NAM2.Water') or 0x00000018
-    subs += pack_formid_subrecord('NAM2', nam2)
-    subs += pack_formid_subrecord('NAM3', 0x00000018)
-    subs += pack_float_subrecord('NAM4', get_float(rec, 'NAM4.LODWaterHeight'))
-    subs += pack_subrecord('DNAM', struct.pack(
-        '<ff', get_float(rec, 'DNAM.DefaultLandHeight', -2048.0),
-        get_float(rec, 'DNAM.DefaultWaterHeight')))
+    subs += _world_water_and_planes(rec)
 
     # MODL — "Cloud Model", the mesh the WORLD MAP drapes over the terrain.
     # xEdit places the Cloud Model struct after the LOD/land data and before the
@@ -777,7 +843,9 @@ def _refr_base_formid(rec: dict, name_raw: int) -> int:
     master offset.
     See: docs/commentary/tes4_export_falloutnv.md#marker-base-objects
     """
-    marker = TES4_MARKER_FORMID_TO_SKYRIM.get(name_raw)
+    marker = final_base(rec)
+    if marker is None:
+        marker = TES4_MARKER_FORMID_TO_SKYRIM.get(name_raw)
     if marker is None:
         marker = marker_substitute(name_raw)
     return marker if marker is not None else get_formid(rec, 'NAME')
@@ -816,13 +884,16 @@ def _refr_xloc(rec: dict):
 
     Returns (bytes, barrier_door).  XLOC is 20 bytes in TES5 and the lock is
     transferred faithfully -- TES4 level 100 becomes Requires Key (255).  AI
-    passage through a locked barrier door is granted by OWNERSHIP, never by
-    weakening the lock.
+    passes a locked barrier door by OWNERSHIP, never a weakened lock.  A TES3
+    lock sealing only the way out is dropped: TES5 locks the doorway.
 
     See: docs/commentary/tes5_import_actors.md#barrier-door-ownership
+    See: docs/commentary/tes5_import_world.md#tes3-exit-only-door-locks
     """
     lock_level = get_int(rec, 'XLOC.Level', -1)
     if lock_level < 0:
+        return b'', False
+    if is_tes3_source() and lock_is_exit_only(rec):
         return b'', False
     barrier_door = False
     lock_key = get_formid(rec, 'XLOC.Key')
@@ -884,10 +955,20 @@ def shifted_position(rec: dict, scale) -> tuple:
     return px - shift * s * wx, py - shift * s * wy, pz - shift * s * wz
 
 
+def _refr_open_by_default(rec: dict) -> bool:
+    """True if the ref authored ONAM "Open by Default" and has no lock.
+
+    See: docs/commentary/tes5_import_actors.md#open-by-default
+    """
+    return (get_str(rec, 'ONAM.OpenByDefault') == '1'
+            and get_int(rec, 'XLOC.Level', -1) < 0)
+
+
 def _refr_data(rec: dict, scale) -> bytes:
-    """The DATA position/rotation subrecord, with furniture-origin shift."""
+    """[ONAM] then the DATA position/rotation subrecord, with furniture-origin shift."""
     px, py, pz = shifted_position(rec, scale)
-    return pack_subrecord('DATA', struct.pack(
+    onam = pack_subrecord('ONAM', b'') if _refr_open_by_default(rec) else b''
+    return onam + pack_subrecord('DATA', struct.pack(
         '<ffffff', px, py, pz,
         _safe_angle(get_float(rec, 'RotX')),
         _safe_angle(get_float(rec, 'RotY')),
@@ -895,7 +976,7 @@ def _refr_data(rec: dict, scale) -> bytes:
 
 
 def _refr_head(rec: dict) -> bytes:
-    """EDID, NAME and the XPRM primitive of a REFR.
+    """EDID, NAME, the open-by-default XACT and the XPRM primitive of a REFR.
 
     An invisible-marker base is substituted with its Skyrim.esm equivalent so
     the ref points into index 0.  Oblivion.esm ships 6 refs on the MapMarker
@@ -915,6 +996,9 @@ def _refr_head(rec: dict) -> bytes:
         name_fid = 0x0000003B
     if name_fid:
         subs += pack_formid_subrecord('NAME', name_fid)
+    if _refr_open_by_default(rec):
+        subs += pack_subrecord('XACT', struct.pack(
+            '<I', get_int(rec, 'XACT.ActionFlag', _REFR_ACTION_OPEN_BY_DEFAULT)))
     primitive = get_str(rec, 'XPRM.Raw')
     if primitive:
         subs += pack_subrecord('XPRM', bytes.fromhex(primitive))
@@ -929,7 +1013,7 @@ def convert_REFR(rec: dict) -> bytes:
     ... XSCL ... XMRK/FNAM/FULL/TNAM ... XLRT ... DATA
 
     A keyless barrier door with no authored owner is owned to the
-    plugin-origin faction; TES4 XACT/ONAM is deliberately not transferred.
+    plugin-origin faction.
 
     See: docs/commentary/tes5_import_actors.md#barrier-door-ownership
 
@@ -960,11 +1044,11 @@ def convert_REFR(rec: dict) -> bytes:
     if xesp_ref and base_uses_parent_ref(rec.get('NAME', '')):
         subs += pack_subrecord('XLKR', struct.pack('<II', 0, xesp_ref))
 
-    # Ownership (XOWN)
-    xown = get_formid(rec, 'XOWN.Owner')
+    xown = (stock_owner(get_formid(rec, 'FormID'))
+            or get_formid(rec, 'XOWN.Owner'))
     if not xown and barrier_door:
-        from .actor_common import get_origin_faction_fid
-        xown = get_origin_faction_fid()
+        from .actor_common import get_origin_faction_fid, is_support_root
+        xown = get_origin_faction_fid() if is_support_root() else 0
     if xown:
         subs += pack_formid_subrecord('XOWN', xown)
 
@@ -997,7 +1081,7 @@ def convert_REFR(rec: dict) -> bytes:
         # Map markers must be persistent references — the map/fast-travel system
         # resolves them outside the loaded cell.  All 397 vanilla markers set it.
         flags |= REFR_PERSISTENT_FLAG
-    return pack_record('REFR', get_formid(rec, 'FormID'), flags, subs)
+    return pack_record('REFR', get_formid(rec, 'FormID'), tes3_refr_flags(flags), subs)
 
 
 def convert_ACHR(rec: dict) -> bytes:
@@ -1019,6 +1103,7 @@ def convert_ACHR(rec: dict) -> bytes:
     name_fid = get_formid(rec, 'NAME')
     if name_fid:
         subs += pack_formid_subrecord('NAME', name_fid)
+    subs += linked_ref_subrecord(rec)
 
     # XLCN — Persistent Location (see convert_REFR). This is what lets a quest
     # marker resolve onto a persistent actor placed inside an interior — without
@@ -1039,13 +1124,15 @@ def convert_ACHR(rec: dict) -> bytes:
 
     px = get_float(rec, 'PosX')
     py = get_float(rec, 'PosY')
-    pz = get_float(rec, 'PosZ')
+    pz = actor_placement_z(get_float(rec, 'PosZ'))
     rx = _safe_angle(get_float(rec, 'RotX'))
     ry = _safe_angle(get_float(rec, 'RotY'))
     rz = _safe_angle(get_float(rec, 'RotZ'))
     subs += pack_subrecord('DATA', struct.pack('<ffffff', px, py, pz, rx, ry, rz))
 
     flags = get_int(rec, 'RecordFlags')
+    if starts_dead(get_str(rec, 'FormID')):
+        flags |= STARTS_DEAD_FLAG
     return pack_record('ACHR', get_formid(rec, 'FormID'), flags, subs)
 
 
@@ -1096,9 +1183,10 @@ def build_land_layers(rec: dict) -> bytes:
     Split out of convert_LAND so the override path can rebuild the whole run
     from the PLUGIN's export when an author changes Layer[] (override_builder
     _RUN_LAND_LAYERS). The merge/sort/cap below is lossy and order-dependent,
-    so an override MUST reuse this function rather than reimplement it — two
-    implementations would disagree and the terrain would re-texture itself on
-    every unrelated edit.
+    so an override MUST reuse this function: two implementations would
+    disagree and re-texture the terrain on every unrelated edit. A quadrant
+    with alpha layers and no BASE is written without a BTXT.
+    See: docs/commentary/tes5_import_world.md#land-quadrants-without-a-base-layer
     """
     subs = b''
 
@@ -1149,11 +1237,10 @@ def build_land_layers(rec: dict) -> bytes:
             else:
                 alpha_layers[quad].append([tex, vtxt])
 
-    # Pass 2: emit base layers first, then sorted alpha layers
-    for quad in sorted(base_layers):
-        tex = base_layers[quad]
-        btxt = struct.pack('<IBBxx', tex, quad, 0)
-        subs += pack_subrecord('BTXT', btxt)
+    for quad in sorted(base_layers.keys() | alpha_layers.keys()):
+        if quad in base_layers:
+            btxt = struct.pack('<IBBxx', base_layers[quad], quad, 0)
+            subs += pack_subrecord('BTXT', btxt)
 
         layers_for_quad = alpha_layers.get(quad, [])
         # Sort by coverage score descending (sum of opacity values), keep top 6
@@ -1227,7 +1314,7 @@ def _cell_location(rec: dict) -> bytes:
     return pack_formid_subrecord('XLCN', lctn_fid) if lctn_fid else b''
 
 
-def _cell_music(rec: dict) -> bytes:
+def cell_music(rec: dict) -> bytes:
     """CELL XCMO: an FO3/FNV MUSC, else TES4's 3-value XCMT enum resolved.
 
     An interior with no authored XCMT takes the engine default; exteriors are
@@ -1252,6 +1339,8 @@ def _cell_pointers(rec: dict) -> bytes:
     XEZN exists only in FO3/FNV sources; XCWT overrides the worldspace NAM2.
     XCIM is deliberately NOT written: TES5 HNAM has no FNV source, so the
     imagespace HDR block is approximated and darkened every interior.
+    XCCM names the region a "Show Sky" interior takes its sky and weather
+    from, and follows the music exactly as vanilla Skyrim writes it.
 
     See: docs/commentary/tes5_import_landscape.md#cell-water-and-music
     """
@@ -1263,7 +1352,11 @@ def _cell_pointers(rec: dict) -> bytes:
     xcwt = get_formid(rec, 'XCWT.Water')
     if xcwt:
         subs += pack_formid_subrecord('XCWT', xcwt)
-    return subs + _cell_music(rec)
+    subs += cell_music(rec)
+    xccm = get_formid(rec, 'XCCM.Climate')
+    if xccm and region_was_emitted(xccm):
+        subs += pack_formid_subrecord('XCCM', xccm)
+    return subs
 
 
 # ---------------------------------------------------------------------------
@@ -1459,8 +1552,8 @@ def convert_EFSH(rec: dict) -> bytes:
     put_f(112, 'DATA.PartBirthRampUp')
     put_f(116, 'DATA.PartFullBirthTime')
     put_f(120, 'DATA.PartBirthRampDown')
-    put_f(124, 'DATA.PartFullBirthRatio', 1.0)
-    put_f(128, 'DATA.PartPersistBirthRatio', 1.0)
+    for off, key in ((124, 'DATA.PartFullBirthRatio'), (128, 'DATA.PartPersistBirthRatio')):
+        struct.pack_into('<f', data, off, get_float(rec, key, 1.0) * EFSH_PARTICLES_PER_RATIO)
     put_f(132, 'DATA.PartLifetime', 1.0)
     put_f(136, 'DATA.PartLifetimeDelta')
     put_f(140, 'DATA.PartInitSpeedNormal')

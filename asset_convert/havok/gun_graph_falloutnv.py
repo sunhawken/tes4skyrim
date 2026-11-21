@@ -1,13 +1,13 @@
 """The FO3/FNV gun state machines, as nodes for the SSE humanoid graphs.
 
-A gun is hand type 13 (TESRuntime writes it for a WEAP carried in a gun
+A gun is hand type 13 (FalloutRuntime writes it for a WEAP carried in a gun
 sidecar; the vanilla types stop at 12, the crossbow). Every machine here is
 keyed on the graph variables the DLL sets beside it: `iGunClass` (index into
 GUN_CLASSES), `iGunReload` (reload letter index), `iGunAttack` (index into
 ATTACK_ACTIONS), `iGunClipSize` and `iGunAuto`. Firing goes through the
 engine's own ranged-weapon events (arrowAttach, bowDrawn, BowRelease,
 arrowRelease, attackStop), so the shot, the ammo and the projectile are the
-engine's; TESRuntime counts the magazine into `iGunShots` (a shot adds one,
+engine's; FalloutRuntime counts the magazine into `iGunShots` (a shot adds one,
 the reload clip's end resets it), so the graph only reads it.
 
 Machines:
@@ -24,40 +24,39 @@ from asset_convert.havok.behavior_nodes import (F_LOCAL, GraphBuilder,
                                                 TRIGGER_TMPL)
 from asset_convert.havok.gun_vocabulary_falloutnv import (ATTACK_ACTIONS,
                                                           GUN_CLASSES,
+                                                          LOOP_ACTION,
                                                           RELOAD_LETTERS)
 
-#: The hand type TESRuntime writes for a gun (vanilla stops at 12, crossbow).
+#: The hand type FalloutRuntime writes for a gun (vanilla stops at 12, crossbow).
 GUN_HAND_TYPE = 13
 
 #: Variables the DLL sets per equipped gun, plus the graph's own counters.
 GUN_VARIABLES = ('iGunClass', 'iGunReload', 'iGunAttack', 'iGunClipSize',
                  'iGunAuto', 'iGunShots', 'iGunZoom')
-#: The zoom selector TESRuntime writes (0 hip, 1 iron sights) for the attack clips.
+#: The zoom selector FalloutRuntime writes (0 hip, 1 iron sights) for the attack clips.
 ZOOM_VAR = 'iGunZoom'
-#: REAL variable: the zoom blend TESRuntime ramps (0 hip .. 1 iron); every aim pose crossfades on it.
+#: REAL variable: the zoom blend FalloutRuntime ramps (0 hip .. 1 iron); every aim pose crossfades on it.
 ZOOM_BLEND_VAR = 'fGunZoom'
 #: hkbBlenderGenerator flags: sync + parametric, what every vanilla parametric blend carries.
 PARAMETRIC_BLEND = 17
 #: REAL variable: the automatic loop clip's playbackSpeed, weaponSpeedMult x loop duration.
 LOOP_SPEED_VAR = 'fGunLoopSpeed'
-#: The attack action that fires once per loop pass (automatic weapons).
-LOOP_ACTION = 'attackloop'
 #: Events the gun clips raise for their own machines.
 GUN_EVENTS = ('TES4GunFireEnd', 'TES4GunReloadStart', 'TES4GunReloadEnd',
               'TES4GunAttackEnd', 'TES4GunReloadRequest', 'reloadStart',
               'TES4GunFire', 'TES4GunFireRelease')
-#: The attack-button events TESRuntime sends (press, release); the engine's attack actions never reach a gun.
+#: The attack-button events FalloutRuntime sends (press, release); the engine's attack actions never reach a gun.
 FIRE_EVENT = 'TES4GunFire'
 FIRE_RELEASE = 'TES4GunFireRelease'
-#: The clip trigger TESRuntime fires the gun on (an engine event name, one per round).
+#: The clip trigger FalloutRuntime fires the gun on (an engine event name, one per round).
 SHOT_EVENT = 'arrowRelease'
-#: The event TESRuntime sends for the reload key.
+#: The event FalloutRuntime sends for the reload key.
 RELOAD_REQUEST = 'TES4GunReloadRequest'
 #: A reload only while the magazine is not full.
 RELOAD_ALLOWED = 'iGunShots > 0'
 #: The engine's own ammo-equipped event, which vanilla routes to the crossbow reload.
 ENGINE_RELOAD = 'reloadStart'
-#: The engine's crossbow attack event; a gun's root never takes it (TESRuntime owns the click).
+#: The engine's crossbow attack event; a gun's root never takes it (FalloutRuntime owns the click).
 CROSSBOW_ATTACK = 'crossbowAttackStart'
 #: Root transitions that must keep the crossbow's hand type only (no gun bash).
 BASH_EVENTS = ('bashStart', 'bashPowerStart')
@@ -130,6 +129,7 @@ class GunClips:
         self.entries = {c['stem']: c for c in manifest['clips']}
         self.anim_dir = manifest['anim_dir']
         self.classes = manifest['classes']
+        self.camera_bone = manifest.get('camera_bone')
         self.by_key = {}
         for stem, c in self.classes.items():
             if stem in self.entries:
@@ -154,9 +154,18 @@ class GunClips:
         have = {c['cls'] for c in self.classes.values()}
         return [c for c in GUN_CLASSES if c in have and self.attacks_of(c)]
 
+    def timing_stem(self, cls, action, iron=False):
+        """The clip an attack's triggers are timed on: its level clip, else
+        its down clip when both pitched clips exist (the pitch blend's
+        midpoint is the level pose), else None."""
+        level = self.find(cls, action, iron=iron)
+        down = self.find(cls, action, pitch='down', iron=iron)
+        up = self.find(cls, action, pitch='up', iron=iron)
+        return level or (down if up else None)
+
     def attacks_of(self, cls) -> list:
-        """The attack actions the class has a level clip for."""
-        return [a for a in ATTACK_ACTIONS if self.find(cls, a)]
+        """The attack actions the class can play (level or both pitches)."""
+        return [a for a in ATTACK_ACTIONS if self.timing_stem(cls, a)]
 
     def reloads_of(self, cls) -> list:
         """The reload letters the class has a clip for."""
@@ -272,6 +281,24 @@ class GunGraphBuilder(GraphBuilder):
         t.param('pDefaultGenerator', gen_ref)
         t.param('iStateToSetAs', istate)
         t.param('iPriority', prio)
+        return t
+
+    def eased_direction_blend(self, name, kids):
+        """The direction blend under a BSCyclicBlendTransitionGenerator on
+        `Direction`, a smooth ease between directions."""
+        blend = self._blender(f'{name}_Blend', kids, None, '0.000000', 49)
+        t = self.add('BSCyclicBlendTransitionGenerator')
+        t.param('variableBindingSet',
+                self.binding_set([('fBlendParameter', 'Direction')]).ref)
+        t.param('userData', 0)
+        t.param('name', name)
+        t.param('pBlenderGenerator', blend.ref)
+        for member, event in (('EventToFreezeBlendValue', 'CyclicFreeze'),
+                              ('EventToCrossBlend', 'CyclicCrossBlend')):
+            t.param_raw(member, _EVENT_TMPL.format(eid=self.eid.get(event, -1)))
+        t.param('fBlendParameter', '0.000000')
+        t.param('fTransitionDuration', f'{DIRECTION_EASE_SECONDS:.6f}')
+        t.param('eBlendCurve', 'BLEND_CURVE_SMOOTH')
         return t
 
     def eem_assign(self, name, items):
@@ -494,7 +521,7 @@ def ready_machine(gb: GunGraphBuilder, cls, lower_bw, upper_bw):
 
 
 def fire_triggers(entry: dict) -> list:
-    """The shot trigger at the clip's fire frame (TESRuntime launches the
+    """The shot trigger at the clip's fire frame (FalloutRuntime launches the
     round on it), and the attack window opening at FNV's `a:` key.
     See: docs/commentary/tes_runtime_guns.md#the-shot
     """
@@ -512,9 +539,9 @@ def _attack_blend(gb: GunGraphBuilder, cls, action, name, iron):
     shot triggers; the loop attack plays at the class' loop speed.
     See: docs/commentary/asset_convert_falloutnv.md#automatic-fire-rate
     """
-    level = gb.clips.find(cls, action, iron=iron)
-    trig = fire_triggers(gb.clips.entries[level])
-    stems = (gb.clips.find(cls, action, pitch='down', iron=iron), level,
+    trig = fire_triggers(gb.clips.entries[gb.clips.timing_stem(cls, action, iron)])
+    stems = (gb.clips.find(cls, action, pitch='down', iron=iron),
+             gb.clips.find(cls, action, iron=iron),
              gb.clips.find(cls, action, pitch='up', iron=iron))
     speed = LOOP_SPEED_VAR if action == LOOP_ACTION else 'weaponSpeedMult'
     return gb.pitch_blend(name, stems, trig, looping=False, speed_var=speed)
@@ -527,7 +554,7 @@ def _attack_gen(gb: GunGraphBuilder, cls, action, tag):
     """
     name = f'TES4Gun_{cls}_{action}{tag}'
     hip = _attack_blend(gb, cls, action, name, False)
-    if not gb.clips.find(cls, action, iron=True):
+    if not gb.clips.timing_stem(cls, action, iron=True):
         return hip
     iron = _attack_blend(gb, cls, action, f'{name}_IS', True)
     return gb.msg(f'{name}_ZoomMSG', [hip.ref, iron.ref], ZOOM_VAR)
@@ -537,7 +564,7 @@ def _fire_gen(gb: GunGraphBuilder, cls, letter):
     """The fire clip selector, under a per-frame loop-speed assignment when
     the class has a loop attack."""
     gen = fire_msg(gb, cls, letter)
-    loop = gb.clips.find(cls, LOOP_ACTION)
+    loop = gb.clips.timing_stem(cls, LOOP_ACTION)
     if not loop:
         return gen
     dur = gb.clips.entries[loop]['duration']
@@ -608,7 +635,7 @@ def fire_machine(gb: GunGraphBuilder, cls, reload_entry=False):
     """Fire (A/B alternate for automatics) -> reload or done; `reload_entry`
     starts the machine at Reload (Done without a reload clip).
 
-    `iGunShots` is TESRuntime's; the transitions are instant since the fire
+    `iGunShots` is FalloutRuntime's; the transitions are instant since the fire
     clips end at the aim pose.
     See: docs/commentary/asset_convert_falloutnv.md#fire-transitions-are-instant
     """
@@ -678,6 +705,10 @@ def class_selector(gb: GunGraphBuilder, name, build):
 # ---------------------------------------------------------------------------
 
 _DIRS = (('forward', 0.0), ('right', 0.25), ('backward', 0.5), ('left', 0.75))
+#: fTransitionDuration of every vanilla direction BSCyclicBlendTransitionGenerator.
+DIRECTION_EASE_SECONDS = 0.2
+_EVENT_TMPL = ('<hkobject>\n\t<hkparam name="id">{eid}</hkparam>\n'
+               '\t<hkparam name="payload">null</hkparam>\n</hkobject>')
 
 
 def _gait(gb: GunGraphBuilder, cls, direction, name):
@@ -703,8 +734,8 @@ def loco_machine(gb: GunGraphBuilder, cls):
         g = _gait(gb, cls, d, f'TES4Gun_{cls}_{d}')
         if g is not None:
             kids.append((g, anchor))
-    blend = (gb.direction_blend(f'TES4Gun_{cls}_DirectionBlend',
-                                [(g.ref, a) for g, a in kids])
+    blend = (gb.eased_direction_blend(f'TES4Gun_{cls}_DirectionBlend',
+                                      [(g.ref, a) for g, a in kids])
              if len(kids) > 1 else kids[0][0])
     return gb.istate(f'TES4Gun_{cls}_iStateGen', blend.ref, RANGED_ISTATE,
                      RANGED_PRIORITY)

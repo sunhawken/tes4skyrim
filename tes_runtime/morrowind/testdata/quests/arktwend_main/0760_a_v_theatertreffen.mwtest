@@ -1,0 +1,117 @@
+# Chapter V opens: two of the Kanzler's guards take the player to the old
+# magician Calisto, whom the Kanzler wants dead. Calisto is an old friend; one
+# guard kills the other, and Calisto leaves his house.
+# Position stands in for the walks the guards take no part in; where they
+# follow, the player walks. Ref FormIDs carry Arktwend's slot 05.
+# Run: python -m tools.live.test_instance mwtest --cases <this folder> --fast --checkpoints --stop-on-fail --from theater_guards
+# See docs/commentary/headless_testing.md#quest-runs
+
+# The two guards in front of the theater greet the player and come along. The
+# second enables himself only while the journal is still 2, which the first's
+# greeting moves on, so the player arrives ~1200 units out, as a walker would,
+# and the guards' scripts run before the approach. The spot is on the navmesh (a walk needs a start triangle).
+case theater_guards
+# The thieves' guild fight follows the player out (DiebBoernAufbrausende, DiebGardeshSilberzunge): a player in
+# combat runs no travel package, so the walk below never starts.
+defend
+run
+player->Position -776 48005 239 0
+wait 120
+# Walked in, not placed: Wache02 greets within 500 and Wache01 within 400, so an approaching player meets Wache02
+# first ("we will accompany you", journal 2 -> 3 and both follow). The walk stops on its own route inside
+# Wache02's range only (388 from him, 451 from Wache01): ending inside both is a race between the two scripts.
+# A walk may stop up to 128 short; along this route that still leaves the player within ~485 of Wache02.
+walk -690 48955 208
+until 300 MenuMode == 1
+wait 60
+bye
+expect GetJournalIndex A_V_TheaterTreffen == 3
+# The second guard then greets on his own (TheaterWache02: Stormwendvar 20, within 500).
+until 300 MenuMode == 1
+wait 60
+bye
+end
+
+# Calisto's house near Castle Grel, the guards following the player; they
+# stay outside.
+case theater_calisto_house
+# The guards follow, so the player walks there; the gate guard's recruiting pitch and STADAntonia
+# outside the gate may greet on the way, which ends a walk, so the walk is taken up again.
+defend
+# The engine's route walks into the gap between a rock and a tree south of the town and stalls on
+# the X0Y6 hill: the player steers past both (the old route's turns), at pace 10 for the climb.
+walk -1641 28801 742
+bye if open
+walk -1641 28801 742
+bye if open
+pace 10
+steer -1145 27342 418
+walk 1994 26389 201
+bye if open
+walk 1994 26389 201
+steer 2270 26119 354
+steer 2251 25961 524
+steer 2161 25751 552
+steer 2018 25584 580
+steer 1987 25499 596
+steer 1729 24498 1015
+pace 25
+# A long walk round the PastureLand mountains (several cells): legs at the north valley's turns, since the
+# engine otherwise takes the newly meshed slopes over the hill east and slides back on them.
+walk 9960 28811 450
+bye if open
+walk 11602 31869 450
+bye if open
+walk 14089 34673 450
+bye if open
+# Planner turns east of the valley: the engine turned south into the dip at (14600 34200) and slid (11-16 recording).
+walk 15170 35301 670
+bye if open
+walk 18107 37130 847
+bye if open
+walk 33300 37150 123
+bye if open
+walk 33300 37150 123
+bye if open
+walk 33300 37150 123
+bye if open
+walk 33300 37150 123
+until 3000 "TheaterTreffenWache01"->GetDistance player < 800
+until 3000 "TheaterTreffenWache02"->GetDistance player < 800
+until 300 GetJournalIndex A_V_TheaterTreffen == 4
+# "We'll stand watch out here": both guards stop following before the door.
+until 600 "TheaterTreffenWache01"->GetCurrentAIPackage != 3
+until 600 "TheaterTreffenWache02"->GetCurrentAIPackage != 3
+activate 055BCF10
+until 300 GetPCCell "Calisto's House" == 1
+end
+
+# Inside.
+case theater_inside
+run
+player->PositionCell -216 740 127 0 "Calisto's House"
+until 300 GetJournalIndex A_V_TheaterTreffen == 5
+end
+
+# Calisto remembers that night, and proposes a pact against the Kanzler.
+case theater_calisto
+run
+player->PositionCell -257 200 136 0 "Calisto's House"
+talk CalistoHausCalisto01
+ask remember that night
+choose 1
+choose 2
+choose 3
+bye
+expect GetJournalIndex A_V_TheaterTreffen == 6
+until 300 "TheaterTreffenWache01"->GetHealth <= 0
+end
+
+# Outside, the surviving guard explains, and leaves to report to the Kanzler.
+case theater_guard_report
+activate 052ED5FB
+until 300 GetPCCell "Calisto's House" == 0
+talk TheaterTreffenWache02
+bye
+expect GetJournalIndex A_V_TheaterTreffen == 7
+end

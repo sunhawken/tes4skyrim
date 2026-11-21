@@ -12,8 +12,253 @@ Parameter remapping and the crash rule are in
 ## Contents
 
 - [Actor-value indices diverge from the BOOK skill table](#actor-value-vs-book-skill-table)
+- [Fallout actor values use Fallout's own table](#fallout-actor-values)
+- [Short Fallout CTDAs: the source decides, not the length](#fallout-short-ctda)
+- [Which functions carry an actor value](#av-param-funcs)
 - [Chargen-identity conditions become menu-choice globals](#chargen-identity-to-menu-globals)
 - [Speak-as topics drop the actor-interrogating conditions](#non-actor-speaker-drop)
+- [GetInCell names a prefix family, not a cell](#getincell-prefix-family)
+- [Condition order: cheapest OR group first](#condition-order)
+- [How the engine evaluates conditions and builds the topic list](#engine-evaluation)
+- [Engine-fixed FormID parameters](#engine-fixed-params)
+- [GameDaysPassed reads a whole-day copy](#whole-days)
+- [GetIsRace on a plugin-authored race becomes a faction test](#plugin-authored-races)
+- [GetVampire becomes a test for the vampirism effect](#get-vampire)
+
+## <a id="engine-fixed-params"></a>Engine-fixed FormID parameters
+
+**Code:** `_remap_formid` in `tes5_import/base/conditions.py`
+
+A condition parameter is remapped like a record field (`text_reader.remap_formid`),
+with two exceptions for forms the engine owns.
+
+**Player forms and engine globals pass through unchanged.** Both games define
+the player base 0x07, PlayerRef 0x14 and the six clock globals (GameYear 0x35 ..
+TimeScale 0x3A) at the same ids, and a condition reads the runtime copy.
+Shifting the player rewrote `GetIsID(Player) [Target]` on 3,761 INFOs to
+0x01000007, which never passes: stage-gated reveal greetings died and NPCs kept
+only "Rumors" (Pinarus Inventius). Shifting the globals cost 119 CK warnings on
+`GetGlobalValue` against 0x01000038/0x01000037. The set is enumerated, not
+"everything below 0x100": Oblivion.esm defines 127 records of its own there
+(Tamriel WRLD 0x3C, 57 DIALs from 0xAA, 21 SKILs, 27 marker STATs), and passing
+those through would name an unrelated Skyrim form.
+
+**Engine-fixed items become the Skyrim record** (`TES4_ITEM_FORMID_TO_SKYRIM`:
+Gold001 0xF -> 0xF, lockpick 0xA -> 0xA, DASkeletonKey 0xB -> TG08SkeletonKey
+0x3A070). `get_formid` substitutes them for every item reference, so the gold
+and keys the player carries are Skyrim's. A condition that remapped them to our
+own copies asked `GetItemCount(0x0100000F)`, which is always 0: Penniless
+Olvus's "Have a coin, beggar." topic never showed, and the two MQ08 skeleton-key
+INFOs could never pass either.
+
+## <a id="whole-days"></a>GameDaysPassed reads a whole-day copy
+
+**Code:** `_remap_global` in `tes5_import/base/conditions.py`,
+`create_day_clock` in `tes5_import/base/owned_records.py`,
+`script_convert/static_scripts/TES4_DayClock.psc`
+
+The one engine global that does NOT pass through. Oblivion declares
+`GameDaysPassed` Short (`GLOB 00000039`, `FNAM.Type=s`) and counts whole days;
+Skyrim declares it Float (`FNAM=102`) and carries the fraction of the current
+day. Converted scripts store the day as `GameDaysPassed.GetValue() as Int`
+(see [tes5_import_quest.md](tes5_import_quest.md#section-2-2-2-2-2-2-2-2)), so a
+condition comparing that stored day against Skyrim's global passes at once:
+Jayred Ice-Veins (SE02) gated "The arrows are ready" (INFO 00012063) on
+`ArrowMakingFinishHour < GameHour OR ArrowMakingStartDay < GameDaysPassed`, and
+at day 12.4 the stored 12 was already less, so he handed over the bone arrows
+instead of making the player wait.
+
+A condition cannot floor a global, so the converter owns one that is already
+floored: `TES4GameDaysPassed`, held at the whole part of Skyrim's by the
+start-game quest `TES4DayClock`, whose `TES4_DayClock` script sets it on start
+and re-registers `RegisterForSingleUpdateGameTime` for just past each midnight.
+Every Use Global comparison value and every `GetGlobalValue` parameter naming
+0x39 reads it instead. In Oblivion.esm that is 16 INFO and 3 PACK conditions.
+
+The authored indicator is the source's own declaration: the clock is built only
+when the plugin or a master exports `GameDaysPassed` as Short. FalloutNV.esm
+declares it Float (`FNAM.Type=f`), so FO3/FNV conditions keep reading Skyrim's.
+A dependent plugin adopts its master's global by EditorID.
+
+## <a id="engine-evaluation"></a>How the engine evaluates conditions and builds the topic list
+
+Read from SkyrimSE 1.6.1170 (unpacked). Stable ids are Address Library ids.
+
+| Function | id | rva 1.6.1170 |
+|---|---|---|
+| `TESConditionItem::IsTrue` (one CTDA; dispatches the handler at table row +0x40) | 29924 | 0x4a05e0 |
+| `TESCondition::IsTrue` (walks the list) | 29895 | 0x49fa70 |
+| Pick a topic's line (quest gate, then each INFO in order) | 25544 | 0x3e82f0 |
+| One INFO's check (deleted, said-once, then its conditions) | — | 0x3eba10 |
+| Add one topic to the dialogue menu | — | 0x5e28e0 |
+| Build the top-level topic list (two branch lists on MenuTopicManager) | 35276 | 0x5e0190 |
+
+The script-function table is at rva 0x1fdba10, stride 0x50; condition id N is
+row N. Id 21971 also indexes it but is the script compiler, not the evaluator.
+
+**The list walk is AND over OR groups, evaluated in order.** A failing AND stops
+the walk, and an OR group stops at its first passing member. There is no time
+budget and no retry. Beside the result it returns a "not settled" flag, but only
+nested walks set it. So condition order changes cost, never the result.
+
+**The line picker drops a quest's whole topic while `Quest.IsStarting` is
+true.** That is the running flag plus either flag 0x80 ("stage wait") or a
+pending start job (+0x248). The same test backs the Papyrus native
+(rva 0xa49a30). It skips every topic in that quest, so it cannot explain one
+topic vanishing while another from the same quest stays.
+
+**Four handlers keep an unlocked single-entry "last answer" cache in globals.**
+They can hold wrong answers in play (measured below). This is vanilla engine
+behavior and we leave it alone: bypassing all four in TESRuntime changed nothing
+visible in game.
+
+| Handler | rva | Cache (key → value) |
+|---|---|---|
+| `GetIsID` | 0x32d770 | 0x3137ec0 ref → 0x3137eb8 base |
+| `GetIsVoiceType` | 0x32d850 | 0x3137ed0 ref → 0x3137ec8 voice type |
+| `GetInFaction` | 0x32d390 | 0x3137ea8 ref, 0x3137ea0 faction → 0x3137eb0 rank |
+| `GetIsPlayableRace` | 0x32d2c0 | 0x3137ed8 ref → 0x3137eb4 result |
+
+On a miss each handler stores the key and the value as separate writes, and on
+a hit it returns the stored value without recomputing it. `GetIsRace` and
+`GetIsSex` keep no cache. Conditions run on more than one thread: the walker
+keeps its context in thread-local slots, and a crash during a dialogue open had
+the topic-list build (id 35276) on a `BSJobs::JobThread`.
+
+Measured live on 1.6.1170 by reading the caches from outside the process and
+recomputing each cached actor's answer the handler's way (`ExtraLeveledCreature`
+original base, else the reference's base): cached pairs that were wrong and
+still held on the next read, e.g. actor 130653B0 held with base 13C5457C
+(another actor's) and, in another window, 00000007 (the player's), where its
+own is 13464733. Any `GetIsID` on that actor answers wrongly until another
+actor overwrites the entry. This was NOT why NPCs showed only "Rumors"; that was
+a greeting choice link replacing the topic list
+([tes5_import_dialogue.md](tes5_import_dialogue.md#info-tclt-choice-filter)).
+
+A dialogue open cost 1.1 and 2.0 million CTDA evaluations (two opens, counted on
+id 29924), against about 40,000 for one pass over every converted INFO with her
+as the subject. The bridge's generic hook on id 35304 (the branch loop) crashed
+the game at +0x44 on the next dialogue open.
+
+## <a id="condition-order"></a>Condition order: cheapest OR group first
+
+**Code:** `order_condition_groups` in `tes5_import/base/conditions.py`, applied
+to every INFO's full list in `dialogue/converter.py:_info_conditions`.
+
+Skyrim evaluates a record's conditions in order and stops at the first
+failure. It also walks a topic's INFOs this way every time it builds the topic
+list or picks a `Say` line.
+
+The unit that can move is the **OR group**: a run of conditions chained by the
+Or flag (bit 0). Groups are AND-joined, so their order never changes which lines
+pass. Within a group nothing moves. The ordering is stable and sorts groups by:
+
+1. **Groups that read a Papyrus variable go last.** Every
+   `GetVMQuestVariable`(629) or `GetVMScriptVariable`(630) evaluation crosses
+   from the main thread into the Papyrus VM (lock plus a lookup by mangled
+   name); every other condition is a plain field read. CharGenMain had 59 INFOs
+   whose `convCount` VM read came before their `GetIsID`, and its four escort
+   speakers share one voice type, so every `Say` paid about 59 VM round-trips.
+2. **Then smallest group first.** The prefix-family rewrite
+   ([above](#getincell-prefix-family)) produces OR groups of up to about 360
+   `GetInCell` checks (IC). The gates injected by the dialogue builder (the
+   speaker's `GetIsID`, `GetIsVoiceType`, the AddTopic unlock global) are small
+   and reject most speakers. Placed first, they reject a wrong speaker in a
+   couple of checks instead of after the whole chain.
+
+On the build before this ordering, Oblivion.esm's INFOs carried 311,739
+conditions (mean 18, max 753), 204,470 of them in family chains. Vanilla
+Skyrim.esm carries 55,641 over 31,465 INFOs (mean 1.8, max 22).
+
+The injected gates arrive as packed bytes, so `_info_conditions` unpacks them
+into (CTDA, CIS2) pairs and orders the combined list once. The list must not
+end on an Or flag; both builders clear a trailing one.
+
+## <a id="script-variable-conditions"></a>GetQuestVariable (79) and GetScriptVariable (53) become 629 and 630
+
+**Code:** `tes5_import/base/conditions.py` (`GET_VM_QUEST_VARIABLE`),
+`tes5_import/packages/aliases.py` (`build_script_var_map`)
+
+TES5 still LISTS functions 53 and 79, but the legacy VM behind them is gone:
+vanilla Skyrim uses them zero times and a CTDA emitted as-is can never pass.
+Function 79 is `GetQuestVariable(param1 = QUST FormID, param2 = script-local
+variable INDEX)`, and 53 is its per-reference twin `GetScriptVariable(ref,
+index)`. Param2 is an SLSD index, not a name: the name lives only in the quest's
+SCPT `Variable[i].Index/Name` table. The converter rewrites them to
+`GetVMQuestVariable` (629, param1 = quest) and `GetVMScriptVariable` (630, param1
+= ref) and writes the variable NAME in a `CIS2` subrecord right after the CTDA as
+`::<name>_var` (mangled with `_safe_property_name` to match converter renames),
+because Skyrim's param2 is a runtime string pointer. The index to name table comes
+from `build_script_var_map`, which keys on LOW-24 FormIDs (param1 is a raw TES4
+FormID with no load-order offset) and must include `master_export` or the name
+lookup misses.
+
+The lookup only works when the compiled `.pex` carries the CONDITIONAL user flag
+on both the script object and the auto-property's backing variable, so
+`script_convert` emits `Conditional` on the `ScriptName` line and on value-typed
+Auto properties (without it the CK warns "Unable to find variable ::X_var on any
+VM scripts"; Owyn's Battle-Raiment check and Kud-Ei's recommendation greetings
+died this way).
+
+Do not diagnose 79 as broken: it appearing in the TES4 EXPORT is expected (the
+export is a pure dump), and the check for a working conversion is a non-zero
+`output/Oblivion.esm/Oblivion.esm` byte count of `::convCount_var`. Only a
+missing `CIS2` or missing variable NAME is a real defect.
+
+## <a id="getincell-prefix-family"></a>GetInCell names a prefix family, not a cell
+
+**Code:** `tes5_import/base/cell_family.py`, `tes5_import/base/locations.py`
+(`_build_family_locations`).
+
+TES4 matches the `GetInCell` argument as an EditorID **prefix**:
+`GetInCell Anvil` is true in `AnvilTheCountsArms` and in the exterior
+`AnvilBayWest01`. The named cell is often an empty dummy that exists only to
+anchor the family. The script-side fix for the same semantics is
+[tes5_import_quest.md](tes5_import_quest.md#1-getincell-matched-one-cell-instead-of-the-whole-prefix-family).
+
+TES5 tests one exact cell. The condition handler (1.6.659 RVA `0x2ED0E0`)
+requires the param to be a CELL (form type `0x3C`) and compares it with the
+subject's parent cell (`+0x60`). There is no name comparison. Converted
+verbatim, every family condition passed only in the empty dummy cell, so
+"Anvil" and the other city topics vanished. On Oblivion.esm that affected
+2,879 dialogue conditions: 692 on the INFOs themselves, and 2,187 copied from
+10 `NQD<City>` quests. 95 families were affected; the largest are IC (431
+cells), Anvil (91) and Chorrol (86).
+
+**An exterior cell cannot be a condition parameter.** It is not a form until
+its grid loads. Measured live with `TESForm::LookupByID`: the interior
+`AnvilTheCountsArms` resolved to a CELL, but the exteriors `AnvilBayWest01` and
+`AnvilExteriorLighthouse02` returned null. Vanilla agrees: all 919 of
+Skyrim.esm's `GetInCell` params are interiors. The family's exterior cells are
+never whole worldspaces either (0 of 61 family/worldspace pairs), so
+`GetInWorldspace` cannot stand in for them.
+
+**Re-expression.**
+
+- Each interior member gets an exact `GetInCell(member)`.
+- The exterior members are tested with `LocationHasKeyword(TES4InCell_<anchor>)`.
+  That handler (`0x2F3EC0`) checks only the subject's *current* location, with
+  no parent walk. For an actor, the current location comes from its parent
+  cell's own XLCN before any worldspace fallback (`0x275840`).
+- So every exterior member gets its own Location
+  (`TES4<Cell>CellLocation`). It is a child of the square's former location,
+  with that location's name, marker and radius, so the load-door name and map
+  discovery are unchanged. Vanilla shares MNAM between a place and its child 24
+  times. The child owns the square's LCEC exclusively, and its KWDA lists every
+  family keyword the cell belongs to.
+- Interiors keep their ordinary Location, because the child locations are
+  built after the door pass.
+
+"In the family" becomes an OR over those tests, and "not in the family" an AND.
+The rewrite runs per OR group in conjunctive form: `X OR not-in-F` becomes the
+AND over members m of `X OR not-in-m`, so an existing OR group keeps its
+meaning.
+
+A keyword is created only for an anchor that some condition in the plugin
+names and whose family holds one of this plugin's own exterior cells. A
+dependent plugin adopts its master's keyword by EditorID. That plugin's own
+exterior family cells are tagged only when it builds Locations (i.e. when it
+owns a new worldspace).
 
 ## <a id="chargen-identity-to-menu-globals"></a>Chargen-identity conditions become menu-choice globals
 
@@ -51,19 +296,54 @@ and only there.
 
 ## <a id="actor-value-vs-book-skill-table"></a>Actor-value indices diverge from the BOOK skill table
 
-`_TES4_AV_TO_TES5` maps a TES4 actor-value index to its TES5 index. Skills
-mostly follow `base.equivalents.TES4_SKILL_TO_TES5_INDEX`, but **two entries
-deliberately differ**, because the two tables answer different questions: the
+`_TES4_AV_TO_TES5` maps a TES4 actor-value index to its TES5 index; FO3/FNV
+conditions use [their own table](#fallout-actor-values). The two games' tables
+share no entry: TES4 0 is Strength, TES5 0 Aggression; TES4 5 Endurance, TES5 5
+Assistance. Passed through unchanged, Morroblivion's Fighters Guild gate
+`Strength >= 30 AND Endurance >= 30` became `Aggression >= 30 AND Assistance >=
+30` (0-3 enums), so every guild refused the player, as did ~600 conditions
+across the exports.
+
+**Skyrim has no attributes**, and no actor value is a faithful stand-in (every
+candidate is on a different scale), so an attribute gate has no key in the
+table and drops, failing open. Oblivion's attribute gates keep an
+under-developed character out; a Skyrim character can never satisfy one, so
+enforcing it would lock the content away for good. Skills, and derived values
+both games have, translate and keep their threshold (both games score skills
+0-100).
+
+The BOOK
+table `base.equivalents.TES4_SKILL_TO_TES5_INDEX` is keyed by BOOK
+`DATA.Teaches`, a 0-20 skill index (xEdit `wbSkillEnum`), so a skill's actor
+value is its book index + 12. Until 2026-09-28 that table was keyed by actor
+value, and all 110 Oblivion skill books taught nothing or the wrong skill
+(a Mysticism book taught Smithing). Skills follow the BOOK table, except **one entry that
+deliberately differs**, because the two tables answer different questions: the
 BOOK table must name a real *trainable* skill, while a CONDITION only has to
 read a comparable number.
 
 | TES4 value | BOOK table | Condition table | Why |
 |---|---|---|---|
-| Mercantile | Pickpocket | **Speech (17)** | Mercantile is Oblivion's haggling skill and Speech is Skyrim's. Pickpocket appears in the BOOK table only because Skyrim already ships a Speech skill book for that slot. |
 | Athletics, Acrobatics | — | **Stamina (26)** | Neither has a Skyrim skill at all; Stamina is the athletic-capacity value the engine actually tracks. |
 
-Changing either to match the BOOK table would make the condition read a value
-the actor never trains, so it would compare against a constant.
+Mercantile used to differ (Pickpocket in the BOOK, NPC and trainer tables,
+Speech here). A book's Teaches field is only a skill index, so nothing forced
+Pickpocket; every table now reads Speech, and Mysticism reads Alteration
+everywhere, the school its spells convert to. See
+[the character sheet plan](../plans/character_sheet.md#bug-mysticism).
+
+### <a id="fame-infamy-global"></a>A player Fame/Infamy test reads the scripts' global
+
+Converted scripts keep Fame and Infamy in the conversion-owned `TES4Fame` and
+`TES4Infamy` globals (`ModPCFame` → `TES4Fame.Mod`). Skyrim's own Fame and
+Infamy actor values (60, 61) exist, but nothing in vanilla reads or writes them
+(0 of Skyrim.esm's conditions), so a condition mapped onto them always read 0.
+A **run-on-target** `GetActorValue Fame/Infamy` (the player, 10 of Oblivion.esm's
+14) becomes `GetGlobalValue` on the global (`_fame_global`). A **subject** test
+stays on the actor value: those 4 are guard greetings testing the guard's own
+Infamy, which read 0 in Oblivion too. FO3/FNV conditions are left alone; their
+indices 38 and 39 are Melee Weapons and Repair
+([Fallout's table](#fallout-actor-values)).
 
 ## <a id="fallout-ctda"></a>A Fallout CTDA is 28 bytes and numbers its functions differently
 
@@ -73,8 +353,8 @@ table: `tes5_import/generated/ctda_fnv_remap.py` from
 
 FO3/FNV write TES4's 20 shared bytes, then an explicit **Run On** u32 and a
 **Reference** u32 where TES4 has 4 unused bytes (xEdit `wbDefinitionsFNV.pas`
-`wbConditions`). The length is the format signal: a 28-byte raw is Fallout, a
-24-byte raw is TES4, so no per-game switch is needed.
+`wbConditions`). A 28-byte raw is always Fallout, but a shorter one is not
+always TES4: see [short Fallout CTDAs](#fallout-short-ctda).
 
 Census over FalloutNV.esm's 59,664 INFO conditions: Run On 0 (Subject) 55,872,
 1 (Target) 2,905, 2 (Reference) 821, 3 (Combat Target) 66. TES4's type-byte
@@ -105,6 +385,70 @@ Absent functions are dropped, failing open, the way TES4's `_FUNC_DROP` does.
 the disposition-tier evaluation applies. `GetScriptVariable` (53) and
 `GetQuestVariable` (79) keep TES4's treatment: the strings path rewrites them
 to the VM reads, every other path drops them.
+
+### <a id="fallout-short-ctda"></a>Short Fallout CTDAs: the source decides, not the length
+
+**Code:** `conditions_falloutnv.py` `fallout_ctda`, applied in `convert_ctda` and
+`convert_ctda_list_with_strings` (so `split_skill_ctdas` sees the padded raw too).
+
+xEdit marks everything from Run On onward optional (`wbConditions`
+`.SetOptionalFrom(7)`), and the masters use it. FalloutNV.esm's INFO, QUST,
+PACK, IDLE, PERK, MESG, TERM, NOTE, CHAL and RCPE conditions: 65,830 are 28
+bytes, 123 are 20 bytes and 2 are 24 bytes. A 20-byte CTDA omits Run On and
+Reference, a 24-byte one Reference. Judged by length they took the TES4 path,
+which reads the function through TES4's numbering: 37 of the 125 name a
+function Fallout numbers differently (391 ×34, 392 ×2, 427 `GetIsVoiceType`
+×1), and 21 are `GetActorValue`, whose value went through TES4's table. A
+24-byte `GetActorValue` 14 would also have been split as TES4 Blade.
+
+So a CTDA shorter than 28 bytes is Fallout's whenever the source plugin is
+(`is_fallout_source`, set once per plugin in `build_actor_indexes`), and is
+zero-padded to 28: Run On 0 is Subject, the omitted fields' meaning. A TES4
+source keeps the length rule.
+
+### <a id="av-param-funcs"></a>Which functions carry an actor value
+
+**Code:** `conditions.py` `_AV_PARAM_FUNCS`.
+
+Every Skyrim condition function whose param1 is an actor value (xEdit
+`wbDefinitionsTES5.pas`, `ParamType1: ptActorValue`) needs that index
+translated, or dropped when the source value has none: `GetActorValue` (14),
+`IsWeaponSkillType` (109), `GetBaseActorValue` (277), `GetPermanentActorValue`
+(494) and `GetActorValuePercent` (640). FNV and FO3 number `GetPermanentActorValue`
+495, remapped to 494 before this lookup; with only 14 and 277 listed, its
+Fallout index passed straight through. TES4's 109 (`GetWeaponSkillType`) is
+in `_FUNC_DROP` and never reaches the table.
+
+### <a id="fallout-actor-values"></a>Actor values: Fallout's own table
+
+**Code:** `FALLOUT_AV_TO_TES5` in `conditions_falloutnv.py`, chosen by CTDA size in
+`convert_ctda`.
+
+An actor-value parameter is a raw index into each game's own table, and the
+three tables share no numbering (TES4 0 Strength, FNV 0 Aggression, TES5 0
+Aggression). A Fallout condition used to go through the TES4 table, so the
+FalloutNV.esm census of `GetActorValue`/`GetBaseActorValue` conditions read:
+
+| FNV value | Conditions | Read as |
+|---|---|---|
+| Speech (43) | 540 | dropped (no TES4 43), so every Speech check passed |
+| Barter (32) | 209 | Speech, by accident (TES4 32 Speechcraft) |
+| SPECIAL (5-11) | 133 | dropped, or Health, Magicka, Stamina, Carry Weight |
+| Medicine (37) | 63 | dropped (TES4 37 is Bounty) |
+| Karma (23) | 44 | Illusion |
+| Limb conditions (25-31) | 274 | Stamina and assorted skills |
+| Melee Weapons (38), Repair (39) | 16 | Fame, Infamy |
+| Variable01-10 (62-71) | 48 | resistances, or dropped |
+
+The table maps a value to its Skyrim counterpart where one exists. The Fallout
+skills fold where converted content makes them: Guns, Energy Weapons and Big
+Guns to Archery (guns convert to crossbows), Melee Weapons to One-Handed (and
+Two-Handed, [split](../plans/character_sheet.md#bug-blade-blunt)), Unarmed to
+One-Handed like TES4 Hand to Hand, Barter and Speech to Speech, Lockpick to
+Lockpicking, Repair to Smithing, Medicine to Restoration. SPECIAL, Karma,
+Action Points, XP, limb condition, rads, Explosives, Science and Survival have
+none and drop (fail open), for the reason TES4 attributes do (below).
+`Variable01`-`10` keep their names, as the converted FNV scripts do.
 
 ## <a id="convert-ctda-phases"></a>`convert_ctda`: the three phases and why each is shaped as it is
 
@@ -160,13 +504,70 @@ dialogue menu on every NPC. `CTDA_FORMID_PARAMS` is keyed by the POST-remap
 parameters are a raw index into each game's own table, which do not align:
 attributes have no Skyrim equivalent and drop (fail open); skills and shared
 derived values translate through `_TES4_AV_TO_TES5`. Race parameters translate
-to the Skyrim race the converted NPCs actually use (`_map_race_param`), or the
-condition drops.
+to the Skyrim race the converted NPCs actually use (`_map_race_param`), except
+a plugin-authored race in `GetIsRace` (below).
+
+### <a id="plugin-authored-races"></a>GetIsRace on a plugin-authored race becomes a faction test
+
+**Code:** `tes5_import/base/race_factions.py`, `_authored_race_faction` in
+`conditions.py`, `_npc_snams` in `record_types/npc.py`
+
+`TES4_RACE_FID_TO_EDID` knows only the 15 vanilla Oblivion races. An NPC of any
+other race (Morroblivion's `mwBMRieklingRace`, Nehrim's `Aeterna1`) converts
+onto a stand-in vanilla Skyrim race, so no race test can pick out that race
+again: whatever vanilla race the condition names, every actor of that race
+passes too. Measured on the Morroblivion build before this fix: Rieklings
+converted as Imperials, while `_map_race_param` sent `GetIsRace(Riekling)` to
+`DEFAULT_RACE` (Nord). So `mwGenericRieklingGreeting` ("What is it, human?")
+greeted as every Nord (Ergnir) and never as a Riekling. Pointing both at the
+same race would have handed the lines to every Imperial instead.
+
+Dropping the condition is no better: a dropped condition fails OPEN, and the
+Riekling greetings then outranked `fbmwMSGreetings` for every actor in the
+plugin (Fargoth lost his "ring" topic that way).
+
+Instead each plugin-authored race in reach (the plugin's own plus its masters')
+gets a bare marker FACT, `TES4RaceFaction_<race EditorID>`. Every NPC of that
+race joins it, and `GetIsRace(race)` is written as `GetInFaction(fact)`, which
+compares the same 1/0 value, so operator, comparison value and OR flag carry
+over unchanged. A dependent plugin adopts its master's FACT by EditorID.
+`GetPCIsRace` keeps the race fallback, since the player's race is always a
+Skyrim one.
+
+Counted in the exports: Morroblivion has 1 such quest condition (Riekling) and
+2 INFO conditions (ash ghoul races), Nehrim 8 INFO conditions (`Aeterna1`), and
+Oblivion none.
+
+### <a id="get-vampire"></a>GetVampire becomes a test for the vampirism effect
+
+**Code:** `_vampirism` in `conditions.py`
+
+Oblivion's GetVampire (function 40, opcode 0x1028) has no Skyrim counterpart,
+and dropping it failed open: every vampire-only line played for everyone. Its
+condition handler in Oblivion.exe (`0x4F4830`) returns 1 when the subject is an
+actor and `0x5E04C0` answers true, and `0x5E04C0` is just
+`GetActorValue(0x45) > 0` -- the Vampirism actor value, which only the VAMP
+effect raises. In Oblivion.esm that effect is on the five `Vampirism*`
+abilities (`Vampirism25` .. `Vampirism100`, `testvampire`), carried by 104
+NPCs. Skyrim has no Vampirism value, but the effect survives conversion as a
+hidden MGEF, so the condition becomes `HasMagicEffectKeyword` on VAMP's family
+keyword ([effect families](tes5_import_magic.md#effect-families)), which
+compares the same 1/0 and keeps the operator, run-on and OR flag. Skyrim's own
+`Vampire` keyword is no substitute: it sits on Skyrim's vampire races, which no
+converted actor uses. A plugin with no VAMP effect in reach keeps dropping it.
+Counted in the exports: 13 conditions in Oblivion.esm, 95 in Morrowind_ob.esm.
 
 ### <a id="run-on-target"></a>Run On = Target under a script-driven topic
 
 TES4's run-on-target flag bit becomes TES5 Run On = 1 (Target) and the bit is
-cleared so it is not double-counted. In a Say-driven topic there is no
+cleared so it is not double-counted.
+
+The bounty tests are the exception (`_PLAYER_BOUNTY_FUNCS`). Oblivion's arrest
+greetings ask `GetCrimeGold` / `CanPayCrimeGold` of the TARGET, the player,
+whose bounty is global; Skyrim's versions answer "the player's bounty in the
+SUBJECT's crime faction", so run on the player -- who has none -- they are
+always 0 and no arrest line could pass. They run on the subject, as vanilla's
+`DialogueCrimeGuards` lines do. In a Say-driven topic there is no
 dialogue target, so a target-run condition can never pass. With a resolved,
 unique listener the condition is retargeted to Run On = Reference on that ref,
 EXCEPT for identity functions (`_NO_TARGET_RETARGET_FUNCS`): a GetIsID pinned
@@ -183,3 +584,23 @@ an identity function is likewise dropped: the listener IS the NPC the call
 site addresses, so the authored check is statically satisfied (first hit: the
 restored NPC-conversation head topics, whose GetIsID(listener)[Target]
 otherwise survived as a dead Run On = Target).
+
+<a id="player-target-identity"></a>**When the listener is the player, a
+target GetIsID is settled, not dropped** (`_settled_player_identity`). Dropping
+is only right when the test passes. Against the player, "target is the Player
+NPC" is true, but "target is Martin" and "target is not the player" are false.
+Dropping those made lines written for another listener play to the player.
+Oblivion's HELLO `000ADC6C` ("Good to see you.") is a Goodbye-flagged blocking
+line, so nobody starts a random conversation with Martin. With its
+`GetIsID(Martin)[Target]` dropped, only voice types were left. Every NPC with
+one of those voices greeted the player with it, and the Goodbye flag ended the
+talk before the menu opened (Imperial City market: Gin-Wulm, Simplicia the
+Slow, a Watch guard, Dynari Amnis; NPCs with other voices opened menus). The
+test now becomes a constant, `GetRandomPercent >= 0` when it passes and `< 0`
+when it fails. It keeps its OR flag, so a false member of an OR group only
+drops out of the group. `GetIsClass` still drops, because the player's class
+is not the source's. Oblivion.esm: of the GREETING and HELLO lines with a
+target identity test, 628 test "is the player" and stay as they were. 70 HELLO
+lines name another NPC and 31 test "not the player"; these can no longer reach
+the player. Three `GetIsClass` lines are unchanged. Tests:
+`tests/test_dialog.py::TestCTDAConversion::test_player_target_identity_is_settled`.

@@ -23,18 +23,20 @@ from core.plugin_masters import masters_from_export_header
 
 from .morroblivion import (MORROBLIVION_PREFIX, MorroblivionModels,
                            remap_vanilla_models)
+from .morrowind_patch import PATCH_NAME, blacklisted_bases
 from .morroblivion_origin import OriginShifts
-from .morrowind_armor import load_body_models
-from .morrowind_cell import parse_cell
-from .morrowind_ids import (IdIndex, exterior_key, interior_key, land_key,
-                            load_master_doors, persistent_key,
-                            load_index, marker_formid)
+from .morrowind_armor import add_body_models, master_records
+from .morrowind_cell import (FLAG_HAS_WATER, FLAG_INTERIOR,
+                             FLAG_QUASI_EXTERIOR, parse_cell)
+from .morrowind_ids import (IdIndex, encode_editor_id, exterior_key,
+                            interior_key, land_key, load_master_doors,
+                            persistent_key, load_index, marker_formid)
 from .morrowind_markers import MarkerBuilder, marker_lines
+from .morrowind_travel import travel_marker_records
 from .morrowind_pathgrid import pathgrid_records
-from .morrowind_patch import PATCH_NAME
-from .morrowind_grass import (GrassTally, grass_records, is_grass_model,
-                              ltex_grass_lines, master_ltex_fields,
-                              master_texture_grid)
+from .morrowind_region import region_records
+from .morrowind_grass import (emit_groundcover, grass_master_list,
+                              master_ltex_records, register_groundcover)
 from .morrowind_land import (MAX_QUAD_LAYERS, decode_heights,
                              decode_textures, encode_heights, inner_patch,
                              layer_lines, ltex_index, pad_grid,
@@ -43,17 +45,33 @@ from .morrowind_land import (MAX_QUAD_LAYERS, decode_heights,
 from .morrowind_world import (TES4_CELL_SIZE, WORLDSPACE_EDID, cell_editor_id,
                               cell_grid, tes3_cell_quadrants)
 from .record_types.morrowind import (MORROWIND_ITEM_EXPORTERS, emit_ref,
+                                     filled_soulgem_id, filled_soulgems,
                                      tes4_signature)
 from .record_types.morrowind_actors import (MORROWIND_ACTOR_EXPORTERS,
+                                            RACE_FORMIDS, RaceTable,
                                             register_sound_gens)
 from .record_types.morrowind_packages import (package_records,
                                               prune_dropped_packages)
+from .record_types.morrowind_dialog import dialogue_records
+from .record_types.morrowind_quiz import quiz_records
+from .record_types.morrowind_magic import (MORROWIND_MAGIC_EXPORTERS,
+                                           authored_indices,
+                                           effect_editor_id,
+                                           effect_ranges,
+                                           game_settings,
+                                           synthesized_effects)
 from .record_types.morrowind_scripts import MORROWIND_SCRIPT_EXPORTERS
-from .tes3_reader import get_subrecord, read_file, read_masters
+from .record_types.common import escape_value
+from .text_encoding import HEADER_KEY
+from .tes3_reader import (file_type, get_subrecord, is_tes3, read_file,
+                          read_masters)
 
 #: TES3 signature -> exporter, over every base record type this pass converts.
 EXPORTERS = {**MORROWIND_ITEM_EXPORTERS, **MORROWIND_ACTOR_EXPORTERS,
-             **MORROWIND_SCRIPT_EXPORTERS}
+             **MORROWIND_MAGIC_EXPORTERS, **MORROWIND_SCRIPT_EXPORTERS}
+
+#: TES3 allocates this many magic effect indices.
+_MAGIC_EFFECT_COUNT = 143
 
 #: conversion_config.json key choosing which converted plugins a Morrowind mod borrows from.
 MORROWIND_SOURCE_KEY = 'morrowindSource'
@@ -73,6 +91,9 @@ _MAX_REHASH = 64
 #: SkyrimClimate (0x812), the climate vanilla Tamriel itself uses.
 _SKYRIM_CLIMATE = '00000812'
 
+#: Morroblivion's converted Morrowind climate, holding the ten MW weathers.
+_MORROWIND_CLIMATE_EDID = 'mwMorrowindClimate'
+
 #: LAND DATA 0x1D (4,207 vanilla LANDs): normals, layers, unknown4, auto-calc.
 _LAND_FLAGS = 29
 
@@ -84,9 +105,6 @@ _PLACEMENT_SIGNATURES = {'NPC_': 'ACHR', 'CREA': 'ACRE'}
 
 #: TES4 record flag for a persistent reference; every load door carries it.
 _PERSISTENT = 1024
-
-#: How far a DODT destination may sit from the door it arrives beside.
-_PARTNER_RADIUS = 1024.0
 
 #: Signature every engine marker resolves as.
 _MARKER_SIGNATURE = 'STAT'
@@ -110,13 +128,12 @@ class MorrowindContext:
         self.index = index if index is not None else IdIndex()
         self.own_index = own_index
         self.master_bounds = None
-        self.body_models = {}
         self.morroblivion = None
         self.origin_shifts = None
         self.derived = {}
         self.unresolved = Counter()
         self.own_ids = {}
-        self._taken = set(self.index.form_ids())
+        self.taken = set(self.index.form_ids())
         self._exterior_cells = set()
         self.exterior_cell_ids = set()
         self.rehomed_persistent = 0
@@ -125,19 +142,46 @@ class MorrowindContext:
         self.interior_names = set()
         self.markers = MarkerBuilder()
         self.known_grids = set()
+        self.region_cells = {}
+        self._master_weat = None
         self.pending_teleports = []
         self.doors_by_cell = {}
+        self.own_doors = {}
+        self.gap_ids = {}
+        self.unlinked_doors = 0
+        self.persisted_partners = 0
+        self.vtex_by_cell = {}
+        self.master_dirs = []
+        self.effect_ranges = {}
+        self.game_settings = {}
+        self._init_terrain()
+        self._init_barks()
+        self._init_actors()
+
+    def _init_actors(self) -> None:
+        """The actor tables: body-part meshes, races, sound generators, packages, placements."""
+        self.body_models = {}
+        self.race_formids = dict(RACE_FORMIDS)
+        self.sound_gens = {}
         self.pending_packages = []
         self.dropped_packages = set()
         self.placements = {}
-        self.sound_gens = {}
-        self.gap_ids = {}
-        self.unlinked_doors = 0
-        self.vtex_by_cell = {}
-        self.master_dirs = []
+
+    def _init_terrain(self) -> None:
+        """Where this plugin sits among the converted exports, and its land textures."""
         self.grass = None
-        self.grass_models = {}
-        self.grass_ltex = {}
+        self.folded_ltex = set()
+        self.export_root = ''
+        self.own_dir = ''
+        self.master_names = []
+
+    def _init_barks(self) -> None:
+        """Who can speak a voiced bark, and the audiences already resolved.
+
+        See: docs/commentary/tes4_export_morrowind.md#voiced-barks
+        """
+        self.bark_speakers = []
+        self.bark_audiences = {}
 
     def grass_id(self, record_id: str, texture: str) -> str:
         """The FormID of the GRAS one static becomes on one land texture."""
@@ -236,6 +280,46 @@ class MorrowindContext:
             self.markers.note_interior(cell)
         else:
             self.known_grids.update(tes3_cell_quadrants(*cell.grid))
+            if cell.region:
+                named = self.region_cells.setdefault(
+                    cell.region.lower(), (cell.region, set()))
+                named[1].update(tes3_cell_quadrants(*cell.grid))
+
+    def region_id(self, record_id: str) -> str:
+        """The FormID for a region: a converted master's, else derived.
+
+        See: docs/commentary/tes4_export_morrowind.md#region-weather
+        """
+        return (self.index.lookup_editor_id(encode_editor_id(record_id))
+                or self.index.lookup_region(record_id)
+                or self.derive('regn:' + record_id.lower()))
+
+    def region_grids(self, record_id: str) -> set:
+        """Every grid square whose cell names this region.
+
+        See: docs/commentary/tes4_export_morrowind.md#region-weather
+        """
+        named = self.region_cells.get(record_id.lower())
+        return named[1] if named else set()
+
+    def region_name(self, key: str) -> str:
+        """The authored spelling of a region, which its EditorID is cased on."""
+        named = self.region_cells.get(key)
+        return named[0] if named else key
+
+    def region_weather(self, rec) -> bytes:
+        """A REGN's WEAT chance bytes, one per hardcoded weather type."""
+        sub = get_subrecord(rec, 'WEAT')
+        return sub.data if sub else b''
+
+    def master_region_weather(self) -> dict:
+        """{lowercase region id: WEAT bytes} from every master's own source.
+
+        See: docs/commentary/tes4_export_morrowind.md#region-weather
+        """
+        if self._master_weat is None:
+            self._master_weat = _master_region_weather(self.master_dirs)
+        return self._master_weat
 
     def destination_cell(self, ref) -> str:
         """The FormID of the cell a door reference teleports into, or ''.
@@ -327,44 +411,65 @@ class MorrowindContext:
             offset = int.from_bytes(digest[:4], 'little') % _DERIVED_SPAN
             candidate = '%08X' % ((self.own_index << 24)
                                   | (_DERIVED_BASE + offset))
-            if candidate not in self._taken:
-                self._taken.add(candidate)
+            if candidate not in self.taken:
+                self.taken.add(candidate)
                 self.derived[key] = candidate
                 return candidate
         raise RuntimeError('no free derived FormID for %r' % record_id)
 
 
-def load_context(export_root: str, masters=()) -> MorrowindContext:
+def _refused_ids(export_root: str, masters) -> frozenset:
+    """Morrowind ids whose Morroblivion base wears a mesh we refuse.
+
+    Only when the compatibility patch is a master, because it is what supplies
+    the vanilla record in their place.
+    See: docs/audits/morroblivion_mesh_axis_rotation.md#base-objects-not-meshes
+    """
+    names = [n for n, _p in masters]
+    if not any(n == PATCH_NAME for n in names):
+        return frozenset()
+    morroblivion = [n for n in names
+                    if n.lower().startswith(MORROBLIVION_PREFIX)]
+    return frozenset(blacklisted_bases(export_root, morroblivion))
+
+
+def load_context(export_root: str, masters=(), declared=()) -> MorrowindContext:
     """Build a context from the converted masters, in master-list order.
 
     Each master's ids are re-keyed into THIS plugin's master list: the
     master's own byte (its header's master count) becomes its slot here and
     each of its masters is translated by name, exactly as the importer's
-    `load_master_export` does.
+    `load_master_export` does. `declared` is that list when it names more
+    files than `masters`, whose ids alone are indexed.
     See: docs/commentary/tes4_export_morrowind.md#masters
     """
     paths = [p if os.path.isabs(p) else os.path.join(export_root, p)
              for _n, p in masters]
-    slot_of = {n.lower(): i for i, n in enumerate(_master_list(masters))}
+    names = list(declared) or _master_list(masters)
+    slot_of = {n.lower(): i for i, n in enumerate(names)}
     index = IdIndex()
     master_doors = []
     master_remaps = []
-    for slot, path in enumerate(paths):
+    refused = _refused_ids(export_root, masters)
+    for name, path in zip(_master_list(masters), paths):
         own = masters_from_export_header(path)
-        remap = {len(own): slot}
+        remap = {len(own): slot_of[name.lower()]}
         for k, sub in enumerate(own):
             target = slot_of.get(sub.lower())
             if target is not None:
                 remap[k] = target
-        index.merge(load_index(path, remap=remap))
+        drop = refused if name.lower().startswith(MORROBLIVION_PREFIX) else ()
+        index.merge(load_index(path, remap=remap, skip=drop))
         master_doors.append(load_master_doors(path, remap))
         master_remaps.append((path, remap))
-    ctx = MorrowindContext(index, own_index=len(paths))
+    ctx = MorrowindContext(index, own_index=len(names))
     for doors in master_doors:
         for cell, entries in doors.items():
             ctx.doors_by_cell.setdefault(cell, []).extend(entries)
     ctx.master_bounds = _master_world_bounds(paths)
     ctx.master_dirs = master_remaps
+    ctx.master_names = names
+    ctx.export_root = export_root
     return ctx
 
 
@@ -392,8 +497,8 @@ def _missing_master_message(plugin: str, missing: list) -> str:
              "would claim their load-order slots as its own.", '', 'Missing:']
     lines += [f'  {name}' for name in missing]
     if PATCH_NAME in missing:
-        lines += ['', f'Build {PATCH_NAME} from Settings > Morrowind source > '
-                      'Build compatibility patch, or run:', '',
+        lines += ['', f'Build {PATCH_NAME} by choosing Settings > Morrowind '
+                      'source > Morroblivion + patch, or run:', '',
                   '  python convert.py --build-morrowind-patch '
                   '"<Morrowind>/Data Files"']
     others = [n for n in missing if n != PATCH_NAME]
@@ -415,6 +520,12 @@ def run_export(file_name: str, source: str, export_dir: str,
     start = time.time()
     print(f'[{file_name}] Exporting (Morrowind)...')
     mode = (config or {}).get(MORROWIND_SOURCE_KEY, SOURCE_VANILLA)
+    if mode == SOURCE_MORROBLIVION and not morroblivion_allowed(file_name, source):
+        print(f'[{file_name}] ERROR: {file_name} is a vanilla Morrowind master '
+              'or has no masters, so it is never built in Morroblivion mode. '
+              'Export again with --morrowind-source vanilla, or choose '
+              'Settings > Morrowind source > Vanilla.')
+        return False
     masters, missing = converted_master_dirs(export_dir, file_name, source, mode)
     if missing:
         print(f'[{file_name}] ERROR: '
@@ -431,6 +542,8 @@ def run_export(file_name: str, source: str, export_dir: str,
     if result['unlinked_doors']:
         print(f"  {result['unlinked_doors']} load doors lead to a cell that "
               f'is not converted and stay plain doors')
+    if result['persisted_partners']:
+        print(f"  {result['persisted_partners']} one-way doors' arrival doors made persistent")
     print(f'[{file_name}] Export complete in {time.time() - start:.2f}s')
     return True
 
@@ -461,6 +574,15 @@ def converted_master_dirs(export_dir: str, plugin: str, source_path: str,
     return found, missing
 
 
+def morroblivion_allowed(plugin: str, source_path: str) -> bool:
+    """Whether Morroblivion mode may build this plugin: a dependent mod only.
+
+    See: docs/commentary/tes4_export_morrowind.md#masters
+    """
+    return (plugin.lower() not in VANILLA_MASTERS
+            and bool(read_masters(source_path)))
+
+
 def morroblivion_exports(export_dir: str) -> list:
     """Every converted Morroblivion plugin, the ESM ahead of its patches."""
     if not os.path.isdir(export_dir):
@@ -478,32 +600,71 @@ def export_plugin(source_path: str, export_dir: str, masters=()) -> dict:
     other stage uses, so nothing downstream needs to know the source was TES3.
     """
     plugin = os.path.basename(source_path)
-    ctx = load_context(export_dir, masters)
-    records = read_file(source_path)[1]
-    ctx.body_models = load_body_models(source_path, records, export_dir)
+    header, records = read_file(source_path)
+    ctx = _plugin_context(export_dir, masters, records, plugin)
+    _load_part_tables(ctx, source_path, records, export_dir)
     own_meshes = assets_for(record_dir(export_dir, plugin)) / 'meshes'
     ctx.morroblivion = MorroblivionModels(
         export_dir, masters, source_path, own_meshes)
     ctx.origin_shifts = OriginShifts(
         export_dir, [own_meshes] + _master_mesh_roots(export_dir, masters))
     out = convert_plugin(records, ctx)
+    for sig, rows in quiz_records(source_path, header.page.codec, ctx).items():
+        known = {form_id for form_id, _lines in out.get(sig, [])}
+        out.setdefault(sig, []).extend(row for row in rows if row[0] not in known)
     owned = sum(1 for _f, lines in out.get('CREA', [])
                 if any(l.startswith('MorrowindModel') for l in lines))
     if out.get('CREA'):
         print(f"  Creatures: {owned} of {len(out['CREA'])} converted here, "
               f"the rest from a master")
-    remapped, shifted, pitched = remap_vanilla_models(out, ctx)
+    remapped, shifted, corrected = remap_vanilla_models(out, ctx)
     if remapped:
         print(f'  Morroblivion models: {remapped} vanilla mesh references remapped'
-              + (f', {shifted} re-seated' if shifted else '')
-              + (f', {pitched} refs axis-pitched' if pitched else ''))
+              + (f', {shifted} origin-shifted' if shifted else '')
+              + (f', {corrected} ref corrections (pitch/Z)' if corrected else ''))
     out_dir = str(record_dir(export_dir, plugin))
     counts = write_export(out, out_dir)
-    write_header(out_dir, _master_list(masters), sum(counts.values()),
-                 f'Converted from {plugin}')
+    write_header(out_dir, ctx.master_names, sum(counts.values()),
+                 f'Converted from {plugin}', file_type(header) & 1,
+                 codec=header.page.codec)
+    print(f'  Text code page: {header.page.codec}')
     return {'plugin': plugin, 'output': out_dir, 'counts': counts,
             'dropped': sum(ctx.unresolved.values()),
-            'unlinked_doors': ctx.unlinked_doors}
+            'unlinked_doors': ctx.unlinked_doors,
+            'persisted_partners': ctx.persisted_partners}
+
+
+def _load_part_tables(ctx: MorrowindContext, source_path: str, records, export_dir: str) -> None:
+    """Fill ctx.body_models and ctx.race_formids from every declared master, then `records`.
+
+    See: docs/commentary/tes4_export_morrowind.md#custom-races
+    """
+    races = RaceTable()
+    for recs in (*master_records(source_path, export_dir), records):
+        add_body_models(ctx.body_models, recs)
+        races.add(recs)
+    ctx.race_formids = races.formids()
+
+
+def _plugin_context(export_dir: str, masters, records,
+                    plugin: str) -> MorrowindContext:
+    """The context, its master list grown by every file owning ground under grass.
+
+    The list is final before any FormID is minted: a groundcover binding
+    overrides the texture under its clumps, so that texture's file must be one.
+    See: docs/commentary/tes4_export_morrowind.md#land-texture-fold
+    """
+    ctx = load_context(export_dir, masters)
+    ctx.own_dir = str(record_dir(export_dir, plugin))
+    names = grass_master_list(export_dir, ctx.master_names,
+                              register_groundcover(records, ctx))
+    if names == ctx.master_names:
+        return ctx
+    print(f"  Groundcover: listing {', '.join(n for n in names if n not in ctx.master_names)}"
+          ' as masters, for the textures under its grass')
+    grown = load_context(export_dir, masters, declared=names)
+    grown.own_dir, grown.grass = ctx.own_dir, ctx.grass
+    return grown
 
 
 def _master_mesh_roots(export_dir: str, masters) -> list:
@@ -547,13 +708,15 @@ def convert_plugin(records, ctx: MorrowindContext) -> dict:
     for rec in records:
         if rec.type in EXPORTERS and not rec.deleted:
             ctx.register_own(rec.record_id, tes4_signature(rec))
+    register_magic_effects(records, ctx)
+    register_filled_soulgems(records, ctx)
     _register_land_textures(records, ctx)
     _register_land_grids(records, ctx)
-    _register_groundcover(records, ctx)
     register_sound_gens(records, ctx)
 
     out = {sig: [] for sig in
-           ('CELL', 'REFR', 'ACHR', 'ACRE', 'LAND', 'PGRD')}
+           ('CELL', 'REFR', 'ACHR', 'ACRE', 'LAND', 'PGRD', 'REGN')}
+    out.update(dialogue_records(records, ctx))
     out['PGRD'] = pathgrid_records(_collect_records(records, ctx, out), ctx)
     teleport_records(ctx)
     out['PACK'], travel_markers = package_records(ctx)
@@ -561,9 +724,14 @@ def convert_plugin(records, ctx: MorrowindContext) -> dict:
         prune_dropped_packages(out.get(sig, []), ctx)
     out['REFR'].extend(travel_markers)
     out['REFR'].extend(map_marker_records(ctx))
+    out['REFR'].extend(travel_marker_records(records, ctx, _is_convertible))
+    out['REGN'] = region_records(records, ctx)
     out['WRLD'] = worldspace_record(ctx)
     out['CELL'].extend(persistent_cell_record(ctx))
-    _emit_groundcover(out, ctx)
+    out.setdefault('MGEF', []).extend(magic_effect_records(records, ctx))
+    out.setdefault('SLGM', []).extend(
+        filled_soulgem_records(records, ctx))
+    emit_groundcover(out, ctx)
     return out
 
 
@@ -593,36 +761,21 @@ def _collect_base(rec, ctx: MorrowindContext, out: dict) -> None:
     """Add one converted base record to the bucket for its TES4 signature."""
     sig = tes4_signature(rec)
     out.setdefault(sig, []).append(
-        (ctx.resolve(rec.record_id, sig), export_record(rec, ctx)))
+        (ctx.resolve(_base_key(rec), sig), export_record(rec, ctx)))
 
 
-def _emit_groundcover(out: dict, ctx: MorrowindContext) -> None:
-    """Turn the tallied placements into GRAS records and LTEX bindings.
+def _base_key(rec) -> str:
+    """The ID this base record resolves its own FormID under.
 
-    The LTEX records are OVERRIDES of the master's own: a groundcover plugin
-    defines no texture itself, and the binding has to land on the texture the
-    terrain actually names.
-    See: docs/commentary/tes4_export_morrowind.md#groundcover-as-grass
+    A TES3 MGEF carries no record ID -- it is addressed by index -- so it
+    resolves under the EditorID its synthesized record uses.
     """
-    if ctx.grass is None:
-        return
-    placed = sum(ctx.grass.pairs.values())
-    bindings = ctx.grass.bindings()
-    records = grass_records(ctx.grass, ctx.grass_models, ctx.grass_id)
-    if not records:
-        print('  Groundcover: no grass survived binding; %d placements dropped'
-              % (placed + ctx.grass.unplaced))
-        return
-    out['GRAS'] = records
-    out.setdefault('LTEX', [])
-    for texture in sorted(bindings):
-        lines = ltex_grass_lines(bindings, texture, ctx.grass_id,
-                                 ctx.grass_ltex.get(texture.upper()))
-        if lines:
-            out['LTEX'].append((texture, lines))
-    print('  Groundcover: %d placements -> %d GRAS over %d textures '
-          '(%d off-terrain)'
-          % (placed, len(records), len(bindings), ctx.grass.unplaced))
+    if rec.type != 'MGEF':
+        return rec.record_id
+    index = get_subrecord(rec, 'INDX')
+    if index is None or len(index.data) < 4:
+        return ''
+    return effect_editor_id(struct.unpack_from('<i', index.data, 0)[0])
 
 
 def map_marker_records(ctx: MorrowindContext) -> list:
@@ -643,12 +796,49 @@ def map_marker_records(ctx: MorrowindContext) -> list:
     return out
 
 
+def register_magic_effects(records, ctx: MorrowindContext) -> None:
+    """Register all 143 effect indices, the ranges spells use them at and the GMSTs bound effects read."""
+    ctx.effect_ranges = effect_ranges(records)
+    ctx.game_settings.update(game_settings(records))
+    for index in range(_MAGIC_EFFECT_COUNT):
+        ctx.register_own(effect_editor_id(index), 'MGEF')
+
+
+def register_filled_soulgems(records, ctx: MorrowindContext) -> None:
+    """Register one SLGM per soul size each of this plugin's gems can hold."""
+    for gem_id, soul, _lines in filled_soulgems(records):
+        ctx.register_own(filled_soulgem_id(gem_id, soul), 'SLGM')
+
+
+def filled_soulgem_records(records, ctx: MorrowindContext) -> list:
+    """`(form_id, lines)` for the FILLED variant of each gem.
+    See: docs/commentary/tes4_export_morrowind.md#filled-soul-gems
+    """
+    return [(ctx.resolve(filled_soulgem_id(gem_id, soul), 'SLGM'), lines)
+            for gem_id, soul, lines in filled_soulgems(records)]
+
+
+def magic_effect_records(records, ctx: MorrowindContext) -> list:
+    """`(form_id, lines)` for the effects neither this plugin's MGEF records
+    nor a master supplies; a stub over a master's authored effect would hide it."""
+    out = []
+    for index, lines in synthesized_effects(authored_indices(records),
+                                           getattr(ctx, 'effect_ranges', None)):
+        if not ctx.index.lookup(effect_editor_id(index)):
+            out.append((ctx.resolve(effect_editor_id(index), 'MGEF'), lines))
+    return out
+
+
 def _register_land_textures(records, ctx: MorrowindContext) -> None:
     """Map each LTEX's own index to its FormID, before any LAND is written.
 
     A LAND names its textures by index, so the whole table has to exist
     before the first terrain record is emitted.
     """
+    shared = {}
+    for fid, fields in master_ltex_records(ctx.master_dirs).items():
+        shared.setdefault(fields.get('EditorID', '').lower(),
+                          (fid, fields.get('ICON', '').lower()))
     for rec in records:
         if rec.type != 'LTEX' or rec.deleted:
             continue
@@ -656,36 +846,23 @@ def _register_land_textures(records, ctx: MorrowindContext) -> None:
         if intv is None or len(intv.data) < 4:
             continue
         ctx.register_ltex(struct.unpack_from('<I', intv.data, 0)[0],
-                          ctx.resolve(rec.record_id, 'LTEX'))
+                          _land_texture_id(rec, ctx, shared))
 
 
-def _register_groundcover(records, ctx: MorrowindContext) -> None:
-    """Note every groundcover static, and open a tally over the master terrain.
+def _land_texture_id(rec, ctx: MorrowindContext, shared: dict) -> str:
+    """The FormID one LTEX converts to: a master's when it is that same texture.
 
-    A plugin with no grass statics leaves `ctx.grass` None, which keeps every
-    ordinary Morrowind plugin on the untouched path.
-    See: docs/commentary/tes4_export_morrowind.md#groundcover-as-grass
+    TES3 re-declares a master's texture only because a LAND can name no other
+    plugin's; the same id over the same image is the master's record.
+    See: docs/commentary/tes4_export_morrowind.md#land-texture-fold
     """
-    for rec in records:
-        if rec.type != 'STAT' or rec.deleted:
-            continue
-        model = get_subrecord(rec, 'MODL')
-        path = '' if model is None else model.data.split(
-            bytes(1))[0].decode('cp1252', 'replace')
-        if is_grass_model(path):
-            ctx.grass_models[rec.record_id] = path
-    if not ctx.grass_models:
-        return
-    grid = {}
-    for master, remap in ctx.master_dirs:
-        for cell, quads in master_texture_grid(master, remap).items():
-            grid.setdefault(cell, quads)
-    ctx.grass = GrassTally(grid)
-    for master, remap in ctx.master_dirs:
-        for fid, edid in master_ltex_fields(master, remap).items():
-            ctx.grass_ltex.setdefault(fid, edid)
-    print('  Groundcover: %d grass statics over %d textured cells'
-          % (len(ctx.grass_models), len(grid)))
+    fid, icon = shared.get(escape_value(rec.record_id).lower(), ('', None))
+    own = [line[len('ICON='):].lower() for line in EXPORTERS['LTEX'](rec, ctx)
+           if line.startswith('ICON=')]
+    if fid and own == [icon]:
+        ctx.folded_ltex.add(rec.record_id.lower())
+        return fid
+    return ctx.resolve(rec.record_id, 'LTEX')
 
 
 def _register_land_grids(records, ctx: MorrowindContext) -> None:
@@ -725,16 +902,32 @@ def worldspace_record(ctx: MorrowindContext) -> list:
         return []
     return [(ctx.worldspace_id(),
              [f'EditorID={WORLDSPACE_EDID}', 'FULL=Morrowind',
-              f'CNAM.Vanilla={_SKYRIM_CLIMATE}', 'DATA.Flags=0',
+              _world_climate_line(ctx), 'DATA.Flags=0',
               f'NAM0.MinX={min_x}', f'NAM0.MinY={min_y}',
               f'NAM9.MaxX={max_x}', f'NAM9.MaxY={max_y}'])]
+
+
+def _world_climate_line(ctx: MorrowindContext) -> str:
+    """The worldspace's CNAM: Morrowind's own climate when a master has it.
+
+    Skyrim has no runtime climate fallback, so a worldspace must name one.
+    Morroblivion converted Morrowind's, and it carries the ten hardcoded
+    weathers; without it the sky falls back to Skyrim's own.
+    See: docs/commentary/tes4_export_morrowind.md#region-weather
+    """
+    climate = ctx.index.lookup_editor_id(_MORROWIND_CLIMATE_EDID)
+    if climate:
+        return f'CNAM.Climate={climate}'
+    return f'CNAM.Vanilla={_SKYRIM_CLIMATE}'
 
 
 def _is_convertible(rec, ctx: MorrowindContext) -> bool:
     """Whether this plugin writes a base record of its own for `rec`."""
     return (rec.type in EXPORTERS
             and marker_formid(rec.record_id) is None
-            and ctx.index.lookup(rec.record_id) is None)
+            and ctx.index.lookup(rec.record_id) is None
+            and not (rec.type == 'LTEX'
+                     and rec.record_id.lower() in ctx.folded_ltex))
 
 
 def _collect_cell(rec, ctx: MorrowindContext, out: dict) -> None:
@@ -795,14 +988,21 @@ def write_export(out: dict, output_dir: str) -> dict:
 
 
 def write_header(output_dir: str, masters: list, num_records: int,
-                 description: str = 'Converted from Morrowind') -> None:
-    """Write the _HEADER.txt the import stage reads for the master list."""
+                 description: str, flags: int, source: str = 'TES3',
+                 codec: str = '') -> None:
+    """Write the _HEADER.txt the import stage reads for masters, ESM flag and
+    source game, plus the source's text `codec`; an empty `source` or
+    `codec` writes no line for it."""
     lines = ['HEDR.Version=1.0', f'HEDR.NumRecords={num_records}',
              'HEDR.NextObjectID=2048',
              'CNAM.Author=TESConversion',
              f'SNAM.Description={description}']
     lines.extend(f'Master[{i}]={name}' for i, name in enumerate(masters))
-    lines.append('Flags=1')
+    lines.append(f'Flags={flags}')
+    if source:
+        lines.append(f'Source={source}')
+    if codec:
+        lines.append(f'{HEADER_KEY}={codec}')
     with open(os.path.join(output_dir, '_HEADER.txt'), 'w',
               encoding='utf-8') as fh:
         fh.write('\n'.join(lines) + '\n')
@@ -897,12 +1097,48 @@ def _ranked_textures(patch: list, ctx: MorrowindContext) -> list:
             for value in (ranked + ring)[:MAX_QUAD_LAYERS]]
 
 
+def _emit_cell_lighting(lines: list, ambient: tuple) -> None:
+    """Emit the XCLL color keys for one interior's authored AMBI.
+
+    Morrowind packs each color `0x00BBGGRR`; the import builds the full 92-byte
+    XCLL from these keys and defaults what TES3 does not author.
+
+    See: docs/commentary/tes4_export_morrowind.md#interior-lighting
+    """
+    for key, packed in (('Ambient', ambient[0]), ('Directional', ambient[1]),
+                        ('Fog', ambient[2])):
+        lines.append(f'XCLL.{key}R={packed & 0xFF}')
+        lines.append(f'XCLL.{key}G={(packed >> 8) & 0xFF}')
+        lines.append(f'XCLL.{key}B={(packed >> 16) & 0xFF}')
+
+
 def _interior_cell(cell, ctx: MorrowindContext) -> tuple:
-    """One interior cell and every placement it holds."""
+    """One interior cell and every placement it holds.
+
+    TES3, TES4 and TES5 agree on DATA bit 1 (has water) and bit 7 (Morrowind
+    QuasiEx / Skyrim "Show Sky"), so the authored flags carry through and a
+    cell that renders the skybox keeps doing so.  A quasi exterior draws its
+    sky and weather from its region, which is what XCCM names.
+
+    A Has Water cell with no WHGT takes level 0, which is what Morrowind
+    itself reads (`mWater` defaults to 0) and is sea level in both games.
+
+    See: docs/commentary/tes4_export_morrowind.md#quasi-exterior-interiors
+    """
     form_id = ctx.interior_cell_id(cell.name)
-    lines = [f'EditorID={cell.name}', f'FULL={cell.name}', 'DATA.Flags=1']
+    flags = cell.flags & (FLAG_HAS_WATER | FLAG_QUASI_EXTERIOR)
+    lines = [f'EditorID={cell.name}', f'FULL={cell.name}',
+             f'DATA.Flags={flags | FLAG_INTERIOR}']
+    if cell.region:
+        lines.append(f'Region[0]={ctx.region_id(cell.region)}')
+        if flags & FLAG_QUASI_EXTERIOR:
+            lines.append(f'XCCM.Climate={ctx.region_id(cell.region)}')
     if cell.water_height is not None:
         lines.append(f'XCLW.WaterHeight={cell.water_height}')
+    elif flags & FLAG_HAS_WATER:
+        lines.append('XCLW.WaterHeight=0.0')
+    if cell.ambient is not None:
+        _emit_cell_lighting(lines, cell.ambient)
     return [(form_id, lines)], _emit_refs(cell.refs, form_id, ctx)
 
 
@@ -930,31 +1166,32 @@ def _exterior_cells(cell, ctx: MorrowindContext) -> tuple:
         lines = [f'EditorID={edid}', 'DATA.Flags=2',
                  f'XCLC.X={grid[0]}', f'XCLC.Y={grid[1]}',
                  f'ParentWRLD={ctx.worldspace_id()}']
+        if cell.region:
+            lines.append(f'Region[0]={ctx.region_id(cell.region)}')
         if cell.name:
             lines.append(f'FULL={cell.name}')
         if not ctx.claim_exterior(grid):
             cells.append((form_id, lines))
-        placements.extend(_emit_refs(held, form_id, ctx))
+        placements.extend(_emit_refs(held, form_id, ctx, ctx.grass))
     return cells, placements
 
 
-def _emit_refs(refs, parent_cell: str, ctx: MorrowindContext) -> list:
+def _emit_refs(refs, parent_cell: str, ctx: MorrowindContext,
+               grass=None) -> list:
     """Every emittable placement in one cell, as (signature, FormID, lines).
 
     Keyed on the owning cell's own FormID plus the placement's index, which is
     unique because cell ids already are -- a cell NAME is not, since Morrowind
     leaves most exterior cells unnamed. A placed NPC is an ACHR and a placed
     creature an ACRE; everything else, leveled creatures included, is a REFR.
+    `grass`, the exterior's tally, takes the groundcover it can plant.
     See: docs/commentary/tes4_export_morrowind.md#actors-and-placements
     """
     out = []
     for ref in refs:
-        if ref.deleted:
+        if ref.deleted or (grass is not None and grass.absorb(ref)):
             continue
-        if ctx.grass is not None and ref.record_id in ctx.grass_models:
-            ctx.grass.add(ref.record_id, ref.pos, ref.scale)
-            continue
-        lines = _ref_lines(ref, parent_cell, ctx)
+        lines = ref_lines(ref, parent_cell, ctx)
         if not lines:
             continue
         form_id = ctx.next_ref_id(parent_cell)
@@ -963,11 +1200,12 @@ def _emit_refs(refs, parent_cell: str, ctx: MorrowindContext) -> list:
         if ctx.base_signature(ref.record_id) == 'DOOR':
             ctx.doors_by_cell.setdefault(parent_cell, []).append(
                 (form_id, ref.pos))
+            ctx.own_doors[form_id] = lines
         if ref.teleport and ref.dest_pos and signature == 'REFR':
             ctx.pending_teleports.append((form_id, lines, ref))
         elif signature != 'REFR':
             ctx.placements.setdefault(ref.record_id.lower(), []).append(
-                (form_id, parent_cell))
+                (form_id, parent_cell, ref.pos))
         out.append((signature, form_id, lines))
     return out
 
@@ -984,7 +1222,7 @@ def _placement_lines(pos: tuple, rot: tuple, prefix: str = '') -> list:
             f'{prefix}RotY={rot[1]}', f'{prefix}RotZ={rot[2]}']
 
 
-def _ref_lines(ref, parent_cell: str, ctx: MorrowindContext):
+def ref_lines(ref, parent_cell: str, ctx: MorrowindContext):
     """One placed reference, or None when its base object cannot resolve.
 
     A reference whose base record is missing crashes the engine, so an
@@ -1045,21 +1283,36 @@ def persistent_cell_record(ctx: MorrowindContext) -> list:
               f'RecordFlags={_PERSISTENT}'])]
 
 
-def _partner_door(ctx: MorrowindContext, cell: str, pos: tuple,
+def _destination_cells(ctx: MorrowindContext, ref) -> list:
+    """The cell a door arrives in and, outdoors, the eight around it: the
+    pair's other door may stand across a cell border from the DODT point."""
+    cell = ctx.destination_cell(ref)
+    if not cell or ref.dest_cell:
+        return [cell] if cell else []
+    grid_x, grid_y = cell_grid(ref.dest_pos[0], ref.dest_pos[1])
+    grids = [(grid_x + dx, grid_y + dy) for dx in (-1, 0, 1) for dy in (-1, 0, 1)]
+    return [ctx.exterior_cell_id(grid) for grid in grids
+            if grid in ctx.known_grids or ctx.index.lookup_exterior(grid)]
+
+
+def _partner_door(ctx: MorrowindContext, cells: list, pos: tuple,
                   door_id: str) -> str:
-    """The door reference standing at `pos` in `cell`, or '' if none is near.
+    """The door reference nearest `pos` in any of `cells`, or '' if they hold none.
 
     Candidates are this plugin's placements AND its masters', since a
-    dependent plugin's door usually arrives in a cell the master owns.
+    dependent plugin's door usually arrives in a cell the master owns. A
+    one-way door arrives where no door stands; its nearest door still names the
+    right cell, and the XTEL position is where the player lands.
     See: docs/commentary/tes4_export_morrowind.md#teleport-doors
     """
-    best, best_dist = '', _PARTNER_RADIUS
-    for form_id, other in ctx.doors_by_cell.get(cell, ()):
-        if form_id == door_id:
-            continue
-        dist = sum((a - b) ** 2 for a, b in zip(other, pos)) ** 0.5
-        if dist < best_dist:
-            best, best_dist = form_id, dist
+    best, best_dist = '', float('inf')
+    for cell in cells:
+        for form_id, other in ctx.doors_by_cell.get(cell, ()):
+            if form_id == door_id:
+                continue
+            dist = sum((a - b) ** 2 for a, b in zip(other, pos)) ** 0.5
+            if dist < best_dist:
+                best, best_dist = form_id, dist
     return best
 
 
@@ -1069,18 +1322,52 @@ def teleport_records(ctx: MorrowindContext) -> list:
     Skyrim's XTEL names a destination REFERENCE and vanilla's is another DOOR
     in 1,703 of 1,722 cases -- never once an XMarker, which is what an earlier
     pass minted. A door whose destination cell is not converted, or which has
-    no partner door there, stays a plain door and is counted.
+    no partner door there, stays a plain door and is counted. A partner that is
+    no load door itself (a one-way door's arrival) is made persistent too.
     See: docs/commentary/tes4_export_morrowind.md#teleport-doors
     """
+    partners = set()
     for door_id, lines, ref in ctx.pending_teleports:
-        cell = ctx.destination_cell(ref)
-        partner = (_partner_door(ctx, cell, ref.dest_pos, door_id)
-                   if cell else '')
+        partner = _partner_door(ctx, _destination_cells(ctx, ref), ref.dest_pos, door_id)
         if not partner:
             ctx.unlinked_doors += 1
             continue
         rot = ref.dest_rot or (0.0, 0.0, 0.0)
         lines.append(f'XTEL.Door={partner}')
         lines.extend(_placement_lines(ref.dest_pos, rot, 'XTEL.'))
-        lines.append(f'RecordFlags={_PERSISTENT}')
-        _rehome_persistent(lines, ctx)
+        _make_persistent(lines, ctx)
+        partners.add(partner)
+    for partner in partners & ctx.own_doors.keys():
+        ctx.persisted_partners += _make_persistent(ctx.own_doors[partner], ctx)
+
+
+def _make_persistent(lines: list, ctx: MorrowindContext) -> bool:
+    """Flag a reference persistent and rehome it; False when it already was."""
+    flags = [line for line in lines if line.startswith('RecordFlags=')]
+    old = int(flags[-1][len('RecordFlags='):]) if flags else 0
+    if old & _PERSISTENT:
+        return False
+    lines.append(f'RecordFlags={old | _PERSISTENT}')
+    _rehome_persistent(lines, ctx)
+    return True
+
+def _master_region_weather(master_dirs) -> dict:
+    """{lowercase region id: WEAT bytes} over every master's retained source.
+
+    See: docs/commentary/tes4_export_morrowind.md#region-weather
+    """
+    out = {}
+    for path, _remap in master_dirs or ():
+        source = os.path.join(path, '_source')
+        if not os.path.isdir(source):
+            continue
+        for name in sorted(os.listdir(source)):
+            if not is_tes3(os.path.join(source, name)):
+                continue
+            for rec in read_file(os.path.join(source, name))[1]:
+                if rec.type != 'REGN' or rec.deleted:
+                    continue
+                sub = get_subrecord(rec, 'WEAT')
+                if sub and rec.record_id.lower() not in out:
+                    out[rec.record_id.lower()] = sub.data
+    return out

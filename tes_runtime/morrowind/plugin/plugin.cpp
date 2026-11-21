@@ -1,0 +1,219 @@
+// MorrowindRuntime.dll -- Morrowind dialogue, topics and journal in Skyrim.
+//
+// A SEPARATE DLL from the other runtimes on purpose: it links vendored
+// GPL-3.0 OpenMW code, and a fault in a script interpreter must not take the
+// jails, guns or the animation cache down with it.
+// See: docs/commentary/morrowind_runtime.md#licensing
+
+#include <windows.h>
+
+#include <cstdio>
+#include <iterator>
+#include <type_traits>
+
+#include "activation.h"
+#include "addresses.h"
+#include "conversation.h"
+#include "cosave.h"
+#include "dialogue_state.h"
+#include "game_calls.h"
+#include "ids_pre_ae.h"
+#include "log.h"
+#include "main_thread.h"
+#include "menu.h"
+#include "npc_anim.h"
+#include "object_tick.h"
+#include "paths.h"
+#include "script_tables.h"
+#include "skse_abi.h"
+#include "stats_sheet.h"
+#include "store.h"
+#include "topic_events.h"
+
+namespace tesruntime::mw {
+
+namespace {
+
+constexpr UInt32 kPluginVersion = 1;
+
+//: Serialization owner id, 'MWRT' -- the co-save records belong to this plugin.
+constexpr UInt32 kSerializationId = 'MWRT';
+
+SKSESerializationInterface* g_serialization = nullptr;
+SKSEMessagingInterface* g_messaging = nullptr;
+
+// The sidecars are only readable once the engine knows its own data path, so
+// the store loads on kMessage_DataLoaded rather than at plugin load.
+void OnSKSEMessage(SKSEMessagingInterface::Message* msg) {
+    if (msg && msg->type == SKSEMessagingInterface::kMessage_NewGame) {
+        RevertState();
+        return;
+    }
+    if (!msg || msg->type != SKSEMessagingInterface::kMessage_DataLoaded) return;
+    SetSidecarLoadedCheck(SidecarPluginLoaded);
+    const StoreStats stats = LoadStore();
+    Log("store: %zu topics, %zu responses, %zu scripts from %zu sidecar(s)",
+        stats.topics, stats.infos, stats.scripts, stats.files);
+    if (!stats.files) {
+        Log("store: no sidecar found -- no Morrowind dialogue will be offered, "
+            "and every activation falls through to vanilla");
+    }
+    const std::size_t actors = LoadActorIndex();
+    Log("activation: %zu actor(s) indexed", actors);
+    LoadNpcAnims(SidecarDir());
+    // After the actor index, which is what resolves each plugin's live slot.
+    BindInstances();
+    // The MenuManager singleton only exists once the game is up, so the menu
+    // registers here rather than at plugin load.
+    Log("menu: install %s", InstallMenu() ? "ok" : "FAILED");
+    InstallConversation();
+    Log("topic: TES4 AddTopic listener %s",
+        InstallTopicEvents(g_messaging) ? "ok" : "FAILED");
+    InstallGameCalls();
+    InstallActivation();
+    // Only a converted game with attributes -- one whose sidecar staged its
+    // skills, Morrowind or TES4 -- has attributes to show or raise.
+    Log("sheet: %zu skill row(s) staged", SkillCount());
+    if (SkillCount()) InstallCharacterSheet();
+    StartObjectTick();
+}
+
+// SKSE hands the Papyrus VM over here, before kMessage_DataLoaded, which is
+// what lets the actor index resolve each plugin's live load-order position.
+bool CaptureVm(void* vm) {
+    SetPapyrusVm(vm);
+    Log("papyrus: VM %p", vm);
+    return true;
+}
+
+void QueryInterfaces(const SKSEInterface* skse) {
+    auto* msg = static_cast<SKSEMessagingInterface*>(
+        skse->QueryInterface(kInterface_Messaging));
+    g_messaging = msg;
+    if (msg) msg->RegisterListener(skse->GetPluginHandle(), "SKSE",
+                                   OnSKSEMessage);
+    auto* papyrus = static_cast<SKSEPapyrusInterface*>(
+        skse->QueryInterface(kInterface_Papyrus));
+    if (papyrus) papyrus->Register(CaptureVm);
+    auto* task = static_cast<SKSETaskInterface*>(
+        skse->QueryInterface(kInterface_Task));
+    SetTaskInterface(task);
+    g_serialization = static_cast<SKSESerializationInterface*>(
+        skse->QueryInterface(kInterface_Serialization));
+    if (g_serialization) {
+        g_serialization->SetUniqueID(skse->GetPluginHandle(),
+                                     kSerializationId);
+    }
+    InstallCoSave(g_serialization, skse->GetPluginHandle());
+    Log("interfaces: messaging %s, papyrus %s, serialization %s, task %s",
+        msg ? "ok" : "MISSING", papyrus ? "ok" : "MISSING",
+        g_serialization ? "ok" : "MISSING", task ? "ok" : "MISSING");
+}
+
+}  // namespace
+
+}  // namespace tesruntime::mw
+
+extern "C" {
+
+// MUST stay a static aggregate: SKSE reads it with
+// LOAD_LIBRARY_AS_IMAGE_RESOURCE and runs no initializers, so an initializer
+// here lands the export in .pdata and SKSE reads unwind entries as version
+// fields (project_skse_version_data_static_init).
+__declspec(dllexport) SKSEPluginVersionData SKSEPlugin_Version = {
+    SKSEPluginVersionData::kVersion,   // dataVersion
+    tesruntime::mw::kPluginVersion,    // pluginVersion
+    "MorrowindRuntime",                // name[256]
+    "TESConversion",                   // author[256]
+    "",                                // supportEmail[252]
+    0,                                 // versionIndependenceEx
+    SKSEPluginVersionData::kVersionIndependent_AddressLibraryPostAE |
+        SKSEPluginVersionData::kVersionIndependent_Signatures |
+        SKSEPluginVersionData::kVersionIndependent_StructsPost629,
+    {0},                               // compatibleVersions
+    0,                                 // seVersionRequired
+};
+
+static_assert(std::is_trivially_copyable<SKSEPluginVersionData>::value,
+              "SKSEPlugin_Version must stay a POD written straight into .data");
+
+// The pre-AE discovery path: SKSE 2.0.x (runtime 1.5.97) and SKSEVR call this
+// instead of reading the version struct. Both exports coexist.
+__declspec(dllexport) bool SKSEPlugin_Query(const SKSEInterface* skse,
+                                            PluginInfo* info) {
+    info->infoVersion = PluginInfo::kInfoVersion;
+    info->name = SKSEPlugin_Version.name;
+    info->version = tesruntime::mw::kPluginVersion;
+    return skse && !skse->isEditor;
+}
+
+__declspec(dllexport) bool SKSEPlugin_Load(const SKSEInterface* skse) {
+    tesruntime::SetPluginName(SKSEPlugin_Version.name);
+    tesruntime::OpenLog();
+    tesruntime::Log("MorrowindRuntime %u loading (runtime %08X, SKSE %08X)",
+                    tesruntime::mw::kPluginVersion, skse->runtimeVersion,
+                    skse->skseVersion);
+    if (!tesruntime::g_versionDb.Load(skse->runtimeVersion) &&
+        !tesruntime::g_versionDb.LoadPreAe(skse->runtimeVersion, tesruntime::pre_ae::kTables,
+                                           std::size(tesruntime::pre_ae::kTables))) {
+        tesruntime::Log("addresses: no Address Library database for this "
+                        "runtime; falling back to signature scans only");
+    } else {
+        tesruntime::Log("addresses: loaded %s (%zu entries)",
+                        tesruntime::g_versionDb.path().c_str(),
+                        tesruntime::g_versionDb.count());
+    }
+    tesruntime::mw::QueryInterfaces(skse);
+    return true;
+}
+
+// The headless test runner's `pick` for a game whose chargen asks this
+// runtime's class and birthsign menus (TES4_Chargen.Ask): TESRuntime's runner
+// finds this export and picks the row named `name`, as `pick` does here.
+// See: docs/commentary/headless_testing.md#tes4-quest-cases
+__declspec(dllexport) bool TESTestPick(const char* name) {
+    const auto pick = tesruntime::mw::Hooks().menuPick;
+    return name && pick && pick(name);
+}
+
+// The engine's game clock in milliseconds, which a sped-up test game runs ahead of
+// real time; 0 while unresolved. TESRuntime's runner stamps lines with it.
+// See: docs/commentary/headless_testing.md#quiet
+__declspec(dllexport) std::uint32_t TESTestGameMs() {
+    const auto clock = tesruntime::mw::Hooks().frameClockMs;
+    return clock ? clock() : 0;
+}
+
+// `pace <speed>` in a converted TES4 game's cases: this runtime's frame governor
+// steers every game it is loaded in, so TESRuntime's runner sets its speed here.
+__declspec(dllexport) bool TESTestPace(float speed) {
+    const auto pace = tesruntime::mw::Hooks().setPaceTarget;
+    if (pace) pace(speed);
+    return pace != nullptr;
+}
+
+// The test runner's `defend` for another runtime's cases: the player kills whatever attacks it, a follower, or
+// the actor with runtime FormID `ally` (0 for none).
+__declspec(dllexport) bool TESTestKillPlayerAttackers(std::uint32_t ally) {
+    const auto kill = tesruntime::mw::Hooks().killAttackersOf;
+    if (kill) kill(ally);
+    return kill != nullptr;
+}
+
+// The test runner's `follow` for another runtime's cases: a reference is a runtime FormID, 0 for the player.
+__declspec(dllexport) float TESTestPosition(std::uint32_t ref, int axis) {
+    const auto position = tesruntime::mw::Hooks().testPosition;
+    return position ? position(ref, axis) : 0.0f;
+}
+
+__declspec(dllexport) float TESTestDistance(std::uint32_t from, std::uint32_t to) {
+    const auto distance = tesruntime::mw::Hooks().testDistance;
+    return distance ? distance(from, to) : 0.0f;
+}
+
+__declspec(dllexport) void TESTestPlaceHere(std::uint32_t ref, float x, float y, float z, float zRot) {
+    const auto place = tesruntime::mw::Hooks().testPlaceHere;
+    if (place) place(ref, x, y, z, zRot);
+}
+
+}  // extern "C"

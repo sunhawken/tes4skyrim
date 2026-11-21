@@ -16,23 +16,15 @@ Two carriers, because a mod declares its base in two different ways:
 """
 import os
 
+from core.plugin_masters import master_dirs, masters_from_export_header
+
 FILE_NAME = '.base_plugins'
 
 
 def names_for(own_dir):
     """Base plugin names for the export tree at `own_dir`, nearest first."""
     own_dir = str(own_dir)
-    names = []
-
-    header = os.path.join(own_dir, '_HEADER.txt')
-    if os.path.isfile(header):
-        with open(header, encoding='utf-8', errors='replace') as fh:
-            for line in fh:
-                if line.startswith('Master['):
-                    n = line.partition('=')[2].strip()
-                    if n and n not in names:
-                        names.append(n)
-
+    names = list(dict.fromkeys(masters_from_export_header(own_dir)))
     recorded = os.path.join(own_dir, '_source', FILE_NAME)
     if os.path.isfile(recorded):
         with open(recorded, encoding='utf-8', errors='replace') as fh:
@@ -63,6 +55,23 @@ def export_dirs(own_dir):
         if os.path.isdir(p) and p not in out:
             out.append(p)
     return out
+
+
+def record_chain_for_assets(asset_dir):
+    """Every RECORD folder serving the assets in `asset_dir`, nearest first.
+
+    The plugins' own (`output_layout.record_dirs_for_assets`), then each one's
+    exported masters, last master first, then the recorded bases
+    (`export_dirs`). A first-match reader lets the own record win.
+    See: docs/commentary/asset_convert_nif.md#flame-stats-from-the-masters
+    """
+    from output_layout import record_dirs_for_assets
+    own = [os.path.abspath(str(r)) for r in record_dirs_for_assets(asset_dir)]
+    chain = list(own)
+    for rec in own:
+        chain += [os.path.abspath(m) for m in reversed(master_dirs(rec))]
+    chain += export_dirs(asset_dir)
+    return list(dict.fromkeys(chain))
 
 
 def subdirs(own_dir, sub):

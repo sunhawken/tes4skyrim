@@ -18,14 +18,14 @@ Usage:
 
 import argparse
 import sys
-import zipfile
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from output_layout import finished_dir
+from output_layout import finished_dir, tree_members, write_mod_zip
 from tools.release.make_game_select_esp import build as build_start_mod
+from tools.release.make_nehrim_no_start_patch import PATCH_NAME as DEV_PATCH_NAME
 
 MOD_NAME = "TESGameSelect"
 
@@ -34,7 +34,8 @@ def package(out_root: Path) -> int:
     """Build the starter mod, then zip what the build produced.
 
     Archive paths are relative to the build root, so the archive root IS the
-    Data folder: the .esp, scripts and seq all sit at top level.
+    Data folder: the .esp, scripts and seq all sit at top level. A hand-built
+    developer patch sitting beside the .esp stays out.
     """
     build_dir = out_root / MOD_NAME
 
@@ -45,7 +46,8 @@ def package(out_root: Path) -> int:
         print("ERROR: the starter mod did not build — nothing to package.")
         return 1
 
-    files = sorted(p for p in build_dir.rglob('*') if p.is_file())
+    files = [(arc, path) for arc, path in tree_members(build_dir)
+             if path.name != DEV_PATCH_NAME]
     if not files:
         print(f"ERROR: {build_dir} is empty — nothing to package.")
         return 1
@@ -56,11 +58,7 @@ def package(out_root: Path) -> int:
     print(f"  Output: {zip_path}")
     print()
 
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for src in files:
-            arc = src.relative_to(build_dir)
-            zf.write(src, arcname=str(arc))
-            print(f"  + {arc}")
+    write_mod_zip(zip_path, files, lambda _i, arc: print(f"  + {arc}"))
 
     size = zip_path.stat().st_size
     print()

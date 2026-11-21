@@ -7,8 +7,8 @@ from script_convert.emit import script as _script
 from script_convert.tes4 import nodes as _tes4_nodes
 from script_convert.blocks import BLOCK_FILTER_PARAM
 from script_convert.constants import (
-    KNOWN_GLOBALS, LOOSE_OPS, PAPYRUS_BOOL_FUNCTIONS, PLACED_REF_SIGS,
-    PLAYER_ALIAS_EXTENDS, RETURN_TYPES, SELF_NAMES, TYPE_MAP, _REF_TYPES,
+    COMBAT_APPROACH_QUEST, FALL_DAMAGE_SPELL, KNOWN_GLOBALS, LAST_ACTIVATOR_VAR, LOOSE_OPS, UDF_RESULT_VAR, PAPYRUS_BOOL_FUNCTIONS, PLACED_REF_SIGS,
+    PLAYER_ALIAS_EXTENDS, REMOTE_ADD_PREFIX, RETURN_TYPES, SELF_NAMES, TYPE_MAP, _REF_TYPES,
     _canonical_global, digit_stripped_formid, _record_type_to_base_papyrus,
     generated_script_stem, is_generated_script_type, safe_property_name, papyrus_script_name,
     resolve_property_formid,
@@ -25,6 +25,7 @@ from script_convert import resolve_name as _resolve_name
 from script_convert import assemble as _assemble
 from script_convert import commands as _commands
 from script_convert.context import ScriptContext
+from script_convert.misc_stats import page_stat_global
 from script_convert.poll_interval import update_interval
 from script_convert.emit import dispatch as _dispatch
 from script_convert.cross_ref import CrossRefGraph
@@ -41,6 +42,9 @@ from script_convert import symbols as _symbols
 # (`"1TrapFireMineWorldRef"`, `"2akulaSdoorSa"`), and leaving those quoted here
 # is exactly the `_MQ01Tate_` trap described below.
 _QUOTED_NAME_RE = re.compile(r'^"(\w+)"$')
+
+#: A converted `Owner.var = Owner.var +/- X` line: the target, the sign, X, a trailing comment.
+_REMOTE_ADD_LINE = re.compile(r'^([\w.]+\.\w+) = \1 ([+-]) ([^;\n]+?)(\s*;.*)?$')
 
 #: Any `ACTOR_ONLY_FUNCTIONS` name called BARE, longest-first.
 _ACTOR_ONLY_ANY_RE = re.compile(
@@ -67,7 +71,7 @@ _EXTRA_COMMAND_NAMES = frozenset({
     'createfullactorcopy', 'forcecloseobliviongate', 'getactionref',
     'getangle', 'getbookread', 'getcontainer', 'getcrimeknown',
     'getincell', 'getinsamecell', 'getisid', 'getisrace', 'getisref',
-    'getissex', 'getpcisrace', 'getpcissex', 'getpos', 'getquestrunning',
+    'getissex', 'getpcisrace', 'getpcissex', 'getplayerbirthsign', 'getpos', 'getquestrunning',
     'getrandompercent', 'getself', 'getstage', 'getstagedone',
     'getstartingangle', 'isactionref', 'isexpelled', 'isinfaction',
     'isquestcompleted', 'message', 'messagebox', 'placeatme', 'pme', 'say',
@@ -98,11 +102,16 @@ class ScriptConverter:
     # the two can never disagree about which INFOs carry a fragment.
     say_topics: set = set()
 
-    #: DIAL EditorID (lower) -> `TES4Unlock_<topic>` global, from build_unlock_plan.
-    topic_unlock_globals: dict = {}
+    #: DIAL EditorID or unlock global (lower) -> (unlock global or '', display name), from topic_reveals.
+    topic_reveals: dict = {}
 
-    #: DIAL EditorID (lower) -> chain line count, from build_script_chain_map.
-    conversation_chains: dict = {}
+    #: Started topic EditorID (lower) -> its plugin's StartConversation routing script.
+    conversation_starts: dict = {}
+
+    #: StartConversation topic (lower, '' = none) -> (first alias, count), from build_force_greet_slots.
+    force_greet_slots: dict = {}
+    #: ForceFlee destination key ('cell|ref', lower) -> (first alias, count), from build_force_flee_slots.
+    force_flee_slots: dict = {}
 
     # script EditorID (lower) -> [(mesg_edid, text, buttons)], from
     # script_convert.message_menus.build_message_plan. Populated once per run
@@ -122,10 +131,7 @@ class ScriptConverter:
         # Parsed arguments of the call being emitted, for handlers that
         # have moved off `args_str` (see _emit_function).
         self._arg_nodes: tuple = ()
-        #: Did the current call's argument list open with a COMMA?  For a
-        #: zero-argument command the token after it is the RECEIVER
-        #: (`StopCombat, Player` is `Player.StopCombat`), which is the only
-        #: thing that says so.
+        #: Did the current call's argument list open with a COMMA (`StopCombat, Player`)?
         self._leading_comma = False
         #: Papyrus type of the value in the assignment being emitted, read off
         #: its parse tree by `emit_assignment`.  Empty outside an assignment.
@@ -181,8 +187,7 @@ class ScriptConverter:
     _SAY_CALL_RE = re.compile(r'^\s*(?P<recv>.+?)\.Say\((?P<topic>[^()]*)\)\s*$')
     # The speak-as shape emitted by the Say handler (see _say_speak_as).
     _SPEAK_AS_CALL_RE = re.compile(
-        r'^\s*TES4Polyfill\.SpeakAs\((?P<speaker>[^,()]+),'
-        r'(?P<inhead>[^,()]+),(?P<topic>[^,()]+)\)\s*$')
+        r'^\s*TES4Polyfill\.SpeakAs\((?P<topic>[^,()]+),(?P<scene>[^,()]+)(?:,[^,()]+)?\)\s*$')
 
     # Events that run on the engine's own dispatch path, where a blocking
     # Say would stall the engine rather than just this script's tick.  A
@@ -190,9 +195,12 @@ class ScriptConverter:
     # match that too.
 
     def _say_may_block(self) -> bool:
-        """True when a blocking SayLine is safe here (a poll, not a callback)."""
+        """True when a blocking SayLine is safe here (a poll or a quest stage, not a callback).
+
+        See: docs/commentary/script_convert.md#stage-say-waits
+        """
         ev = (self._current_event or '').lower()
-        if 'onupdate' in ev:
+        if 'onupdate' in ev or ev == 'stagefragment':
             return True
         if 'fragment' in ev:
             return False
@@ -229,9 +237,8 @@ class ScriptConverter:
             # returns the same measured length.
             pre = SAY_START_WAIT + 0.25
             fn = 'SpeakAsLine' if self._say_may_block() else 'SpeakAsLineNoWait'
-            call = (f'TES4Polyfill.{fn}({ms.group("speaker").strip()}, '
-                    f'{fallback:g}, {ms.group("inhead").strip()}, '
-                    f'{ms.group("topic").strip()})')
+            call = (f'TES4Polyfill.{fn}({fallback:g}, '
+                    f'{ms.group("topic").strip()}, {ms.group("scene").strip()})')
             if self.sc.var_types.get(target.lower().split('.')[-1]) == 'Int':
                 return (f'{target} = {int(pre + 0.999)}  ; TES4 Say: closed until the line is under way\n'
                         f'  {target} = Math.Ceiling({call}){delay}')
@@ -250,14 +257,6 @@ class ScriptConverter:
         # line charged 2.0s of closed guard even though SayLine had already
         # returned -- dead air on the timer of every line in the topic.
         pre = SAY_START_WAIT + 0.25
-        # ð A BLOCKING SayLine IS ONLY SAFE IN A POLL.  It waits for the
-        # engine's OnBegin fragment -- 0.18s median, up to SAY_START_WAIT when
-        # the line is refused.  In OnUpdate that costs this script's own tick.
-        # On the ENGINE'S DISPATCH PATH (a quest-stage or INFO fragment, or an
-        # OnPackageStart/End, OnHit, OnCombatStateChanged callback) it stalls
-        # the transition itself: the stage cannot advance, the package cannot
-        # swap.  That is the stutter that accompanies a line at a STAGE CHANGE
-        # rather than a polled line.  Those sites fire and don't wait.
         call_fn = 'SayLine' if self._say_may_block() else 'SayLineNoWait'
         call = f'TES4Polyfill.{call_fn}({speaker}, {topic}, {fallback:g})'
         if self.sc.var_types.get(target.lower().split('.')[-1]) == 'Int':
@@ -286,8 +285,7 @@ class ScriptConverter:
             out.append(ptype.lower())
         if not via_record:
             return out
-        fid = (self.xref.edid_to_formid.get(ref_name)
-               or self.xref.edid_to_formid.get(ref_name.lower(), ''))
+        fid = resolve_property_formid(self.xref, ref_name)
         scri = self.xref.record_scri.get(fid, '') if fid else ''
         if scri:
             edid = self.xref.script_formid_to_edid.get(scri, '').lower()
@@ -433,19 +431,30 @@ class ScriptConverter:
         writes the clicked index here, and the converted GetButtonPressed
         reads it back through the consumer — once, then -1 again, which is
         TES4's own contract and what keeps every `if button == N` poll from
-        re-firing forever on a stale index."""
+        re-firing forever on a stale index.
+
+        See: docs/commentary/script_convert.md#one-box-at-a-time"""
         if not self.sc.uses_msg_buttons:
             return []
         return [
             '',
             'Int TES4_MsgButton = -1',
+            'Bool TES4_MsgOpen = False',
             '',
             '; Displaying a box resets the pressed state (TES4: GetButtonPressed',
             '; reads -1 from display until the click), then Show() parks this',
             '; thread on the box and its return lands in TES4_MsgButton.',
-            'Int Function TES4_ShowMsg(Message TES4_akMsg)',
+            '; While this script\'s box is up, a second request leaves it alone.',
+            'Int Function TES4_ShowMsg(Message TES4_akMsg, ' + ', '.join(
+                f'Float afArg{n} = 0.0' for n in range(1, 10)) + ')',
+            '  If TES4_MsgOpen',
+            '    Return TES4_MsgButton',
+            '  EndIf',
             '  TES4_MsgButton = -1',
-            '  Return TES4_akMsg.Show()',
+            '  TES4_MsgOpen = True',
+            '  Int TES4_shown = TES4_akMsg.Show(' + ', '.join(f'afArg{n}' for n in range(1, 10)) + ')',
+            '  TES4_MsgOpen = False',
+            '  Return TES4_shown',
             'EndFunction',
             '',
             'Int Function TES4_TakeMsgButton()',
@@ -530,7 +539,8 @@ class ScriptConverter:
         prev = self.sc
         self.sc = ScriptContext(property_refs=dict(prev.property_refs),
                                 scro_aliases=dict(prev.scro_aliases),
-                                quest_delay=prev.quest_delay)
+                                quest_delay=prev.quest_delay,
+                                on_book=prev.on_book)
         return _assemble.build(self, name, source, extends, editor_id)
 
     def convert_fragment(self, source: str, extends: str = 'Quest') -> list[str]:
@@ -538,6 +548,9 @@ class ScriptConverter:
 
         Returns list of converted lines (indented for function body).
         Preserves _property_refs across calls (quest fragments share a converter).
+        A quest stage's Say waits for its line; an INFO's does not.
+
+        See: docs/commentary/script_convert.md#stage-say-waits
         """
         # A fragment gets a FRESH context, carrying over the property table
         # and the GetInCell families that go with it: the caller emits both
@@ -550,12 +563,7 @@ class ScriptConverter:
             property_refs=dict(prev.property_refs),
             cell_families=dict(prev.cell_families),
             scro_aliases=dict(prev.scro_aliases))
-        # A fragment body runs on the ENGINE'S DISPATCH PATH: a quest stage
-        # cannot advance, and an INFO cannot finish, while the fragment is
-        # still executing.  A blocking SayLine there stalls the transition
-        # itself -- the stutter that accompanies a line at a stage change.
-        # _say_may_block() reads this to emit SayLineNoWait instead.
-        self._current_event = 'Fragment'
+        self._current_event = 'StageFragment' if extends == 'Quest' else 'Fragment'
         # PARSED, not re-scanned: a fragment is a script without the block
         # wrappers, which is a parser MODE rather than a second hand-written
         # loop.  The three regexes this replaces (the `scn` skip, the
@@ -577,9 +585,6 @@ class ScriptConverter:
         body = _script.emit_body(self, tree.body, extends, 1)
         return [_script.fragment_local(self, v) for v in tree.variables] + body
 
-
-    _CONTROLS_WRITE_RE = re.compile(
-        r'^(\s*)Game\.(Disable|Enable)PlayerControls\(\)\s*(;.*)?$')
 
 
     def get_cell_family_helpers(self) -> list:
@@ -780,9 +785,36 @@ class ScriptConverter:
         # whether the rendering happens to contain a decimal point.
         self._value_type = _symbols.type_of_expr(stmt.value, self.type_of)
         try:
-            return self._assign(stmt, target, extends)
+            line = self._mirror_page_stat(stmt, target, self._assign(stmt, target, extends))
+            return self._remote_add(stmt, line)
         finally:
             self._value_type = ''
+
+    def _remote_add(self, stmt, line: str) -> str:
+        """`Owner.var = Owner.var +/- X` as a call of the owner's add function, else `line`.
+
+        Oblivion ran one script at a time; in Papyrus two scripts doing that
+        read and write at once lose a count, so the owner does both.
+        """
+        found = _REMOTE_ADD_LINE.match(line)
+        owner, _, var = _expr.emit_source(stmt.target).partition('.')
+        if not found or not var or not self.xref or not self.xref.adds_remotely(owner, var):
+            return line
+        receiver, _, name = found.group(1).rpartition('.')
+        amount = found.group(3) if found.group(2) == '+' else f'0 - {found.group(3)}'
+        return f'{receiver}.{REMOTE_ADD_PREFIX}{name}({amount}){found.group(4) or ""}'
+
+    def _mirror_page_stat(self, stmt, target: str, line: str) -> str:
+        """`line`, followed by a write of the new value into the mirror global of
+        a variable a game's statistics page showed (misc_stats.PAGE_VARIABLES).
+
+        See: docs/commentary/morrowind_runtime.md#statistics-tab
+        """
+        mirror = page_stat_global(_expr.emit_source(stmt.target))
+        if not mirror or line.lstrip().startswith(';'):
+            return line
+        self.sc.property_refs[mirror] = 'GlobalVariable'
+        return f'{line}\n{mirror}.SetValue({target})'
 
     def _assign(self, stmt, target: str, extends: str) -> str:
 
@@ -943,23 +975,23 @@ class ScriptConverter:
         return _dispatch.as_statement(self, _expr.emit(self, expr, extends))
 
     def emit_return(self, stmt, extends: str) -> str:
-        """TES4 `return` ends the block; a UDF carries its value out here."""
+        """TES4 `return` ends the block; a UDF carries its result out here."""
         if self.sc.udf_returns:
-            return f'Return {self.sc.udf_return_value or "0"}'
+            return f'Return {UDF_RESULT_VAR}'
         return f'{self.sc.poll_return_prefix}Return' if self.sc.poll_return_prefix \
             else 'Return'
 
     def emit_set_function_value(self, stmt, extends: str) -> str:
-        """OBSE `SetFunctionValue <expr>` -- record a user function's result.
+        """OBSE `SetFunctionValue <expr>` -- set a user function's result and keep running.
 
-        Emits nothing itself: TES4 always pairs it with a `return`, which is
-        what carries the value out.  Emitting a `Return` here as well gave the
-        pair two, and the second was unreachable.
+        The first value's type becomes the function's return type.
+        See: docs/commentary/script_convert.md#set-function-value
         """
+        value = _expr.emit(self, stmt.value, extends) if stmt.value else '0'
+        if not self.sc.udf_returns:
+            self.sc.udf_return_type = self.type_of(value) or 'Int'
         self.sc.udf_returns = True
-        self.sc.udf_return_value = (_expr.emit(self, stmt.value, extends)
-                                    if stmt.value else '0')
-        return ''
+        return f'{UDF_RESULT_VAR} = {value}'
 
     def emit_jump(self, stmt, extends: str) -> str:
         """OBSE `Label <n>` / `Goto <n>` -- the head and tail of a ref-walk.
@@ -1163,71 +1195,33 @@ class ScriptConverter:
         """
         return dict(self.sc.property_refs)
 
-    # Where the speak-as identity sits in a TES4 Say/SayTo argument list:
-    #   Say   <topic> <force-subtitles> <speak-as> [<in-players-head>]
-    #   SayTo <target> <topic> <flag> <speak-as> <flag>
-
-    def _say_speak_as(self, ref_name, pparts: list, fname_low: str) -> tuple:
-        """(speaker property, in-head) for a speak-as call site.
+    def _say_speak_as(self, ref_name, pparts: list, fname_low: str) -> str:
+        """The scene property that speaks a speak-as call site, or ''.
 
         TES4's third `Say` argument is the identity the line belongs to; the
-        receiver only emits the sound.  Skyrim has no equivalent parameter and
-        keys voice lookup on the SPEAKER, so the emitting marker (a STAT, with
-        no voice type) resolves to no voice folder and the line is silent.
-        The importer places a TACT carrying that NPC's voice type at the
-        emitter's authored position and registers it under the speaker name --
-        see tes5_import/dialogue/speak_as.py, which derives the SAME name
-        from the same authored pair, so the two agree with no side-channel.
-
-        The fourth authored argument is TES4's "speak in the player's head",
-        which Skyrim exposes natively as `Say`'s third parameter
-        (abSpeakInPlayersHead) -- passed straight through by
-        TES4Polyfill.SpeakAs.  🛑 Never emulate it by moving the speaker.
-
-        Returns ('', False) when this is not a speak-as site.
+        receiver only emits the sound.  The importer places a TACT at the
+        emitter and a one-action scene per topic whose INFOs name that NPC as
+        their speaker, registered under the SAME name derived here from the same
+        authored tokens (tes5_import/dialogue/speak_as.py).
+        See: docs/commentary/tes5_import_dialogue.md#speaker-activator-construction
         """
-        none = ('', False)
-        if not ref_name:
-            return none
-        need = SAY_SPEAKAS_MIN_TOKENS.get(fname_low)
-        if need is None:
-            return none
-        tokens = []
-        for part in pparts:
-            tokens.extend(str(part).split())
-        if len(tokens) < need:
-            return none
-        # The identity is the first non-numeric token after the topic; the
-        # in-head flag is the numeric token after it.
-        rest = tokens[2:] if fname_low == 'sayto' else tokens[1:]
-        topic = tokens[1] if fname_low == 'sayto' else tokens[0]
-        voice = ''
-        in_head = False
-        for i, t in enumerate(rest):
-            if t and not t.lstrip('-').replace('.', '').isdigit():
-                voice = t
-                nxt = rest[i + 1] if i + 1 < len(rest) else ''
-                in_head = bool(nxt) and nxt.lstrip('-').isdigit() and int(nxt) != 0
-                break
-        if not voice or not re.fullmatch(r'\w+', voice):
-            return none
-        topic = topic.strip().strip('"')
-        if not re.fullmatch(r'\w+', topic):
-            return none
-        # Only an actor BASE is a speak-as identity; anything else in that slot
-        # is a flag or a stray token.  And only a real DIAL is a topic.
-        if self.xref:
-            fid = self.xref.edid_to_formid.get(voice.lower(), '')
-            if not fid or self.xref.record_type.get(fid, '') not in ('NPC_',
-                                                                     'CREA'):
-                return none
-            tfid = self.xref.edid_to_formid.get(topic.lower(), '')
-            if not tfid or self.xref.record_type.get(tfid, '') != 'DIAL':
-                return none
-        speaker = safe_property_name(
-            f'TES4Voice_{ref_name.lower()}_{voice.lower()}')
-        self.sc.property_refs[speaker] = 'ObjectReference'
-        return speaker, in_head
+        parsed = _speak_as_tokens(pparts, fname_low) if ref_name else None
+        if not parsed or not self._is_speak_as_identity(*parsed):
+            return ''
+        topic, voice = parsed
+        scene = safe_property_name(
+            f'TES4Scene_{ref_name.lower()}_{voice.lower()}_{topic.lower()}')
+        self.sc.property_refs[scene] = 'Scene'
+        return scene
+
+    def _is_speak_as_identity(self, topic: str, voice: str) -> bool:
+        """Only an actor BASE is a speak-as identity, and only a real DIAL a topic."""
+        if not self.xref:
+            return True
+        fid = self.xref.edid_to_formid.get(voice.lower(), '')
+        tfid = self.xref.edid_to_formid.get(topic.lower(), '')
+        return (self.xref.record_type.get(fid, '') in ('NPC_', 'CREA')
+                and self.xref.record_type.get(tfid, '') == 'DIAL')
 
     def _mark_topic_property(self, name: str) -> None:
         """Type `name` as a Topic, but only if it really names a DIAL.
@@ -1350,6 +1344,7 @@ class ScriptConverter:
         The parser already owns the body, so it is handed over directly.
         """
         from script_convert.tes4.parser import Mode, parse
+        self.sc.source = source
         try:
             tree = parse(source, Mode.SCRIPT)
         except Exception:
@@ -1414,42 +1409,26 @@ class ScriptConverter:
                 return param
         return 'Game.GetPlayer()'
 
-    _FALL_RESTORE = 'TES4Polyfill.RestoreFallDamage()'
-
     def _append_fall_damage_restore(self, out: list, extends: str) -> list:
-        """Pair every SuppressFallDamage() with a restore when the effect ends.
+        """End a magic effect's fall-damage window when the effect itself ends.
 
-        `TES4Polyfill.SuppressFallDamage()` (the ResetFallDamageTimer
-        conversion) writes fJumpFallHeightMin, a GLOBAL game setting.  Oblivion
-        needed no teardown because ResetFallDamageTimer only cleared a
-        per-actor accumulator; leaving the Skyrim equivalent set would disable
-        fall damage permanently.
-
-        The restore goes in whichever teardown event the script already has —
-        OnEffectFinish for a magic-effect script, otherwise OnUpdate's exit —
-        and a fresh OnEffectFinish is synthesized when the script has none.
+        The restore dispels the spell from the teardown event's own target (the
+        actor the suppression was cast on); an ActiveMagicEffect with no
+        OnEffectFinish gets one synthesized.  Other callers need no teardown:
+        each call only opens a short window.
+        See: docs/commentary/script_convert.md#fall-damage-is-a-perk
         """
+        restore = 'TES4Polyfill.RestoreFallDamage({}, ' + FALL_DAMAGE_SPELL + ')'
         idx = next((i for i, line in enumerate(out)
                     if line.startswith('Event OnEffectFinish(')), None)
-
-        if idx is not None:
-            # Restore the SAME actor the suppression applied to, which is the
-            # teardown event's own target parameter.
+        end = None if idx is None else next(
+            (i for i in range(idx + 1, len(out)) if out[i] == 'EndEvent'), None)
+        if end is not None:
             m = re.search(r'\bActor\s+(ak\w+)', out[idx])
-            actor = m.group(1) if m else ''
-            end = next((i for i in range(idx + 1, len(out))
-                        if out[i] == 'EndEvent'), None)
-            if end is not None:
-                out.insert(end, f'  TES4Polyfill.RestoreFallDamage({actor})')
-                return out
-
-        # No teardown event at all: an ActiveMagicEffect always gets one, so
-        # synthesize it rather than leaving the suppression permanent.
-        if extends == 'ActiveMagicEffect':
-            out.append('Event OnEffectFinish(Actor akTarget, Actor akCaster)')
-            out.append('  TES4Polyfill.RestoreFallDamage(akTarget)')
-            out.append('EndEvent')
-            out.append('')
+            out.insert(end, '  ' + restore.format(m.group(1) if m else 'None'))
+        elif extends == 'ActiveMagicEffect':
+            out += ['Event OnEffectFinish(Actor akTarget, Actor akCaster)',
+                    '  ' + restore.format('akTarget'), 'EndEvent', '']
         return out
 
 
@@ -1473,11 +1452,8 @@ class ScriptConverter:
         for btype, _bf, body in blocks:
             if btype != 'onactivate':
                 continue
-            top_level_activate = any(
-                isinstance(st, _tes4_nodes.ExprStmt)
-                and st.expr.called == 'activate'
-                and st.expr.receiver is None
-                for st in body or ())
+            top_level_activate = any(_assemble.is_self_activate(st)
+                                     for st in body or ())
             if not top_level_activate:
                 consumes = True
         return consumes
@@ -1683,18 +1659,7 @@ class ScriptConverter:
         if fid:
             # Use canonical EditorID (original case) as key to match _add_scro_ref
             canon_edid = self.xref.formid_to_edid.get(fid, name)
-            rtype = self.xref.record_type.get(fid, '')
-            ptype = _resolve_name.papyrus_type_for(self.xref, fid, rtype)
-            # Prefer attached script type over generic Actor/ObjectReference
-            # so cross-script property access works (e.g., NPCRef.rent).
-            # Base-object types (Armor/Weapon/Potion/...) are excluded: the VM
-            # refuses to bind an ObjectReference-derived script class to a base
-            # record, and the property then reads None. A unique-placed
-            # ACTI/LIGH is the exception — the binder redirects to its ref.
-            script_type = self.xref.get_record_script_type(name)
-            if script_type and _resolve_name.script_type_binds(
-                    self.xref, ptype, fid):
-                ptype = script_type
+            ptype = self._record_property_type(fid, canon_edid)
             safe = safe_property_name(canon_edid)
             # Don't downgrade a more specific type (e.g., Actor from
             # _resolve_self_ref) back to a generic one (ObjectReference).
@@ -1705,6 +1670,21 @@ class ScriptConverter:
             return safe
 
         return safe_property_name(name)
+
+    def _record_property_type(self, fid: str, canon_edid: str) -> str:
+        """Property type for record `fid`: its attached script class when that binds, else its record type.
+
+        The script is found by the CANONICAL EditorID, so a leading-digit record
+        named by its stripped spelling still gets its class.  Base objects
+        (Armor/Weapon/...) keep the record type: the VM will not bind an
+        ObjectReference-derived class to one, except a unique-placed ACTI/LIGH.
+        """
+        ptype = _resolve_name.papyrus_type_for(
+            self.xref, fid, self.xref.record_type.get(fid, ''))
+        script_type = self.xref.get_record_script_type(canon_edid)
+        if script_type and _resolve_name.script_type_binds(self.xref, ptype, fid):
+            return script_type
+        return ptype
 
     def arg_srcs(self) -> list:
         """Every argument as AUTHORED source text."""
@@ -1881,17 +1861,31 @@ class ScriptConverter:
         return f'{f1}.SetAlly({f2}, true, true)' + _mirror(2)
 
     def _force_combat_call(self, ref: str, target: str) -> str:
-        """Emit a TES4Polyfill.ForceCombat call with the conversion-owned
-        enemy-faction pair that makes the fight stick for ANY actors.
+        """Emit TES4Polyfill.ForceCombatApproach with the factions and the pool."""
+        factions = self._combat_factions('TES4ForceCombatAttackers', 'TES4ForceCombatVictims')
+        return f'TES4Polyfill.ForceCombatApproach({ref}, {target}, {factions}, {self._approach_pool()})'
+
+    def _end_combat_call(self, ref: str) -> str:
+        """Emit TES4Polyfill.EndCombatApproach: StopCombat, leaving the pair."""
+        factions = self._combat_factions('TES4ForceCombatAttackers')
+        return f'TES4Polyfill.EndCombatApproach({ref}, {factions}, {self._approach_pool()})'
+
+    def _approach_pool(self) -> str:
+        """Register the combat-approach pool Quest property; return its name."""
+        self.sc.property_refs[COMBAT_APPROACH_QUEST] = 'Quest'
+        return COMBAT_APPROACH_QUEST
+
+    def _combat_factions(self, *names: str) -> str:
+        """Register ForceCombat faction properties; return them as arguments.
 
         The two factions are records the import writes at fixed FormIDs
         (record-side mutual Enemy XNAM); the property names are registered
         in _WELL_KNOWN_PROPERTIES so the VMAD fill binds them.
         """
-        self.sc.property_refs['TES4ForceCombatAttackers'] = 'Faction'
-        self.sc.property_refs['TES4ForceCombatVictims'] = 'Faction'
-        return (f'TES4Polyfill.ForceCombat({ref}, {target}, '
-                'TES4ForceCombatAttackers, TES4ForceCombatVictims)')
+        for name in names:
+            if name:
+                self.sc.property_refs[name] = 'Faction'
+        return ', '.join(names)
 
     def _destroyed_formlist(self) -> str:
         """Register and name the conversion-owned destroyed-reference FormList.
@@ -1907,13 +1901,15 @@ class ScriptConverter:
         return 'TES4DestroyedRefs'
 
     def _get_action_ref_param(self) -> str:
-        """Return the correct event parameter for GetActionRef/IsActionRef.
-        
-        TES4 GetActionRef is available in every block. Papyrus scopes event params.
-        Map to the appropriate parameter based on the current event being converted.
+        """The Papyrus name for TES4's action ref (GetActionRef, bare Activate) in the current event.
+
+        An event without an action-ref parameter reads the object's last
+        activator when the script has an OnActivate block, else None/Self.
+
+        See: docs/commentary/script_convert.md#last-activator
         """
         ev = self._current_event.lower()
-        if 'onactivate' in ev or 'ontrigger' in ev:
+        if 'onactivate' in ev or 'ontrigger' in ev or 'onread' in ev:
             return 'akActionRef'
         if 'onequipped' in ev or 'onunequipped' in ev:
             return 'akActor'
@@ -1925,13 +1921,12 @@ class ScriptConverter:
             return 'akNewContainer'
         if 'oncombatstate' in ev:
             return 'akTarget'
-        # OnUpdate/OnInit/other events have no action ref - use None as fallback
+        if any(b.btype.lower() == 'onactivate'
+               for b in (self._tree.blocks if self._tree else ())):
+            self.sc.uses_last_activator = True
+            return LAST_ACTIVATOR_VAR
         if 'onupdate' in ev or 'oninit' in ev:
             return 'None'
-        # Every other event -- OnUpdate, OnInit, OnLoad, OnDeath's siblings --
-        # declares NO action ref, and naming one there is an undefined
-        # identifier that fails the whole script.  TES4 answered GetActionRef
-        # outside an activation block with the script's own subject.
         return 'Self'
 
     # Papyrus locals/parameters that are already actors — calling an actor-only
@@ -1961,6 +1956,20 @@ class ScriptConverter:
         if not ref or not re.match(r'^[A-Za-z_]\w*$', ref):
             return False
         return ref.lower() not in self._NON_PROPERTY_REFS
+
+    def walk_speed_formula(self, ref_name: str):
+        """(authored Speed, walk min, walk max) of a Speed write's subject, or None.
+
+        A named receiver is that actor; a bare call is whatever actor attaches
+        the script being converted.
+        """
+        if not self.xref:
+            return None
+        if ref_name and ref_name.lower() not in SELF_NAMES:
+            fids = [self.xref.actor_formid(ref_name)]
+        else:
+            fids = self.xref.script_owner_actors(self.sc.edid) if self.sc.edid else []
+        return self.xref.walk_speed_formula(fids)
 
     def _packages_of_type(self, ref_name: str, pkg_type: int) -> list:
         """PACK EditorIDs backing a `GetCurrentAIPackage == <type>` test.
@@ -2255,8 +2264,7 @@ class ScriptConverter:
         owner_low, var_low = owner.strip().lower(), var.strip().lower()
         if not owner_low or not var_low or var_low in KNOWN_COMMANDS:
             return ''
-        # Resolve the owner EditorID to its attached script's variable table.
-        fid = self.xref.edid_to_formid.get(owner_low, '')
+        fid = resolve_property_formid(self.xref, owner_low)
         script_low = ''
         if fid:
             scri = self.xref.record_scri.get(fid, '')
@@ -2438,6 +2446,31 @@ def sctx_onactivate_consumes(sctx: str) -> bool:
     if not blocks:
         return False
     return ScriptConverter._onactivate_consumes(blocks)
+
+
+# ---------------------------------------------------------------------------
+# Say call sites
+# ---------------------------------------------------------------------------
+
+def _speak_as_tokens(pparts: list, fname_low: str):
+    """(topic, voice) from a TES4 Say/SayTo argument list, or None.
+
+    `Say <topic> <force-subtitles> <speak-as> [<voice-at-player>]`, and SayTo
+    names its target first: the identity is the first non-numeric token after
+    the topic.
+    """
+    need = SAY_SPEAKAS_MIN_TOKENS.get(fname_low)
+    tokens = [t for part in pparts for t in str(part).split()]
+    if need is None or len(tokens) < need:
+        return None
+    rest = tokens[2:] if fname_low == 'sayto' else tokens[1:]
+    topic = (tokens[1] if fname_low == 'sayto' else tokens[0]).strip().strip('"')
+    for t in rest:
+        if t and not t.lstrip('-').replace('.', '').isdigit():
+            if re.fullmatch(r'\w+', t) and re.fullmatch(r'\w+', topic):
+                return topic, t
+            return None
+    return None
 
 
 def _call_name(node) -> str:

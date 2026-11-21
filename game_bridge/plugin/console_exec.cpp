@@ -200,6 +200,26 @@ void* LookupForm(std::uint32_t formId) {
 // `player.getpos x` printed a real value. Commands still returned success, so
 // the failure was invisible: `moveto player` on a quest actor reported ok and
 // moved nothing at all.
+// The last fault caught in ExecOne: its code and its address as an offset into the game exe (0 = outside it).
+DWORD g_faultCode = 0;
+std::uintptr_t g_faultOffset = 0;
+
+int NoteFault(const EXCEPTION_POINTERS* info) {
+    g_faultCode = info->ExceptionRecord->ExceptionCode;
+    const auto at = reinterpret_cast<std::uintptr_t>(info->ExceptionRecord->ExceptionAddress);
+    const auto base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+    g_faultOffset = at >= base && at - base < 0x8000000 ? at - base : at;
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void FaultMessage(std::string* err) {
+    if (!err) return;
+    char where[96];
+    std::snprintf(where, sizeof where, " (code %08lX at SkyrimSE+0x%llx)", static_cast<unsigned long>(g_faultCode),
+                  static_cast<unsigned long long>(g_faultOffset));
+    *err = std::string("engine raised an exception executing the command") + where;
+}
+
 bool ExecOne(const std::string& cmd, std::string* err, void* target = nullptr) {
     void* script = AllocScriptObject(cmd);
     if (!script) {
@@ -207,15 +227,15 @@ bool ExecOne(const std::string& cmd, std::string* err, void* target = nullptr) {
         return false;
     }
 
-    // arg1 is the console's execution context. We do NOT have it: the only way
-    // to obtain it would be to hook ConsoleExecute, and that function cannot be
-    // detoured -- its prologue does `mov rax,rsp`, which is meaningless once
-    // relocated, and attempting it crashed the game (see console_capture.cpp).
-    //
-    // With a null context the engine COMPILES the script and returns success
-    // without running it. That is a false positive, so the result is reported
-    // honestly rather than dressed up as a success.
-    const std::uintptr_t ctx = g_execContext.load();
+    // The "execution context" is the ScriptCompiler, and on 1.6.1170 nothing
+    // on the compile path reads it: ConsoleExecute only forwards it to
+    // CompileAndRun, which only passes it as `this` to helpers that never
+    // dereference it. So a zeroed stand-in serves until the game's own pointer
+    // is captured, and a headless run needs no typed console command.
+    // See: docs/commentary/headless_testing.md#console-without-a-keystroke
+    alignas(16) static std::uint8_t statelessCompiler[64] = {};
+    const std::uintptr_t captured = g_execContext.load();
+    const std::uintptr_t ctx = captured ? captured : reinterpret_cast<std::uintptr_t>(statelessCompiler);
 
     // Handlers only PRINT while the thread-local console-mode byte is set (see
     // console_capture.cpp) -- without this, every command runs fine and reports
@@ -265,8 +285,8 @@ bool ExecOne(const std::string& cmd, std::string* err, void* target = nullptr) {
             auto fn = reinterpret_cast<ConsoleExecute_t>(g_addr.consoleExecute);
             ok = fn(reinterpret_cast<void*>(ctx), script, target, kCompilerTypeConsole);
         }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        if (err) *err = "engine raised an exception executing the command";
+    } __except (NoteFault(GetExceptionInformation())) {
+        FaultMessage(err);
         ok = false;
     }
 

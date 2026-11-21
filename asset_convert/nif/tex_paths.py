@@ -3,7 +3,9 @@
 Both are pure string/slot readers with no NIF state, so they sit below every
 module that needs them.
 """
-from asset_convert.game_paths import current_namespace
+import re
+
+from asset_convert.game_paths import ascii_path, current_namespace
 
 
 def bs_pp_texture_slots(prop):
@@ -29,36 +31,72 @@ def bs_pp_texture_slots(prop):
 
 
 #: Source extensions that always ship as DDS, whatever the mesh calls them.
-_IMAGE_EXTS = ('tga', 'bmp')
+IMAGE_EXTS = ('tga', 'bmp')
+
+#: Byte encoding of AUTHORED NIF path strings (Windows-1252, as plugins store text).
+PATH_ENCODING = 'cp1252'
+
+#: A whole `textures` folder anywhere in a backslash path.
+_TEXTURES_FOLDER = re.compile(r'(?:^|\\)textures\\', re.I)
+
+
+def path_text(raw) -> str:
+    """A NIF path string as text; bytes are read as Windows-1252."""
+    return raw.decode(PATH_ENCODING, errors='replace') \
+        if isinstance(raw, bytes) else str(raw)
+
+
+def path_bytes(text) -> bytes:
+    """A path as the bytes a NIF stores: its `ascii_path`, the name output ships under."""
+    return ascii_path(text).encode('ascii')
+
+
+def texture_rel_path(raw) -> str:
+    """An authored texture path below `textures\\`, separators normalized FIRST.
+
+    Everything up to the first whole `textures\\` folder is dropped wherever it
+    sits (`\\..\\Textures\\`, an absolute authoring path), as OpenMW's
+    `correctResourcePath` does; else a leading 'data\\'. Every other segment is
+    kept, 'lowres\\' included (`full_res_twin` decides its fallback).
+    See: docs/commentary/asset_convert_texture.md#per-game-asset-namespace
+    See: docs/commentary/asset_convert_shader.md#top-level-texture-fallback
+    """
+    path = path_text(raw).replace('/', '\\')
+    folder = _TEXTURES_FOLDER.search(path)
+    if folder:
+        return path[folder.end():]
+    if path.lower().startswith('data\\'):
+        path = path[len('data\\'):]
+    return path
 
 
 def rewrite_tex_path(raw_bytes):
-    """Prepend the game's namespace to a texture path that lacks it.
+    """The namespaced Skyrim path for an AUTHORED texture path; .tga/.bmp -> .dds.
 
-    Separators are normalized FIRST; a leading 'data\\' and a 'lowres\\'
-    segment are dropped, and a .tga/.bmp name becomes .dds. The idempotence
-    check keys on the ACTIVE namespace, so a path already carrying ANOTHER
-    game's prefix is still namespaced rather than passed through unchanged.
     See: docs/commentary/asset_convert_shader.md#rewrite-tex-path
-    See: docs/commentary/asset_convert_texture.md#per-game-asset-namespace
     """
-    ns = current_namespace()
-    path = raw_bytes.decode('utf-8', errors='replace').replace('/', '\\')
-    if path.lower().startswith('data\\'):
-        path = path[len('data\\'):]
-    low = path.lower()
+    return ('Textures\\' + current_namespace() + '\\'
+            + as_dds(texture_rel_path(raw_bytes)))
 
-    if low.startswith('textures\\'):
-        rest = path[len('textures\\'):]
-    else:
-        rest = path
-    if rest.lower().startswith('lowres\\'):
-        rest = rest[len('lowres\\'):]
-    rest = as_dds(rest)
 
-    if rest.lower().startswith(ns + '\\'):
-        return 'Textures\\' + rest
-    return 'Textures\\' + ns + '\\' + rest
+def full_res_twin(tex):
+    """The full-resolution path a rewritten 'lowres\\' texture mirrors, or None.
+
+    See: docs/commentary/asset_convert_shader.md#lowres-textures
+    """
+    prefix = 'Textures\\' + current_namespace() + '\\'
+    lowres = prefix + 'lowres\\'
+    if tex.lower().startswith(lowres.lower()):
+        return prefix + tex[len(lowres):]
+    return None
+
+
+def top_level_twin(tex):
+    """The rewritten path naming `tex`'s file directly under the namespace folder.
+
+    See: docs/commentary/asset_convert_shader.md#top-level-texture-fallback
+    """
+    return 'Textures\\' + current_namespace() + '\\' + tex.replace('/', '\\').rsplit('\\', 1)[-1]
 
 
 def as_dds(path: str) -> str:
@@ -68,6 +106,6 @@ def as_dds(path: str) -> str:
     load; without this every converted path names a file that does not exist.
     """
     stem, dot, ext = path.rpartition('.')
-    if dot and ext.lower() in _IMAGE_EXTS:
+    if dot and ext.lower() in IMAGE_EXTS:
         return stem + '.dds'
     return path

@@ -16,6 +16,10 @@ from pyffi.formats.nif import NifFormat
 from asset_convert.nif.nif_flags import (TT_SCALE_U, TT_SCALE_V,
                                          TT_TRANSLATE_U,
                                          TT_TRANSLATE_V)
+from asset_convert.nif.uv_transform import (OFFSET_OP_OF_SCALE,
+                                            affine_interpolator,
+                                            scale_offset_affine, target_map,
+                                            translate_affine)
 
 #: Types vanilla ships in a controlled block. See: docs/commentary/asset_convert_nif.md#sequence-controller-retargeting
 _VANILLA_SEQ_CONTROLLERS = frozenset({
@@ -57,6 +61,12 @@ TEX_TRANSFORM_VARS = {
 #: NiMaterialColorController.target_color 3 = TC_SELF_ILLUM, the only channel with a Skyrim analogue.
 MATERIAL_COLOR_EMISSIVE = 3
 
+#: NiTimeController flags of a sequence-driven controller: active, clamp, compute scaled time.
+MANAGED_CONTROLLER_FLAGS = 0x4C
+
+#: NiMultiTargetTransformController flags on all 157 vanilla animated door/activator meshes.
+VANILLA_MTTC_FLAGS = 0x6C
+
 #: Emissive color-controller type, (lighting, effect). See: docs/commentary/asset_convert_shader.md#ob-enums
 _SHADER_COLOR_EMISSIVE = (1, 0)
 
@@ -73,8 +83,14 @@ SCRIPT_DRIVEN_SEQUENCES = frozenset((
 AUTOPLAY_SEQUENCE = 'AutoPlay'
 AUTOLOOP_SEQUENCE = 'AutoLoop'
 
-#: nif.xml CycleType: 0 = LOOP, 1 = REVERSE, 2 = CLAMP.
-_CYCLE_CLAMP = 2
+#: Name suffixes of a looping sequence's own lead-in and lead-out, played once around its loop.
+INTRO_SUFFIX = ' Intro'
+OUTRO_SUFFIX = ' Outro'
+
+#: nif.xml CycleType LOOP.
+CYCLE_LOOP = 0
+#: nif.xml CycleType CLAMP (1 is REVERSE).
+CYCLE_CLAMP = 2
 
 #: Oblivion names meaning "ambient, plays by itself"; script-driven names keep theirs.
 _AMBIENT_SEQUENCES = frozenset(('idle',))
@@ -251,7 +267,7 @@ def _entry_signature(cb):
             getattr(cb.controller, 'type_of_controlled_color', None))
 
 
-def _shallow_clone(block):
+def shallow_clone(block):
     """A same-class copy of a pyffi block, field by declared field."""
     out = block.__class__()
     for m in block._get_names():
@@ -264,7 +280,7 @@ def _shallow_clone(block):
 
 def _clone_sibling_controller(src_ctrl):
     """A per-shape copy of a converted controller, key data shared."""
-    c2 = _shallow_clone(src_ctrl)
+    c2 = shallow_clone(src_ctrl)
     for priv in _CTRL_RESTAMP_MARKERS:
         if hasattr(src_ctrl, priv):
             setattr(c2, priv, getattr(src_ctrl, priv))
@@ -273,8 +289,8 @@ def _clone_sibling_controller(src_ctrl):
     return c2
 
 
-def _append_sibling_entry(seq, src_cb, sib):
-    """Append one controlled block driving `sib` the way `src_cb` drives its own."""
+def append_sibling_entry(seq, src_cb, sib):
+    """Append and return a controlled block driving `sib` the way `src_cb` drives its own."""
     seq.num_controlled_blocks += 1
     seq.controlled_blocks.update_size()
     cb = seq.controlled_blocks[seq.num_controlled_blocks - 1]
@@ -289,10 +305,35 @@ def _append_sibling_entry(seq, src_cb, sib):
                 pass
     c2 = _clone_sibling_controller(src_cb.controller)
     if src_cb.interpolator is not None:
-        i2 = _shallow_clone(src_cb.interpolator)
+        i2 = shallow_clone(src_cb.interpolator)
         c2.interpolator = i2
         cb.interpolator = i2
     cb.controller = c2
+    return cb
+
+
+def _append_uv_companions(seq, ctx):
+    """Give each center-scaled UV scale entry the offset entry its scale moves.
+
+    Shapes sharing the source entry's property get the companion as well; an
+    axis whose translate is animated too keeps that curve alone.
+    See: docs/commentary/asset_convert_shader.md#texture-transform
+    """
+    animated = {(ctx['resolve'](cb, seq, 'node_name'),
+                 getattr(cb.controller, '_tt_operation', None))
+                for cb in seq.controlled_blocks}
+    for src_cb, name in ctx['uv_companions']:
+        op = OFFSET_OP_OF_SCALE[src_cb.controller._tt_operation]
+        if (name, op) in animated:
+            continue
+        cb = append_sibling_entry(seq, src_cb, name)
+        ctrl = cb.controller
+        ctrl._tt_operation = op
+        ctrl.type_of_controlled_variable = TEX_TRANSFORM_VARS[op][0]
+        ctrl.interpolator = cb.interpolator = affine_interpolator(
+            src_cb.interpolator, *src_cb.controller._uv_offset_affine)
+        ctx['shared_extras'] += [(cb, sib) for src, sib in ctx['shared_extras']
+                                 if src is src_cb]
 
 
 def _fan_out_shared_entries(seq, extras):
@@ -312,29 +353,59 @@ def _fan_out_shared_entries(seq, extras):
         if sig in have:
             continue
         have.add(sig)
-        _append_sibling_entry(seq, src_cb, sib)
+        append_sibling_entry(seq, src_cb, sib)
         added += 1
     return added
 
 
 def _apply_rotation(m, quat):
-    """Write quaternion (w,x,y,z) into an existing pyffi Matrix33."""
+    """Write quaternion (w,x,y,z) into a pyffi Matrix33 (row-vector layout)."""
     w, x, y, z = quat
     m.m_11 = 1 - 2 * (y * y + z * z)
-    m.m_12 = 2 * (x * y - z * w)
-    m.m_13 = 2 * (x * z + y * w)
-    m.m_21 = 2 * (x * y + z * w)
+    m.m_21 = 2 * (x * y - z * w)
+    m.m_31 = 2 * (x * z + y * w)
+    m.m_12 = 2 * (x * y + z * w)
     m.m_22 = 1 - 2 * (x * x + z * z)
-    m.m_23 = 2 * (y * z - x * w)
-    m.m_31 = 2 * (x * z - y * w)
-    m.m_32 = 2 * (y * z + x * w)
+    m.m_32 = 2 * (y * z - x * w)
+    m.m_13 = 2 * (x * z - y * w)
+    m.m_23 = 2 * (y * z + x * w)
     m.m_33 = 1 - 2 * (x * x + y * y)
+
+
+def _bake_accum_root_pose(root, quat):
+    """Pose the root as the dropped accum entry did; its authored rotation moves to NonAccum.
+
+    The exporter stores the real pose as NonAccum's frame 0, so NonAccum's rest
+    must carry it too, or a sequence that never plays leaves the mesh unrotated.
+    See: docs/commentary/asset_convert_nif.md#accum-root-classification
+    """
+    na = _find_named_node(root, bytes(root.name) + b' NonAccum')
+    if na is None:
+        return
+    authored = root.rotation.get_copy()
+    _apply_rotation(root.rotation, quat)
+    delta = authored * root.rotation.get_transpose()
+    na.rotation = na.rotation * delta
+    na.translation = na.translation * delta
+
+
+def _rotation_keyed(interp):
+    """Does the interpolator's data hold a rotation key, in either key form?
+
+    Without one the pose rotation is what plays, whatever the other channels key.
+    See: docs/commentary/asset_convert_nif.md#accum-root-classification
+    """
+    d = getattr(interp, 'data', None)
+    return d is not None and bool(
+        getattr(d, 'num_rotation_keys', 0)
+        or any(g.num_keys for g in d.xyz_rotations))
 
 
 def _dropped_accum_root_pose(root, mgr, resolve_name):
     """Apply the accum-root entry's pose to the root NODE, since the entry dies.
 
-    Only for an entry naming the FILE ROOT, the one the root-name rule drops.
+    Only for an entry naming the FILE ROOT, the one the root-name rule drops,
+    and only while its rotation is un-keyed: the pose is then what plays.
     See: docs/commentary/asset_convert_nif.md#accum-root-classification
     """
     root_name = bytes(getattr(root, 'name', b'') or b'')
@@ -352,7 +423,7 @@ def _dropped_accum_root_pose(root, mgr, resolve_name):
                 continue
             it = cb.interpolator
             if (isinstance(it, NifFormat.NiTransformInterpolator) and
-                    it.data is None and it.rotation.w > _NO_VALUE):
+                    not _rotation_keyed(it) and it.rotation.w > _NO_VALUE):
                 q = it.rotation
                 return (float(q.w), float(q.x), float(q.y), float(q.z))
             break
@@ -378,8 +449,8 @@ def _seq_name_resolver(palette):
                 return palette.get_string(val)
             except Exception:
                 pass
-        return _palette_lookup(
-            _palette_bytes(getattr(seq, 'string_palette', None)),
+        return palette_lookup(
+            palette_bytes(getattr(seq, 'string_palette', None)),
             getattr(blk, attr + '_offset', None))
     return resolve
 
@@ -494,15 +565,25 @@ def _convert_tex_transform(blk):
 
     Vanilla ships ZERO of these, and the engine instantiates a controlled
     block's type by NAME, so leaving one rejects the whole NIF.  TT_ROTATE has
-    no Skyrim equivalent.
-    See: docs/commentary/asset_convert_nif.md#sequence-controller-retargeting
+    no Skyrim equivalent.  A translate's keys move onto the Skyrim offset; a
+    scale records the offset curve its companion entry will carry.
+    See: docs/commentary/asset_convert_shader.md#texture-transform
     """
     src = blk.controller
     op = getattr(src, 'operation', None)
     if op not in TEX_TRANSFORM_VARS:
         return False
+    desc = target_map(src)
+    if op in OFFSET_OP_OF_SCALE:
+        offset_ab = scale_offset_affine(desc, op)
+    else:
+        offset_ab = None
+        ab = translate_affine(desc, op)
+        if ab is not None:
+            blk.interpolator = affine_interpolator(blk.interpolator, *ab)
     new = _shader_float_ctrl(src, blk.interpolator, TEX_TRANSFORM_VARS[op][0])
     new._tt_operation = op
+    new._uv_offset_affine = offset_ab
     blk.controller = new
     blk.controller_type = b'BSLightingShaderPropertyFloatController'
     return True
@@ -565,6 +646,8 @@ def _handle_block(ctx, seq, key):
             src_ctrl = blk.controller
             if not convert(blk):
                 return False
+            if getattr(blk.controller, '_uv_offset_affine', None) is not None:
+                ctx['uv_companions'].append((blk, node_name))
             if ctx['prop_index'] is None:
                 ctx['prop_index'] = _property_ctrl_index(node)
             for sib in _shapes_sharing_property_ctrl(ctx['prop_index'],
@@ -600,16 +683,18 @@ def process_controller_manager(node, palette):
         ctx['accum_name'] = bytes(accum_name)
         ctx['accum_mode'] = _accum_root_mode(seq, node, resolve)
         ctx['shared_extras'] = []
+        ctx['uv_companions'] = []
         key = 0
         while key < seq.num_controlled_blocks:
             if _handle_block(ctx, seq, key):
                 key += 1
             else:
                 _drop_block(seq, key)
+        _append_uv_companions(seq, ctx)
         _fan_out_shared_entries(seq, ctx['shared_extras'])
 
     if pending_bake is not None:
-        _apply_rotation(node.rotation, pending_bake)
+        _bake_accum_root_pose(node, pending_bake)
 
 
 #: NiAVObject.flags bit 0. Only scene-graph objects have it.
@@ -650,18 +735,18 @@ def _hide_named_nodes(root, name):
 
 def _vis_entries(block):
     """(entry, node name) for each NiVisController entry in a sequence."""
-    raw = _palette_bytes(getattr(block, 'string_palette', None))
+    raw = palette_bytes(getattr(block, 'string_palette', None))
     out = []
     for cb in block.controlled_blocks:
         ctrl_type = bytes(getattr(cb, 'controller_type', b'') or b'')
         if not ctrl_type:
-            ctrl_type = _palette_lookup(
+            ctrl_type = palette_lookup(
                 raw, getattr(cb, 'controller_type_offset', None))
         if ctrl_type != b'NiVisController':
             continue
         name = bytes(getattr(cb, 'node_name', b'') or b'')
         if not name:
-            name = _palette_lookup(raw, getattr(cb, 'node_name_offset', None))
+            name = palette_lookup(raw, getattr(cb, 'node_name_offset', None))
         if name:
             out.append((cb, name))
     return out
@@ -696,6 +781,58 @@ def apply_rest_visibility(root, stats=None):
 #: The two Skyrim shader property classes a sequence entry can drive.
 _SHADER_CLASSES = ('BSLightingShaderProperty', 'BSEffectShaderProperty')
 
+#: Below this a NiPoint3Interpolator pose is the "use the key data" sentinel.
+_POSE_SENTINEL_LIMIT = -1e30
+
+
+def _rest_emissive(cb):
+    """(r, g, b) an emissive color entry holds at time 0, or None."""
+    ctrl = cb.controller
+    effect = isinstance(ctrl, NifFormat.BSEffectShaderPropertyColorController)
+    if not (effect or isinstance(ctrl, NifFormat.BSLightingShaderPropertyColorController)):
+        return None
+    if ctrl.type_of_controlled_color != _SHADER_COLOR_EMISSIVE[1 if effect else 0]:
+        return None
+    interp = cb.interpolator
+    data = getattr(interp, 'data', None)
+    keys = getattr(data, 'data', None) if data is not None else None
+    if keys is not None and keys.num_keys:
+        value = min(keys.keys, key=lambda k: k.time).value
+    else:
+        value = getattr(interp, 'point_3_value', None)
+        if value is None or value.x < _POSE_SENTINEL_LIMIT:
+            return None
+    return tuple(max(0.0, c) for c in (value.x, value.y, value.z))
+
+
+def apply_rest_emissive(root, stats=None):
+    """Give each sequence-animated emissive its time-0 value as the resting color.
+
+    Before a sequence plays the engine draws the shader's static color, which
+    an effect shader holds at white when Oblivion authored black.
+    See: docs/commentary/asset_convert_shader.md#rest-emissive
+    """
+    shaders = _shader_by_node_name(root)
+    done = set()
+    for block in root.tree():
+        if (not isinstance(block, NifFormat.NiControllerSequence)
+                or _plays_from_cell_load(block)):
+            continue
+        raw = palette_bytes(getattr(block, 'string_palette', None))
+        for cb in block.controlled_blocks:
+            rgb = _rest_emissive(cb)
+            name = (bytes(getattr(cb, 'node_name', b'') or b'')
+                    or palette_lookup(raw, getattr(cb, 'node_name_offset', None)))
+            shader = shaders.get(name)
+            if rgb is None or shader is None or name in done:
+                continue
+            done.add(name)
+            color = shader.emissive_color
+            color.r, color.g, color.b = rgb
+    if done and stats is not None:
+        stats['rest_emissive'] = stats.get('rest_emissive', 0) + len(done)
+    return len(done)
+
 
 def _shader_by_node_name(root):
     """{node name: its BS*ShaderProperty} for every named block in the tree."""
@@ -720,8 +857,23 @@ def _already_chained(shader, ctrl):
     return False
 
 
+def _chained_twin(shader, ctrl):
+    """The controller already on the shader driving the same value as `ctrl`, or None."""
+    probe = shader.controller
+    while probe is not None:
+        if (type(probe) is type(ctrl)
+                and getattr(probe, 'type_of_controlled_variable', None)
+                == getattr(ctrl, 'type_of_controlled_variable', None)
+                and getattr(probe, 'type_of_controlled_color', None)
+                == getattr(ctrl, 'type_of_controlled_color', None)):
+            return probe
+        probe = probe.next_controller
+    return None
+
+
 def attach_seq_shader_controllers(root, stats=None):
-    """Hang each sequence's shader controller off the shader it drives.
+    """Hang each sequence's shader controller off the shader it drives; every
+    sequence driving the same shader value shares that one controller, as vanilla does.
 
     See: docs/commentary/asset_convert_nif.md#seq-shader-controller-attach
     """
@@ -730,16 +882,20 @@ def attach_seq_shader_controllers(root, stats=None):
     for block in root.tree():
         if not isinstance(block, NifFormat.NiControllerSequence):
             continue
-        raw = _palette_bytes(getattr(block, 'string_palette', None))
+        raw = palette_bytes(getattr(block, 'string_palette', None))
         for cb in block.controlled_blocks:
             ctrl = cb.controller
             if ctrl is None or 'ShaderProperty' not in ctrl.__class__.__name__:
                 continue
             name = bytes(getattr(cb, 'node_name', b'') or b'')
             if not name:
-                name = _palette_lookup(raw, getattr(cb, 'node_name_offset', None))
+                name = palette_lookup(raw, getattr(cb, 'node_name_offset', None))
             shader = shaders.get(name)
             if shader is None or _already_chained(shader, ctrl):
+                continue
+            twin = _chained_twin(shader, ctrl)
+            if twin is not None:
+                cb.controller = twin
                 continue
             ctrl.target = shader
             ctrl.next_controller = shader.controller
@@ -751,7 +907,7 @@ def attach_seq_shader_controllers(root, stats=None):
     return attached
 
 
-def _clone_sequence_as(root, seq, new_name, cycle_type):
+def clone_sequence_as(root, seq, new_name, cycle_type):
     """Add a second NiControllerSequence named *new_name* beside *seq*.
 
     None when the manager cannot be reached -- a sequence with no manager is
@@ -788,28 +944,35 @@ def _clone_sequence_as(root, seq, new_name, cycle_type):
 def autoplay_ambient_sequences(root, stats=None):
     """Turn Oblivion's self-playing "Idle" sequence into vanilla's AutoPlay pair.
 
-    The authored Idle becomes AutoLoop and KEEPS its cycle type; a CLAMP clone
-    named AutoPlay is added for the graph's start state. Script-driven names
-    are left alone.
+    The authored Idle becomes AutoLoop and KEEPS its cycle type. The graph's
+    start state plays AutoPlay: Idle's own lead-in (`Idle Intro`) when it has
+    one, else a CLAMP clone of Idle. Script-driven names are left alone.
     See: docs/commentary/asset_convert_nif.md#autoplay-ambient-sequences
     """
-    renamed = 0
+    named = []
     for block in root.tree():
-        if not isinstance(block, NifFormat.NiControllerSequence):
-            continue
-        raw = getattr(block, 'name', b'') or b''
-        name = raw.decode('latin-1') if isinstance(raw, bytes) else str(raw)
-        if name.lower() not in _AMBIENT_SEQUENCES:
+        if isinstance(block, NifFormat.NiControllerSequence):
+            raw = getattr(block, 'name', b'') or b''
+            name = raw.decode('latin-1') if isinstance(raw, bytes) else str(raw)
+            named.append((name.lower(), block))
+    by_name = dict(reversed(named))
+    renamed = 0
+    for name, block in named:
+        if name not in _AMBIENT_SEQUENCES:
             continue
         block.name = AUTOLOOP_SEQUENCE.encode('latin-1')
-        _clone_sequence_as(root, block, AUTOPLAY_SEQUENCE, _CYCLE_CLAMP)
+        intro = by_name.get((name + INTRO_SUFFIX).lower())
+        if intro is not None:
+            intro.name = AUTOPLAY_SEQUENCE.encode('latin-1')
+        else:
+            clone_sequence_as(root, block, AUTOPLAY_SEQUENCE, CYCLE_CLAMP)
         renamed += 1
     if renamed and stats is not None:
         stats['autoplay_sequences'] = stats.get('autoplay_sequences', 0) + renamed
     return renamed
 
 
-def _palette_bytes(string_palette):
+def palette_bytes(string_palette):
     """Raw NUL-separated blob out of a NiStringPalette ref, or b''.
 
     PyFFI nests it: NiStringPalette.palette is a StringPalette struct whose own
@@ -827,7 +990,7 @@ def _palette_bytes(string_palette):
         return b''
 
 
-def _palette_lookup(raw, offset):
+def palette_lookup(raw, offset):
     """Read the NUL-terminated string at `offset` in a palette blob."""
     if not raw or offset is None or offset == 0xFFFFFFFF or offset >= len(raw):
         return b''
@@ -927,13 +1090,13 @@ def match_seq_shader_types(root):
     for blk in root.tree():
         if not isinstance(blk, NifFormat.NiControllerSequence):
             continue
-        raw = _palette_bytes(getattr(blk, 'string_palette', None))
+        raw = palette_bytes(getattr(blk, 'string_palette', None))
         for cb in blk.controlled_blocks:
             if cb.controller is None:
                 continue
             name = bytes(getattr(cb, 'node_name', b'') or b'')
             if not name:
-                name = _palette_lookup(raw, getattr(cb, 'node_name_offset', None))
+                name = palette_lookup(raw, getattr(cb, 'node_name_offset', None))
             _restamp_entry(cb, name, shader_of, shader_block_of)
 
     _normalize_shader_cb_strings(root)
@@ -973,7 +1136,7 @@ def _retarget_geometry_suffix_entries(root):
     for blk in root.tree():
         if not isinstance(blk, NifFormat.NiControllerSequence):
             continue
-        raw = _palette_bytes(getattr(blk, 'string_palette', None))
+        raw = palette_bytes(getattr(blk, 'string_palette', None))
         for cb in blk.controlled_blocks:
             ctrl = cb.controller
             cn = ctrl.__class__.__name__ if ctrl is not None else ''
@@ -983,7 +1146,7 @@ def _retarget_geometry_suffix_entries(root):
                 continue
             name = bytes(getattr(cb, 'node_name', b'') or b'')
             if not name:
-                name = _palette_lookup(raw, getattr(cb, 'node_name_offset', None))
+                name = palette_lookup(raw, getattr(cb, 'node_name_offset', None))
             shader = _resolve_geometry_suffix(root, name)
             if shader is None:
                 continue
@@ -1026,3 +1189,33 @@ def _resolve_geometry_suffix(root, name):
     node, shader = geoms[want]
     shader._owner_name = bytes(getattr(node, 'name', b'') or b'')
     return shader
+
+
+def _managed(ctrl, target, flags):
+    """Fill a NiTimeController as a sequence-driven one on `target`."""
+    ctrl.flags = flags
+    ctrl.frequency = 1.0
+    ctrl.phase = 0.0
+    ctrl.start_time = 3.402823e38
+    ctrl.stop_time = -3.402823e38
+    ctrl.target = target
+    return ctrl
+
+
+def transform_manager(root, palette, targets, target_flags=VANILLA_MTTC_FLAGS):
+    """(manager, controller): a NiControllerManager on `root` over `palette`
+    whose sequences move `targets` through one NiMultiTargetTransformController,
+    vanilla's layout for in-mesh transform animation.
+    See: docs/commentary/asset_convert_falloutnv.md#gun-parts
+    """
+    manager = _managed(NifFormat.NiControllerManager(), root, MANAGED_CONTROLLER_FLAGS)
+    manager.cumulative = False
+    manager.object_palette = palette
+    controller = _managed(NifFormat.NiMultiTargetTransformController(), root, target_flags)
+    controller.num_extra_targets = len(targets)
+    controller.extra_targets.update_size()
+    for i, node in enumerate(targets):
+        controller.extra_targets[i] = node
+    manager.next_controller = controller
+    root.add_controller(manager)
+    return manager, controller

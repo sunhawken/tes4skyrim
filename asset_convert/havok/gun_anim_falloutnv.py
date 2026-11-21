@@ -35,6 +35,7 @@ from asset_convert.havok.creature_pipeline import foot_enum_map
 from asset_convert.havok.gun_vocabulary_falloutnv import (ANIM_TYPE_CLASS,
                                                           ATTACK_ACTIONS,
                                                           ATTACK_ANIMS,
+                                                          LOOP_ACTION,
                                                           PART_PREFIX,
                                                           RELOAD_LETTERS)
 from asset_convert.havok.hkx_anim import (decode_clip, event_annotations,
@@ -80,6 +81,11 @@ FIRST_PERSON_BONE_MAP = {
 FIRST_PERSON_TRANSLATED = ('NPC LookNode [Look]', 'NPC COM [COM ]',
                            'Camera1st [Cam1]')
 FIRST_PERSON_ANCHOR = ('Bip01 Looking', 'NPC LookNode [Look]')
+#: The source bone mapped onto the one Skyrim's first-person camera sits on (FirstPersonState +0x58).
+FIRST_PERSON_CAMERA = 'Camera1st'
+#: Arms whose hands reach FNV's camera-relative hand positions (IK).
+FIRST_PERSON_ARMS = tuple((f'Bip01 {s} UpperArm', f'Bip01 {s} Forearm',
+                           f'Bip01 {s} Hand') for s in 'RL')
 
 
 # ---------------------------------------------------------------------------
@@ -244,31 +250,32 @@ def _rig(skeleton_nif: str) -> dict:
             deltas=load_pose_deltas(str(
                 gen / 'best_animation_pose_falloutnv.json')),
             translated=FIRST_PERSON_TRANSLATED if first else TRANSLATED_BONES,
-            anchor=FIRST_PERSON_ANCHOR if first else None)
+            anchor=FIRST_PERSON_ANCHOR if first else None,
+            ik=FIRST_PERSON_ARMS if first else ())
     return _RIG[skeleton_nif]
 
 
 def retarget_gun_clip(kf_path: str, skeleton_nif: str, fps: float = 30.0,
-                      fill_kf: str = None, pose: bool = False):
+                      fills=(), pose: bool = False):
     """(source clip, retargeted clip, motion, annotations, events) for one .kf.
 
     Hit keys are the FIRE frame of a gun clip, not a melee damage window:
     they reach the graph as arrowRelease triggers, never as HitFrame. The
     accum bone keeps its authored facing; bones the clip leaves out take
-    `fill_kf`'s first frame (the class' aim pose). `pose` keeps only the
-    clip's first frame, as a looping pose.
+    the first frame of the first of `fills` (aim pose kfs) that has them.
+    `pose` keeps only the clip's first frame, as a looping pose.
     See: docs/commentary/asset_convert_falloutnv.md#accum-root-identity
     """
     rig = _rig(skeleton_nif)
     clip, motion = decode_clip(kf_path, fps)
     if pose:
         clip, motion = first_frame_pose(clip, fps), None
-    if fill_kf:
-        fill_missing_tracks(clip, decode_clip(fill_kf, fps)[0])
+    for kf in fills:
+        fill_missing_tracks(clip, decode_clip(kf, fps)[0])
     events = parse_kf_events(clip.text_keys, foot_enum_map({0: '', 1: ''}))
     out = retarget_clip(clip, rig['src'], rig['dst'], rig['bone_map'],
                         rig['deltas'], translated=rig['translated'],
-                        anchor=rig['anchor'])
+                        anchor=rig['anchor'], ik_chains=rig['ik'])
     return clip, out, motion, event_annotations(events, False), events
 
 
@@ -303,12 +310,12 @@ def _part_tracks(src_clip, stem: str) -> list:
 
 def convert_one(kf_path: str, out_hkx: str, skeleton_nif: str,
                 verify: bool = False, fps: float = 30.0,
-                fill_kf: str = None, stem: str = None,
+                fills=(), stem: str = None,
                 pose: bool = False) -> dict:
     """Retarget one clip to a 64-bit hkx; the manifest entry for it."""
     rig = _rig(skeleton_nif)
     src_clip, clip, motion, annotations, events = retarget_gun_clip(
-        kf_path, skeleton_nif, fps, fill_kf, pose)
+        kf_path, skeleton_nif, fps, fills, pose)
     stem = stem or os.path.splitext(os.path.basename(kf_path))[0].lower()
     write_clip_hkx(clip, rig['dst_bones'], out_hkx, annotations)
     entry = {
@@ -372,13 +379,18 @@ def _level_aim(corpus: dict, prefix: str, cls: str, iron: str = ''):
          if f'{prefix}{cls}{a}{iron}' in corpus), None)
 
 
-def _fill_clip(corpus: dict, stem: str):
-    """The class' level aim kf a partial clip is composed over, or None."""
+def _fill_clips(corpus: dict, stem: str) -> tuple:
+    """The level aim kfs a partial clip is composed over, first wins: an
+    iron-sight clip's own stance before the hip aim. A hip aim has none.
+    See: docs/commentary/asset_convert_falloutnv.md#first-person-hands-spread
+    """
     c = classify_stem(stem)
-    if c is None or c['action'] == 'aim':
-        return None
-    return (_level_aim(corpus, c['prefix'], c['cls'])
-            or _level_aim(corpus, '', c['cls']))
+    if c is None or (c['action'] == 'aim' and not c['iron']):
+        return ()
+    irons = ('is', '') if c['iron'] else ('',)
+    kfs = (_level_aim(corpus, p, c['cls'], i)
+           for i in irons for p in (c['prefix'], ''))
+    return tuple(dict.fromkeys(k for k in kfs if k))
 
 
 def _synthesized_aims(corpus: dict, classes) -> list:
@@ -402,6 +414,22 @@ def _synthesized_aims(corpus: dict, classes) -> list:
     return out
 
 
+def _synthesized_loops(bindings, corpus: dict) -> list:
+    """[(loop stem, aim kf)] for a class whose guns fire in a loop but that
+    ships no loop clip at any pitch (FNV's first-person `1hp`): the class'
+    level aim pose, hip and iron sights, is the loop.
+    See: docs/commentary/asset_convert_falloutnv.md#automatic-fire-rate
+    """
+    out = []
+    for cls in sorted({b['cls'] for b in bindings if b['attack'] == LOOP_ACTION}):
+        for iron in ('', 'is'):
+            stem = f'{cls}{LOOP_ACTION}{iron}'
+            kf = _level_aim(corpus, '', cls, iron)
+            if kf and not any(stem + p in corpus for p in ('', 'up', 'down')):
+                out.append((stem, kf))
+    return out
+
+
 def _plan_view(bindings, corpus: dict, names) -> list:
     """[(stem, kf, fill kf, pose only)] to convert: the selected clips, the
     level aims synthesized from an attack clip, and the base `mt`
@@ -411,17 +439,19 @@ def _plan_view(bindings, corpus: dict, names) -> list:
     """
     wanted = ([s.lower() for s in names] if names
               else select_stems(bindings, corpus))
-    plan = [(s, corpus[s], _fill_clip(corpus, s), False) for s in wanted
+    plan = [(s, corpus[s], _fill_clips(corpus, s), False) for s in wanted
             if s in corpus]
     if names:
         return plan
     classes = sorted({b['cls'] for b in bindings})
-    plan += [(s, kf, None, True) for s, kf in _synthesized_aims(corpus, classes)]
+    plan += [(s, kf, _fill_clips(corpus, s), True)
+             for s, kf in (_synthesized_aims(corpus, classes)
+                           + _synthesized_loops(bindings, corpus))]
     for cls in classes:
         aim = _level_aim(corpus, '', cls)
         if f'{cls}forward' in corpus or not aim:
             continue
-        plan += [(f'{cls}{d}', corpus[f'mt{d}'], aim, False)
+        plan += [(f'{cls}{d}', corpus[f'mt{d}'], (aim,), False)
                  for d in LOCO_ACTIONS if f'mt{d}' in corpus]
     return plan
 
@@ -455,9 +485,12 @@ def _convert_view(bindings, chars_dir: str, out_meshes_dir: str, view,
     clips.sort(key=lambda c: c['stem'])
     log(f'  Gun clips: {len(clips)} written, {len(failures)} failed -> '
         f'{layout["anim_dir"]}')
+    rig = _rig(skeleton)
+    camera = rig['bone_map'].get(FIRST_PERSON_CAMERA)
     return {'anim_dir': layout['anim_dir'], 'clips': clips,
             'classes': {c['stem']: classify_stem(c['stem']) for c in clips},
-            'failures': failures}
+            'failures': failures,
+            'camera_bone': rig['dst'].index.get(camera) if rig['anchor'] else None}
 
 
 def convert_gun_clips(export_dir: str, out_meshes_dir: str, names=None,

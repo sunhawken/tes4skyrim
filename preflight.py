@@ -137,7 +137,7 @@ def _has_imported_mods() -> bool:
 def _have_native(mod: str) -> bool:
     """True if the compiled navmesh extension for THIS interpreter is present.
 
-    Mirrors ``tes5_import/navmesh/_native_loader.py``: the ABI tag is in the
+    Mirrors ``tes5_import/navmesh/native_loader.py``: the ABI tag is in the
     filename, so a .pyd built for another Python version does not count.
     """
     suffix = sysconfig.get_config_var('EXT_SUFFIX') or '.pyd'
@@ -202,13 +202,14 @@ def _ffmpeg() -> 'Missing | None':
     """ffmpeg ships with the repo (external/ffmpeg/), so absence is a broken
     checkout rather than a missing user install -- same as the other bundled
     exes.  PATH is still searched as a fallback, so a user who deleted the
-    bundled copy but has their own ffmpeg keeps working."""
+    bundled copy but has their own ffmpeg keeps working.  The build must
+    decode Vorbis, the codec of every FO3/FNV voice line."""
     from asset_convert.audio.audio_converter import find_ffmpeg
-    if find_ffmpeg():
+    if find_ffmpeg(need_decoder='vorbis'):
         return None
     return Missing(
         'ffmpeg',
-        'Decoding Oblivion MP3/WAV audio before re-encoding',
+        'Decoding MP3/WAV/Ogg Vorbis audio before re-encoding',
         'This binary ships with the repo. Restore it:\n'
         'git checkout -- external/ffmpeg/ffmpeg.exe\n'
         '(if that does not restore it, your antivirus may have quarantined '
@@ -287,6 +288,19 @@ def _papyrus_headers() -> 'Missing | None':
     )
 
 
+def _skse_headers() -> 'Missing | None':
+    """SKSE's own .psc headers, resolved by the compile phase's own lookup."""
+    from papyrus_compile import find_skse_source_scripts
+    if find_skse_source_scripts(_load_config()):
+        return None
+    return Missing(
+        "SKSE's script files (UI.psc and friends)",
+        'Compiling converted scripts that call SKSE functions',
+        'Install SKSE from https://skse.silverlock.org/ by copying ALL of its\n'
+        'files, the Data folder included, straight into your Skyrim folder',
+    )
+
+
 # ---------------------------------------------------------------------------
 #  Phase requirements
 
@@ -361,6 +375,7 @@ _REQUIREMENTS = {
             'external/papyrus-compiler/papyrus.exe', 'papyrus.exe',
             'Compiling the converted .psc scripts to .pex'),
         _papyrus_headers,
+        _skse_headers,
     ],
 
     'lod': [
@@ -407,7 +422,7 @@ PHASE_LABELS = {
     'sounds':       'Sounds',
     'scripts':      'Scripts',
     'lod':          'LOD',
-    'skyrim_patch': 'Patch Skyrim',
+    'skyrim_patch': 'Body Slot Patch',
     'pack_bsa':     'Pack BSAs',
     'pack_zip':     'Pack Mod Zip',
     'pack_lod':     'Pack LOD',

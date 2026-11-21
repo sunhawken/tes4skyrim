@@ -26,6 +26,23 @@ Each stage has a `--<step>-only` flag. The steps are: `export`, `import`,
 `modify-body-meshes`, `pack`, `pack-zip`. Read `convert.py`'s module docstring
 for the authoritative list — it changes more often than this doc.
 
+### <a id="scoping-a-stage"></a>Scoping a stage: `--only`
+
+`--only <name> ...` narrows a stage to the named units instead of rebuilding all
+of them. Only the stages in `convert_cli.SCOPED_STEPS` honor it; with any other
+selected step the run refuses instead of silently rebuilding everything.
+
+| Stage | `--only` names | Shared output a scoped run keeps |
+|---|---|---|
+| `--creatures-only` | creature folder names (`rat`, `mudcrab`) | every other project in the animation fragment, and its gun appends |
+
+```bash
+python convert.py -f Oblivion.esm --creatures-only --only rat
+```
+
+The Morrowind creature split still runs over the whole plugin first. That is
+cheap, because it keeps every folder that is newer than its inputs.
+
 ### 🛑 LOD is NOT built with `convert.py --lod-only`
 
 **`tools/release/create_lod.py` is the entry point for all LOD generation.** A
@@ -67,6 +84,22 @@ After `--import-mod`, the tool prints the exact command with the applicable
 flags already filled in. **Never conclude that an asset has "no plugin to
 build" because no ESP references it** — check `--list-mods` first.
 
+### <a id="-f-takes-the-plugin"></a>🛑 A mod WITH a plugin takes the plugin, never the mod name
+
+The mod-name form above is only for asset-only mods. A mod that ships a plugin
+is converted by that plugin's filename: `-f TR_Mainland.esm`, never
+`-f "Tamriel Rebuilt 25.08.12"`. The mod name used to be accepted and silently
+build the wrong thing. `splitext` read `.12` as an extension, so the import
+staged a second MorrowindRuntime sidecar, `Tamriel Rebuilt 25.08/`, with every
+row naming a plugin that does not exist. The runtime keeps the first row per id,
+so that folder shadowed the real one and the journal and follower ids resolved
+to nothing in game.
+
+`convert.py` now refuses a `-f` name that matches an imported mod's folder or
+label when the mod ships plugins, and names the plugins to use instead
+(`source_registry.mod_plugins`). `python convert.py --list-mods` lists every
+mod with its plugins.
+
 ### <a id="plugin-source-resolution"></a>Where a plugin's binary comes from
 
 **Code:** `convert.py` `resolve_plugin_path`
@@ -75,13 +108,24 @@ build" because no ESP references it** — check `--list-mods` first.
 
 1. **An imported mod's retained binary** — `export/<plugin>/_source/<plugin>`,
    written by `mod_ingest.py` when the plugin came from a mod archive.
-2. **The registered game directory that owns it** — `source_registry`
-   records each source Data folder as `kind: "directory"` (Oblivion, Nehrim,
-   Fallout New Vegas), and `directory_for()` maps a plugin name back to its
-   own folder.
-3. **The default Data directory** (`tes4_data`), for anything unregistered.
+2. **The selected Data directory** (`tes4_data` = `--data-dir`, else
+   `tes4DataPath`, which the GUI rewrites whenever a directory source is
+   picked), if it holds the plugin.
+3. **The plugin's home, then the first registered game directory that holds
+   it** — `source_registry` records each source Data folder as
+   `kind: "directory"` (Oblivion, Nehrim, Fallout New Vegas), and
+   `directory_for()` maps a plugin name back to a folder. This is how a master
+   living in another install is found. The home comes first so a second copy
+   of the same name never wins by registration order; see
+   [same-named plugins](../commentary/asset_convert_mod_ingest.md#same-named-plugins).
 
-Step 2 is what lets a second or third game convert at all. Without it every
+Step 2 must come before step 3 because plugin NAMES are not unique across
+installs: Tale of Two Wastelands puts its own `Fallout3.esm` (masters
+FalloutNV.esm + the FNV DLCs) in the New Vegas Data folder. With the registry
+consulted first, picking the "Fallout 3 goty" source still exported the TTW
+copy whenever New Vegas was registered earlier.
+
+Step 3 is what lets a second or third game convert at all. Without it every
 plugin resolves against the *default* Data directory, so `-f FalloutNV.esm`
 looked for `FalloutNV.esm` inside the Oblivion folder and failed with
 "Source file not found" — even though the registry held the correct path all
@@ -165,7 +209,8 @@ Linux/Mac than on Windows.
 
 `conversion_config.json` is the only file the running application mutates: the
 GUI writes it whenever a setting changes (data paths, output directory, worker
-count, navmesh-cache toggle, collision winding, LOD detail, Morrowind source).
+count, navmesh-cache toggle, collision winding, navmesh generator, LOD detail,
+Morrowind source).
 It is therefore **gitignored** — committing it would ship one machine's paths to
 every user, and any updater that overwrote it would wipe the real ones.
 
@@ -179,6 +224,26 @@ absent file as `{}`, and each consumer falls back on its own constant
 
 An explicit `--config PATH` is the one exception: a named file that does not
 exist raises, because that is a typo rather than a fresh install.
+
+**`outputDir` is saved relative to the install when it lies inside it**
+(`output_layout.output_setting`, so the default saves as `output`), and a
+relative value is read against the install, not the working directory
+(`output_layout.configured_output`). Users copy their config into each new
+release's folder. An absolute default sent every later build back to the old
+install's `output/`, so the new zips never appeared where they looked. A folder
+outside the install is still saved in full.
+
+**Per-run overrides** change a setting for one run without saving it
+(`convert_cli.apply_config_overrides`): `--morrowind-source vanilla|morroblivion`
+picks the Morrowind export mode, so an agent can build Arktwend in authored mode
+and Tamriel Rebuilt in Morroblivion mode back to back without touching the
+saved setting; `--no-engine-branches` forces the Python SpeedTree generator.
+
+**The Morroblivion compatibility patch** is a normal `-f` target once
+`--build-morrowind-patch "<Morrowind>/Data Files"` has registered its source:
+`-f Morrowind-Morroblivion-Compatibility.esp --import-only` (or `--meshes-only`,
+`--creatures-only`, `--sounds-only`, `--scripts-only`, `--export-only`) reruns one step
+([details](../commentary/tes4_export_morrowind.md#the-patch-builds-its-own-plugin)).
 
 <a id="run-logs"></a>
 ### Run logs
@@ -200,7 +265,7 @@ opening every file. Two runs starting inside the same second get a `-2` suffix
 rather than one overwriting the other. `logRunsKept` in
 `conversion_config.json` sets how many are kept (default 20); `0` disables run
 logging entirely. A new run deletes only the surplus oldest, so an existing
-log's name never changes under a reader. Tools ▸ Open Logs Folder opens the
+log's name never changes under a reader. Plugins ▸ Open Logs Folder opens the
 directory, and each run prints its own log path into the log.
 `TESCONV_LOGS_DIR` overrides the directory (the test suite uses it so it never
 writes beside a live run).
@@ -262,7 +327,7 @@ either way.
 
 3. **The compiled navmesh extension** (`native/dist/_navgrow_native*`) is a
    `.pyd` on Windows and a `.so` elsewhere, selected automatically by Python's
-   own `EXT_SUFFIX` (`tes5_import/navmesh/_native_loader.py` already handles
+   own `EXT_SUFFIX` (`tes5_import/navmesh/native_loader.py` already handles
    this — no code differs). Only the Windows `.pyd` ships in the repo; build
    the local one with:
 
@@ -415,7 +480,7 @@ the normal "headers not found" Missing rather than crashing.
 
 `SKIP_TYPES` in [tes5_import/base/constants.py](../../tes5_import/base/constants.py) is the
 single source of truth. Currently skipped: ROAD, SCPT, SKIL, BSGN, RACE, MGEF,
-CSTY, IDLE, GMST, EYES, HAIR.
+IDLE, GMST, EYES, HAIR.
 
 Notably **converted** (do not assume otherwise): GLOB, CLAS, CLMT, WATR, PACK,
 WTHR, REGN. PACK is converted in its own phase (3b2, after QUST) rather than
@@ -469,6 +534,7 @@ TESConversion/
     subprocess_flags.py   # POPEN_FLAGS, windows_cmd, run_streamed
     process_job.py        # Win32 Job Object containment
     collision_options.py  # collision winding-repair toggle
+    navmesh_options.py    # navmesh generator (--navmesh-generator), user pin folder (--navmesh-pins)
     plugin_masters.py     # master lists from binary headers
 
     gui/                  # the converter window
@@ -479,7 +545,7 @@ TESConversion/
       selection.py        # sources, step checkboxes, Upgrade, drop zone
       panels.py           # the five modal panels
       runner.py           # log, run state, commands, stamps, execution
-      mods.py             # Mods menu
+      mods.py             # Plugins ▸ import mod entries
       morrowind.py        # Settings > Morrowind source
 
   logs/                   # run-<timestamp>-<plugin>.log (gitignored)
@@ -519,7 +585,8 @@ TESConversion/
     spt_parser.py spt_generator.py spt_converter.py   # SpeedTree
 
   native/                 # C++ extensions (grow.cpp -> _navgrow_native)
-  tes_runtime/            # TESRuntime.dll, the shipped SKSE plugin (animation cache + FNV guns/limbs)
+  tes_runtime/            # the shipped SKSE plugins, one folder each (tes, creature, fallout,
+                         #   havok_world_size, morrowind) + common/; built DLLs in dist/
   external/               # third-party binaries (see README license table)
   tests/ tools/ docs/ references/ temp/
   export/                 # cached exports (gitignored)
@@ -527,8 +594,9 @@ TESConversion/
     <Mod Label>/          #   an IMPORTED mod: one folder for the whole archive
   output/                 # WORKING area (gitignored)
     <plugin>/             #   one folder per converted plugin...
-      SKSE/Plugins/TESRuntime/           # <plugin>.bodyparts.json / .guns.json, loose (never in a BSA)
-      SKSE/Plugins/TESRuntime/animation/ #   the plugin's animation cache fragment
+      SKSE/Plugins/TESRuntime/           # <plugin>.crime.json, loose (never in a BSA)
+      SKSE/Plugins/FalloutRuntime/       # <plugin>.bodyparts.json / .guns.json, loose
+      SKSE/Plugins/CreatureRuntime/animation/ # the plugin's animation cache fragment
       meshes/actors/character/           # FO3/FNV only: patched humanoid behaviors + animations/<game>guns/
     <Mod Label>/          #   ...or one per imported mod (mirrors export/)
     AutoConvertLOD/       #   the baked LOD mod (tools/release/create_lod.py)
@@ -581,6 +649,19 @@ export/ and output/ only agree because they all go through them:
 A plugin that is not an imported mod resolves to `<root>/<plugin>` from all
 three, so the game-Data path is byte-for-byte unchanged.
 
+#### <a id="master-resolution"></a>Masters resolve in one place
+
+A master's export is found only through `core/plugin_masters.py`:
+`masters_from_export_header` (names), `export_root`, `master_export_dir` /
+`master_dir` (one master's record folder), `master_dirs` (direct masters that
+exist) and `master_chain` (transitive). Every stage used to carry its own copy.
+The script stage's copy joined the master's name onto the dependent's PARENT.
+For `export/<Mod>/<plugin>/` that is the mod folder, so Oblivion.esm read as
+absent, was skipped silently, and Morrowind_ob.esm imported as a mod lost 939
+of 17,993 script compiles to `undefined identifier gold001` and similar.
+`tests/test_plugin_path_resolution.py` now also flags `x.parent / name` and
+`os.path.join(os.path.dirname(x), name)`.
+
 Two consequences worth knowing:
 
 * **The output scanners cannot use `<folder>/<folder>`.** A group folder is
@@ -608,7 +689,7 @@ Everything installable is collected in `output/Finished Mods/` instead:
 | `<plugin>.zip` | `convert.py --pack-zip-only` (`phase_pack_zip`) |
 | `AutoConvertLOD.zip` | `tools/release/pack_lod.py` |
 | `TESGameSelect.zip` | `tools/release/package_start_mod.py` |
-| `Slot44 Patch.esp` | `convert.py --modify-body-meshes` (loose — one plugin with no assets is not worth an archive) |
+| `Body Slots Patch.zip` | `convert.py --modify-body-meshes` (the patch plugin and the split skin meshes it points at; see [body slots](../commentary/asset_convert_armor.md#body-slot-layout)) |
 
 The folder name lives in `output_layout.py` (`FINISHED_DIR_NAME`), spelled once
 because it contains a space and is user-facing. Its `finished_dir(out_root)`

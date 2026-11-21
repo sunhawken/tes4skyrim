@@ -185,8 +185,8 @@ def _emit_proj_deltas(lines: list, rec: Record):
 
     DATA offsets (wbDefinitionsFNV): 0 flags u16, 2 type u16, 4 gravity,
     8 speed, 12 range, 16 light, 20 muzzle flash light, 24 tracer chance,
-    36 explosion, 40 sound, 44 muzzle flash duration, 48 fade duration,
-    52 impact force, 64 default weapon.
+    28/32 alt-trigger proximity/timer, 36 explosion, 40 sound, 44 muzzle
+    flash duration, 48 fade duration, 52 impact force, 64 default weapon.
     See: docs/commentary/tes4_export_falloutnv.md#projectiles
     """
     emit_string(lines, "FULL", get_subrecord(rec, "FULL"))
@@ -197,7 +197,8 @@ def _emit_proj_deltas(lines: list, rec: Record):
         lines.append(f"DATA.Flags={struct.unpack_from('<H', d, 0)[0]}")
         lines.append(f"DATA.Type={struct.unpack_from('<H', d, 2)[0]}")
         for key, off in (("Gravity", 4), ("Speed", 8), ("Range", 12),
-                         ("TracerChance", 24), ("MuzzleFlashDuration", 44),
+                         ("TracerChance", 24), ("AltTriggerProximity", 28),
+                         ("AltTriggerTimer", 32), ("MuzzleFlashDuration", 44),
                          ("FadeDuration", 48), ("ImpactForce", 52)):
             emit_float(lines, f"DATA.{key}", data, off)
         for key, off in (("Light", 16), ("MuzzleFlashLight", 20),
@@ -258,7 +259,8 @@ def _emit_navm_deltas(lines: list, rec: Record):
 
     FO3/FNV ship real navmeshes where TES4 has only pathgrids, so this is
     authored data to repack rather than geometry to generate. NVVX/NVTR/NVDP
-    are dumped verbatim; the importer reinterprets them into TES5's NVNM blob.
+    and the NVEX edge links are dumped verbatim; the importer reinterprets
+    them into TES5's NVNM blob.
 
     See: docs/commentary/tes4_export_falloutnv.md#navmesh-authored-not-generated
     """
@@ -273,7 +275,7 @@ def _emit_navm_deltas(lines: list, rec: Record):
         lines.append(f"DATA.CoverTriangleCount={ncover}")
         lines.append(f"DATA.DoorLinkCount={ndoor}")
 
-    for sig in ("NVVX", "NVTR", "NVDP"):
+    for sig in ("NVVX", "NVTR", "NVDP", "NVEX"):
         emit_raw_hex(lines, sig, get_subrecord(rec, sig))
 
 
@@ -459,6 +461,30 @@ def _emit_effect_deltas(lines: list, rec: Record):
             lines.append(f"{pfx}.Condition[{j}].Raw={raw.hex().upper()}")
 
 
+#: IDLE lines the TES4 export_IDLE reads with Oblivion's layout; FO3/FNV swap ANAM and DATA.
+SUPERSEDED_IDLE_KEYS = ("ANAM.", "DATA.")
+
+
+def _emit_idle_deltas(lines: list, rec: Record):
+    """IDLE ANAM (Parent, Previous) and DATA (section, looping, delay, flags) in xEdit FNV order.
+
+    See: docs/commentary/tes4_export_falloutnv.md#idle-anam-data-swapped
+    """
+    anam = get_subrecord(rec, "ANAM")
+    if anam and len(anam.data) >= 8:
+        parent, previous = struct.unpack_from("<II", anam.data, 0)
+        lines.append(f"ANAM.Parent={get_formid_str(parent)}")
+        lines.append(f"ANAM.Previous={get_formid_str(previous)}")
+    data = get_subrecord(rec, "DATA")
+    if data and len(data.data) >= 3:
+        lines.append(f"DATA.AnimGroupSection={data.data[0]}")
+        lines.append(f"DATA.LoopMin={data.data[1]}")
+        lines.append(f"DATA.LoopMax={data.data[2]}")
+    if data and len(data.data) >= 7:
+        lines.append(f"DATA.ReplayDelay={struct.unpack_from('<h', data.data, 4)[0]}")
+        lines.append(f"DATA.Flags={data.data[6]}")
+
+
 #: Effect lines the TES4 emit_effects writes from a layout FO3/FNV does not use.
 SUPERSEDED_EFFECT_KEYS = ("EffectCount=", "Effect[")
 
@@ -482,6 +508,7 @@ _DELTA_DISPATCH = {
     "ENCH": _emit_effect_deltas,
     "INGR": _emit_effect_deltas,
     "QUST": emit_quest_deltas,
+    "IDLE": _emit_idle_deltas,
 }
 
 #: Types carrying an OBND that TES4 has no field for; Skyrim reads it natively.
@@ -656,13 +683,16 @@ IMPACT_MATERIALS = ("Stone", "Dirt", "Grass", "Glass", "Metal", "Wood",
 
 
 def export_IMPACT(rec: Record) -> list:
-    """An IPCT: model, the 24-byte DATA as hex, and its two SOUN links.
+    """An IPCT: model, the 24-byte DATA and 36-byte DODT decal data as hex,
+    its decal TXST (`DNAM`) and its two SOUN links.
     See: docs/commentary/tes4_export_falloutnv.md#impacts
     """
     lines = []
     emit_string(lines, "EditorID", get_subrecord(rec, "EDID"))
     emit_model(lines, "Model", rec)
     emit_raw_hex(lines, "DATA", get_subrecord(rec, "DATA"))
+    emit_raw_hex(lines, "DODT", get_subrecord(rec, "DODT"))
+    emit_formid(lines, "DNAM", get_subrecord(rec, "DNAM"))
     emit_formid(lines, "SNAM", get_subrecord(rec, "SNAM"))
     emit_formid(lines, "NAM1", get_subrecord(rec, "NAM1"))
     return lines
@@ -679,6 +709,50 @@ def export_IMPACTSET(rec: Record) -> list:
         for i, key in enumerate(IMPACT_MATERIALS[:len(data.data) // 4]):
             fid = struct.unpack_from("<I", data.data, 4 * i)[0]
             lines.append(f"DATA.{key}={get_formid_str(fid)}")
+    return lines
+
+
+#: FNV EXPL DATA (wbDefinitionsFNV): (key, offset, kind) for every field TES5 keeps.
+EXPLOSION_FIELDS = (("Force", 0, "f"), ("Damage", 4, "f"), ("Radius", 8, "f"),
+                    ("Light", 12, "id"), ("Sound1", 16, "id"), ("Flags", 20, "u"),
+                    ("ISRadius", 24, "f"), ("ImpactDataSet", 28, "id"),
+                    ("Sound2", 32, "id"), ("SoundLevel", 48, "u"))
+
+
+def export_EXPLOSION(rec: Record) -> list:
+    """An EXPL: bounds, name, model, enchantment (`EITM`), image-space
+    modifier (`MNAM`), the DATA fields TES5 shares and the placed impact
+    object (`INAM`). FNV's radiation block has no TES5 field.
+    See: docs/commentary/tes4_export_falloutnv.md#explosions
+    """
+    lines = []
+    emit_string(lines, "EditorID", get_subrecord(rec, "EDID"))
+    _emit_obnd(lines, rec)
+    emit_string(lines, "FULL", get_subrecord(rec, "FULL"))
+    emit_model(lines, "Model", rec)
+    for sig in ("EITM", "MNAM", "INAM"):
+        emit_formid(lines, sig, get_subrecord(rec, sig))
+    data = get_subrecord(rec, "DATA")
+    if data and len(data.data) >= 52:
+        for key, off, kind in EXPLOSION_FIELDS:
+            val = struct.unpack_from("<f" if kind == "f" else "<I", data.data, off)[0]
+            lines.append(f"DATA.{key}={get_formid_str(val) if kind == 'id' else val}")
+    return lines
+
+
+def export_ADDON(rec: Record) -> list:
+    """An ADDN: bounds, model, node index (`DATA`), sound and the 4-byte DNAM.
+    See: docs/commentary/tes4_export_falloutnv.md#addon-nodes
+    """
+    lines = []
+    emit_string(lines, "EditorID", get_subrecord(rec, "EDID"))
+    _emit_obnd(lines, rec)
+    emit_model(lines, "Model", rec)
+    data = get_subrecord(rec, "DATA")
+    if data and len(data.data) >= 4:
+        lines.append(f"DATA.Index={struct.unpack_from('<i', data.data)[0]}")
+    emit_formid(lines, "SNAM", get_subrecord(rec, "SNAM"))
+    emit_raw_hex(lines, "DNAM", get_subrecord(rec, "DNAM"))
     return lines
 
 
@@ -720,6 +794,8 @@ FALLOUT_BASE_EXPORTERS = {
     "MUSC": export_MUSICTYPE,
     "IPCT": export_IMPACT,
     "IPDS": export_IMPACTSET,
+    "EXPL": export_EXPLOSION,
+    "ADDN": export_ADDON,
     "NAVM": export_NAVMESH,
     "NAVI": export_NAVMESH,
     "MSTT": export_STATIC_BASE,

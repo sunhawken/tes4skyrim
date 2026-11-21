@@ -11,20 +11,54 @@ them does.
 - [ACBS flags: the same bit means three different things](#acbs-flag-collision)
 - [NAM5 and NAM8: widths taken from the binary](#nam5-nam8-widths)
 - [Crime factions are derived from the scripts](#crime-factions-derived)
+  - [Members of an Evil faction are no crime victims](#evil-factions)
 - [Faction reactions and player disposition](#faction-player-disposition)
 - [Aggression and confidence are TIERS, not scalars](#aggression-tiers)
-- [Confidence: why converted actors used to flee](#confidence-tiers)
+- [Confidence: only Cowardly or Foolhardy, plus an own-health threshold](#confidence-tiers)
+  - [Oblivion's flee rule](#oblivion-flee-rule)
+  - [The attack score the flee score must beat](#attack-score)
+  - [The flee margin](#flee-margin)
+  - [Morrowind: Flee 100 or never](#morrowind-flee)
+- [Combat styles: Oblivion's percentages inverted onto Skyrim's multipliers](#combat-styles)
 - [Vendor factions](#vendor-factions)
+- [A vendor faction without PLVD is never selected](#vendor-faction-needs-plvd)
+- [A Morrowind merchant sells what it owns nearby](#morrowind-merchant-stock)
+- [A dependent adopts its masters' vendor factions](#vendor-factions-in-a-dependent)
 - [The merchant marker faction: a CTDA ceiling](#barter-gate-ctda-limit)
+- [Spell merchants sell tomes](#spell-tomes)
 - [The plugin-origin marker faction](#origin-faction)
 - [It also unlocks AI barrier doors](#barrier-door-ownership)
+- [Open by Default: unlocked refs only](#open-by-default)
 - [FACT relations: Ally and Friend are not interchangeable](#faction-relations)
 - [Trainers](#trainers)
 - [Health is written as an OFFSET, not a pool](#health-offset)
+- [Morrowind health is absolute — the same manual-NPC rule](#morrowind-health-is-absolute)
+- [Corpses carry Starts Dead, not just 0 health](#corpses-start-dead)
 - [Hair color: a generated CLFM per authored RGB](#hair-color)
 - [NAM5/NAM6/NAM7/NAM8 are all required](#required-nam-subrecords)
 - [Head parts: RNAM decides who can see the hair](#hdpt-valid-races)
+- [A plugin's own race stands in by its shared face parts](#new-races-by-face-parts)
+- [Morrowind faces: authored head and hair, measured sliders](#morrowind-faces)
+- [A creature race is a caster only for a castable spell](#caster-race-needs-a-castable-spell)
+- [Attack reach is per creature: reach-variant races](#reach-variant-races)
+- [A creature race allows PC dialogue only when a creature on it talks](#creature-talk-prompt)
 - [Voice type resolution](#voice-resolution)
+- [Morrowind vampirism is Skyrim's vampirism](#morrowind-vampirism)
+- [Diseases pass on through Skyrim's creature-disease mechanism](#disease-contact)
+- [Outfits: one inventory split into worn and carried](#outfit-split)
+  - [The upper-body piece is chosen first](#upper-body-first)
+
+## <a id="npcs-use-skyrim-rigs"></a>Only creatures get converted rigs; NPCs use Skyrim's
+
+`RACE` is in `SKIP_TYPES` (`tes5_import/registry.py`, "NPCs map to Skyrim
+races") and every NPC_ is re-pointed at a stock Skyrim race through `RACE_MAP` /
+`DEFAULT_RACE` in `skyrim_overrides.py`. `creature_races.py`, the only code that
+assigns `skeleton_nif` / `behavior_hkx`, runs for CREA alone. NPCs therefore
+already have Skyrim's skeleton, animations and `magicbehavior` casting graph:
+casting art on an NPC needs only an ARTO naming a stock graph
+(`Magic\CastingBasic.hkx`), and no skeleton/behavior work exists "for NPCs".
+Creatures use our generated graphs, so creature casting is the case that can
+break.
 
 ## <a id="acbs-flag-collision"></a>ACBS flags: the same bit means three different things
 
@@ -68,6 +102,32 @@ defining its own crime faction gets the same treatment as vanilla's `0005D556`.
 
 SCTX arrives with `\r\n` still escaped; the regex only needs the function name
 and its first argument, so no unescaping is needed.
+
+These are the GUILD factions a script asks about. The bounty guards act on is
+a separate crime faction per realm, which every NPC reports to through `CRIF`;
+see [tes_runtime_crime.md](tes_runtime_crime.md#bounty-realms).
+
+### <a id="evil-factions"></a>Members of an Evil faction are no crime victims
+
+TES4, FO3 and FNV FACT `DATA.Flags` bit 1 is Evil (xEdit `wbDefinitionsTES4`,
+`wbDefinitionsFO3`): any crime against a member carries no bounty (UESP
+Oblivion talk:Factions). Skyrim has no such flag; an actor is a crime victim
+exactly when it has a crime faction. So an NPC whose factions, this plugin's
+or a master's, are ALL Evil gets no `CRIF` and no crime-faction membership,
+the same treatment as one that attacks on sight. Guard classes keep theirs.
+
+🛑 **One non-Evil faction makes the actor a victim again** (same UESP page:
+"as soon as they are in a single non-evil faction they cause a bounty").
+Morroblivion puts nearly every actor in `0factMorrowind` (Hidden + Evil) beside
+its town or guild faction. Testing ANY Evil faction stripped crime status from
+3,120 of Morrowind_ob's 3,146 NPCs; only 749 are in Evil factions alone. In
+Oblivion.esm the two readings give 886 and 770, and in Nehrim.esm 325 and 269.
+All of `AbtruennigeMagier`'s members are in that faction alone.
+
+Aggression alone cannot catch this: Nehrim's `AbtruennigeMagier` mages in
+`NQ00Karick` have Aggression 5, so they were written as crime victims and the
+player got a bounty for the hit the quest asks for. Census: 117 Evil factions
+in Oblivion.esm, 25 in Nehrim.esm, 44 in FalloutNV.esm, none in Morrowind.esm.
 
 ## <a id="faction-player-disposition"></a>Faction reactions and player disposition
 
@@ -141,7 +201,8 @@ Skyrim separates these two cases with AIDT's Aggro Radius fields (EncWolf is
 Aggression 0 but carries `aggroRadiusBehavior=1`, attack radius 1500) — fields
 TES4's AIDT does not have at all (xEdit wbDefinitionsTES4: AIDT is
 Aggression/Confidence/Energy/Responsibility/Services/Teaches/MaxTraining only).
-The discriminator therefore has to be reconstructed; see `_predator_attack_radius`.
+The discriminator therefore has to be reconstructed from the TES4 margin below;
+no converted actor sets the aggro radius.
 
 ### The calibrated rule
 
@@ -161,32 +222,321 @@ Two terms decide it:
   margin of 48 and tame animals -47, while Benno scores just 8 — hostile in
   principle, not a threat on sight.
 
+### <a id="tes3-fight-targets-the-player"></a>TES3: Fight targets the player and nobody else
+
+Morrowind's Fight is not a per-target rule. OpenMW's `Actors::engageCombat`
+applies `isAggressive` only when the target is the player or a player
+follower (actors.cpp:721-731). The one other on-sight fight is a guard
+against a hostile creature already in combat. A goblin never attacks an NPC,
+and a bystander never joins someone else's fight.
+
+Tier 2 attacks every neutral, and to Skyrim every NPC is a neutral. Before
+this rule, a leveled goblin in Arktwend's Upper Mines killed Irfl before his
+quest greeting. So a TES3 source never gets past tier 1, and the actor that
+OpenMW calls aggressive joins `TES4DispositionHostileFaction`, an Enemy of
+PlayerFaction alone. Vanilla does the same: DragonFaction (31 of its members
+at tier 1), MQ202EnemyofPlayerFaction and TG09NightingaleEnemyFaction are
+tier 1 plus a faction that is the player's enemy. TES3 faction reactions are
+-3 to 3, and only -50 or below becomes an XNAM Enemy, so no TES3 faction
+makes another TES3 actor an enemy.
+
+"Aggressive" is `Fight + iFightDistanceBase + (50 - disposition) *
+fFightDispMult >= 100`, OpenMW's `getFightTerm` at distance 0. Morrowind.esm
+and Arktwend both author 20 and 0.2. Disposition is the NPDT's
+(`ACBS.Disposition` in the export); a creature counts as 50, as in OpenMW.
+This is the same 0-100 faction system the TES4 sources use: a TES3 run makes
+all three factions, ranking each actor in `TES4DispositionFaction` at its
+disposition and in `TES4AggressionFaction` at its Fight, so a `GetDisposition`
+condition reads the faction rank on both games. Only the line differs: OpenMW's
+rule here, Oblivion's `disposition < aggression - 5` there. At run time
+MorrowindRuntime owns the numbers. Every `SetFight` and every disposition
+change (`SetDisposition` re-applies Fight) writes both ranks and joins or leaves
+the hostile faction by the same rule, using the runtime's live disposition.
+The factions reach it as the `disposition`, `aggression` and `hostile` rows of
+`effects_formid.txt`.
+
+Not matched: OpenMW's distance term, `iFightDistanceBase - 0.005 * distance`,
+so a Fight-87 wolf engages only within about 1,400 units. Skyrim has no
+falloff, and its aggro radius cannot stand in. The CK wiki says a radius makes
+the actor attack "a Neutral/Enemy" inside it, and to Skyrim every NPC is
+Neutral: vanilla's radius wolves (EncWolfRed, Aggression 0, attack 1500) attack
+travelers. So a TES3 hunter engages at Skyrim's detection range.
+
+### <a id="tes3-guards-attack-hostile-creatures"></a>TES3: guards attack hostile creatures
+
+OpenMW's one on-sight fight that does not target the player (actors.cpp:733-780):
+an NPC whose class is `Guard` attacks a creature that is in combat within
+`fAlarmRadius`, when that creature's Fight term toward the player is >= 100 and
+no follow package sides it with someone. The guard's own Fight does not enter
+into it. Without this, Arktwend's Nordrand snow wolves (`LandSchneewolf01`)
+fought the player beside two dwarf guards who never moved. Tier 2 used to hide
+this, because the guards attacked every neutral.
+
+A TES3 run makes two more hidden factions. `TES3GuardFaction` marks every
+Guard-class NPC. `TES3HostileCreatureFaction` replaces the hostile faction for
+a creature, and like it is an Enemy of PlayerFaction alone. Hostile NPCs stay
+in the general hostile faction, because OpenMW's guards leave them alone.
+MorrowindRuntime applies the rule itself (`GuardsEngage`, `game_calls_combat.cpp`).
+Three times a second it walks the engine's high-process actors. Each guard
+that is not already fighting is set (`StartCombat`) on the first member of the
+creature faction that is in combat within `fAlarmRadius` (default 2000). At
+run time `SetFight` picks the creature faction from the `creature` flag in the
+actor table. The factions reach the runtime as the `hostile_creature` and
+`guard` rows.
+
+Two static versions failed, measured at Nordrand with the player 4,880 units
+away. With the guard and creature factions Enemies both ways, the snow wolves
+attacked the guards the moment the cell loaded. With only the guards naming
+the creatures, the guards went after the idle wolves themselves. Either way a
+guard died before his quest greeting. A faction relation cannot say "only once
+the creature is fighting", which is the whole rule.
+
+Not matched: werewolf NPCs, which OpenMW's guards also attack, and its
+exception for a creature that a follow package sides with someone.
+
 FO3/FNV does not go through any of this: it already stores both axes in the
 TES5 enums. See
 [tes5_import_falloutnv_actors.md](tes5_import_falloutnv_actors.md#aggression-is-already-a-tier).
 
-## <a id="confidence-tiers"></a>Confidence: why converted actors used to flee
+## <a id="confidence-tiers"></a>Confidence: only Cowardly or Foolhardy, plus an own-health threshold
 
-Both engines feed confidence into `fAIFleeConfBase`/`fAIFleeConfMult` to score
-"should I run away", but TES4 supplies a 0-100 number while TES5 supplies one
-of five tiers (xEdit `wbConfidenceEnum`: 0 Cowardly, 1 Cautious, 2 Average,
-3 Brave, 4 Foolhardy). Only tier 4 never flees.
+**Code:** `tes5_import/actors/confidence.py`, `attack_score.py`; scripted
+changes in [script_convert.md](script_convert.md#confidence-through-the-polyfill).
 
-The old mapping was `<30 → 0, >=70 → 3, else 2`, which never emitted tier 1 or
-tier 4 at all and capped the whole top of the range at Brave. That is why
-converted actors fled constantly: Oblivion's "fearless" value 100 is by far the
-most common setting (1,567 of 3,396 exported actors) and it landed on Brave,
-which still has a nonzero flee score, instead of Foolhardy.
+The two engines mean different things by confidence, so no tier ladder can map
+one onto the other:
 
-Vanilla Skyrim leans the opposite way — of 5,118 NPC_ records the distribution
-is 292/90/1730/393/2613, i.e. Foolhardy is the single most common tier and more
-than half of all NPCs sit at 3 or 4.
+- **Oblivion** (Oblivion.exe, below): an actor flees when its flee score beats
+  every attack it could make. Confidence, its own health and its own best attack
+  all count; the enemy plays no part. UESP's "percentage of health lost before
+  fleeing" is wrong: Confidence 60 or more never flees in Oblivion.esm, and a
+  weak Confidence 10 animal flees on sight.
+- **Skyrim** (CK wiki AI Data Tab; 1.6.1170): tiers 0-3 flee when the actor's
+  strength divided by its enemy's falls below the tier's setting.
+  `fConfidenceCowardly/Cautious/Average/Brave` are 1000 (exe default) / 0.375 /
+  0.15 / 0.0375 in Skyrim.esm; the table at 0x1fd51e8 maps tier to setting.
+  Strength (0x6b66b0) is current Health ÷ (1 − armor reduction), so it is an
+  effective-hit-point ratio; the flee test at 0x70ac60 is
+  `setting > own ÷ enemy`, and the combat group re-sums both sides every
+  `fCombatThreatRatioUpdateTime` (5 s, 0x80a5f0). Only Foolhardy (4) never flees.
 
-Anchoring on the values Oblivion actually uses (100 = fearless, 75-95 = brave,
-50 = the engine default "average", 5-25 = timid, 0 = flees on sight) reproduces
-a vanilla-shaped spread. Must stay in sync with `_scale_enum_av` in
-`script_convert/converter.py`, which buckets scripted `setav confidence N` onto
-the same tiers.
+The Nehrim intro shows the difference. The twelve trolls at the Shadowshriek
+Mine exit (`MQ00troll01Ausgang`) are authored with Health 1 and Confidence 80 so
+they charge through Merzul's wall of fire and die at it (their script kills any
+troll within 300 units of a fire marker). Under the old ladder (80 → Brave) a
+1-HP troll against the player or Merzul (365 HP) scored far below 0.0375 and ran
+away at once, and Merzul walked through the fire after them.
+
+So every converted actor is Cowardly or Foolhardy, which switches Skyrim's
+strength comparison off, and Oblivion's own rule decides between them.
+
+### <a id="oblivion-flee-rule"></a>Oblivion's flee rule
+
+Oblivion.exe 0x621b40 picks each combat action by score; the highest wins. The
+flee score (0x546cc0) is
+
+`F = Confidence × fAIFleeConfMult + fAIFleeConfBase + (1 − health/max) × fAIFleeHealthMult`
+
+and the actor flees when F is strictly above `fAICombatFleeScoreThreshold` AND
+above every other action's score, unless its combat style has Fleeing Disabled
+(0x20) or it is over-encumbered (vfunc 0x25c zeroes F). Confidence is the current
+value (Demoralize and scripts count). Settings (exe default / Oblivion.esm):
+ConfMult −0.5, ConfBase 40 / 30, HealthMult 20 / 10, threshold 10. Nehrim has
+no master and overrides none of them, so it runs on the exe defaults.
+
+Two things switch fleeing off for the rest of a fight (CombatController +0x4d):
+being over-encumbered when the flee starts (0x620e80), and a counter kept while
+fleeing passing `iAIFleeMaxHitCount` 3 (0x624dd9).
+
+### <a id="attack-score"></a>The attack score the flee score must beat
+
+**Code:** `tes5_import/actors/attack_score.py`.
+
+| Action | Score | Where |
+|---|---|---|
+| Weapon | `fAIMeleeWeaponMult` (2.0) × damage + `fAIMagicSpellMult` (3.0) × enchantment cost, the enchantment only when hostile | 0x612560, 0x547140 |
+| Creature natural attack | `fAIMeleeHandMult` (1.3) × int(AttackDamage × fatigue) | Creature vfunc 0x34c = 0x624f90 |
+| NPC unarmed | 1.3 × int(`fHandHealthMin` + (`fHandHealthMax` − Min) × min(1, strength term × fatigue × skill term)) | 0x60e270, 0x547280 |
+| Touch / Target spell | 3.0 × the spell's cost to this caster | 0x616980 |
+
+- Weapon damage (0x547070) = `fDamageWeaponMult` × base × condition ×
+  (`fDamageSkillBase` + `fDamageSkillMult` × skill%) × (`fDamageStrengthBase` +
+  `fDamageStrengthMult` × min(Str, 100)%) × fatigue. Skill is clamped
+  skill + Luck × `fActorLuckSkillMult` + `iActorLuckSkillBase` (0x547b90). The
+  weapon skill is Blade for types 0-1, Blunt for 2-4 (staffs too), Marksman for
+  bows (table 0xb086a0). Arrows add nothing.
+- A creature reads Armorer to Heavy Armor and Marksman as its Combat skill,
+  magic skills as Magic, the rest as Stealth (Creature vfunc 0x284 = 0x6253c0).
+  Only a creature with Weapon & Shield uses a weapon.
+- An armed NPC considers unarmed only when its Hand to Hand skill is higher
+  than its weapon skill; an armed creature never does (both read Combat).
+- Fatigue at full is `fFatigueBase`; condition at full is
+  `fDamageWeaponConditionBase` + `fDamageWeaponConditionMult`.
+- Spell candidates (0x61b1b0): the actor's own spells of SPIT type Spell, an
+  NPC's race spells, and carried scrolls. Powers enter only on a random roll
+  (`iAINPCRacePowerChance`), abilities and diseases never. A spell counts when
+  it has a hostile effect and no summon/bound effect (MGEF 0x70000): with a
+  Target effect it is a ranged spell, else with a Touch effect a touch spell
+  (0x414fe0, 0x415030). Touch spells score only when unarmed; ranged spells when
+  unarmed or the style Prefers Ranged. Each evaluation picks one spell per list
+  at random, and fleeing is re-checked every evaluation, so the cheapest spell of
+  each list is the one the flee score has to beat.
+- Spell cost: a Manual Spell Cost spell pays SPIT.Cost × (`fMagicCasterSkillCostBase`
+  + `fMagicCasterSkillCostMult` × (1 − skill%)), skill of the costliest effect's
+  school (0x41d320). Otherwise each effect costs max(1, floor(0.1 × BaseCost ×
+  max(1, Duration) × Magnitude^`fMagicCostScale` × max(1, 0.15 × Area) × 1.5 if
+  Target) × the caster factor for its own school) (0x413890, 0x548b50). No
+  Magnitude/Duration/Area flags drop their term. An enchantment pays its ENIT
+  cost when No Autocalc is set, else the effect sum with no caster factor.
+
+Not reproduced, because it changes during a fight: a melee actor that cannot
+reach its target scores 0 for melee, lower fatigue and weapon condition lower
+the attack, a castability check drops spells the actor cannot cast now. A
+level-scaled actor is scored at the stats the export stores for it, and its
+leveled weapons and spells at the level a level-1 player meets it.
+
+### <a id="flee-margin"></a>The flee margin
+
+With M = max(threshold, best attack score), solving F > M for health gives
+
+`flee when (1 − health) × Q > margin`,  `Q = fAIFleeHealthMult ÷ −fAIFleeConfMult`,
+`margin = Confidence + (M − fAIFleeConfBase) ÷ −fAIFleeConfMult`.
+
+Q is 20 for Oblivion.esm and 40 for Nehrim. Margin ≤ 0 flees on sight
+(Cowardly), margin ≥ Q never flees (Foolhardy), and in between the actor is
+Foolhardy until health falls to 1 − margin/Q. Margin rises by exactly the change
+in Confidence, so a script's SetAV only shifts it.
+
+- Every TES4 actor joins hidden `TES4ConfidenceFaction` at rank = its authored
+  Confidence and `TES4FleeMarginFaction` at rank = its margin. The attack term
+  is capped at Q (it can only mean "never"), and Fleeing Disabled sets it to Q.
+- An actor inside the window carries the `TES4ConfidenceFlee` ability: one
+  effect per rank k = 1 … ⌈Q⌉−1, conditioned `GetFactionRank(margin) == k AND
+  GetActorValuePercent(Health) <= 1 − k/Q`. The engine re-evaluates ability
+  conditions itself.
+- Each effect's script (`TES4_ConfidenceFlee`) calls
+  `TES4Polyfill.ApplyConfidence` on start and finish, which picks Cowardly or
+  Foolhardy from the live margin, health and Q. Changing the tier mid-fight
+  restarts the fight ([why](script_convert.md#confidence-restarts-combat)).
+- Q lives in the Constant global `TES4FleeHealthScale`, read by the effect
+  script and by `TES4Polyfill.SetConfidence`.
+
+The factions, global and ability are created by the masterless plugin and
+adopted by a dependent through `master_index.find_by_edid`, like
+`TES4NoFallDamage`. Vanilla has no constant-effect Demoralize to copy (all 21
+of its Demoralize effects are cast), which is why the flee goes through the
+Confidence tier instead.
+
+### <a id="morrowind-flee"></a>Morrowind: Flee 100 or never
+
+The Morrowind exporter writes Confidence = 100 − Flee. OpenMW's
+`vanillaRateFlee` (`aicombataction.cpp`) scores
+`(1 − health%) × fAIFleeHealthMult + Flee × fAIFleeFleeMult` plus a distance
+bias of at most `iFightDistanceBase`, and flees only at 100: below Flee 100 the
+score tops out near 57, and Flee ≥ 100 flees at once. So a Morrowind actor is
+Cowardly (Flee ≥ 100) or Foolhardy and gets no threshold; FO3/FNV already author
+the Skyrim tier. Neither source creates the faction or ability.
+
+## <a id="combat-styles"></a>Combat styles: Oblivion's percentages inverted onto Skyrim's multipliers (2026-09-27, confirmed in game: Nehrim mine exit, Charactergen)
+
+**Code:** `tes5_import/actors/combat_style.py`; export layout in
+`tes4_export/record_types/actors.py` (`_CSTD_FIELDS`, xEdit wbDefinitionsTES4).
+
+Every TES4 CSTY converts to a Skyrim CSTY with the same FormID, and an actor's
+ZNAM points at its own converted style. Before this, CSTY was skipped: creatures
+got csWolf (flanking, circle 0.5, walk-back 0.4) or DefaultCombatstyle by
+`DATA.Type`, so every authored style was lost, and the exporter read CSTD at
+wrong offsets (Flags read at 84, not 80).
+
+**No style means Oblivion's game settings.** An Oblivion actor without ZNAM
+fights by `iAIDefault*`/`fAIDefault*` (CS wiki Combat Style). Their compiled-in
+values come from Oblivion.exe's setting initializers (`push value; push name`):
+dodge 75, left/right 50, block 30, attack 40, power attack 25, stagger bonuses 5,
+and so on; Oblivion.esm overrides the stagger attack bonus to 30. The masterless
+plugin writes `TES4DefaultCombatStyle` from exe values plus master and own
+GMSTs; a dependent adopts it, rewriting it only when it authors one of those
+settings.
+
+**Skyrim's side, from SkyrimSE 1.6.1170.** Each chance is
+`min + (max − min) × mult` (0x1408dc070, unclamped), with the Min/Max settings
+read from their static `{vtable, value, name}` objects
+(`tools/disasm/ck_settings_dump.py --pattern`):
+
+| Chance | Multiplier (style offset) | Min–Max |
+|---|---|---|
+| Attack (0x8dcc20) | Offensive (+0x20), × group term when several attack the player | 0.05–1.0 |
+| Block (0x8dce60) | Defensive (+0x24) | 0–1 |
+| Circle (0x8dc3c0) | CSCR Circle (+0x68) | 0–0.75 |
+| Fallback (0x8dc300) | CSCR Fallback (+0x6c) | 0–0.5 |
+| Strafe (0x8ddb30) | CSLR Strafe (+0x78) | 0–0.75 |
+
+An attack against a staggered target is multiplied by
+max(Attack Staggered, Power Attack Staggered).
+
+**The mapping** inverts Oblivion's per-decision chance onto the multiplier that
+gives the same Skyrim chance. CSAD values come from the record only when the
+Advanced flag is set (Oblivion's getters at 0x4a9e70 test it), else from the
+settings:
+
+- Attack: (Attack% + attack skill base) × Attack Not Under Attack Mult.
+- Block: (Block% + block skill base) × Block While Under Attack Mult.
+- Circle: Dodge% × Dodge Not Under Attack Mult × Left/Right%. Strafe copies it.
+- Fallback: the non-left/right dodges × back ÷ (back + forward), using the
+  Not Under Attack / Not Attacking multipliers. Oblivion's direction chooser
+  (0x546e10) weights back and forward by those multipliers times a 1–5 roll.
+- Attack Staggered: the chance with the Recoil/Stagger bonus ÷ the chance
+  without; Power Attack Staggered: (PA% + its bonus) ÷ PA%.
+- Prefers Ranged: vanilla csHumanMissile's 3.2 ranged, 0.83 melee, with the
+  ranged mult on magic and staff too.
+- Fleeing Disabled: the actor never flees ([flee margin](#flee-margin)).
+  TrollStyle carries it, so Nehrim's exit trolls never flee.
+- Bash mults are 0 (Oblivion has no bash). Group offensive, avoid threat,
+  special attack, flanking and flight keep the TESCombatStyle constructor
+  values. DATA is Dueling.
+
+Not expressible per style: actor skill, fatigue and speed terms, timers,
+power-attack direction chances, standoff and switch distances, range mults,
+rushing attacks, yield and Do Not Acquire. FO3/FNV and Morrowind sources keep
+the old vanilla fallback.
+
+### <a id="combat-style-stance"></a>Defensive is capped at Offensive (2026-09-29, confirmed in game: Nehrim trolls)
+
+**Symptom:** Nehrim's trolls backed away as the player closed in, before they
+could swing.
+
+**Cause:** Skyrim reads Defensive − Offensive (TESCombatStyle +0x24 − +0x20) as
+a stance. Defensive is read only through the getter 0x8dc050, which has 14
+callers in SkyrimSE 1.6.1170:
+- **On its own** it sets block chance (0x8dce60), block start/stop distance,
+  block time, bash chance and cover search distance.
+- **The stance** sets the advance radii (0x8dc190), cover wait/attack time,
+  `fCombatMaximumOptimalRange*` and `fCombatInventoryDesiredRangeScoreMult*`.
+  Above 0, the inner advance radius grows to `fCombatAdvanceInnerRadiusMax`
+  (512).
+- **The back-up:** 0x870260 walks the actor backward, still facing its target,
+  whenever the target is closer than `fCombatBackoffMinDistanceMult` (0.75) ×
+  (base + inner radius). The flat `fCombatBackoffChance` 0.25 is just a getter
+  (0x8dc580).
+
+Mapping Oblivion's block chance onto Defensive therefore invented a keep-away
+distance Oblivion never had. `TrollStyle` (attack 50 → 0.474, block 30 × 2.0 →
+0.600) stood 65 units off. With Nehrim's troll reach of 32 edge to edge, that
+put the troll outside its own swing.
+
+**Fix:** Defensive = min(Offensive, block) for a style that attacks, so the
+stance is never positive. Attack chance is exact, and block only drops where it
+exceeded attack. A style with Offensive 0 keeps its full Defensive, as vanilla's
+trainers do (`MG01TolfdirWard`, `csHumanMelee_AllD`: 0 / 1.0). Without that,
+Oblivion's `HelviusCeciaTraining` block partner lost all blocking.
+- **Vanilla:** 19 of 145 styles run Defensive > Offensive: tanks, bosses,
+  horses, wisps and the all-defensive ones. `csTroll` is 0.88 / 0.0.
+- **Blast radius:** 26 of 127 Oblivion.esm styles and 10 of 44 Nehrim styles
+  change. The no-style default drops 0.60 → 0.37 and `TrollStyle` 0.60 → 0.47.
+  The largest drops are `CombatKim` 0.80 → 0.37 and `CombatMage` 0.50 → 0.16.
+  An actor without a shield blocks at only `fCombatBlockChanceWeaponMult`
+  (0.25) of that anyway (0x8dce98).
+- **Tests:** `TestCombatStyleConversion::test_defensive_never_exceeds_offensive`,
+  `test_never_attacking_style_keeps_its_block`.
 
 ## <a id="vendor-factions"></a>Vendor factions
 
@@ -205,6 +555,69 @@ inventory only. `_merchant_faction_by_npc` holds the per-merchant factions,
 which carry a VENC (Merchant Container) pointing at the actor's own converted
 Oblivion merchant chest so the barter menu stocks its full merchandise.
 
+### <a id="vendor-faction-needs-plvd"></a>A vendor faction without PLVD is never selected
+
+`Actor::CalculateCurrentVendorFaction` (ID 37383, 1.6.1170 RVA `0x66c250`)
+walks the actor's factions and takes the FIRST vendor faction whose VENV hours
+contain the current hour, whose conditions (+0xC0) pass, and whose PLVD
+location (+0xB8, written by `TESFaction::Load` at `0x3acdab`) is non-null and
+within the VENV radius. **A null PLVD skips the faction outright.** All 145
+vanilla vendor factions carry PLVD. A faction the selector skips leaves the
+actor with no vendor faction: the barter menu still opens, but only on the
+actor's carried inventory and gold, so its VENC chest is never read.
+
+So every vendor faction copies vanilla's anywhere-vendors (ServicesDBBabette,
+the caravans, the hunters — 26 factions use PLVD type 12 Near Self): VENV open
+0-24h, PLVD Near Self. Oblivion merchants barter wherever you talk to them. A
+chest-backed merchant joins ONLY its VENC faction: the selector takes the first
+match, and the chest-less shared faction used to sit ahead of it.
+
+The barter menu copies the merchant's own inventory (`0x1bcd40` → `0x237860`)
+and counts form `0xF` in it (`0x234350`), and adds the VENC chest's only when a
+vendor faction resolved. Carried gold is therefore vendor gold either way.
+
+### <a id="morrowind-merchant-stock"></a>A Morrowind merchant sells what it owns nearby
+
+**Code:** `record_types/vendor_stock_morrowind.py`
+
+TES3 trades the merchant's inventory plus every container with capacity > 0 and
+every loose item in the loaded cells whose owner is the merchant (OpenMW
+`TradeWindow::setPtr` → `World::getContainersOwnedBy` / `getItemsOwnedBy`). A TR
+smith like TR_m4_Ulran_Teryon carries 8 items and owns 115 refs, 16 of them
+containers; 611 of TR's 680 ref-owning merchants own a container.
+
+Skyrim's barter builder (`0x1bcd40`, 1.6.1170) has the same rule. When the
+resolved vendor faction's PLVD is Near Reference (type 0) or In Cell (type 1)
+it walks refs within 10000 units of the merchant (`0x177d728`) and, through the
+callback `0x1bd630`, keeps each ref OWNED BY THE VENDOR FACTION (not the VENC
+chest): a CONT adds its contents, a loose ARMO/BOOK/INGR/LIGH/MISC/APPA/WEAP/
+AMMO/KEYM/ALCH adds itself, anything else is skipped. Near Self (type 12)
+walks nothing.
+
+So each merchant of a TES3 source (`is_tes3_export`) that owns stock gets its
+own `TES4Merchant_<id>` vendor faction with PLVD In Cell at its placement cell,
+and its owned containers (capacity > 0), carriable lights and loose items are
+re-owned from the NPC to that faction (`stock_owner`, read by `convert_REFR`).
+The merchant is a member, so taking them is still theft. Away from that cell
+the faction does not resolve and the Morrowind runtime's ShowBarterMenu trades
+the carried inventory only, as TES3 does when the shop is not loaded.
+
+TES3 restocks through respawning containers; the exporter writes their FLAG
+0x02 as TES4 `DATA.Flags` Respawns 0x02, which Skyrim reads as the same bit.
+
+### <a id="vendor-factions-in-a-dependent"></a>A dependent adopts its masters' vendor factions
+
+`ACBS.BarterGold` is written only for an actor in a vendor faction, so a plugin
+that built none lost every merchant's gold: 20/20 Tribunal, 11/11 Bloodmoon and
+778/778 TR_Mainland (Morroblivion mode) merchants with authored gold carried
+none. `create_service_records` now runs for every plugin. A support root
+(`is_support_root()`: a root master, or the Morroblivion patch) creates all its
+records as before, so its FormIDs do not move. A dependent adopts each keyword
+FLST, shared vendor FACT, the merchant marker and the trainer FACT by EditorID
+from its masters and creates only what they lack — its masters' shared factions
+cover 7-12 of TR's 77 service combos — plus its own per-merchant VENC factions.
+Trainer classes are also looked up in the masters' export.
+
 ### <a id="barter-gate-ctda-limit"></a>The merchant marker faction: a CTDA ceiling
 
 Every merchant joins one marker faction purely so the Barter topic can be gated
@@ -219,6 +632,44 @@ while Training (a 1-condition gate) kept working.
 Membership in the marker is what the dialogue asks about; the per-service
 factions still do the actual vending via the VEND keyword filter and VENC chest.
 
+### <a id="spell-tomes"></a>Spell merchants sell tomes
+
+**Code:** `record_types/spell_tomes.py`, `record_types/spell_tomes_morrowind.py`
+
+Both games sell a spell straight into the spellbook from a service menu Skyrim
+lacks, so every spell a merchant offered becomes a BOOK with DATA flag Teaches
+Spell (0x04) in the merchant's CARRIED inventory -- the barter menu always
+lists that, chest or no chest. The shape copies vanilla's tomes: FULL
+`Spell Tome: <spell>`, KWDA VendorItemBook + VendorItemSpellTome, weight 1.0,
+and the model and INAM of the first effect's school
+(`SpellTome<School>LowPoly.nif`, `0002FBB3`-`0002FBB7`). Mysticism folds to
+Alteration, as the effects do. The value is the spell's base price in its own
+game; Skyrim's barter markup then applies as to every other converted item.
+
+**Oblivion rule:** the ordinary spells (SPIT.Type 0) in the merchant's own
+list, at `SPIT.Cost x fSpellmakingGoldMult`. Oblivion.esm sets 3.0, which is
+UESP's "three times the magicka cost"; `Oblivion.exe` constructs the setting
+from `fld1`, so a chain that sets none (Nehrim) prices at 1.0. It is the only
+GMST in the executable tying spells to gold. Measured: Oblivion.esm 36 spell
+merchants, 588 list entries, all SPEL (one ability); Nehrim has 2 LVSP entries,
+which are not sold.
+
+**Morrowind rule:** OpenMW `SpellBuyingWindow::setPtr` -- the merchant's known
+spells of type Spell, minus its race's powers, at
+`calcSpellCost x fSpellValueMult`. An NPC whose NPDT is the 12-byte form also
+knows what `autoCalcNpcSpells` picks from the whole spell store in store order,
+so the chain's binaries are read (the export keeps only mean magnitudes). The
+cost port, in float32, reproduces the CS-stored cost of all 708 autocalc spells
+of Morrowind.esm and 715 of the TR chain. TR_Mainland has 23 autocalc spell
+merchants with no list of their own; every autocalc NPC's AIDT services equal
+its class's (6,712 of 6,712), so the vendor factions need no change.
+
+A tome's EditorID is `TES4SpellTome_` or `TES3SpellTome_` plus the spell's, and
+a dependent adopts its masters' tome only under its own rule: TR's merchants
+price vanilla spells by Morrowind's rule, Morrowind_ob's by Oblivion's.
+Measured: Oblivion.esm 311 tomes / 33 merchants, Morrowind_ob.esm 350 / 94,
+TR_Mainland 452 / 154.
+
 ## <a id="origin-faction"></a>The plugin-origin marker faction
 
 Every actor a file defines joins it, and dialogue that states no plugin-scoped
@@ -230,10 +681,62 @@ NEGATIVE `GetIsID`), and conversion rewrites `GetIsRace` to a VANILLA Skyrim
 race every plugin shares, so Nehrim NPCs passed them. Race was Oblivion's
 plugin boundary only because Oblivion was the only file loaded.
 
-ONLY a root master (no TES4 masters of its own) creates and applies this. A
-DLC/plugin must stay ungated so it can extend and override its master's
-dialogue exactly as it does in Oblivion — its own actors are already members
-via the master's NPC records it inherits or overrides.
+EVERY converted plugin creates its own, root or dependent, and gates its own
+new lines on it -- unless it defines no actor of its own (a dialogue-only
+add-on, or one that only overrides its masters' actors). Then nobody can join
+its faction, so its lines gate on the factions of the masters its header lists
+instead, the only speakers its author could have meant. Measured on every
+dependent exported here, none is such an add-on, so no current build changes.
+A plugin's actors join its own and every converted master's
+(`origin_memberships`, found by EditorID through
+`ChainedMasterIndex.find_all_by_edid`), so dialogue flows DOWN the master chain
+and never up or across: Oblivion's generic lines reach Morroblivion's actors,
+Morroblivion's never reach Oblivion's, and neither reaches Nehrim's or
+vanilla Skyrim's. Dependents' actors used to join nothing: measured on
+TR_Mainland, 0 of 9,264 NPCs carried the compatibility patch's origin faction
+while 4,322 of the patch's 4,647 voiced barks were gated on it, so nearly every
+vanilla Morrowind bark was silent on every Tamriel Rebuilt actor.
+
+🛑 **Only the masters the plugin's own header lists count, never the inherited
+ones.** A plugin also indexes its masters' masters so it can adopt their support
+records (see [phase 0](tes5_import_pipeline.md#phase-0-dependent-skips-support-records)).
+Those inherited masters sit below the header's first slot (`get_formid_index_offset`),
+and `reset_origin_faction` skips their factions. When they were joined, every
+Tamriel_Data, TR_Mainland and Sky_Main NPC (633, 9,243 and 950) became a member
+of Oblivion.esm's faction. Oblivion's greetings then passed for them, since they
+share Oblivion's voice types. Those greetings sit in quests up to priority 90 and
+the Morrowind barks in `TES4GenericHELO` at 0, so the Oblivion line won and the
+Morrowind ones went unheard.
+
+Dependents used to stay ungated, so a DLC could hand the master's NPCs new
+generic lines. Measured on the Morroblivion build before the change: 95 new
+lines were scoped only by an Oblivion.esm class or faction, 624 only by a voice
+type Morroblivion shares with Oblivion, and 14 non-scene lines by nothing at
+all, so vanilla Skyrim followers qualified too. A line that names a master's NPC
+with `GetIsID` is still ungated: naming an individual is deliberate. An
+OVERRIDE of a master's INFO keeps the master's audience and is never gated.
+
+A barrier door is owned by the origin faction only in the plugin that creates
+the support records (see below).
+
+#### What counts as naming the speaker
+
+`needs_origin_gate` looks for one condition that POSITIVELY tests the SPEAKER's
+membership: `GetIsID` on any actor, or `GetInFaction`/`GetFactionRank`/
+`GetIsClass` on a form at the plugin's OWN index. In an OR group every member
+must qualify: Morroblivion's skooma line is `GetIsClass(own) OR
+GetIsClass(Oblivion's)`, and the second half lets Oblivion's actors in. Three
+more traps, each measured against the Oblivion/Nehrim exports:
+
+- Race and cell look like an audience but name no plugin-owned form:
+  `GetIsRace` becomes a vanilla Skyrim race every converted plugin shares. This
+  was the cause of Oblivion guard/crime/directions lines on Nehrim NPCs.
+- A NEGATIVE test is an exclusion. Oblivion's Rumors channel (1,854 lines) is
+  built from `GetIsID(SomeNPC) == 0`; counting it as pinned let 395 rumour lines
+  (plus 77 with no conditions) reach Nehrim NPCs.
+- A Run On = Target test is about the LISTENER. `GetIsID(PlayerRef)[Target]`
+  holds in every conversation; counting it left 55 greeting/rumour/guard lines
+  open to any actor.
 
 It is a plain membership marker: no flags, no relations, no vendor data, so it
 can never affect crime, combat reaction, or the barter menu.
@@ -254,12 +757,24 @@ because the faction carries no crime data. The player is not a member, so the
 lock still reads Requires Key and activation stays blocked; the OnActivate
 preamble restores the lock after each AI passage.
 
-TES4 `XACT`/`ONAM` ("Open by Default") is deliberately NOT transferred by
-`convert_REFR`. In Skyrim those make the door SPAWN open, but Oblivion doors
-carrying them still spawn closed — verified in-game, where every CharacterGen
-portcullis stood open at load once they were passed through. Oblivion opens
-such doors through the AI bypass instead, which is what the consume-door
-handling at `XLOC` reproduces.
+### <a id="open-by-default"></a>Open by Default: unlocked refs only
+
+**Code:** `tes5_import/record_types/world.py` `_refr_open_by_default`
+
+TES4 `ONAM` ("Open by Default") is written as vanilla writes it: `XACT` = 13
+right after `NAME`, an empty `ONAM` right before `DATA` (all 354 vanilla ONAM
+refs). Both engines load it the same way, as bit 8 of the ref's action extra
+data, and pose the door open when its 3D loads (1.6.1170: the REFR loader's
+ONAM case at `0x2d8436`; Oblivion.exe: `0x4d9f94`, pose at `0x4df54a`).
+
+A LOCKED ref is written closed. Confirmed in-game: CharacterGen's
+`CGAmbushCBackGate` portcullis (level 100, `ONAM`) must start closed and
+stood open when ONAM was passed through; the party passes it through the
+barrier-door ownership above. No vanilla ONAM ref carries `XLOC` (0 of 354).
+Unlocked refs need it: Nehrim's `SchattenrufGitterTuer01Ref` trap gate
+(`SchattenrufGitterTuerScript`) only acts while `GetOpenState == 1`, so a
+closed start left it permanently shut. Counts: 106 ONAM refs in Oblivion.esm
+(4 locked), 45 in Nehrim.esm (3 locked).
 
 ## <a id="faction-relations"></a>FACT relations: Ally and Friend are not interchangeable
 
@@ -340,31 +855,145 @@ skill — which is why `create_trainer_records` mints one per trainer and
 
 ## <a id="health-offset"></a>Health is written as an OFFSET, not a pool
 
+**Code:** `tes5_import/record_types/npc.py` (`_health_and_level`),
+`actor_common.py` (`convert_CLAS`), audited by `tools/audit/actor_health_audit.py`.
+
 Every playable/Dremora RACE that `RACE_MAP` targets ships Starting Health 50.0
-(verified: all 11 target races in Skyrim.esm decode to 50.0/50.0/50.0), and the
-engine derives an actor's max health as
+(verified: all 11 target races in Skyrim.esm decode to 50.0/50.0/50.0). The
+engine's max health depends on ACBS bit 0x10, **Auto calc stats**
+(SkyrimSE 1.6.1170 disassembly):
 
-    StartingHealth + HealthOffset + (Level - 1) * fNPCHealthLevelBonus
+| NPC | Health | Where |
+|---|---|---|
+| manual (0x10 clear) | `StartingHealth + HealthOffset` — no level term | TESNPC ActorValueOwner getter `0x3c0130`, Health case → `0x3a9000` reads the ACBS offset |
+| auto-calc (0x10 set) | `StartingHealth + HealthOffset + (L-1)*fNPCHealthLevelBonus + (L-1)*iAVDhmsLevelUp*wH/(wH+wM+wS)` | `0x3bf630`, run only when vtable slot 62 (`0x3a8e10`: form type NPC_ and ACBS & 0x10) is true |
 
-with `fNPCHealthLevelBonus` = 5.0 (Skyrim.esm GMST). `ACBS.HealthOffset` (int16
-at byte 20) is the AUTHORED control; `DNAM.Health` is only a cache the engine
-recomputes — vanilla proves it is not a function of the record at all (52 groups
+`fNPCHealthLevelBonus` = 5.0, `iAVDhmsLevelUp` = 10 (Skyrim.esm GMSTs); `wH/wM/wS`
+are CLAS DATA bytes 32–34, the class's Health/Magicka/Stamina weights. The player
+(FormID 7) reads a different GMST at the same site. The auto-calc formula matches
+935 of 935 vanilla auto-calc, non-PCLM, untemplated NPCs (899 exact, 34 off by one
+from the distributor's rounding, and 2 corpses whose negative pool is stored as a
+wrapped uint16). The class share goes to magicka and stamina too; a total weight of
+0 skips the distribution entirely (checked at `0x3c516b`).
+
+`ACBS.HealthOffset` (int16 at byte 20) is the AUTHORED control; `DNAM.Health` is
+only a cache — vanilla proves it is not a function of the record at all (52 groups
 of NPCs with identical race/class/level/offset carry different DNAM.Health, e.g.
 55 / 51 / 0 / 20971), matching UESP's "otherwise seems to be random".
 
-TES4 `DATA.Health` is the actor's FINAL hit-point pool, already fully
-calculated. So a faithful conversion pins the engine's result to that exact
-number by solving for the offset rather than copying the pool into the cache.
+TES4 `DATA.Health` is the actor's FINAL hit-point pool: typed into the CS for a
+fixed-stat NPC, or the CS's calculated result for an auto-calc one (UESP
+Oblivion:NPCs#Health). So a faithful conversion solves for the offset:
 
-When the required offset overflows int16, Level is raised so its bonus absorbs
+- **manual**: `offset = pool − 50`, Level untouched.
+- **auto-calc**: `offset = pool − 50 − (L−1)*5`. Converted classes write zero HMS
+  weights, the same as creature classes, so no class share lands on top.
+- **PC Level Mult**: `offset = pool − 50`; the level term tracks the player.
+
+The old rule subtracted `(L−1)*5` from every NPC. A manual NPC got that much less
+health, and every one whose pool was below `50 + (L−1)*5` spawned dead: Oblivion
+had 9 (Thaurron, level 10, pool 40 → −5; Torbern; Tandilwe) and 299 more low, and
+Nehrim had 67 dead and 975 low. The 1/1/1 class weights meanwhile added
+`(L−1)*10/3` to each auto-calc NPC (Oblivion 397 of 440 too high, e.g. Umbra
+394 → 557). After the fix, `actor_health_audit.py` measures 1,410 of 1,413
+fixed-level Oblivion NPCs exact and 0 spawning dead.
+
+When an auto-calc offset overflows int16, Level is raised so its bonus absorbs
 the surplus and the offset is re-solved for the remainder, capped at the U16
 field limit. That division rounds UP: too few levels leaves the remainder above
-the int16 cap and the final clamp would silently lose it.
+the int16 cap and the final clamp would silently lose it. A manual NPC has no
+level term to spend, so its pool caps at `50 + 32767`; the three remaining
+Oblivion mismatches are the 100,000-health `TestStair`/`TestArena01`/`TestArena02`.
 
 DNAM offsets 36/38/40 are the engine's calculated Health/Magicka/Stamina cache,
 not authored stats. The TES4 totals are written there so the cache agrees with
 what the engine computes from the offsets (it recomputes on load regardless).
 Magicka is Oblivion's SpellPoints; stamina is Fatigue.
+
+## <a id="morrowind-health-is-absolute"></a>Morrowind health is absolute — the same manual-NPC rule
+
+**Code:** `tes5_import/record_types/npc.py` (`_health_and_level`, shared with TES4)
+
+This section once justified a Morrowind-only function that dropped the level term.
+The real cause was the general one in [the offset section](#health-offset): the
+engine gives only an auto-calc NPC a level term, and TES3 flag 0x10 (autocalc)
+maps straight to ACBS 0x10. One rule keyed on the written flag now covers both
+games, and it also fixes Morrowind auto-calc NPCs, which the old function left
+with the engine's level bonus added on top. The TES3 evidence below still holds.
+
+OpenMW's `MWClass::Npc::ensureCustomData`
+(`apps/openmw/mwclass/npc.cpp`) takes the two NPDT layouts apart:
+
+| NPDT | branch | health |
+|---|---|---|
+| 52-byte (authored) | `setHealth(mNpdt.mHealth)` | used verbatim |
+| 12-byte (autocalc) | `autoCalculateAttributes` | `floor(0.5*(Str+End)) + multiplier*(Level-1)` |
+
+An authored TES3 NPC's health is the whole final pool and carries no level term
+at all. Subtracting a second, Skyrim-shaped level bonus from it double-counts.
+
+An autocalc NPC's record holds no pools at all. The exporter is a pure dump,
+so it writes no `DATA.Health`, `ACBS.SpellPoints` or `ACBS.Fatigue` for one,
+and the import used to fall back to 50 health, 0 magicka and 100 fatigue
+whatever the level. Arktwend's level-30 Nordrand guard (`NordrandWache01`) had
+50 health and was dead, 180 units down the slope from his post, before his
+quest greeting could fire.
+`npc_morrowind.tes3_pools` now derives the pools at import from the run's TES3
+tables, the way OpenMW does. Health is `autoCalculateAttributes`' formula
+above. The multiplier is 3, plus 2 for a Combat class or 1 for a Stealth class,
+plus 1 when Endurance is a class attribute. Fatigue is
+`Str + Wil + Agi + End`, and magicka is `fNPCbaseMagickaMult * Int`
+(`CreatureStats::setAttribute` / `recalculateMagicka`). The pools then go
+through the same offset rule as an authored one. Not matched: a race or
+birthsign Fortify Maximum Magicka ability, which OpenMW adds on top.
+
+The damage is proportional to level. High Bishop Derminus (Arktwend intro,
+health 397, level 100) solved to `397 - 50 - 99*5 = -148`, i.e. −98 effective
+health: dead on load, before the intro's force-greet. Across Arktwend,
+652 of 2,053 NPCs converted to ≤ 0 health, city guards and quest actors
+included (a further 50 are authored corpses, which stay dead).
+
+Vanilla Skyrim corroborates that a large negative offset is not how the format
+is used: of 5,118 NPC_ records, 395 carry a negative offset, all small and all
+on actors meant to be weak or already dead (`CurweDead`, `VeezaraDead`,
+`MS06Victim`, the summons). `MS13FrostbiteSpider` sits at level 1200 with offset
+−90, which only makes sense if the level term is not being relied on to add
+6,000 health back.
+
+Derminus is a manual (52-byte NPDT) NPC, so he now converts to `397 − 50` with
+his level untouched, which is what the engine needs.
+
+## <a id="corpses-start-dead"></a>Corpses carry Starts Dead, not just 0 health
+
+**Code:** `tes5_import/actors/starts_dead.py`, `record_types/world.py` (`convert_ACHR`)
+
+TES4 authors a corpse prop as an actor whose base has `DATA.Health=0`. The
+health offset reproduces that pool exactly, so the actor loads with 0 health —
+but alive: it dies on its first update and never equips its outfit, so it lay
+naked (Nehrim `Leiche01Startcelle`, ref `xx1A9288`). The outfit record itself
+was correct throughout.
+
+Bethesda's own CK tutorial (`Bethesda_Tutorial_Clutter`) states that "simply
+setting the health of an actor doesn't actually cause it to be dead at game
+time"; a corpse needs the reference's **Starts Dead** flag, ACHR record flag
+`0x200`. Vanilla agrees: ~1,140 of Skyrim.esm's 10,504 ACHRs carry it, and no
+vanilla NPC starts at 0 health (the lowest offset is −49). No TES4 ACHR uses
+`0x200`, so setting it collides with nothing. Counts: 905 refs in Nehrim, out
+of 915 that place a 0-health base (212 bases); 787 such refs in Oblivion.
+
+**A corpse a script resurrects keeps the health path.** The Papyrus
+`Resurrect` native (1.6.1170 rva `0x9e99f0`) calls a check at `0x2dd710` —
+form type `0x3E` (ACHR) and record flag bit 9 — and on a hit logs "is dead from
+the editor and cannot be resurrected" and returns. So a ref named in any
+`X.Resurrect` call site (by ref or base EditorID), or placing a base whose own
+script calls a bare `Resurrect`, is left unflagged. Nehrim has 10 such refs
+(Daromith, the Bestiarium minotaur, the Schattenruf Verbranntes Wesen …); they
+still lie unclothed until raised. A resurrect through a ref variable cannot be
+resolved statically.
+
+FO3/FNV author the flag themselves on the reference, so their refs are left as
+exported. Creatures share the rule: `creature_health_offset` pins a 0 pool at
+−32768, and their refs get the same flag.
 
 ## <a id="hair-color"></a>Hair color: a generated CLFM per authored RGB
 
@@ -386,6 +1015,29 @@ an NPC is silent.
 
 NAM6/NAM7 are Height/Weight, which TES4 keeps on RACE rather than the NPC, so
 neutral 1.0 defaults are written and the race's own scale applies.
+
+## <a id="vtck-placeholder"></a>Every actor writes VTCK, even when the voice is 0
+
+**Code:** `tes5_import/record_types/creature.py` (`convert_CREA`),
+`tes5_import/actors/creature_races.py` (`patch_creature_voices`)
+
+Creature voices use placeholder-then-patch: `patch_creature_voices` does
+`blob.find(b'VTCK', 24)` and SKIPS a record that has no such tag. A creature's
+humanoid voice chain (`VOICE_TYPE_MAP[(race, gender)]`, Imperial fallback) yields
+0, because no TES4 creature race is in the map, so the old
+`if voice: pack VTCK` emitted nothing and all 442 creature NPC_ records ended up
+with no voice type. The whole creature sound channel was dead however correct the
+SNDRs, animationdata triggers, event tables and `.wav` files were, while the build
+log still said "42 generated, 1132 records bound": those were the RACE records,
+which carry an 8-byte male/female VTCK and patch fine. A healthy-looking patch
+count can cover only one of two record types.
+
+Rule: emission of a subrecord a later pass patches never depends on the value that
+pass supplies. After the fix 909 creature actors bind to one of 42 `TES4Cr*Voice`
+VTYPs with 0 dangling VTCK. The 442 records still without a VTCK are the `*_Lvl`
+TEMPLATE actors (`TPLT` set, `ACBS=0`), which inherit from their template, as
+vanilla LCharacter records do. Census: all 3,887 vanilla Skyrim.esm NPC_ records
+carry a non-zero VTCK.
 
 ## <a id="hdpt-valid-races"></a>Head parts: RNAM decides who can see the hair
 
@@ -420,6 +1072,10 @@ Vanilla routes its own hair exactly this way — censused over Skyrim.esm's hair
 HDPTs: every Khajiit hair uses 000A8036 (x21), every Orc 000A8032 (x43), every
 Elf 000A8024 (x36), plus Argonian 000A8039 and Dremora 000A8027.
 
+A variant for a family other than the hair's home family carries that
+family's list (`FAMILY_RNAM` in `npc.py`); see
+[Hair variants follow the wearer](asset_convert_armor.md#hair-variants-follow-the-wearer).
+
 ### NAM0 races-tri does not apply to hair
 
 `HDPT.NAM0` Part Type is 0 Race Morph, 1 Tri, 2 Chargen Morph. All 123 vanilla
@@ -436,6 +1092,85 @@ cleanly (`head_fit.GROUP_MORPHS`): all five human races plus Dremora wear the
 BASE scalp (morphs <= 0.15 there), the three elf races share one shape (2.6 off
 base), Orc its own (1.5). The human mesh serves two HDPTs — the humans+vampires
 list and the one-race Dremora list, which share that base scalp.
+
+## <a id="new-races-by-face-parts"></a>A plugin's own race stands in by its shared face parts
+
+**Code:** `tes5_import/base/race_lookup.py`
+
+An NPC's Skyrim race comes from its TES4 race FormID (`TES4_RACE_FID_TO_EDID`
+-> `RACE_MAP`). A race a plugin adds has an id no table knows, and used to fall
+back to Imperial whatever it looked like. Nehrim's playable Halb-Aeterna (215
+NPCs, plus three RenMysticElf variants) are authored with Wood Elf ears, so they
+became Imperials with a human head and human-fitted hair.
+
+The authored data answers it: the new race is matched to the KNOWN races by the
+face-part meshes they author, and takes the one sharing the most paths. The
+Halb-Aeterna share `EarsWoodElf.nif` (and the mouth/teeth/tongue) with Nehrim's
+Sternling, which carries Oblivion's WoodElf FormID, so they become Wood Elves.
+When the best matches name different races — every human-eared new race ties
+across all the human races — the race keeps the Imperial fallback, so
+Alemanne1 and the other Nehrim human variants are unchanged. In
+Morrowind_ob, Dagoth Ur and the Ash Ghoul/Zombie/Slave/Vampire races are
+authored with `EarsWoodElf.nif` and become Wood Elves the same way.
+
+Only the actor's race uses it (`_actor_race_edid`, leveled-actor shells);
+`GetIsRace` on a plugin's own race is already a marker-faction test
+(`race_factions.py`), and voice types resolve from the plugin's own race
+EditorIDs first, so neither moves.
+
+## <a id="morrowind-faces"></a>Morrowind faces: authored head and hair, measured sliders
+
+**Code:** `tes5_import/actors/npc_face_morrowind.py`, `asset_convert/character/morrowind_head.py`,
+`tes5_import/generated/morrowind_faces.json`; export lines from `_emit_head_parts` in
+`tes4_export/record_types/morrowind_actors.py`.
+
+A TES3 NPC names a head and a hair BODY part (`BNAM`, `KNAM`), each reused by
+many NPCs: the top Dark Elf male heads carry about 110 NPCs each in
+Morrowind.esm. Across Morrowind, Tribunal, Bloodmoon, Tamriel_Data, TR_Mainland
+and Arktwend, 12,939 NPCs use 846 heads and 678 hairs. Before this, the
+exporter dropped both, so every NPC was bald with the race's neutral face.
+
+The export writes `MorrowindHead`, `MorrowindHair` and each part's mesh
+(`...Model`). The import builds:
+
+- **Hair and beard** from a hand-made table of the closest vanilla head part,
+  keyed by BODY id. It was made by rendering every part (`tools/nif/nif_render.py`
+  contact sheets, hair on its paired head), matching against the playable
+  vanilla hairs and beards rendered on Skyrim heads, then hand-reviewing every
+  low-confidence row (62 of 167 hairs and 21 of 50 beard picks corrected). An
+  empty pick means bald / clean-shaven. Morrowind paints beards into the head,
+  so the beard is keyed by the HEAD id. Arktwend reuses 34 vanilla ids with
+  its own meshes; the Morrowind answer wins.
+- **Validity per race**: a pick is written only if its vanilla FLST lists the
+  NPC's Skyrim race. Tamriel Data marks some heads with a race other than the
+  NPC wearing them (a Dark Elf head filed as a beast race). A hair that fails,
+  or is missing from the table (another plugin's part), takes a hair from the
+  race's playable pool, chosen by the hair id's CRC — the same part always
+  gets the same hair.
+- **Sliders (NAM9)**: seven proportions of the head mesh (nose reach, nose
+  drop, jaw width, chin reach, chin length, brow reach, cheek width), each
+  divided by head height. Each becomes a z-score against the other heads of
+  its Morrowind race and sex in this run (all heads when a group has fewer
+  than 6), clamped to ±2.5, and lands on Skyrim's slider as
+  `vanilla mean + z × vanilla spread`. Slider directions come from SKSE's
+  `FaceMorphList` enum (`kMorph_NoseShortLong`: positive is long, and so on).
+  Vanilla means and spreads are a census of Skyrim.esm's non-templated NPCs
+  per playable race and sex (spreads 0.3–0.8 everywhere). Unmeasured sliders
+  sit at the race mean. Each NPC then adds noise of 0.1 × spread seeded by the
+  CRC of its EditorID, so NPCs sharing a head look related, not identical.
+- **Skin** is the median color of the head's texture, written as the
+  skin-tone tint layer — Morrowind's head textures carry their own tone
+  (a Nord head samples pink, a Dark Elf head gray).
+- **Hair color** is the hair texture's median, mapped to the nearest vanilla
+  CLFM (`map_hair_color`). A generated CLFM would be keyed on a computed
+  color, which the FormID rules forbid.
+- **Weight (NAM7)** is the race's vanilla mean (vanilla writes 0–100; the
+  census means run 15–64) with the same 0.1 × spread noise. Other sources
+  still write 1.0.
+
+Meshes resolve through the plugin's and its masters' asset trees, then the
+Morrowind install's archives (`morrowind_assets`); a head that cannot be read
+keeps the race mean plus noise. Measuring takes about 12 ms per part.
 
 ## <a id="package-order"></a>AI packages keep TES4 order
 
@@ -531,6 +1266,26 @@ multiplier (1000 = 1.0x). A raw TES4 offset (0..5) read as a multiplier is
 0.000x..0.005x, which the CK clamps to the 0.10 minimum, so a PC-levelled actor
 defaults to 1.0x instead.
 
+### <a id="creature-unarmed-damage"></a>Unarmed damage: race base plus a per-creature ability
+
+**Code:** `tes5_import/actors/creature_unarmed.py`
+
+Unarmed damage has no per-NPC field, and the shared race used to take its
+DATA unarmed damage from whichever creature founded it. The eight SE02
+Gatekeepers share one race and are authored 10/15/20/25/31/40/49/58; all
+eight shipped hitting for 40 (Gatekeeper 6's).
+
+Vanilla splits it the same way it splits dragons, vampires and werewolves: the
+race carries a base and each stronger NPC lists an Ability of
+`AbFortifyUnarmedDamage` (Skyrim.esm 0x000424E2, PeakValueModifier on
+UnarmedDamage) for the rest — `crDragonUnarmedDamage02..05` are +25/+75/+125/+175.
+So the race now carries the WEAKEST authored `DATA.AttackDamage` of the
+creatures sharing it, and every stronger creature gets
+`TES4<race founder>UnarmedDamage<N>` (+N − base) appended to its SPLO. The
+FormID is keyed on the race key and the authored damage, so creatures of one
+race that hit equally hard share an ability. Oblivion.esm: 202 abilities,
+0 existing FormIDs moved. Confirmed in game (SE02 Gatekeeper scene).
+
 ## <a id="crea-vtck-always"></a>A creature's VTCK is ALWAYS emitted
 
 Even when the humanoid chain yields nothing — the normal case for a creature,
@@ -557,6 +1312,96 @@ whatever the behavior graph offered them.
 Order is RNAM → SPCT → SPLO[] → COCT → CNTO, verified against both the xEdit
 TES5 definition (`wbDefinitionsTES5.pas`) and a real Skyrim.esm dump.
 
+## <a id="caster-race-needs-a-castable-spell"></a>A creature race is a caster only for a castable spell
+
+**Code:** `tes5_import/actors/creature_races.py` `_creature_equip_flags`.
+
+A generated creature race is shared by every CREA with the same mesh folder and
+body set, so its VNAM equipment flags are the union over all of them: goblin
+berserkers, warlords and shamans share one skeleton but carry blades, bows and
+staffs. Hand-to-hand is always set, the one bit even DogRace carries. A census of
+99 Skyrim.esm races: 60 set the Spell bit, 31 are exactly `FFFFE001` with neither
+spells nor weapons.
+
+The Spell bit (and with it the LeftHand QNAM slot a caster needs) used to follow
+`SpellCount > 0`. That counts Oblivion Diseases (SPIT.Type 1) and Abilities
+(Type 4), which are passive and never equipped. Nehrim's nightmare-troll race
+turned into a caster because two of its ten creatures carry
+`KrankheitTrollpest` (Disease), `MobGhostEffectGreenNoAlpha` and
+`MobEigenschaftWaffenresistenz100` (Abilities), although no creature on it knows
+a castable spell and its graph has no cast states. The bit now requires a
+castable spell (Type 0, resolved through leveled spell lists by
+`_spell_effect_ranges`), so that race is fists-only with the RightHand slot, like
+the plain troll race.
+
+This was found while chasing the intro black troll (`SchattenrufAlptraumTroll01`)
+that swung once and never again, but it was NOT that bug's cause: the troll still
+refused after this change. The cause was a hit window on its recoil clip
+([asset_convert_creature.md](asset_convert_creature.md#hit-window-attacks-only)).
+
+## <a id="reach-variant-races"></a>Attack reach is per creature: reach-variant races
+
+**Code:** `tes5_import/actors/creature_races.py` `_build_race_chain`.
+
+Skyrim has unarmed reach only on the RACE (DATA +100, `handReach` at
+`TESRace+0x14C` in 1.6.1170), but TES4 authors `RNAM.AttackReach` per CREA. A
+generated race is shared by every CREA with the same mesh folder and body set, so
+it used to take the founding record's reach and every other creature lost its own.
+Now the race keeps the founder's reach (and its FormID), and each other authored
+reach among its creatures gets a variant race `TES4<Edid>RaceReach<n>`, identical
+but for DATA +100, derived from `('CREA_RACE_REACH', (key, reach))`. Variants share
+the skin: the body ARMA lists them as Additional Races (`MODL`, before the `SNDD`
+that `patch_creature_footsteps` appends). Nehrim: 75 variants. Its nightmare-troll
+race carries 32 from `DaromithTroll02`, while the intro black troll authors 42,
+`38Troll` 164, `42Helmut` and `NQ15W02Enemy01` 255. Confirmed in game: the black
+troll lands far more of its swings on Celebro.
+
+Both engines measure reach the same way, so the TES4 value copies across
+unscaled (disassembly, measured):
+- **Skyrim** (`0x851520`, used by the target picker `0x5c0b80`): the gap is the 2D
+  center distance minus both actors' radii (`0x8518c0`; radius = bound max.y ×
+  scale, `0x694fb0`, cached on the process). It is compared against
+  `handReach × ref scale × NPC height` (`0x6749d0` × `0x2e09c0`).
+- **Oblivion** (`0x625220`, Creature vtable slot `0x26c`): the raw RNAM byte, ×
+  `fCombatGiantCreatureReachMult` (2.2) for creature type 5 only. NPCs use
+  `fHandReachMult × fCombatDistance` = 0.6 × 128 = 76.8. The caller (`0x699500`)
+  multiplies by the actor's scale and compares against `0x612f50`: center distance
+  minus both bound half-extents × scale.
+
+Bethesda's own values differ between the games with no fixed ratio (Oblivion →
+Skyrim race: troll 100→128, skeleton 36→96, mudcrab 32→120, deer 32→96, rat
+96→64, NPC 76.8→96), so no rescale is applied. Not yet traced: whether
+`0x5c0b80` is the HitFrame hit test itself or the combat AI's approach check.
+
+## <a id="creature-talk-prompt"></a>A creature race allows PC dialogue only when a creature on it talks
+
+**Code:** `tes5_import/actors/creature_speakers.py` `talking_creatures`,
+`creature_races.py` `_race_data`.
+
+Skyrim shows the "Talk" prompt from RACE DATA flag `0x00200000` Allow PC
+Dialogue (xEdit `wbRACE_DATAFlags01`), not from whether the actor has any lines.
+The creature race template is vanilla `DogRace` (`0x00308948`), so every
+converted creature showed "Talk" and opened an empty menu. Vanilla sets the bit
+only where an animal talks: `WolfRace` is `0x00108948`, and of 89 non-playable
+races the only animals with it are the talking dog races and `WerewolfBeastRace`.
+
+The bit is now cleared unless a CREA sharing the race is the named speaker of a
+line the player can reach. A single talking creature turns it on for its whole
+shared race; there are no talking-only race variants.
+- **TES4 INFO** (plugin and masters): a positive `GetIsID(creature)` under
+  `GREETING` or a topic that is neither a bark (`classify_topic`) nor a
+  Conversation (type 1, NPC-to-NPC and Say).
+- **TES3 MWIN** (the plugin's own): `Actor=<creature id>` on a Topic, Greeting
+  or Persuasion line. OpenMW's `Filter::testActor` gives a creature only lines
+  that name its own id, so this is complete.
+
+Measured: Oblivion.esm 0 of 914 CREA, Nehrim.esm 0 of 734, Morrowind.esm 33 of
+260 (Yagrum Bagarn, `vivec_god`, the Dagoth brothers, `scamp_creeper`,
+`mudcrab_unique`), TR_Mainland 139 of 721. No TR talk line names a Tamriel_Data
+creature, so reading only the plugin's own MWIN loses nothing. The Morroblivion
+compat patch's Yagrum has only barks in our build and loses "Talk". Confirmed
+in game.
+
 ## <a id="creature-class-and-package"></a>A creature needs a CLASS and a PACKAGE
 
 **CNAM.** 5,118 of 5,118 vanilla NPC_ carry a class; a converted creature never
@@ -573,6 +1418,17 @@ gave creatures NO working packages — the AI layer made no decisions and the
 engine never sent the graph movement/attack events. That was the stuck-in-idle
 root cause. Every vanilla creature carries exactly ONE package,
 `DefaultMasterPackageCreature`, so converted creatures get the same hookup.
+
+Once PACK records were converted, that single package became the bug: it threw
+away the creature's authored AIPackage list. Nehrim's black troll
+(`SchattenrufAlptraumTroll01`) is walked across a rope by its own Travel
+packages, and its script advances a state per marker it reaches. With only the
+default package, the troll stood at the rope's start forever (save: script
+`myState = 5`, position = marker 03), so MQ00 never got it into its cave. So
+`PKID` is now the creature's own packages in TES4 order, through the same
+`npc_packages` filter NPCs use (quest packages stay on the QUST alias),
+followed by `DefaultMasterPackageCreature` as the fallback. Confirmed in game
+2026-09-26.
 
 **ZNAM.** CSTY is skipped, so the vanilla styles stand in, chosen off TES4
 `DATA.Type` (0 Creature, 1 Daedra, 2 Undead, 3 Humanoid, 4 Horse).
@@ -604,3 +1460,124 @@ Oblivion. `import_main` sets it in Phase 0 so VTCK matches the
 
 The (race, gender) computation is only the fallback for actors the map has no
 entry for.
+
+## <a id="morrowind-vampirism"></a>Morrowind vampirism is Skyrim's vampirism
+
+**Code:** `tes5_import/actors/vampirism_morrowind.py`, `record_types/equipment.py`, `record_types/npc.py`;
+runtime `tes_runtime/morrowind/plugin/game_calls_spell.cpp` (`LeftToSkyrim`, `CuredBySkyrim`, `PlayerIsVampire`)
+
+Confirmed in game 2026-11-12 (all three clan lines, two full runs each; the cure three times).
+
+- **Catching it.** The import finds the clan bloods from the scripts: a disease the turn script tests
+  for and answers with an AddSpell of a spell carrying the Vampirism effect (Morrowind.esm: 3). Each
+  blood carries Skyrim.esm `DisDamageHealthVampire` (Sanguinare Vampiris: 10% a hit, three days, then
+  `PlayerVampireQuest.VampireChange`). Its carriers -- NPCs whose own script AddSpells a blood on
+  themselves (Morrowind.esm 64, Tribunal 1) -- get per-NPC ATKD attack spells (27 humanoid events,
+  flag 0x80000000, ATKR = the NPC's race): disassembly shows attack spells apply on every melee hit,
+  weapons included, and a Disease rolls against 100 - DiseaseResist.
+- **Turning.** A turn script's gifts that no script tests (`GetSpell`) are stand-ins Skyrim's change
+  already grants (Morrowind.esm: attributes, immunities, skills, sun damage, touch); the runtime skips
+  them, and the one carrying Vampirism casts `TES3VampireChange` (Skyrim's `VampireChangeEffect`)
+  unless Skyrim has turned the player already. The clan Specials still come from the scripts.
+- **Never twice.** Skyrim's vampire races carry `AbResistDisease` 100, so a vampire cannot catch it
+  again; `PcVampire` reads the player's race against the import's `vampire_race:` rows.
+- **The cure.** Morrowind's `Vampire_Cure_PC` (Molag Bal's shrine, `MS_VampireCure`) RemoveSpells the
+  stand-ins; removing the Vampirism one from a Skyrim vampire sets Skyrim.esm `PlayerVampireQuest`
+  stage 10, whose fragment runs `VampireCure` -- the function every vanilla cure calls (Falion's
+  `QF_VC01`, `C03RampageQuest`). The script still sets `PCVampire` -1, so the player cannot turn again.
+  Checked through dialogue: the Mages Guild greets a vampire "Your kind is not welcome here, vampire".
+- **No Morrowind notices.** No "You have contracted" message: Skyrim's own disease and change UI
+  presents it.
+
+## <a id="disease-contact"></a>Diseases pass on through Skyrim's creature-disease mechanism
+
+**Code:** `tes5_import/actors/disease_contact.py`, `record_types/equipment.py` (`_pack_effects`),
+`record_types/creature.py` (`_crea_spell_subs`), `record_types/npc.py` (`_identity_subs`)
+
+Confirmed in game 2026-11-12 (Morrowind `rat_diseased` Witbane and `alit_blighted` Black-Heart Blight,
+3/3 each; case `quests/morrowind_disease`).
+
+- **Vanilla's mechanism.** A Skyrim race names its disease as the ATKD Attack Spell (BearBrownRace on 7
+  attacks, WolfRace Rockjoint on power and lunge attacks, ChaurusRace Rattles on claws and a poison on
+  bites). The chance sits on each disease effect as `GetRandomPercent <= 2.0` (16 vanilla MGEFs); the
+  game checks an MGEF's conditions once, when the effect is added (1.6.1170 0x5c30c0, per effect), so a
+  failed roll drops only that effect. Disease Resist rolls on top, as in both source games.
+- **Carriers.** Any CREA or NPC_ whose spell list holds a Disease (SPIT.Type 1) gets per-actor ATKD
+  overrides (flag 0x80000000, ATKR = its race; NPCs on the 27 NordRace humanoid events) that cast its
+  diseases in turn, plus the attack's own spell where the race has one. Morrowind.esm: 85 carriers
+  (76 creatures, 9 NPCs). Oblivion.esm: 132 (5 creatures, 127 NPCs, mostly Ataxia beggars and
+  prisoners) -- Oblivion passes an attacker's diseases on melee hits too.
+- **The chance.** TES3: `fDiseaseXferChance` (2.5, OpenMW `diseaseContact`). TES4: `fMagicDiseaseTransferMult`
+  x 100 + `fMagicDiseaseTransferBase` (Oblivion.exe 0x5490c0; Oblivion.esm sets Mult 0.15). Fallout: none.
+  Each disease spell's effects are clones (`TES4Disease<Name><n>`): the first rolls the chance, each
+  later one requires `HasMagicEffect` of the first, so a disease lands whole.
+- **The clone's DATA must be vanilla's.** With the source effect's DATA (flags 0x00200007, skill
+  Destruction) the disease never landed, even at a forced 100% chance (293 hits). Every vanilla disease
+  effect that rolls a chance writes flags 0x00400A06 (No Duration, No Area, Recover, Detrimental, Power
+  Affects Duration) and skill Restoration; with those the player catches it.
+- **Not ported:** Morrowind's disease from looting a carrier's corpse. Oblivion is not yet reimported
+  with this change.
+
+## <a id="outfit-split"></a>Outfits: one inventory split into worn and carried
+
+**Code:** `tes5_import/actors/outfits.py`
+
+A TES4 actor has one CNTO inventory holding everything (armor, clothing, weapons, keys, potions, loot
+lists), and the engine picks what to wear from it at runtime, best item per slot. A TES5 actor wears
+exactly what its DOFT outfit lists, equips every item of it with no scoring, and adds the outfit ON TOP
+of CNTO at load. Feeding the raw inventory into both broke three ways:
+
+1. **CK errors.** Loot lists, keys, potions and gold in an OTFT ("LeveledItem ... contains non-armor
+   objects", "Unable to find valid outfit form"), thousands of lines.
+2. **Duplicates.** Every wearable in CNTO and the outfit gave two of each on the corpse.
+3. **Random equipping.** 205 Oblivion NPCs carry armor AND clothes for the same slot
+   (SE32TestJoelGhost: an iron set and shirt/pants/shoes); Skyrim equips all and an arbitrary one wins.
+
+So every entry is classified once: wearables go to the outfit after per-slot conflict resolution, the
+rest stays in CNTO, and the two are disjoint. Nothing is dropped: an outranked wearable stays carried.
+
+- <a id="outfit-no-weapons"></a>**Only ARMO/CLOT (and all-wearable LVLI) enter an outfit.** All 481
+  vanilla OTFTs in Skyrim.esm list only ARMO or all-armor LVLI, never WEAP/AMMO/LIGH; Skyrim's combat AI
+  equips the best weapon from CNTO. Putting weapons in the outfit broke NPC combat equipping entirely.
+- <a id="outfit-index"></a>**The item index holds only carryable types**, masters' included. Indexing
+  all of `by_type` took the plugin's ~1M REFRs too: hundreds of MB in the parent, then 31 navmesh workers
+  forked from it sent the machine to swap ("Generating 8228 navmeshes" looked hung). A dependent plugin
+  dresses its actors from its master's wardrobe: DLCBattlehornCastle draws 155 of 165 NPC inventory
+  entries from Oblivion.esm, and indexing only its own 45 records left all 22 NPCs undressed. Keys are
+  the low 24 bits, the plugin's own records loaded last (an override wins); lookups mask the load-order
+  byte, or every item reads as non-wearable.
+- <a id="outfit-lvli-repeats"></a>**A repeated sublist is a weight, not a cycle.** Oblivion weights an
+  entry by listing it twice (LL2NPCStaff25 names LL1NPCStaff1Normal100 twice); a visited set shared
+  across siblings marked the staff list non-wearable and disarmed every leveled-weapon actor
+  (TESTVampireMage). Cycle detection tracks ancestors only.
+- <a id="outfit-lvli-slots"></a>**A leveled list claims the union of its leaves' slots.** Treating
+  lists as slotless put Azzan in LL0NPCClothingShirt/Pants/ShoesMiddle over his steel set.
+- <a id="outfit-guaranteed"></a>**Only a guaranteed winner closes a slot.** A plain ARMO/CLOT, or an
+  LVLI with ChanceNone 0 down to every slot-filling leaf. Bandits carry chance armor
+  (LL0NPCArmorLightGreaves25, ChanceNone 75; the `NN` in the name is the equip odds) over a guaranteed
+  base (LL0NPCClothingPantsLower); letting the greaves evict the pants left ~75% of bandits bare-legged.
+  Both are kept, as vanilla bandit outfits are authored. A guaranteed item is kept only if EVERY slot it
+  could need is still free: LL0VampireShirt spans body and legs, lost body to a cuirass, and would have
+  been equipped anyway for the legs, re-covering the chest. But a winner CLOSES only the slots it fills
+  whatever it rolls (the slots all its leaves share): one long shirt among LL0NPCClothingShirtLower's 15
+  leaves (LowerShirt09, body + legs) made the whole list close the legs, and 31 Oblivion NPCs carrying
+  such a shirt list beside LL0NPCClothingPantsLower / PantsMiddle or LL0VampirePants100 stood
+  bare-legged.
+- **Ranking:** armor beats clothing (any ARMO leaf makes a list armor), then the higher gold value, then
+  FormID for reproducible output. Trace an actor with
+  `python -m tools.audit.trace_outfit export/Oblivion.esm <EditorID>`.
+
+### <a id="upper-body-first"></a>The upper-body piece is chosen first
+
+The engine does not rank all wearables against each other. Its default-equipment pass (FNV decomp,
+`references/fnv_decomp/src/fallout_shared/tesnpc.cpp` lines 965-988, Oblivion's lineage) walks the
+biped slots in order; the upper-body winner is remembered, and a later slot's item is skipped when the
+upper-body item already covers that slot or when the item itself covers the upper body. So a garment
+that covers the upper body keeps every slot it spans, whatever it is worth.
+
+Ranked by value alone, Oblivion's Mythic Dawn Robe (upper body, lower body, hands, feet; value 0) lost
+the feet to any pair of shoes (value 1+) and with it its place in the outfit: Ruma Camoran, Eldamil,
+Raven Camoran and every Mythic Dawn guard stood in hood and shoes (2026-11-17 recording, 7:08 and
+21:01). A census found 35 Oblivion NPCs whose only upper-body garment was dropped this way, including
+the four Black Hand speakers (DBBlackHandRobe) and five shirts (Wumeek, Edgar Vautrine, Severius Atius,
+Erissare Arenim, MS13FallenKnightF). Items covering the upper body are now resolved before the rest.

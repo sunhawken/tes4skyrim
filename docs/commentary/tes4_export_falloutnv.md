@@ -77,10 +77,11 @@ directly. Four exist only to be referenced — by `CELL.LTMP`, `XCIM`, `XCMO`,
 
 `FLST` itself is byte-identical between the games, but its members are not
 guaranteed to survive. FalloutNV.esm's 464 lists hold **4,436 members**, and
-203 of them (4.6%) name a type this converter does not write: **139 ARMA**
-(TES5 ARMA is generated from ARMO, never read from source), **50 IMOD** and
-**14 EXPL**. Every other member resolves — 1,343 WEAP, 802 ARMO, 748 ALCH,
-550 MISC and the rest.
+189 of them name a type this converter does not write: **139 ARMA**
+(TES5 ARMA is generated from ARMO, never read from source) and **50 IMOD**.
+Every other member resolves — 1,343 WEAP, 802 ARMO, 748 ALCH, 550 MISC, the
+14 EXPL ([explosions](#explosions)) and the rest. The index covers the
+masters' records too, so a DLC list naming a FalloutNV.esm record keeps it.
 
 Writing those 203 verbatim produces a dangling FormID, which the engine treats
 as a broken reference rather than a bad value. `index_convertible_records`
@@ -319,14 +320,30 @@ both games: 1 Missile, 2 Lobber, 4 Beam, 8 Flame; Hitscan 0x01, Muzzle
 Flash 0x08, Supersonic 0x80; FNV's Continuous Beam 0x10 becomes Beam),
 so a bullet is a Missile, which the CK documents as consumed on contact
 where an Arrow sticks or bounces, and carries the FNV model, gravity,
-speed, range, impact force, light and sound. No vanilla Skyrim PROJ sets
-Hitscan (census of 141: none), but the Skyrim CK still documents the flag
-as "immediately impacts its target", so the bullets keep it. The AMMO's
+speed, range, impact force, light, sound and the alt-trigger proximity and
+timer (28 grenade timers, 8 proximity mines). The AMMO's
 TES5 projectile is its own `DAT2` projectile when set, else the projectile
 the guns firing that ammo name most often (both the plugin's and its
 masters' WEAPs), else the arrow fallback. The gun's shoot/dry-fire/idle
 sounds go to the TES5 `SNAM`, `XNAM`, `NAM7`, `TNAM`, `UNAM` through the
 SOUN's companion SNDR id.
+
+<a id="no-hitscan"></a>**No Hitscan on a converted PROJ.** Bullets that
+kept FNV's Hitscan flag only hit at point-blank range in game. No vanilla
+Skyrim PROJ sets it (0 of 134 in Skyrim.esm), and in the engine
+(SkyrimSE 1.6.1170) it is a side path: the Missile setup (0x7e0480) turns
+it into runtime bits on the projectile (+0x1d4: bits 0, 3 = no art, 13 on,
+15 = remove-on-impact off), and the hit is one raycast of the PROJ's range
+(`+0x198`, set from the record by the projectile constructor) from the
+projectile's position, run by vtable slot 0xb7 (0x7e83e0) only once the
+projectile's model has loaded (the 3D-load step 0x7ee3e0, called from
+`Projectile::Update` 0x7e5990). Only `Projectile::Launch` (0x7e46c0) calls
+that slot at once, and only for the Beam type. A Missile's default
+collision layer is L_SPELL (0x260830: Arrow 6, Cone 38, everything else 7),
+the layer every vanilla spell missile flies on. The converter now drops
+Hitscan and keeps the FNV speed with no gravity, so a bullet is an ordinary
+straight-flying Missile (23,680 units/s for the 9mm), which hits at range
+in game.
 
 <a id="no-muzzle-flash-light"></a>**No muzzle-flash light on a converted
 PROJ.** Keeping FNV's Muzzle Flash flag with its `MuzzleFlashLight`
@@ -348,7 +365,7 @@ it in the inventory viewer and on the ground. A gun clip never raises
 hand for 30 ms) is moot and the FNV box model (`ammo\9mmammo.nif`) is
 kept for the inventory and the world; the flying round is the PROJ's own
 model. The quiver attachment (which sat at a gun holder's feet) is
-culled by TESRuntime on every gun draw and ammo equip, and restored on a
+culled by FalloutRuntime on every gun draw and ammo equip, and restored on a
 non-gun draw (docs/commentary/tes_runtime_guns.md#quiver).
 
 ### <a id="impacts"></a>Impacts: the gun's own IPDS, not the arrow's
@@ -372,10 +389,57 @@ stone, light wood, light and chain metal, light armor) pointed at the same
 slots. FNV's IPCT `DATA` (24 bytes: duration, orientation, angle
 threshold, placement radius, sound level, flags u32) is byte-compatible
 with TES5's (flags u8, impact result u8, 2 pad), so it copies through with
-result Default; the model and both SOUN links (as SNDRs) carry over. FNV's
-decal texture sets are TXST records the pipeline does not convert, so the
-IPCT drops `DODT`/`DNAM` and sets No Decal Data: sound, impact effect and
-material response are the gun's, the bullet hole is not yet.
+result Default; the model and both SOUN links (as SNDRs) carry over. The
+decal also copies: `DODT` is the same 36 bytes in both games and `DNAM`
+names a TXST, which converts ([texture sets](#texture-sets)). 119 of the
+125 IPCTs author a `DODT` and 91 a TXST; an impact missing either keeps No
+Decal Data.
+
+### <a id="explosions"></a>Explosions
+
+**Code:** `tes4_export/record_types/falloutnv.py` (`export_EXPLOSION`),
+`tes5_import/record_types/impact_falloutnv.py` (`convert_EXPL`).
+
+EXPL was unexported, so the 51 FNV projectiles naming an explosion (the
+grenades, missiles, mines) pointed at a record that did not exist. Both
+games hold the same fields in a different order: FNV's 52-byte `DATA` is
+force, damage, radius, light, sound 1, flags, IS radius, impact set,
+sound 2, a radiation block and sound level; TES5's is light, both sounds
+(SNDRs), impact set, placed object, spawn projectile, force, damage,
+radius, IS radius, vertical offset, flags and sound level (52 bytes in 136
+of Skyrim.esm's 143). The flags agree bit for bit: FNV's bit 0 is Radius in
+BS Units, set on all 154 FNV and on the vanilla records xEdit calls
+Unknown 0. Radiation has no TES5 field. Vertical offset is 0, as in 116
+vanilla records. A link to a type this run does not write is nulled: the
+97 image-space modifiers (`MNAM`, IMAD is not converted) go, the 98 lights,
+81 impact sets and 22 enchantments stay.
+
+### <a id="addon-nodes"></a>Addon nodes: the muzzle flash's sparks and smoke
+
+**Code:** `tes4_export/record_types/falloutnv.py` (`export_ADDON`),
+`tes5_import/record_types/impact_falloutnv.py` (`convert_ADDN`),
+`asset_convert/nif/addon_nodes_falloutnv.py` (`remap_addon_nodes`).
+
+A FNV effect mesh spawns its particles through `BSValueNode`s named
+`AddOnNode<N>` whose value N is an ADDN's `DATA` index: the SMG's
+`MinigunMuzzleFlash01.nif` carries 22 (`MPSGunSparks01`) and 5
+(`MPSSmokeMetalBurn01`). ADDN was unexported (37 records in FalloutNV.esm,
+indexes 0-36), and Skyrim.esm owns 0-88, so every converted mesh spawned
+the vanilla addon at its index instead: the SMG's flash played
+`MPSPushGrass01` and `MPSFireBallSparkTrail`. SkyrimSE 1.6.1170 has no
+"AddOnNode" string at all; `BGSAddonNode`'s loader (vtable slot 6, 0x255fa0)
+reads `DATA` into +0x68 as a u32, so the value, not the name, selects the
+record. Both sides now move by `ADDON_INDEX_BASE` (20000): the converted
+ADDN's `DATA`, and every FO3/FNV mesh's addon node value and name. The
+record is otherwise the same in both games (model, sound as SNDR, `DNAM`
+particle cap u16 + flags u16); FNV's one flags-0 record (`FireSmall01`)
+becomes 1, since all 89 vanilla ADDNs carry 1 or 3.
+
+Where the flash sits: the projectile's muzzle-flash setup (id 44056,
+0x7e0b40) takes the flash 3D the projectile loaded from `NAM1` and attaches
+it to the firing weapon's `ProjectileNode` (the static-init string at
+0x185d4 for the global the lookup 0x286b00 uses), which the converted FNV
+gun meshes keep.
 
 ## Navmesh: authored, not generated
 
@@ -542,7 +606,7 @@ silently puts armor in the wrong slot rather than failing.
 | Bit | FNV | Oblivion | Skyrim slot chosen |
 |---:|---|---|---|
 | 3 | Left Hand | Lower Body | 33-Hands |
-| 4 | Right Hand | Hand | 33-Hands |
+| 4 | Right Hand | Hand | 59-Right hand ([body slots](asset_convert_armor.md#body-slot-layout)) |
 | 5 | Weapon | Foot | *dropped — not a wearable slot* |
 | 6 | PipBoy | Right Ring | 34-Forearms |
 | 7 | Backpack | Left Ring | 46-Unnamed |
@@ -554,7 +618,7 @@ silently puts armor in the wrong slot rather than failing.
 | 13 | Earrings | Shield | 43-Ears |
 | 14 | Mask | Torch | 30-Head |
 | 15 | Choker | Tail | 35-Amulet |
-| 16-19 | Mouth Object, Body AddOn 1-3 | — | 43-Ears, 47-49 |
+| 16-19 | Mouth Object, Body AddOn 1-3 | — | 43-Ears, 47, 48, 60 (49 is the lower body) |
 
 Censused over all 393 FNV ARMO records, the bits actually authored and what
 the Oblivion table made of them:
@@ -617,7 +681,7 @@ nothing.
 | Field | FNV authored | TES5 written |
 |---|---|---|
 | PNAM | `0x0004` Use Map Data, on all 10 children | authored `& 0x5F` (FO3 bit 5 *Use Image Space* has no TES5 bit) |
-| PNAM | absent (TES4 has no PNAM) | `0x0004`: the map is what Oblivion's parent link provides; every TES4 child (IC districts, SE worlds) carries its own LAND |
+| PNAM | absent (TES4 has no PNAM) | absent, so the engine's `0xFFFF` applies: Oblivion draws the PARENT's land under a child, and the child's own LAND is unfinished (ICImperialPalace: 47 LAND over 58 cells, 35 with flags `0x401` and no texture layers, heights differing from Tamriel's at the same grid). Writing `0x0004` here rendered that junk land and open water in the IC palace and arena worlds; writing `0x005F` lost the parent's distant LOD in AnvilWorld and the other city worlds |
 | ONAM | scale 0.7, offset (-16000, 103000) for the Freeside worlds | authored (scale, x, y, 0); was a constant (1, 0, 0, 0) |
 | NAM4 | -2300 on WastelandNV | authored; TES4 sea level stays 0 |
 | DNAM | authored land/water defaults | authored; TES4 keeps (-2048, 0) |
@@ -628,10 +692,12 @@ ONAM is how FNV places a child on the parent's map: Freeside's gate at
 gate's (-9815, 102729). The identity ONAM put the marker at raw child
 coordinates instead.
 
-Oblivion's own children were affected the same way (ICMarketDistrict rendered
-Tamriel's island terrain under its own); they now get `0x0004`, and see
-[asset_convert_terrain.md](asset_convert_terrain.md#child-worldspaces-with-their-own-lod)
-for the LOD consequence.
+Oblivion's own children get no PNAM at all, never a Fallout-derived value.
+`0x005F` is NOT the engine default: it drops bit 5, which vanilla sets on the
+cities that show Tamriel's LOD (WhiterunWorld and WindhelmWorld author `0x7F`,
+RiftenWorld `0x77`). Only the authored FO3/FNV PNAM is written. With no PNAM,
+terrain LOD still treats a TES4 child as borrowing the parent's grid; see
+[asset_convert_terrain.md](asset_convert_terrain.md#child-worldspaces-with-their-own-lod).
 
 
 ## <a id="humanoid-races"></a>Humanoid races map onto Skyrim playable races
@@ -933,3 +999,22 @@ volume was a bare REFR with nothing to enter: `OnTriggerEnter` never fired.
 VCG01 hung on this — `VCG01VigorTesterTriggerSCRIPT` sets stage 60 from
 `onTriggerEnter`, and the tester's `OnActivate` only advances at stage 60.
 The raw subrecord now round-trips as `XPRM.Raw`.
+
+## <a id="idle-anam-data-swapped"></a>IDLE swaps ANAM and DATA
+
+**Code:** `tes4_export/record_types/falloutnv.py:_emit_idle_deltas`,
+`SUPERSEDED_IDLE_KEYS`.
+
+TES4 keeps an IDLE's animation group section in ANAM and its Parent/Previous
+links in DATA. FO3/FNV swap them (xEdit `wbDefinitionsFNV.pas` IDLE): ANAM is
+Parent then Previous (two FormIDs), DATA is the section byte, looping min/max,
+an unused byte, a replay delay (s16) and flags. The TES4 exporter read both
+with its own layout, so every FalloutNV.esm IDLE wrote `ANAM.AnimGroupSection`
+as the low two bytes of its parent (`SitDownStool`: 31102 = 0x797E, from
+parent `0002797E`), and the 748 with an 8-byte DATA wrote animation bytes as
+`DATA.IdleParent`/`IdlePrev`. The idle tree's parent links were lost. The
+FO3/FNV lines are now `ANAM.Parent`, `ANAM.Previous`, `DATA.AnimGroupSection`,
+`DATA.LoopMin`, `DATA.LoopMax`, `DATA.ReplayDelay` and `DATA.Flags`, and the
+TES4-layout lines are dropped for these sources. No importer read the old
+keys; `furniture_travel` walks the tree to find a sit entry's enter
+animation ([stool entries](asset_convert_falloutnv.md#stool-entries)).

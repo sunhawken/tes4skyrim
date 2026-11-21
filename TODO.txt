@@ -1,115 +1,62 @@
 Major Issues for V1:
 	1 - Iterate on quest and dialog conversion until everything is playable starting with Oblivion Main Quest
-		Morroblivion: can't get fighters guild quest after joining
-		sqv charactergen 74 - Assassin fails to become hostile and kill the emperor
-		I should not be able to loot the emperor's body
-		Arena: corpse of the previous combatant is not removed on re-entry (TES4 ResetInterior cleared it; Skyrim Cell.Reset() leaves non-respawning corpses)
-		Arena: second combatant not hostile after a completed match
-		Arena: speak-as subtitles (announcer, Daedric shrines) never clear - a scripted Say() on a non-actor never retires its subtitle; no verified fix, see docs/reference/dialogue_engine_contracts.md
 
 	2 - Havok feels off. Items don't move like they should. Specifically, there seems to be too much inertia on small items, like I'm dragging a heavy object when it is something as small as a cup, Animated signs will get stuck in a position after swinging a bit, defying gravicty
-
-	3 - Navmesh refinement
-		ensure corridors connect pathgrid islands
-		allow growth even on slopes
-		trim triangles along edges
-		fix slim corridors like vaults in anvilcastlegreathall
-		fix occasional crack (vilvern near entrance)
-		Fix wrong side of door like the upstairs in anvilfightersguild
-
-	5 - Need new skyrim body mesh to actually work to allow leg skin to appear
 	
-	6 - Shops missing full inventory of items
+	5 - Weather particle conversion (snow, rain) SPGD
 
-	7 - Crime system
-
-	8 - Still a lot of reversed collision in morroblivion
-
-	10 - Imperials get all fallback race lines (like reiklings)
-
-	11 - All-in-one installer that people can just click and expect to work
-
-	12 - Quest stages aren't properly closed (MS48)
-
-	13 - Weather particle conversion (snow, rain) SPGD
-
-	14 - AutoUpdater
+	6 - AutoUpdater
 
 Later Issues:
 	1 - Bound items like dagger not removed from inventory, only hands
 	
-	3 - Ajust zip step to pack loose files if bsas are out of date or not generated
+	2 - Ajust zip step to pack loose files if bsas are out of date or not generated
 		Also zip should work on mod without plugin
 
-	4 - Fix walking up stairs
+	3 - Arrows are held at an invisible location behind the arrow when nocking, and can't be picked up after shooting (maybe just scale them?)
 
-	5 - Arrows are held at an invisible location behind the arrow when nocking, and can't be picked up after shooting (maybe just scale them?)
-
-	6 - Some converted books (scrolls) are using the wrong Skyrim base mesh
-
-	7 - Restore Oblivion's remaining NPC-to-NPC conversations (see docs/commentary/tes5_import_dialogue.md)
+	4 - Restore Oblivion's remaining NPC-to-NPC conversations (see docs/commentary/tes5_import_dialogue.md)
 		DONE 2026-08-07: the 15 QUEST-ADVANCING chains are replayed by a generated driver quest
 		REMAINING: the ~240 pure-flavor chatter families are still dropped; they need SCEN synthesis with invented actor pairing.
 
-	8 - Magic and Spell Conversion including effects (see magic conversion md)
+	5 - Magic and Spell Conversion
+		Mixed-range spells: check the Self half of a Target+Self spell lands on the caster
+		pme (PlayMagicEffectVisuals) plays only the effect shader, not the hit art
+		Creature casters have no magic/hand nodes, so casting art cannot attach
+		DLC ESPs: effects cloned from a master get no art (lookup reads only the plugin's own meshes)
+		Rebuild and test Nehrim (its own codes: BA01-BA10, DISE, DUMY)
+		Vanilla-effect clones and scripted bound-item clones have no name or menu art
+		Later: spellmaking, enchanting altar (spell selling done: merchants sell spell tomes through barter)
+		Spell tomes: a dependent plugin's Spell[] override of a master's merchant does not update that merchant's tomes
 
-	9 - Make horses rideable
+	6 - Weapon and armor degradation through TESRuntime, plus a Repair service for Oblivion and Morrowind merchants, always in a Skyrim-styled repair window
 
-	11 - Potential remapping of low level formids like how player (07) or gold (f) already do
+	7 - Make horses rideable
 
-	12 - Add progress bar for navmesh step
+	8 - Add progress bar for navmesh step
 
-	13 - Add optional skyrim weather remapping
+	9 - Add optional skyrim weather remapping
 
-	14 - Add optional skyrim creature remapping
+	10 - Add optional skyrim creature remapping
 
-	15 - Refine armor conversion: rings don't properly attach
+	11 - Refine armor conversion: rings don't properly attach
 
-	16 - Creatures with geometry baked into skeleton.nif (no body-part NIFs, no NIFZ) get no generated race and alias to a vanilla one: scrib (28 records, Morroblivion), willothewisp (5, Oblivion)
+	12 - Creatures with geometry baked into skeleton.nif (no body-part NIFs, no NIFZ) get no generated race and alias to a vanilla one: scrib (28 records, Morroblivion), willothewisp (5, Oblivion)
 
 Minor Issues:
-
 	2 - Improve landscape layer blending
 	
-	3 - Replace Prison marker with the skyrim equivalent as we are doing with the other markers
-
 	4 - Harvested plants don't make a sound. Intentional?
 
-	6 - Convert Skyrim LE meshes to Skyrim SE format
-
 	7 - Flame atronach animated section not properly converted
-
-	12 - Minor issues with 44 patch plugin
 	
-	15 - Missing location topics (Anvil)
-
-	16 - Tripwire doesn't visibly break. and Log trap doesn't visibly roll
-
-	17 - Pandora compatibility
-
 	19 - Leaving a force-greet conversation can soft-lock
-
-	20 - Tree LOD as real Skyrim billboards (.btt instance tables) instead of baked + cards
 
 	21 - FaceGen: Oblivion.exe statically links the FaceGen SDK (matrixVT.hpp, BSFaceGenModelMap, EGM/EGT basis load+apply). Use it like the SpeedTree engine harness to turn FGGS/FGGA coefficients into real vertex deltas
 
-	22 - OblivionBloodFountain01: geyser (SpecialIdle) never plays as the default state
-
-	23 - safe_run.py must REVERT a rule-breaking write, not just report it. Snapshot the bytes of every first-party .py before running, gate the changed set with --gate-file after, then restore (or delete, if newly created) only the files that broke a rule - clean files the same command wrote stay. Exit 2 naming each restored path, and say the write did NOT stand, because the child has already printed its own success. Same contract Edit/Write already gets from gate_pre; the Bash path reports instead of blocking, which is how union_mesh.py landed with 26 violations.
-		touching docstring should note make the entire file owned
-
-	24 - Bounds + Collision scanning should happen during the Meshes step to avoid having to do it twice
-
-	25 - SKSE dll to automatically merge multiple creature animation projects at runtime
-
 Guns (FalloutNV):
 	G1 - HUD magazine readout: the counter text field path is a guess and the hook is disabled (hud.cpp, InstallHud not called); find the field in the loaded HUD movie and re-enable
-	G2 - Iron sights off-center: FNV aligns ##SightingNode to the camera axis at runtime; needs a hook after the engine places the first-person model, the root is stomped every frame (tes_runtime_guns.md#sight-alignment)
-	G3 - Left hand holds air beside the gun (hands should stack on a 1h iron sight, both grip a 2h): the hands are wrong relative to EACH OTHER, not a model offset like G2. Rotation-only retarget from the FNV first-person skeleton keeps FNV arm lengths/shoulder width; needs the left hand constrained to the weapon grip after retarget (IK to the gun's left-hand grip node in gun_anim_falloutnv, or positional retarget of the hand bones)
-	G4 - Gun range: the 9mm only hits at point-blank; check the PROJ speed/range/gravity and the WEAP DNAM range conversion against FNV values
-	G5 - Impact effects: explosions (grenades, missiles) and bullet impact data (IPDS/IPCT) not converted; projectiles hit silently
-	G6 - Animated gun parts (magazine, slide, bolt) untested since the DLL-driven NiControllerSequence build; parts.cpp logs nothing when no sequence starts
-	G7 - Ammo models under clutter/ammo (50MG box etc.) not rebuilt with Prn=QUIVER, still attach at the feet
+	G6 - Animated gun parts: the reload magazine swap works every reload; slide, hammer and bolt motion on fire and equip not yet checked in game
 	G8 - Ammo on a bow/melee holder: FNV rounds equipped with a non-gun still hang on QUIVER and show
 	G9 - Spare ammo, spread, VATS, weapon condition and weapon-specific reload speeds not implemented
 	G10 - NPC gun use: iGunShots is written per actor but AI never reloads or picks rounds; combat style for guns unverified
@@ -120,10 +67,24 @@ Guns (FalloutNV):
 	G15 - Dual-wield 1h guns: mirror the FNV 1hp clips for the left hand (left-hand type 13 in the graph, mirrored clip set, per-hand ammo and shot counts in the DLL, left click = left gun)
 	G16 - Melee/bash key: FNV guns have their own bash (attackbash / 1hpattackbash clips); bind a key that sends a gun bash event instead of the dropped ActionLeftAttack
 	G17 - Holster/draw blend: equip and unequip clips cut to the aim pose with no crossfade
-	G18 - Muzzle flash and shell casings: FNV plays the ##FlashNode light/particle and ejects the casing model on each shot; neither is converted
-	G19 - Recoil: an SMG kicks far harder per shot than FNV. Something already applies a kick, probably the fire clip's camera track (FNV scales the Camera1st animation per weapon / fCameraAnim settings, the retarget plays it at full amplitude every shot) or the engine's bow/crossbow release kick firing on arrowRelease; find which, then apply FNV's WEAP DNAM recoil values and the ADS sway
+	G18 - Shell casings: FNV ejects the WEAP's MOD2 casing model from ShellCasingNode on each shot; Skyrim has no equivalent (needs a casing projectile launched by the DLL)
+	G19 - Recoil on 1hp automatics (10mm SMG): base FNV ships no first-person 1hpattackloop (only the third-person pitched loops; GunRunnersArsenal adds the level clip), so the first-person graph falls back to another attack at weaponSpeedMult = shots/s (9x speed, violent); a still aim-pose loop now plays instead, so the first-person SMG holds still while firing. Find what FNV plays in first person for that class
 	G20 - Third-person aiming pitch: the AimPitchCurrent pitch blend exists but the torso twist toward the crosshair is unverified
 	G21 - Weapon mods (WMOD) and scoped weapons: scope zoom uses a scope overlay in FNV, not iron sights; the sight FOV path shows the mesh instead
 	G22 - Gun sounds beyond dry fire: fire sound is the engine's arrow release path; check the WEAP SNAM/XNAM per-shot and reload sounds are the FNV ones
 	G23 - NPC iron sights and hip fire: NPCs never zoom; the iGunZoom / fGunZoom variables are only written for the player
+	G24 - Strafe snap: strafing in first person shifts the whole skeleton and gun ~22 units toward the strafe direction against the render camera, almost at once (vanilla may do it slower). Not the direction blend: the clips' root/look/camera bones are static, and BSCyclicBlendTransitionGenerator never eases Direction (its duration runs only on CyclicCrossBlend). Next: record a vanilla sword vs the pistol strafing, weapon against the render camera (the WorldRoot Camera under PlayerCamera+0x20) with Direction
 
+Morrowind:
+	1 - Water missing in interiors with it flagged
+	2 - Magic effects with no Skyrim mechanism await the MorrowindRuntime
+	3 - Enchanting service: the NPC should enchant for a fee at the NPC's skill, not the player's (fee = enchantment cost x fEnchantmentValueMult, barter-adjusted; swap the player's Enchanting for the NPC's while the menu is open; no player skill gain)
+	4 - Spellmaking service row (sSpellmakingMenuTitle) has no Skyrim menu yet
+	5 - teradimir ref xxdbbadb spawns dead and doesn't have his clothes equiped. we were supposed to have fixed this already "teloseras, vault"
+	6 - NPC dialogue risk, older than my changes: vanilla NPCs that Morroblivion replaced run Papyrus, so about 220 TR and Tamriel_Data dialogue filters give the wrong answer when one of them is the speaker. That's lost slave and vampire lines, and lore topics on NPCs who shouldn't discuss lore.
+	7 - the blowing banners have no collision at all, and Skyrim only shows an activator's name when the crosshair ray hits its collision.
+	Tamriel_Data's banner (tr_act_banner_inn_01.nif) carries Morrowind's NCO marker. In Morrowind that means "actors walk through this", but the object can still be pointed at, because Morrowind picks with the visible mesh.
+	The converter's rule (fixture_plan.py:3-14) honors NCO on fixtures (statics, activators, lights, containers, doors) by shipping no collision body. Skyrim has no "walk-through but targetable" collision class, so the rule drops the body entirely. That's right for scenery, but an activator is meant to be pointed at, so a bodyless activator loses its name prompt and can't be activated. The same rule already makes an exception for carriable items for exactly this reason. Activators were left out.
+	Morroblivion's static banner has an ordinary bhkBoxShape, so the crosshair hits it, which is why it shows "Dwemer shop" while the animated ones show nothing.
+	This isn't from today's changes. The blowing banners were bodyless before too; you just noticed it now that they move.
+	Suggested fix: when NCO is on an activator (and on a door or container, which also need picking), keep a body the crosshair hits but actors don't block on. Before writing that, I'd count vanilla Skyrim's activator meshes to find which collision layer Bethesda uses for "targetable but walk-through", rather than guessing one. Want me to do that census and the fix? It would need a mesh rebuild of the affected Tamriel_Data and TR activators.

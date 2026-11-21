@@ -40,16 +40,29 @@ from concurrent.futures import ProcessPoolExecutor
 
 from .registry import IMPORT_DISPATCH, TYPE_MAP
 from .overrides.nested import (build_nested_overrides)
-from .dialogue.quest import compute_quest_priorities, convert_QUST
+from .dialogue.quest import compute_quest_priorities, convert_QUST, package_host
+from .packages.converter import latches_when_done
+from .record_types.items import is_engine_form
+from .packages.done_latch import create_latch, latch_condition, latch_vmad
+from .packages.hosts import armed_gate, create_armed_faction, write_forced_lists
+from .dialogue.morrowind_sidecar import is_tes3_export, write_morrowind_sidecar
+from .actors.attribute_tables import (write_attribute_tables, write_chargen_table,
+                                      write_stats_table)
 from .record_types.bodypart_falloutnv import write_falloutnv_sidecars
+from .record_types.world_falloutnv import is_fallout_source
 from .record_types.sound import convert_SOUN
+from .record_types.npc_markers_morrowind import flush_npc_markers
 from .base.owned_records import (
     WELL_KNOWN_PROPERTIES,
 )
 from .navmesh.navi import NAVI_SINGLETON_FID, build_navi_record
 from .navmesh import pool as navm_pool
+from .navmesh.phase import build_navmeshes
 from .actors.lava_placement import LavaPlanner
+from .record_types.region import record_default_water
+from asset_convert.sources.skyrim_assets import find_skyrim_data
 from .base.locations import build_marker_locations
+from .base.master_export import values_of
 from .record_types.world import (
     convert_ACHR,
     convert_CELL,
@@ -86,6 +99,54 @@ _LAND_CHUNK = 24
 
 WORLD_EXTENT_CACHE = 'world_extents.json'
 
+def _emit_override(st, ov, rec: dict) -> None:
+    """Write an override's record and the master outfit it changes; queue its renamed copies."""
+    for record_bytes in (ov.record_bytes, st.ctx.build_outfit_companion(rec)):
+        if record_bytes:
+            st.writer.add_record(record_bytes[:4].decode('ascii', 'replace'),
+                                 record_bytes)
+            st.converted += 1
+    for copy in st.ctx.renamed_copies(rec):
+        st.writer.adoption.queue_copy(copy)
+
+
+#: Record types a later phase converts on its own.
+_SEPARATE_TYPES = frozenset({'CELL', 'WRLD', 'DIAL', 'INFO', 'REFR', 'ACHR', 'ACRE', 'LAND',
+                             'LTEX', 'SOUN', 'PGRD', 'QUST'})
+
+#: Record types whose converter takes the plugin writer.
+_WRITER_TYPES = frozenset({'ARMO', 'CLOT', 'WEAP', 'AMMO', 'NPC_', 'CREA', 'BOOK',
+                           'ENCH', 'SPEL', 'SGST', 'ALCH', 'INGR', 'HAIR', 'PROJ', 'IPCT',
+                           'IPDS', 'EXPL', 'ADDN', 'MUSC'})
+
+
+def _record_climates(st) -> None:
+    """Note every sunless climate, the masters' first, before any record converts."""
+    from .record_types.weather import record_sunless_climate, reset_sunless_climates
+    reset_sunless_climates()
+    for mrec in values_of(getattr(st.ctx, 'master_export', None), 'CLMT'):
+        record_sunless_climate(mrec)
+    for rec in st.by_type.get('CLMT', []):
+        record_sunless_climate(rec)
+
+
+def _stage_runtime_sidecars(st, export_dir: str) -> None:
+    """The runtime DLLs' sidecars: FO3/FNV limbs and guns, Morrowind's tables,
+    a TES4 source's character-sheet tables, and the chargen menus' table."""
+    write_falloutnv_sidecars(st.by_type, st.writer, st.output_path)
+    staged = write_morrowind_sidecar(
+        export_dir, st.output_path, os.path.basename(st.output_path),
+        writer=st.writer,
+        master_index=getattr(st.ctx, 'master_index', None) if st.ctx else None)
+    if not is_tes3_export(export_dir) and not is_fallout_source():
+        staged += write_attribute_tables(st.by_type, st.writer, st.output_path)
+    if not is_fallout_source():
+        staged += write_chargen_table(st.chargen_plan, st.writer, st.output_path, export_dir)
+        staged += write_stats_table(st.by_type, st.writer, st.output_path, export_dir)
+    if staged:
+        print(f'  Staged {staged} runtime sidecar file(s)')
+
+
 def _phase1_simple_records(st, export_dir: str, phase_done, skip_types) -> None:
     """Phase 1: convert every flat top-level record type.
 
@@ -93,37 +154,17 @@ def _phase1_simple_records(st, export_dir: str, phase_done, skip_types) -> None:
     See: docs/commentary/tes5_import_pipeline.md#phase-1-is-serial-on-purpose"""
     print("\nConverting records...")
     st.t2 = time.time()
-
-    simple_types = set()
-    for sig in sorted(st.by_type.keys()):
-        if sig in st.all_skip:
-            continue
-        if sig in ('CELL', 'WRLD', 'DIAL', 'INFO', 'REFR', 'ACHR', 'ACRE', 'LAND',
-                    'LTEX', 'SOUN', 'PGRD', 'QUST'):
-            continue  # Handled separately
-        if sig not in IMPORT_DISPATCH:
-            continue
-        simple_types.add(sig)
-
-    _WRITER_TYPES = {'ARMO', 'CLOT', 'WEAP', 'AMMO', 'NPC_', 'CREA', 'BOOK',
-                     'ENCH', 'SPEL', 'SGST', 'HAIR', 'PROJ', 'IPCT', 'IPDS',
-                     'MUSC'}
-
+    simple_types = {sig for sig in st.by_type if sig not in st.all_skip
+                    and sig not in _SEPARATE_TYPES and sig in IMPORT_DISPATCH}
     st.converted = 0
     st.errors = 0
 
     work_items = [(sig, TYPE_MAP.get(sig, sig), rec)
                   for sig in sorted(simple_types)
                   for rec in st.by_type[sig]]
-
-    from .record_types.weather import record_sunless_climate, reset_sunless_climates
-    reset_sunless_climates()
-    if st.ctx and getattr(st.ctx, 'master_export', None):
-        for mrec in st.ctx.master_export.values():
-            if (mrec.get('Signature') or '') == 'CLMT':
-                record_sunless_climate(mrec)
-    for rec in st.by_type.get('CLMT', []):
-        record_sunless_climate(rec)
+    _record_climates(st)
+    record_default_water(st.by_type, getattr(st.ctx, 'master_export', None), st.writer,
+                         find_skyrim_data())
 
     for sig, target_sig, rec in work_items:
         converter = IMPORT_DISPATCH[sig]
@@ -132,11 +173,7 @@ def _phase1_simple_records(st, export_dir: str, phase_done, skip_types) -> None:
 
             ov = st.ctx.build(rec, sig) if st.ctx else None
             if ov is not None and ov.status != 'reconvert':
-                if ov.record_bytes:
-                    st.writer.add_record(
-                        ov.record_bytes[:4].decode('ascii', 'replace'),
-                        ov.record_bytes)
-                    st.converted += 1
+                _emit_override(st, ov, rec)
                 continue
 
             with st.writer.converting(src_fid, get_formid(rec, 'FormID')):
@@ -153,7 +190,6 @@ def _phase1_simple_records(st, export_dir: str, phase_done, skip_types) -> None:
             edid = get_str(rec, 'EditorID', '?')
             print(f"  ERROR converting {sig} '{edid}': {e}")
             st.errors += 1
-    write_falloutnv_sidecars(st.by_type, st.writer, st.output_path)
     phase_done(f'simple records ({len(work_items)})')
 
 
@@ -246,7 +282,7 @@ def _convert_soun(st, export_dir: str, phase_done, skip_types) -> None:
 
 
 def _convert_qust(st, export_dir: str, phase_done, skip_types) -> None:
-    """Phase 3b: QUST, tracking StartGameEnabled ids for the .seq file."""
+    """Phase 3b: QUST."""
     qust_records = st.by_type.get('QUST', [])
     if qust_records and 'QUST' not in st.all_skip:
         print(f"  Converting {len(qust_records)} QUST records...")
@@ -267,13 +303,47 @@ def _convert_qust(st, export_dir: str, phase_done, skip_types) -> None:
                                           script_vars=st._script_vars)
                 st.writer.add_record('QUST', qust_bytes)
                 st.converted += 1
-                fid = get_formid(rec, 'FormID')
-                flags = get_int(rec, 'DATA.Flags')
-                if flags & 0x01:
-                    st.sge_quest_fids.add(fid)
             except Exception as e:
                 print(f"  ERROR converting QUST '{get_str(rec, 'EditorID', '?')}': {e}")
                 st.errors += 1
+
+
+def _write_package_hosts(st) -> None:
+    """Writes the package host quest."""
+    if st.pack_plan and st.pack_plan.hosts:
+        st.writer.add_record('QUST', package_host(st.pack_plan, st.fid_to_edid))
+        print("  Package host written")
+
+
+def _write_forced_lists(st) -> None:
+    """Writes the forced-package FormLists when this plugin owns them."""
+    fids, own = st.pack_plan.forced_lists if st.pack_plan else ({}, False)
+    if own:
+        write_forced_lists(st.writer, fids, st.pack_plan.armed_factions)
+
+
+def _without_marker_doors(by_type: dict) -> dict:
+    """`by_type` for the navmesh build: engine-form DOOR bases out, their references without a teleport.
+
+    A reference counts as a door there by its base or by its XTEL alone.
+    See: docs/commentary/tes5_import_world.md#nameless-doors
+    """
+    doors = [r for r in by_type.get('DOOR', []) if not is_engine_form(r)]
+    markers = {r.get('FormID') for r in by_type.get('DOOR', [])} - {r.get('FormID') for r in doors}
+    refs = [{k: v for k, v in r.items() if not k.startswith('XTEL.')} if r.get('NAME') in markers else r
+            for r in by_type.get('REFR', [])]
+    return dict(by_type, DOOR=doors, REFR=refs)
+
+
+def _latch_pack(st, rec: dict) -> None:
+    """Gives a package its (VMAD, CTDA) completion gate: armed faction, or Once Per Day latch global."""
+    fid = get_formid(rec, 'FormID')
+    if fid in st.pack_plan.armed:
+        faction = st.pack_plan.armed_factions[fid] = create_armed_faction(st.writer, fid)
+        st.pack_ctx.done_latches[fid] = armed_gate(faction)
+    elif latches_when_done(rec, st.pack_ctx):
+        latch = create_latch(st.writer, fid)
+        st.pack_ctx.done_latches[fid] = (latch_vmad(latch), latch_condition(latch))
 
 
 def _convert_pack(st, export_dir: str, phase_done, skip_types) -> None:
@@ -290,6 +360,7 @@ def _convert_pack(st, export_dir: str, phase_done, skip_types) -> None:
                         st.writer.add_record('PACK', ov.record_bytes)
                         st.converted += 1
                     continue
+                _latch_pack(st, rec)
                 for _pack_bytes in convert_PACK_records(rec, st.pack_ctx):
                     st.writer.add_record('PACK', _pack_bytes)
                 st.converted += 1
@@ -303,11 +374,14 @@ def _convert_pack(st, export_dir: str, phase_done, skip_types) -> None:
 
 def _phases23_records(st, export_dir: str, phase_done,
                       skip_types) -> None:
-    """Phases 2-3: LTEX, SOUN, QUST and PACK."""
+    """Phases 2-3: LTEX, SOUN, QUST and PACK, then the runtime sidecars (they list converted packages)."""
     _convert_ltex(st, export_dir, phase_done, skip_types)
     _convert_soun(st, export_dir, phase_done, skip_types)
     _convert_qust(st, export_dir, phase_done, skip_types)
+    _write_package_hosts(st)
     _convert_pack(st, export_dir, phase_done, skip_types)
+    _write_forced_lists(st)
+    _stage_runtime_sidecars(st, export_dir)
 
 
 
@@ -329,63 +403,11 @@ def _phase4a_navmesh(st, export_dir: str, phase_done, skip_types) -> None:
 
     set_teleport_grid(*navm_pool.build_teleport_grid(
         st.by_type, st.ctx.master_export if st.ctx else None))
-
-
-    _navm_master_export = st.ctx.master_export if st.ctx else None
-    st.base_model_by_fid = navm_pool.build_base_model_index(st.by_type,
-                                                         _navm_master_export)
-    st.door_fids = navm_pool.build_door_fid_set(st.by_type, _navm_master_export)
     st.navm_metas = []
-
-    st.navm_cache = navm_pool.precompute_navmeshes(
-        st.by_type, st.writer, st.base_model_by_fid, st.door_fids,
-        collision_cache=navm_pool.collision_cache_chain(export_dir),
-        master_index=getattr(st.ctx, 'master_index', None) if st.ctx else None,
-        master_export=getattr(st.ctx, 'master_export', None) if st.ctx else None)
-
-    _dump_to = os.environ.get('TESCONV_DUMP_NAVM_CACHE', '').strip()
-    if _dump_to:
-        import pickle as _pickle
-        with open(_dump_to, 'wb') as _fh:
-            _pickle.dump(st.navm_cache, _fh, protocol=_pickle.HIGHEST_PROTOCOL)
-        print(f"  [debug] navm_cache dumped to {_dump_to} "
-              f"({len(st.navm_cache)} entries)")
-
-    from .navmesh.edge_links import build_edge_links
-    _t_el = time.time()
-    _mi = getattr(st.ctx, 'master_index', None) if st.ctx else None
-    _relinked = []
-    build_edge_links(
-        st.navm_cache, master_index=_mi,
-        master_navms=navm_pool.master_navm_grid(
-            getattr(st.ctx, 'master_export', None) if st.ctx else None,
-            _mi),
-        relinked_masters=_relinked)
+    st.navm_cache, st.base_model_by_fid, st.door_fids, relinked = build_navmeshes(
+        _without_marker_doors(st.by_type), st.writer, st.ctx, export_dir, os.path.basename(st.output_path))
     if st.ctx is not None:
-        st.ctx.relinked_master_navms = _relinked
-    print(f"    Edge links: {time.time() - _t_el:.1f}s")
-
-    from .navmesh.split import split_disconnected_interiors
-    _t_sp = time.time()
-    door_xtel_target = {}
-    _xtel_sources = [st.ctx.master_export.items()] if (
-        st.ctx and getattr(st.ctx, 'master_export', None)) else []
-    _xtel_sources.append((r.get('FormID', ''), r) for r in st.by_type.get('REFR', []))
-    for fid_str, rec in (p for src in _xtel_sources for p in src):
-        if 'XTEL.Door' not in rec:
-            continue
-        if not fid_str or rec.get('Signature', 'REFR') != 'REFR':
-            continue
-        tgt = get_formid(rec, 'XTEL.Door')
-        if tgt:
-            src_fid = get_formid({'FormID': fid_str}, 'FormID')
-            if src_fid:
-                door_xtel_target[src_fid] = tgt
-    n_split = split_disconnected_interiors(st.navm_cache, st.writer, door_xtel_target)
-    print(f"    Interior split: {time.time() - _t_sp:.1f}s")
-    if n_split:
-        print(f"  Navmesh split: {n_split} interior meshes split into "
-              f"per-component NAVMs")
+        st.ctx.relinked_master_navms = relinked
 
     door_xndp = {}
     for _key, (_bytes, _meta) in st.navm_cache.items():
@@ -403,6 +425,7 @@ def run_record_phases(st, export_dir: str, phase_done,
     _phase1_simple_records(st, export_dir, phase_done, skip_types)
     _phases23_records(st, export_dir, phase_done, skip_types)
     _phase4a_navmesh(st, export_dir, phase_done, skip_types)
+    flush_npc_markers(st.by_type)
 
     land_cache = _precompute_land(st.by_type, export_dir)
     if st.ctx:
@@ -423,6 +446,7 @@ def run_record_phases(st, export_dir: str, phase_done,
         extents = _merge_world_extents(st.output_root, extents)
     if extents:
         set_world_land_extents(extents)
+    move_persistent_refs(st.by_type, getattr(st.ctx, 'master_export', None))
 
     if st.ctx:
         unattached = build_nested_overrides(
@@ -437,25 +461,30 @@ def run_record_phases(st, export_dir: str, phase_done,
                   f"({sum(len(v) for v in own.values())} records: "
                   + ', '.join(f'{len(own[s])} {s}' for s in world_sigs
                               if own.get(s)) + ")")
-            _build_cell_groups(own, st.writer, st.navm_metas, st.base_model_by_fid,
-                               st.door_fids, st.navm_cache, land_cache)
-            phase_done('own CELL groups')
-            _build_world_groups(own, st.writer, st.navm_metas, st.base_model_by_fid,
-                                st.door_fids, st.navm_cache, land_cache, ctx=st.ctx)
-            phase_done('own WRLD groups')
+            _build_groups(st, own, land_cache, phase_done, 'own ')
     else:
-        _build_cell_groups(st.by_type, st.writer, st.navm_metas, st.base_model_by_fid,
-                           st.door_fids, st.navm_cache, land_cache)
-        phase_done('CELL groups')
-        _build_world_groups(st.by_type, st.writer, st.navm_metas, st.base_model_by_fid,
-                            st.door_fids, st.navm_cache, land_cache)
-        phase_done('WRLD groups')
+        _build_groups(st, st.by_type, land_cache, phase_done, '')
+    _build_navi(st)
 
+
+def _build_groups(st, by_type: dict, land_cache: dict, phase_done, label: str) -> None:
+    """The CELL then WRLD groups of `by_type`, sharing one index of each cell's children."""
+    children = _children_by_cell(by_type)
+    _build_cell_groups(by_type, st.writer, st.navm_metas, st.base_model_by_fid,
+                       st.door_fids, st.navm_cache, land_cache, children)
+    phase_done(f'{label}CELL groups')
+    _build_world_groups(by_type, st.writer, st.navm_metas, st.base_model_by_fid,
+                        st.door_fids, st.navm_cache, land_cache, ctx=st.ctx,
+                        children=children)
+    phase_done(f'{label}WRLD groups')
+
+
+def _build_navi(st) -> None:
+    """The NAVI record over every navmesh the groups registered, when there are any."""
     if st.navm_metas:
         n_edge = sum(len(m.get('edge_link_fids') or ()) for m in st.navm_metas)
         n_door = sum(len(m.get('door_refs') or ()) for m in st.navm_metas)
         from .navmesh.navi import read_master_nvpp
-        from asset_convert.sources.skyrim_assets import find_skyrim_data
         master_nvpp = read_master_nvpp(find_skyrim_data())
         navi_bytes = build_navi_record(NAVI_SINGLETON_FID, st.navm_metas,
                                        master_nvpp=master_nvpp)
@@ -478,6 +507,14 @@ def _index_by_parent_cell(records) -> dict:
     for rec in records:
         by_cell[get_formid(rec, 'ParentCELL')].append(rec)
     return by_cell
+
+
+def _children_by_cell(by_type: dict) -> tuple:
+    """(REFR, ACHR+ACRE, LAND, PGRD) of `by_type`, each grouped by parent CELL."""
+    return (_index_by_parent_cell(by_type.get('REFR', [])),
+            _index_by_parent_cell(by_type.get('ACHR', []) + by_type.get('ACRE', [])),
+            _index_by_parent_cell(by_type.get('LAND', [])),
+            _index_by_parent_cell(by_type.get('PGRD', [])))
 
 
 def _pack_cell_children(cell_fid, refr_by_cell, achr_by_cell,
@@ -559,8 +596,11 @@ def _cell_temporaries(cell_rec, cell_fid, lava, land_cache, land_by_cell,
 def _build_cell_groups(by_type: dict, writer: PluginWriter,
                        navm_metas: list = None, base_model_by_fid: dict = None,
                        door_fids: set = None, navm_cache: dict = None,
-                       land_cache: dict = None):
-    """Build CELL group hierarchy (interior cells only — exterior in WRLD)."""
+                       land_cache: dict = None, children: tuple = None):
+    """Build CELL group hierarchy (interior cells only — exterior in WRLD).
+
+    `children` is `_children_by_cell(by_type)` when the caller already has it.
+    """
     if navm_metas is None:
         navm_metas = []
     if base_model_by_fid is None:
@@ -569,15 +609,8 @@ def _build_cell_groups(by_type: dict, writer: PluginWriter,
         navm_cache = {}
     lava = LavaPlanner(by_type, writer)
     cells = by_type.get('CELL', [])
-    refrs = by_type.get('REFR', [])
-    achrs = by_type.get('ACHR', []) + by_type.get('ACRE', [])
-    lands = by_type.get('LAND', [])
-    pgrds = by_type.get('PGRD', [])
-
-    refr_by_cell = _index_by_parent_cell(refrs)
-    achr_by_cell = _index_by_parent_cell(achrs)
-    land_by_cell = _index_by_parent_cell(lands)
-    pgrd_by_cell = _index_by_parent_cell(pgrds)
+    refr_by_cell, achr_by_cell, land_by_cell, pgrd_by_cell = (
+        children or _children_by_cell(by_type))
 
     interior_cells = [c for c in cells if not get_formid(c, 'ParentWRLD')]
 
@@ -763,6 +796,28 @@ def _pack_exterior_cell(cell_rec, sub_parts, ctx) -> int:
     return converted + 1
 
 
+def move_persistent_refs(by_type: dict, master_export) -> int:
+    """Re-parent each exterior cell's persistent refs onto its world's one
+    persistent cell (this plugin's, else a master's), where Skyrim.esm and both
+    DLCs keep every one; returns the count.  Runs once the navmeshes are built.
+    See: docs/commentary/tes5_import_world.md#exterior-persistent-refs-live-in-the-persistent-cell
+    """
+    pcells, world_of = defaultdict(dict), {}
+    for cell in values_of(master_export, 'CELL') + by_type.get('CELL', []):
+        wrld = get_formid(cell, 'ParentWRLD')
+        if wrld and _is_persistent(cell):
+            pcells[wrld][get_formid(cell, 'FormID')] = cell.get('FormID')
+        elif wrld:
+            world_of[get_formid(cell, 'FormID')] = wrld
+    moved = 0
+    for rec in by_type.get('REFR', []) + by_type.get('ACHR', []) + by_type.get('ACRE', []):
+        target = pcells.get(world_of.get(get_formid(rec, 'ParentCELL')), {})
+        if _is_persistent(rec) and len(target) == 1:
+            rec['ParentCELL'] = next(iter(target.values()))
+            moved += 1
+    return moved
+
+
 def _build_one_world(wrld_fid, wrld_rec, anchor_wrld, ctx):
     """Build one worldspace's records as (list of payloads, converted).
 
@@ -814,8 +869,12 @@ def _build_one_world(wrld_fid, wrld_rec, anchor_wrld, ctx):
 def _build_world_groups(by_type: dict, writer: PluginWriter,
                         navm_metas: list = None, base_model_by_fid: dict = None,
                         door_fids: set = None, navm_cache: dict = None,
-                        land_cache: dict = None, ctx=None):
-    """Build WRLD group hierarchy (worldspaces + exterior cells)."""
+                        land_cache: dict = None, ctx=None, children: tuple = None):
+    """Build WRLD group hierarchy (worldspaces + exterior cells).
+
+    `children` is `_children_by_cell(by_type)` when the caller already has it;
+    misplaced refs are re-homed inside it.
+    """
     if navm_metas is None:
         navm_metas = []
     if base_model_by_fid is None:
@@ -827,10 +886,6 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
     lava = LavaPlanner(by_type, writer)
     worlds = by_type.get('WRLD', [])
     cells = by_type.get('CELL', [])
-    refrs = by_type.get('REFR', [])
-    achrs = by_type.get('ACHR', []) + by_type.get('ACRE', [])
-    lands = by_type.get('LAND', [])
-    pgrds = by_type.get('PGRD', [])
 
     anchor_wrld = _anchor_worldspaces(worlds, cells, ctx)
 
@@ -845,8 +900,8 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
 
     set_world_land_extents(_land_extents_by_wrld(ext_cells_by_wrld))
 
-    refr_by_cell = _index_by_parent_cell(refrs)
-    achr_by_cell = _index_by_parent_cell(achrs)
+    refr_by_cell, achr_by_cell, land_by_cell, pgrd_by_cell = (
+        children or _children_by_cell(by_type))
 
     grid_cell = {}       # (wrld, gx, gy) -> output-space cell FormID
     grid_cell_raw = {}   # (wrld, gx, gy) -> cell's raw (TES4-space) FormID string
@@ -866,9 +921,6 @@ def _build_world_groups(by_type: dict, writer: PluginWriter,
         (refr_by_cell, achr_by_cell), cell_grid, grid_cell, grid_cell_raw)
     if rehomed:
         print(f"  Re-homed {rehomed} misplaced exterior refs to their position's cell")
-
-    land_by_cell = _index_by_parent_cell(lands)
-    pgrd_by_cell = _index_by_parent_cell(pgrds)
 
     if anchor_wrld and worlds:
         print(f"  Building WRLD hierarchy ({len(worlds)} own worldspace(s) "
@@ -984,6 +1036,7 @@ def _precompute_land(by_type: dict, export_dir: str) -> dict:
     from .base.locations import WORLD_NAMES
     from .record_types import items as items_mod
     from .record_types import world as world_mod
+    from .record_types import world_morrowind as world_mw
 
     initargs = (
         get_formid_index_offset(),
@@ -997,6 +1050,7 @@ def _precompute_land(by_type: dict, export_dir: str) -> dict:
         dict(world_mod._DOOR_NAVMESH_LINK),
         set(world_mod._WORLD_GRID_CELLS),
         dict(world_mod._DOOR_PLACEMENT),
+        world_mw.tes3_lock_state(),
     )
 
     chunks = [[('LAND', rec) for rec in lands[i:i + _LAND_CHUNK]]

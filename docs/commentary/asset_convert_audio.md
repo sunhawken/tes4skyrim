@@ -1,6 +1,33 @@
 # asset_convert/audio/audio_converter.py - sound and music
 
-**Code:** `asset_convert/audio/audio_converter.py`, `asset_convert/audio/music_convert.py`, `asset_convert/audio/door_sounds.py`
+**Code:** `asset_convert/audio/audio_converter.py`, `asset_convert/audio/music_convert.py`, `asset_convert/audio/door_sounds.py`, `asset_convert/audio/morrowind_voice.py`
+
+## Morrowind barks
+<a id="morrowind-barks"></a>
+
+Morrowind is barely voiced, and every line it DOES voice is a bark: 8,549 INFOs
+over Morrowind.esm + Tamriel Rebuilt + Tamriel Data, all of topic type `Voice`,
+naming 6,152 distinct files (~118 MB). All 8,549 carry response text, so every
+one can have a lip track.
+
+The only difference from the Oblivion layout is the FILENAME. Morrowind names
+its audio outright (`Vo\d\m\Hlo_DM008.mp3`) while `organize_voice_files` matches
+`<prefix>_<infoFID>_<n>.<ext>` under `sound/Voice/<plugin>/<Race>/<Gender>/`. So
+`morrowind_voice.stage_bark_voices` copies each referenced file into that layout
+under its INFO FormID, and the ordinary pipeline supplies lip, xWMA and fuz
+unchanged.
+
+A bark names its file by STEM, not extension: a record or script may say `.wav`
+where the tree ships `.mp3`, and Morrowind resolves either way. Measured over
+the 87 scripted `Say` targets: 39 match exactly, 48 only once the extension is
+ignored, none are missing.
+
+A scripted `Say` line names no race, so it is staged in a neutral bucket
+(`Imperial/M`) and the importer's voicemap sends it to the voice-type folder of
+each authored speaker. A line spoken by something with no mouth is copied under
+`sound/` by `stage_say_sounds`, keeping the SOURCE's extension under the name
+the script wrote, so the sound stage transcodes an `.mp3` a script called
+`.wav`. See [scripted Say](morrowind_runtime.md#scripted-say).
 
 ## Contents
 
@@ -431,6 +458,22 @@ the contended mutex.
 subdirectory with `FonixData.cdf` hard-linked beside it, since the exe loads the
 `.cdf` relative to its own location.
 
+Lip sync contracts: the SSE Creation Kit's own `LipGenerator.exe`
+(`find_lipgenerator()`, `<SSE install>/Tools/LipGen/LipGenerator/`, needs the
+sibling `FonixData.cdf`) runs as `LipGenerator <wav> "<text>"` and writes
+`<wav basename>.lip` beside the input. It resamples internally but writes
+`tmp16khz.wav` into its CWD, so every parallel job runs in a private temp dir
+(`convert_file_to_xwm` uses `mkdtemp` per job). SSE reads lip data ONLY from `.fuz`
+containers (loose `.lip` is LE-only): `FUZE` + u32 version 1 + u32 lipSize + lip +
+xwm (`pack_fuz()`). Transcripts come from `dialog_converter`
+({(info_fid24, resp_num): NAM1 text}), are written to `<esm>.liptext.txt`, and
+`organize_voice_files` pairs them by (fid24, response index); a line without a
+transcript stays a bare `.xwm` (audio, no mouth movement). INFO ENAM bit 0x0800
+("No LIP File") is never set. Lip bytes are nondeterministic run to run, even
+stock: never byte-compare. FaceFXWrapper was rejected (same Fonix core, same cap,
+and its mutex string is compressed and unpatchable). Oblivion's own `.lip` files
+are an older FaceFX format and are skipped at BSA extraction.
+
 ## Voice file naming: the Oblivion prefix cannot be trusted
 <a id="voice-file-naming-prefix"></a>
 
@@ -454,6 +497,24 @@ actually resolves to when that differs from the Oblivion source race folder —
 Arvena Thelas is a Dark Elf whose recordings sit under `high elf/f/`. An empty
 list means keep the source race folder, which is correct for generic lines
 recorded once per race.
+
+## A plugin's lines come from its own voice folder
+<a id="own-voice-folder"></a>
+
+Oblivion finds a line under `sound/Voice/<the plugin that defines the INFO>/`,
+so a plugin's run converts only the source folder named after it (any case).
+Every other folder in a shared tree belongs to another plugin: converting it
+under this plugin's name copied a master's whole library into a dialogue-less
+patch, and its lines never play there.
+
+Measured over every extracted tree: each has one voice folder, named for its
+plugin, except Unique Landscapes Compilation, whose second folder
+(`xulbrenariverravine.esp`, a plugin merged into it) holds the same 81 INFO ids
+as `unique landscapes.esp`. Both used to land on the same output names, so the
+copy written last won; now the plugin's own copy does.
+
+Lines are not borrowed from other folders by voicemap id: the voicemap is keyed
+on the 24-bit INFO id, so a master's line can share a patch INFO's low bits.
 
 ## Race identity spans the masters
 <a id="race-identity-spans-the-masters"></a>

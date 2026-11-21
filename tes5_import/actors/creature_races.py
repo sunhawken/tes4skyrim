@@ -30,13 +30,22 @@ the Oblivion skeleton — hits still register, dismember targeting is off),
 and ARMA has no footstep SNDD yet.
 """
 
+from asset_convert.game_paths import find_nocase
 from asset_convert.havok.behavior_vocabulary import movement_type_names
 import os
 import struct
 
+from ..base.master_export import records_of, values_of
 from ..base.writer import (pack_record, pack_subrecord, pack_string_subrecord,
                      pack_formid_subrecord, pack_obnd)
 from ..base.text_reader import get_float, get_formid, get_int, get_str
+from ..overrides.adoption import generated_formid
+from ..record_types.equipment import attack_spell
+from .creature_projects import (bodies_of, folder_of,
+                                folders_built_by_master, load_projects)
+from .creature_speakers import talking_creatures
+from .creature_unarmed import build_unarmed_abilities, race_unarmed_damage
+from .creature_unarmed import reset as reset_unarmed_abilities
 
 # GMST fNPCHealthLevelBonus (Skyrim.esm) — health the engine grants per level
 # above 1. Defined here rather than imported from record_types.actors because
@@ -260,14 +269,12 @@ def _pile_mesh_bounds(proj, pile_name):
     """
     import os
 
-    rel = os.path.join('meshes', proj.get('body_dir', ''), pile_name)
+    rel = ('meshes', proj.get('body_dir', ''), pile_name)
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    candidates = []
     out = os.path.join(root, 'output')
-    if os.path.isdir(out):
-        for plugin in sorted(os.listdir(out)):
-            candidates.append(os.path.join(out, plugin, rel))
-    path = next((p for p in candidates if os.path.exists(p)), None)
+    plugins = sorted(os.listdir(out)) if os.path.isdir(out) else []
+    found = (find_nocase(os.path.join(out, plugin), *rel) for plugin in plugins)
+    path = next((p for p in found if p), None)
     if path is None:
         return None
     try:
@@ -339,9 +346,9 @@ def build_creature_death_piles(writer) -> int:
         pile = proj.get('death_pile')
         if not pile:
             continue
-        fid = writer.derive_formid('CREA_PILE', folder)
-        subs = pack_string_subrecord(
-            'EDID', f'TES4Cr{folder.capitalize()}DeathPile')
+        edid = f'TES4Cr{folder.capitalize()}DeathPile'
+        fid = generated_formid(writer, 'ACTI', edid, 'CREA_PILE', folder)
+        subs = pack_string_subrecord('EDID', edid)
         bounds = _pile_mesh_bounds(proj, pile)
         if bounds is None:
             subs += pack_obnd(-24, -24, -4, 24, 24, 16)
@@ -396,9 +403,9 @@ def build_creature_voice_types(writer) -> int:
     """
     _CREA_VOICE_MAP.clear()
     for folder in sorted(set(_CREA_FOLDER_MAP.values())):
-        fid = writer.derive_formid('CREA_VTYP', folder)
-        subs = pack_string_subrecord(
-            'EDID', f'TES4Cr{folder.capitalize()}Voice')
+        edid = f'TES4Cr{folder.capitalize()}Voice'
+        fid = generated_formid(writer, 'VTYP', edid, 'CREA_VTYP', folder)
+        subs = pack_string_subrecord('EDID', edid)
         subs += pack_subrecord('DNAM', struct.pack('<B', _CREATURE_VTYP_DNAM))
         writer.add_record('VTYP', pack_record('VTYP', fid, 0, subs))
         _CREA_VOICE_MAP[folder] = fid
@@ -474,9 +481,9 @@ def build_creature_body_parts(writer) -> int:
             s += pack_subrecord('NAM5', b'')
             return s
 
-        fid = writer.derive_formid('CREA_BPTD', folder)
-        subs = pack_string_subrecord(
-            'EDID', f'TES4{folder.capitalize()}BodyPartData')
+        edid = f'TES4{folder.capitalize()}BodyPartData'
+        fid = generated_formid(writer, 'BPTD', edid, 'CREA_BPTD', folder)
+        subs = pack_string_subrecord('EDID', edid)
         subs += pack_string_subrecord('MODL', skel)
         subs += pack_subrecord('MODT', _BPTD_MODT)
         # vanilla dog order: Head part first, Torso second
@@ -657,6 +664,8 @@ _SHIELD_FIDS = set() # fid_low24 of ARMO records occupying the shield slot
 _LVLI_REC = {}       # fid_low24 → LVLI record dict
 _SPEL_REC = {}       # fid_low24 → SPEL record dict
 _LVSP_REC = {}       # fid_low24 → LVSP record dict
+#: {generated race FormID: [(ATKE event, ATKD)]} of every race written this run.
+_RACE_ATTACKS = {}
 
 # TES4 ARMO BMDT biped slot bits (wbDefinitionsTES4.pas:1326-1341).
 # Shield is bit 13 and Torch bit 14 — NOT bit 9, which is 'Weapon'.
@@ -680,6 +689,7 @@ def load_creature_item_index(by_type: dict, master_export: dict = None) -> None:
     _LVLI_REC.clear()
     _SPEL_REC.clear()
     _LVSP_REC.clear()
+    _RACE_ATTACKS.clear()
 
     def _add(rec):
         sig = rec.get('Signature')
@@ -703,9 +713,8 @@ def load_creature_item_index(by_type: dict, master_export: dict = None) -> None:
         else:
             _LVLI_REC[fid] = rec
 
-    if master_export:
-        for rec in master_export.values():
-            _add(rec)
+    for rec in values_of(master_export, 'WEAP', 'ARMO', 'LVLI', 'SPEL', 'LVSP'):
+        _add(rec)
     # This plugin's own records are indexed LAST so an override wins.
     for sig in ('WEAP', 'ARMO', 'LVLI', 'SPEL', 'LVSP'):
         for rec in by_type.get(sig, []):
@@ -744,25 +753,16 @@ def _item_vnam_bits(fid: int, depth: int = 0, path=()) -> int:
 
 
 def _creature_equip_flags(recs: list) -> int:
-    """VNAM 'Equipment Flags' for a generated race, from what its creatures
-    actually carry.
+    """VNAM 'Equipment Flags' for a generated race: the union over every CREA
+    sharing it of the weapon classes they carry, plus hand-to-hand always, plus
+    Spell only when one of them knows a castable spell (SPIT.Type 0).
 
-    A generated race is SHARED by every CREA with the same mesh folder and body
-    set, so the flags are the union over all of them — a race must permit
-    whatever any of its creatures was authored to wield (goblin berserkers,
-    warlords and shamans share one skeleton but carry blades, bows and staffs
-    respectively).
-
-    Hand-to-hand is always allowed — every creature can attack unarmed, and
-    that is the one bit even DogRace sets.  Spell is added only when a creature
-    sharing the race actually knows one: TES4 grants spells through SPLO rather
-    than an inventory item, so the inventory alone never reveals it.  Vanilla
-    splits the same way (census of 99 Skyrim.esm races: 60 set the Spell bit,
-    31 are exactly FFFFE001 with neither spells nor weapons).
+    See: docs/commentary/tes5_import_actors.md#caster-race-needs-a-castable-spell
     """
     bits = _VNAM_HAND_TO_HAND
     for rec in recs:
-        if get_int(rec, 'SpellCount'):
+        if any(_spell_effect_ranges(get_formid(rec, f'Spell[{i}]') or 0)
+               for i in range(get_int(rec, 'SpellCount'))):
             bits |= _VNAM_SPELL
         for i in range(get_int(rec, 'ItemCount')):
             try:
@@ -788,11 +788,21 @@ def _creature_equip_flags(recs: list) -> int:
 _TES4_CREA_SWIMS, _TES4_CREA_FLIES, _TES4_CREA_WALKS = 0x10, 0x20, 0x40
 _RACE_SWIMS, _RACE_FLIES, _RACE_WALKS = 0x40, 0x80, 0x100
 _RACE_NO_COMBAT_IN_WATER = 0x800
+_RACE_ALLOW_PC_DIALOGUE = 0x200000
+#: TES4 CREA ACBS Biped, which walks without the Walks bit (OpenMW `Creature::canWalk`).
+_TES4_CREA_BIPED = 0x01
+#: RACE DATA Immobile: the race of a creature that cannot move at all, as vanilla dunMiddenEmptyRace.
+_RACE_IMMOBILE = 0x200
+#: RACE DATA Can't Open Doors, which the DogRace template carries.
+_RACE_CANT_OPEN_DOORS = 0x00100000
+#: FO3/FNV CREA ACBS Can't Open Doors; TES3 and TES4 creatures have no such bit, so theirs all open doors.
+_CREA_CANT_OPEN_DOORS = 0x00400000
 
 
 def _race_locomotion_flags(recs: list) -> int:
     """Swims/Flies/Walks union over the creatures sharing the race (one race
-    per mesh folder), plus NoCombatInWater for pure walkers."""
+    per mesh folder), plus NoCombatInWater for pure walkers. A biped walks; a
+    race none of whose creatures can swim, fly or walk is Immobile."""
     t4 = 0
     for r in recs:
         t4 |= get_int(r, 'ACBS.Flags')
@@ -801,26 +811,41 @@ def _race_locomotion_flags(recs: list) -> int:
         bits |= _RACE_SWIMS
     if t4 & _TES4_CREA_FLIES:
         bits |= _RACE_FLIES
-    if t4 & _TES4_CREA_WALKS or not bits:
+    if t4 & (_TES4_CREA_WALKS | _TES4_CREA_BIPED):
         bits |= _RACE_WALKS
+    if not bits:
+        return _RACE_IMMOBILE | _RACE_NO_COMBAT_IN_WATER
     if not (bits & _RACE_SWIMS):
         bits |= _RACE_NO_COMBAT_IN_WATER
     return bits
 
 
-def _race_data(rec: dict, race_recs: list = None) -> bytes:
+def _attack_reach(rec: dict) -> int:
+    """The creature's authored TES4 attack reach, 64 when unset."""
+    return get_int(rec, 'RNAM.AttackReach', 64) or 64
+
+
+def _race_data(rec: dict, race_recs: list = None, reach: int = None,
+               talks: bool = False) -> bytes:
     """The 164-byte RACE DATA: DogRace template with CREA stat patches.
 
     Starting Health is the flat CREATURE_RACE_BASE_HEALTH, NOT this creature's
     pool: the race is shared by every CREA with the same mesh folder and body
     set, so per-creature health belongs in ACBS.HealthOffset instead (see
-    creature_health_offset).
+    creature_health_offset).  Unarmed reach is `reach`, else `rec`'s own.
+    Allow PC Dialogue is set only when `talks`.
+    See: docs/commentary/tes5_import_actors.md#creature-talk-prompt
     """
     data = bytearray(_RACE_DATA_TEMPLATE)
     flags = struct.unpack_from('<I', data, 32)[0]
-    flags &= ~(_RACE_SWIMS | _RACE_FLIES | _RACE_WALKS
-               | _RACE_NO_COMBAT_IN_WATER)
+    flags &= ~(_RACE_SWIMS | _RACE_FLIES | _RACE_WALKS | _RACE_IMMOBILE
+               | _RACE_NO_COMBAT_IN_WATER | _RACE_ALLOW_PC_DIALOGUE
+               | _RACE_CANT_OPEN_DOORS)
     flags |= _race_locomotion_flags(race_recs or [rec])
+    if all(get_int(r, 'ACBS.Flags') & _CREA_CANT_OPEN_DOORS for r in race_recs or [rec]):
+        flags |= _RACE_CANT_OPEN_DOORS
+    if talks:
+        flags |= _RACE_ALLOW_PC_DIALOGUE
     struct.pack_into('<I', data, 32, flags)
     struct.pack_into('<f', data, 36, float(creature_race_health(rec)))
     # Starting Magicka is 0 for the same shared-race reason as health: the
@@ -833,10 +858,8 @@ def _race_data(rec: dict, race_recs: list = None) -> bytes:
     struct.pack_into('<f', data, 88, _MAGICKA_RETURN['fMagickaReturnBase']
                      + _MAGICKA_RETURN['fMagickaReturnMult']
                      * get_int(rec, 'DATA.Willpower', 50))
-    struct.pack_into('<f', data, 96,
-                     float(max(1, get_int(rec, 'DATA.AttackDamage', 5))))
-    reach = get_int(rec, 'RNAM.AttackReach', 64) or 64
-    struct.pack_into('<f', data, 100, float(reach))
+    struct.pack_into('<f', data, 96, race_unarmed_damage(race_recs or [rec]))
+    struct.pack_into('<f', data, 100, float(reach or _attack_reach(rec)))
     return bytes(data)
 
 
@@ -890,31 +913,20 @@ def _spell_is_offensive(fid: int) -> bool:
     return bool(_spell_effect_ranges(fid) - {_TES4_EFFECT_SELF})
 
 
-def creature_touch_attack_spell(recs: list) -> int:
-    """The spell to hang on the race's MELEE attacks as ATKD 'Attack Spell',
-    or 0.
+def creature_touch_attack_spell(recs: list, writer=None) -> int:
+    """The spell the race's MELEE attacks cast as ATKD 'Attack Spell', or 0.
 
-    This is the vanilla melee-caster idiom: the flame atronach's four
-    ordinary attackStart_* entries each name crAtronachFlameMeleeAttack /
-    ...PowerAttack — a fire spell applied by the swing (109 attack entries
-    across Skyrim.esm carry an Attack Spell). Its TES4 analogue is the
-    TOUCH-delivery offensive spell a creature cast in melee range, so
-    exactly those qualify: castable (SPIT.Type 0), at least one Touch
-    effect, and no Target effect (aimed spells go through the real cast
-    chain — the graph's FireForget states — instead).
-
-    First match in (record, slot) order so the result is deterministic; the
-    race is shared by every CREA with the same mesh + body set.
+    The first castable spell (SPIT.Type 0), in (record, slot) order, with a
+    Touch effect and no Target one; aimed spells go through the graph's cast
+    chain instead.  The attack names the spell's Contact copy (`attack_spell`).
+    See: docs/commentary/tes5_import_magic.md#creature-attack-spells
     """
     for rec in recs:
         for i in range(get_int(rec, 'SpellCount')):
             fid = get_formid(rec, f'Spell[{i}]')
-            if not fid:
-                continue
             ranges = _spell_effect_ranges(fid)
-            if _TES4_EFFECT_TOUCH in ranges and \
-                    _TES4_EFFECT_TARGET not in ranges:
-                return fid
+            if _TES4_EFFECT_TOUCH in ranges and _TES4_EFFECT_TARGET not in ranges:
+                return attack_spell(fid, _SPEL_REC.get(fid & 0x00FFFFFF), writer)
     return 0
 
 
@@ -940,11 +952,10 @@ def _atkd(damage_mult: float = 1.0, spell: int = 0, chance: float = 1.0,
                        0.0, 0.0, 1.0)
 
 
-def _build_race(writer, rec, folder: str, bodies: list, proj: dict,
-                race_fid: int, skin_fid: int, edid: str, full: str,
-                vnam_flags: int = None, race_recs: list = None) -> None:
-    subs = b''
-    subs += pack_string_subrecord('EDID', edid)
+def _race_head_subs(rec, folder: str, proj: dict, skin_fid: int, edid: str,
+                    full: str, data: bytes) -> bytes:
+    """A creature race's EDID through MTNM: names, skin, keywords, DATA, skeleton."""
+    subs = pack_string_subrecord('EDID', edid)
     subs += pack_string_subrecord('FULL', full)
     subs += pack_subrecord('DESC', b'\x00')
     subs += pack_formid_subrecord('WNAM', skin_fid)
@@ -953,45 +964,66 @@ def _build_race(writer, rec, folder: str, bodies: list, proj: dict,
     subs += pack_subrecord('KSIZ', struct.pack('<I', len(keywords)))
     subs += pack_subrecord('KWDA',
                            b''.join(struct.pack('<I', k) for k in keywords))
-    subs += pack_subrecord('DATA', _race_data(rec, race_recs))
-
-    skeleton = proj['skeleton_nif']
+    subs += pack_subrecord('DATA', data)
     for marker in ('MNAM', 'FNAM'):
         subs += pack_subrecord(marker, b'')
-        subs += pack_string_subrecord('ANAM', skeleton)
+        subs += pack_string_subrecord('ANAM', proj['skeleton_nif'])
         subs += pack_subrecord('MODT', _MODT)
     for code in _MTNM_CODES:
         subs += pack_subrecord('MTNM', code)
-    from ..record_types.actor_common import resolve_actor_voice
-    subs += pack_subrecord('VTCK', struct.pack(
-        '<II', resolve_actor_voice(rec, 'Male'),
-        resolve_actor_voice(rec, 'Female')))
-    subs += pack_subrecord('PNAM', struct.pack('<f', 5.0))
-    subs += pack_subrecord('UNAM', struct.pack('<f', 3.0))
+    return subs
 
-    # A TOUCH-delivery offensive spell rides the melee attacks as ATKD
-    # 'Attack Spell' — the vanilla melee-caster idiom (the flame atronach's
-    # four ordinary attack entries each name a fire spell; see
-    # creature_touch_attack_spell). Aimed/self spells are NOT attacks: they
-    # go through SPLO + the behavior graph's FireForget cast chain.
-    touch_spell = creature_touch_attack_spell(race_recs or [rec])
-    for event, _clip in proj.get('attacks', []):
-        subs += pack_subrecord('ATKD', _atkd(spell=touch_spell))
-        subs += pack_string_subrecord('ATKE', event)
 
-    subs += pack_subrecord('NAM1', b'')
+def _race_attack_subs(writer, recs: list, proj: dict, race_fid: int) -> bytes:
+    """ATKD/ATKE per graph attack, each casting the race's touch spell; kept for race_attacks()."""
+    touch_spell = creature_touch_attack_spell(recs, writer)
+    attacks = _RACE_ATTACKS[race_fid] = [(event, _atkd(spell=touch_spell))
+                                          for event, _clip in proj.get('attacks', [])]
+    return b''.join(pack_subrecord('ATKD', atkd) + pack_string_subrecord('ATKE', event)
+                    for event, atkd in attacks)
+
+
+def race_attacks(race_fid: int) -> list:
+    """[(ATKE event, ATKD)] of a race this run wrote; [] for any other."""
+    return _RACE_ATTACKS.get(race_fid, [])
+
+
+def spell_record(fid: int):
+    """The export SPEL record of a spell this run or its masters own, else None."""
+    return _SPEL_REC.get(fid & 0x00FFFFFF)
+
+
+def _race_body_subs(proj: dict) -> bytes:
+    """NAM1 face models, GNAM, NAM3 behavior project: the race's body data."""
+    subs = pack_subrecord('NAM1', b'')
     for marker, egt in (('MNAM', _EGT_MALE), ('FNAM', _EGT_FEMALE)):
         subs += pack_subrecord(marker, b'')
         subs += pack_subrecord('INDX', struct.pack('<I', 0))
         subs += pack_string_subrecord('MODL', egt)
         subs += pack_subrecord('MODT', _MODT)
     subs += pack_formid_subrecord('GNAM', _GNAM_BPTD)
-
     subs += pack_subrecord('NAM3', b'')
     for marker in ('MNAM', 'FNAM'):
         subs += pack_subrecord(marker, b'')
         subs += pack_string_subrecord('MODL', proj['project_hkx'])
         subs += pack_subrecord('MODT', _MODT)
+    return subs
+
+
+def _build_race(writer, rec, folder: str, bodies: list, proj: dict,
+                race_fid: int, skin_fid: int, edid: str, full: str,
+                vnam_flags: int = None, race_recs: list = None,
+                reach: int = None, talks: bool = False) -> None:
+    subs = _race_head_subs(rec, folder, proj, skin_fid, edid, full,
+                           _race_data(rec, race_recs, reach, talks))
+    from ..record_types.actor_common import resolve_actor_voice
+    subs += pack_subrecord('VTCK', struct.pack(
+        '<II', resolve_actor_voice(rec, 'Male'),
+        resolve_actor_voice(rec, 'Female')))
+    subs += pack_subrecord('PNAM', struct.pack('<f', 5.0))
+    subs += pack_subrecord('UNAM', struct.pack('<f', 3.0))
+    subs += _race_attack_subs(writer, race_recs or [rec], proj, race_fid)
+    subs += _race_body_subs(proj)
 
     subs += pack_formid_subrecord('NAM4', _NAM4_IMPACT_MAT)
     subs += pack_formid_subrecord('NAM5', _NAM5_IMPACT_SET)
@@ -1066,23 +1098,30 @@ def _build_movts(writer, folder: str, proj: dict) -> None:
 
 
 def _build_skin(writer, folder: str, bodies: list, race_fid: int,
-                skin_fid: int, edid_base: str, body_dir: str) -> None:
+                skin_fid: int, edid_base: str, body_dir: str,
+                extra_races: list = ()) -> None:
     """Single BODY-slot ARMA (the merged whole-animal NIF) + its skin ARMO.
 
     Vanilla creatures use ONE ARMA on slot BODY (0x4); the creature pipeline
     merges every Oblivion body part into one <creature>.nif so a single ARMA
-    covers the whole animal (see merge_creature_body / DogRace census)."""
+    covers the whole animal (see merge_creature_body / DogRace census).
+    `extra_races` (the reach variants sharing this skin) are the ARMA's
+    Additional Races, so the engine fits the body on them too."""
     body = bodies[0]
     # `bodies` are the source CREA's TES4 NIFZ model paths (authored), not
     # our merged output name, so this key survives changes to mesh merging.
-    arma_fid = writer.derive_formid('CREA_ARMA', (folder, tuple(bodies)))
     stem = os.path.splitext(body)[0]
+    arma_edid = f'TES4{edid_base}{stem}AA'
+    arma_fid = generated_formid(writer, 'ARMA', arma_edid, 'CREA_ARMA',
+                                (folder, tuple(bodies)))
     subs = b''
-    subs += pack_string_subrecord('EDID', f'TES4{edid_base}{stem}AA')
+    subs += pack_string_subrecord('EDID', arma_edid)
     subs += pack_subrecord('BOD2', struct.pack('<II', 0x4, 2))
     subs += pack_formid_subrecord('RNAM', race_fid)
     subs += pack_subrecord('DNAM', _ARMA_DNAM)
     subs += pack_string_subrecord('MOD2', f'{body_dir}\\{body}')
+    for extra in extra_races:
+        subs += pack_formid_subrecord('MODL', extra)
     writer.add_record('ARMA', pack_record('ARMA', arma_fid, 0, subs))
     # Footstep sounds hang off ARMA.SNDD, which is written later (the FSTS it
     # points at is allocated last so it cannot shift other FormIDs) — see
@@ -1102,121 +1141,18 @@ def _build_skin(writer, folder: str, bodies: list, race_fid: int,
     writer.add_record('ARMO', pack_record('ARMO', skin_fid, 4, subs))
 
 
-def _load_projects(export_dir: str) -> dict:
-    """This plugin's creature projects, with its MASTERS' projects merged in
-    underneath.
+def _shared_creatures(by_type: dict, master_export: dict) -> list:
+    """Every CREA a generated race serves: the masters' (as overridden), then ours.
 
-    A plugin with a TES4 master re-uses the master's creature folders wholesale
-    (Morrowind_ob.esm places 86 CREA records on Oblivion.esm's rat/skeleton/
-    goblin/... meshes, which its own BSA never ships, so the creatures step
-    extracts no folder for them and its creature_projects.json has no entry).
-    Without the master's projects those CREA records fell through to
-    resolve_creature_race and shipped as BASE SKYRIM creatures — a Skyrim
-    frostbite spider or a Nord standing in for the converted Oblivion actor.
-
-    The master's generated behavior project, skeleton and merged body NIFs all
-    live under ITS output dir and are loaded by path at runtime, so pointing
-    this plugin's generated RACE chain at them is correct: the assets exist and
-    are shared, exactly as the source plugin intended. Own projects win on
-    conflict — this plugin's own conversion of a folder is the authoritative
-    one for the records it ships — EXCEPT when the own project ships no body
-    mesh at all, which is never authoritative for anything: see _usable().
-
-    Projects are keyed on the model folder's LEAF name, so a plugin shipping
-    its own folder under a master's leaf name shadows the master's project
-    even when its CREA records point at the MASTER's path.
-
-    See: docs/commentary/tes5_import_mod_merge.md#master-export-resolution
+    See: docs/commentary/tes5_import_override.md#generated-records-reuse-the-masters
     """
-    from ..base.artifact_schema import read_artifact
-    own_path = os.path.join(export_dir, 'creature_projects.json')
-    own = {}
-    if os.path.exists(own_path):
-        # Raises StaleArtifactError (surfaced by convert.py) when this file
-        # predates a field the builders below subscript without a default.
-        own = read_artifact(
-            own_path, os.path.basename(os.path.normpath(export_dir)))
-
-    header = os.path.join(export_dir, '_HEADER.txt')
-    if not os.path.isfile(header):
-        return own
-    names = []
-    with open(header, 'r', encoding='utf-8') as f:
-        for line in f:
-            if line.startswith('Master['):
-                _, _, val = line.partition('=')
-                names.append(val.strip())
-
-    from ..overrides.nested import export_root, master_export_dir
-    root = export_root(export_dir)
-
-    def _usable(proj) -> bool:
-        """A project can serve a CREA record only if it merged at least one
-        body NIF.  One with none can never satisfy _bodies_of, so letting it
-        shadow a master's real project costs the record its generated race."""
-        return bool(proj.get('bodies') or proj.get('body_map'))
-
-    merged, inherited, rescued = {}, 0, []
-    for name in names:
-        mpath = os.path.join(master_export_dir(root, name),
-                             'creature_projects.json')
-        if not os.path.exists(mpath):
-            continue
-        # The MASTER's file, so the master is what has to be re-run -- pass it
-        # as the hint or a v0 file (no envelope, no plugin field) would blame
-        # whichever plugin happened to be converting.
-        for folder, proj in read_artifact(mpath, name).items():
-            if folder in merged:
-                continue
-            if folder in own and _usable(own[folder]):
-                continue
-            if folder in own and _usable(proj):
-                # Own project has no body mesh; the master's does. Take the
-                # master's — the own folder is dead assets sharing a leaf name.
-                rescued.append(folder)
-            merged[folder] = proj
-            inherited += 1
-    if inherited:
-        print(f'  Creature projects: inherited {inherited} from master(s) '
-              f'{", ".join(names)} (own: {len(own)})')
-    if rescued:
-        print(f'  Creature projects: {len(rescued)} bodyless own project(s) '
-              f'superseded by the master\'s: {", ".join(sorted(rescued))}')
-    for folder, proj in own.items():
-        if folder in merged and not _usable(proj):
-            continue        # keep the master's usable project
-        merged[folder] = proj
-    return merged
+    own = {(rec.get('FormID') or '').upper(): rec for rec in by_type.get('CREA', [])}
+    shared = [own.pop(fid.upper(), rec) for fid, rec in records_of(master_export, 'CREA')]
+    return shared + list(own.values())
 
 
-def _folder_of(rec) -> str:
-    """The creature's mesh folder token: "Creatures\\Dog\\Skeleton.NIF" -> "dog"."""
-    model = (get_str(rec, 'Model.MODL') or '').replace('/', '\\')
-    parts = [p for p in model.lower().split('\\') if p]
-    return parts[-2] if len(parts) >= 2 else ''
-
-
-def _bodies_of(rec, proj):
-    """The merged body NIF(s) for one CREA, or None when the project has none.
-
-    The creature pipeline merged each CREA's NIFZ part set into ONE whole-animal
-    NIF and ships the exact set->file mapping as ``body_map``, so dog / wolf /
-    skeletal-hound (one folder) each point at the right mesh without re-deriving
-    names here.  Falls back to the folder's first merged NIF.
-    """
-    nifz = [(get_str(rec, f'NIFZ[{i}]') or '').lower()
-            for i in range(get_int(rec, 'NIFZCount', 0))]
-    nifz = [p for p in nifz if p.endswith('.nif')]
-    merged = (proj.get('body_map') or {}).get('|'.join(nifz))
-    if merged:
-        return [merged]
-    if proj['bodies']:
-        return [proj['bodies'][0]]
-    return None
-
-
-def _race_groups(by_type: dict) -> dict:
-    """(folder, bodies) -> every CREA sharing it, in by_type order.
+def _race_groups(creatures: list) -> dict:
+    """(folder, bodies) -> every CREA sharing it, in `creatures` order.
 
     A generated race is SHARED by every CREA with the same folder and body set,
     so its equipment flags must be the union over all of them — computed in this
@@ -1224,12 +1160,12 @@ def _race_groups(by_type: dict) -> dict:
     rest of the group has been walked.
     """
     race_recs = {}
-    for rec in by_type.get('CREA', []):
-        folder = _folder_of(rec)
+    for rec in creatures:
+        folder = folder_of(rec)
         proj = _PROJECTS.get(folder)
         if proj is None:
             continue
-        bodies = _bodies_of(rec, proj)
+        bodies = bodies_of(rec, proj)
         if bodies is None:
             continue
         race_recs.setdefault((folder, tuple(bodies)), []).append(rec)
@@ -1242,26 +1178,40 @@ def _race_is_armed(vnam: int) -> bool:
 
 
 def _build_race_chain(writer, rec, folder: str, bodies: list, proj: dict,
-                      key, race_recs: dict) -> tuple:
+                      key, race_recs: dict, talkers: set) -> tuple:
     """Emit the RACE + skin ARMA/ARMO pair for one (folder, bodies) key.
 
-    Derives both FormIDs from ``key`` before writing, keeping allocation order
-    tied to authored data rather than to walk order.  Returns
-    ``(race FormID, VNAM equipment flags)``.
+    The race takes the founding record's attack reach; every other authored
+    reach among the CREA sharing it gets a variant race, identical but for
+    that reach, keyed on (key, reach) and sharing the skin.  FormIDs derive
+    from authored data, never walk order.  Every race allows PC dialogue when
+    any sharing CREA is in `talkers`.  Returns
+    ``(race FormID, {reach: variant race FormID}, VNAM equipment flags)``.
+    See: docs/commentary/tes5_import_actors.md#reach-variant-races
     """
-    race_fid = writer.derive_formid('CREA_RACE', key)
-    skin_fid = writer.derive_formid('CREA_SKIN', key)
     edid = get_str(rec, 'EditorID') or folder
     edid_base = ''.join(c for c in edid if c.isalnum()) or folder
+    race_fid = generated_formid(writer, 'RACE', f'TES4{edid_base}Race',
+                                'CREA_RACE', key)
+    skin_fid = generated_formid(writer, 'ARMO', f'TES4Skin{edid_base}',
+                                'CREA_SKIN', key)
     full = get_str(rec, 'FULL') or edid
-    vnam = _creature_equip_flags(race_recs.get(key, [rec]))
-    _build_race(writer, rec, folder, bodies, proj,
-                race_fid, skin_fid, f'TES4{edid_base}Race', full,
-                vnam_flags=vnam,
-                race_recs=race_recs.get(key, [rec]))
+    recs = race_recs.get(key, [rec])
+    vnam = _creature_equip_flags(recs)
+    variants = {r: generated_formid(writer, 'RACE', f'TES4{edid_base}RaceReach{r}',
+                                    'CREA_RACE_REACH', (key, r))
+                for r in sorted({_attack_reach(x) for x in recs})
+                if r != _attack_reach(rec)}
+    talks = any(get_formid(x, 'FormID') in talkers for x in recs)
+    for reach, fid in [(None, race_fid)] + sorted(variants.items()):
+        suffix = f'Reach{reach}' if reach else ''
+        _build_race(writer, rec, folder, bodies, proj, fid, skin_fid,
+                    f'TES4{edid_base}Race{suffix}', full,
+                    vnam_flags=vnam, race_recs=recs, reach=reach, talks=talks)
+    build_unarmed_abilities(writer, key, recs, f'TES4{edid_base}')
     _build_skin(writer, folder, bodies, race_fid, skin_fid,
-                edid_base, proj['body_dir'])
-    return race_fid, vnam
+                edid_base, proj['body_dir'], list(variants.values()))
+    return race_fid, variants, vnam
 
 
 def _index_crea_folders(by_type: dict) -> None:
@@ -1278,39 +1228,62 @@ def _index_crea_folders(by_type: dict) -> None:
             _CREA_FOLDER_MAP[get_formid(rec, 'FormID') & 0x00FFFFFF] = folder
 
 
+def _reset_tables() -> None:
+    """Forget the previous plugin's creature race, folder, ARMA and ability tables."""
+    _CREA_RACE_MAP.clear()
+    _CREA_FOLDER_MAP.clear()
+    _CREA_ARMA_FOLDER.clear()
+    reset_unarmed_abilities()
+
+
 def build_creature_races(by_type: dict, writer, export_dir: str,
                          master_export: dict = None) -> None:
     """Phase 0f: one generated RACE + skin ARMO/ARMA per unique
     (creature folder, body-part set) among CREA records with a converted
     project. Populates the crea→race map used by convert_CREA."""
     global _PROJECTS
-    _CREA_RACE_MAP.clear()
-    _CREA_FOLDER_MAP.clear()
-    _CREA_ARMA_FOLDER.clear()
+    _reset_tables()
     load_creature_item_index(by_type, master_export)
     _load_magicka_return(by_type, master_export)
     _index_crea_folders(by_type)
 
-    _PROJECTS = _load_projects(export_dir)
+    _PROJECTS, owner_slot = load_projects(export_dir)
     if not _PROJECTS:
         print('  Creature projects: none (creature_projects.json missing — '
               'run the creatures step); CREA falls back to race aliasing')
         return
 
-    race_recs = _race_groups(by_type)
+    creatures = _shared_creatures(by_type, master_export)
+    talkers = talking_creatures(creatures, by_type, master_export, export_dir)
+    movt_folders = folders_built_by_master(master_export, _PROJECTS,
+                                           owner_slot)
+    made = _build_all_races(writer, by_type, _race_groups(creatures), talkers,
+                            movt_folders)
 
+    n_variants = sum(len(v) for _r, v, _n in made.values())
+    n_armed = sum(1 for _r, _v, vnam in made.values() if _race_is_armed(vnam))
+    print(f'  Creature races: {len(made)} generated '
+          f'(+{n_variants} attack-reach variants, {n_armed} weapon-capable, '
+          f'{len(talkers)} talking CREA, '
+          f'{len(_CREA_RACE_MAP)} CREA records mapped, '
+          f'{len(_PROJECTS)} converted projects)')
+
+
+def _build_all_races(writer, by_type: dict, race_recs: dict, talkers: set,
+                     movt_folders: set) -> dict:
+    """Race chain, MOVTs and idles for every own CREA; fills _CREA_RACE_MAP.
+
+    Returns {(folder, bodies): (race FormID, reach variants, VNAM flags)}.
+    """
     made = {}
-    movt_folders = set()
-    n_races = 0
-    n_armed = 0
     for rec in by_type.get('CREA', []):
-        folder = _folder_of(rec)
+        folder = folder_of(rec)
         proj = _PROJECTS.get(folder)
         if proj is None:
             continue
         fid = get_formid(rec, 'FormID') & 0x00FFFFFF
 
-        bodies = _bodies_of(rec, proj)
+        bodies = bodies_of(rec, proj)
         if bodies is None:
             continue
 
@@ -1322,14 +1295,10 @@ def build_creature_races(by_type: dict, writer, export_dir: str,
 
         key = (folder, tuple(bodies))
         if key not in made:
-            made[key], vnam = _build_race_chain(writer, rec, folder, bodies,
-                                                proj, key, race_recs)
-            n_races += 1
-            if _race_is_armed(vnam):
-                n_armed += 1
-        _CREA_RACE_MAP[fid] = (made[key], folder)
-
-    print(f'  Creature races: {n_races} generated '
-          f'({n_armed} weapon-capable, '
-          f'{len(_CREA_RACE_MAP)} CREA records mapped, '
-          f'{len(_PROJECTS)} converted projects)')
+            made[key] = _build_race_chain(writer, race_recs[key][0], folder,
+                                          bodies, proj, key, race_recs,
+                                          talkers)
+        race_fid, variants, _vnam = made[key]
+        _CREA_RACE_MAP[fid] = (variants.get(_attack_reach(rec), race_fid),
+                               folder)
+    return made

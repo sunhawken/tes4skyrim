@@ -1,0 +1,119 @@
+// One cell's collision gather (world.gather_cell_geometry), the walk tests
+// over it (seeding.Ground), and the two pathgrid passes built on them:
+// obstacle_bridge.bridge_obstacles and seeding.seed_graph.
+#pragma once
+
+#include <cstdint>
+#include <functional>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "cellgeo.h"
+#include "trigrid.h"
+#include "mesh.h"
+#include "strip.h"
+
+namespace navgrow {
+
+// A flat game-unit soup, 9 values per triangle, borrowed from the collision
+// cache (float32) or a scanner's list (float64).
+struct SoupView {
+    const float* f = nullptr;
+    const double* d = nullptr;
+    size_t n = 0;                    // values, not triangles
+    double at(size_t i) const { return f ? (double)f[i] : d[i]; }
+};
+
+// One placed REFR: its base mesh's soups and world._placed_soup's transform.
+struct PlacedRef {
+    SoupView w, b;
+    double scale = 1.0;
+    double pos[3] = {0, 0, 0};
+    double rot[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};   // world.rot_matrix, row-major
+    bool door = false;                              // a door base: no blocking faces
+};
+
+// The gathered soups: walkable rows [0, land_from) are placed, the rest LAND.
+// One placed object's collision, kept whole: its triangles (9 doubles each), bounding box, and an index
+// of them for "is any face of it right above this point", built the first time a point asks.
+struct Solid {
+    double box[6];                   // xmin, ymin, zmin, xmax, ymax, zmax
+    std::vector<double> tris;
+    mutable TriGrid grid;
+    mutable bool indexed = false;
+};
+
+// Every placed object of a cell, indexed by plan area.
+struct SolidSet {
+    std::vector<Solid> items;
+    std::unordered_map<long long, std::vector<int>> cells;  // plan bucket -> items whose box touches it
+    // Build the plan buckets; call once, after `items` is filled.
+    void index();
+    // True when (x, y, z) lies inside an object: one of its faces is right above it and its winding
+    // number there is >= 0.5.  The face test skips the costly winding beside an object.
+    bool enclosed(double x, double y, double z) const;
+};
+
+// How far above a floor point the enclosure test samples: a point standing ON an object's top sits on
+// its surface, where the test reads half in.
+constexpr double kEnclosedLift = 8.0;
+
+struct Soups {
+    std::vector<double> walk, block;
+    size_t land_from = 0;            // triangles
+    SolidSet solids;                 // each placed non-door object, for the enclosure test
+};
+
+// gather_cell_geometry(split_land=True) with the LAND rows appended after the
+// placed walkable ones (corridor._cell_geometry).  `water_z` is null for none.
+Soups gather_cell(const std::vector<PlacedRef>& refs, const Land* land, const double* water_z);
+
+// obstacle_bridge._footprint: (xmin, ymin, zmin, xmax, ymax, zmax); false for none.
+bool footprint(const PlacedRef& ref, double box[6]);
+
+// seeding.Ground over one cell's indexed soups.
+struct Ground {
+    CellGeo& geo;
+    const Land* land;
+    const SolidSet* solids = nullptr;
+    // True when (x, y, z) lies inside a placed object's collision shape (winding number >= 0.5); exteriors
+    // only -- an interior's room shell is one object, so its floor always reads as inside something.
+    bool enclosed(double x, double y, double z) const;
+    bool floor(double x, double y, double near_z, double* z) { return geo.walk_at(x, y, near_z, z); }
+    bool blocked(double x, double y, double z, double ux, double uy) const;
+    // True when (x, y, z) stands on the LAND itself with an actor's height clear above it.
+    bool open_land(double x, double y, double z) const;
+    bool walk(const P3& a, const P3& b);
+};
+
+// bridge_obstacles: append walkable edges across each obstacle cluster.
+int bridge_obstacles(const std::vector<P3>& points, std::vector<std::pair<int, int>>& edges,
+                     const std::vector<PlacedRef>& obstacles, Ground& ground);
+
+// seeding.seed_graph: the flooded synthetic pathgrid (empty when none walks in).
+void seed_graph(const std::vector<P3>& seeds, Ground& ground, double ox, double oy,
+                std::vector<P3>& points, std::vector<std::pair<int, int>>& edges);
+
+// The same flood over only the lattice ground `covered` rejects: an authored mesh's gaps.
+// `open` (when given) gets the uncovered keys as bits j * count + i; false when they need over 64 bits.
+bool gap_graph(const std::vector<P3>& seeds, Ground& ground, double ox, double oy,
+               const std::function<bool(const P3&)>& covered,
+               std::vector<P3>& points, std::vector<std::pair<int, int>>& edges, std::uint64_t* open = nullptr);
+
+// gap_graph over the lattice keys of `open` (an earlier gap_graph's mask) in place of a coverage test.
+void open_graph(const std::vector<P3>& seeds, Ground& ground, double ox, double oy, std::uint64_t open,
+                std::vector<P3>& points, std::vector<std::pair<int, int>>& edges);
+
+// True when any seed links into a lattice holding only the keys of one of `opens` (gap_graph's masks):
+// a flood that adds those seeds differs from the one each mask came from.
+bool seeds_link(const std::vector<P3>& seeds, Ground& ground, double ox, double oy,
+                const std::vector<std::uint64_t>& opens);
+
+// door_reach.door_reach: per seed, the walkable lattice path to the nearest anchor it
+// reaches (joins: (point, anchor)); with no anchors, the whole flood from the seeds.
+void door_reach(const std::vector<P3>& seeds, const std::vector<P3>& anchors, Ground& ground,
+                std::vector<P3>& points, std::vector<std::pair<int, int>>& edges,
+                std::vector<std::pair<int, int>>& joins);
+
+}  // namespace navgrow

@@ -47,6 +47,7 @@ class MasterIndex:
         self._paths = {}        # formid -> ((grup_type, label), ...)
         self._land_by_cell = {}  # cell formid -> LAND formid
         self._navm_by_cell = {}
+        self._edid_tables = {}
         self.masters = []
         self.own_index = 0
         self._load()
@@ -145,9 +146,17 @@ class MasterIndex:
         companion manifest (keyed by source FormID) cannot name them — the
         generic dialogue quest is the case that matters. EDID is always the
         first subrecord of the records this is used for, so this stops at the
-        first one rather than parsing the whole body.
+        first one rather than parsing the whole body. The first record in file
+        order wins; each signature is scanned once and cached.
         """
-        want = edid.encode('ascii', 'replace')
+        table = self._edid_tables.get(signature)
+        if table is None:
+            table = self._edid_tables[signature] = self._scan_edids(signature)
+        return table.get(edid.encode('ascii', 'replace'), 0)
+
+    def _scan_edids(self, signature: bytes) -> dict:
+        """{EditorID bytes: FormID} for one signature's uncompressed records."""
+        table = {}
         for fid, (sig, off, size) in self._offsets.items():
             if sig != signature:
                 continue
@@ -158,9 +167,15 @@ class MasterIndex:
             if body[:4] != b'EDID':
                 continue
             got = first_sub(body, b'EDID')
-            if got is not None and got.rstrip(b'\0') == want:
-                return fid
-        return 0
+            if got is not None:
+                table.setdefault(got.rstrip(b'\0'), fid)
+        return table
+
+
+    def find_all_by_edid(self, signature: bytes, edid: str) -> list:
+        """`find_by_edid` as a list, the shape `ChainedMasterIndex` answers in."""
+        fid = self.find_by_edid(signature, edid)
+        return [fid] if fid else []
 
 
 # GRUP types whose 4-byte label is a FormID (the owning record), not a
@@ -210,6 +225,12 @@ _FORMID_FIELDS = {
     #   XPRD  wbFloat    (patrol idle time)
     #   XPPA  wbEmpty    (patrol script marker)
     #   XRGD / XRGB      (ragdoll/biped data blobs)
+}
+
+#: Per-signature FormID fields: WRLD CNAM is a CLMT, a CELL's is a colour.
+_FORMID_FIELDS_BY_SIG = {
+    b'WRLD': {b'CNAM': None, b'NAM2': None},
+    b'MGEF': {b'SNDD': (4, 12, 20, 28, 36, 44), b'DATA': (8, 72, 92, 96)},
 }
 
 
@@ -298,6 +319,42 @@ def _shift_vmad(payload: bytes, index_map: dict) -> bytes:
         return payload
 
 
+
+
+def _shift_payload(payload: bytearray, spots, index_map: dict) -> None:
+    """Restate the FormIDs at `spots` in place; None means the whole run."""
+    offsets = (range(0, len(payload) - 3, 4) if spots is None else spots)
+    for off in offsets:
+        if off + 4 <= len(payload):
+            value = struct.unpack_from('<I', payload, off)[0]
+            struct.pack_into('<I', payload, off,
+                             _shift_formid(value, index_map))
+
+
+def _shift_body_formids(body: bytes, index_map: dict, sig: bytes) -> bytearray:
+    """One record's subrecords, every known FormID restated for the child.
+
+    `sig` selects the fields whose meaning depends on the owning record, so a
+    WRLD's CNAM shifts as a climate while a CELL's stays a colour.
+    """
+    fields = dict(_FORMID_FIELDS)
+    fields.update(_FORMID_FIELDS_BY_SIG.get(sig, {}))
+    out = bytearray()
+    j = 0
+    while j + 6 <= len(body):
+        ssig = body[j:j + 4]
+        ssize = struct.unpack_from('<H', body, j + 4)[0]
+        payload = bytearray(body[j + 6:j + 6 + ssize])
+        if ssig == b'VMAD':
+            payload = bytearray(_shift_vmad(bytes(payload), index_map))
+        elif ssig in fields:
+            _shift_payload(payload, fields[ssig], index_map)
+        out += ssig + struct.pack('<H', ssize) + bytes(payload)
+        j += 6 + ssize
+    out += body[j:]
+    return out
+
+
 def _shift_record_formids(rec: bytes, index_map: dict) -> bytes:
     """A converted record restated in the child's load order.
 
@@ -321,26 +378,7 @@ def _shift_record_formids(rec: bytes, index_map: dict) -> bytes:
             return rec
         flags &= ~0x00040000
 
-    out = bytearray()
-    j = 0
-    while j + 6 <= len(body):
-        ssig = body[j:j + 4]
-        ssize = struct.unpack_from('<H', body, j + 4)[0]
-        payload = bytearray(body[j + 6:j + 6 + ssize])
-        if ssig == b'VMAD':
-            payload = bytearray(_shift_vmad(bytes(payload), index_map))
-        elif ssig in _FORMID_FIELDS:
-            spots = _FORMID_FIELDS[ssig]
-            offsets = (range(0, len(payload) - 3, 4) if spots is None
-                       else spots)
-            for off in offsets:
-                if off + 4 <= len(payload):
-                    v = struct.unpack_from('<I', payload, off)[0]
-                    struct.pack_into('<I', payload, off,
-                                     _shift_formid(v, index_map))
-        out += ssig + struct.pack('<H', ssize) + bytes(payload)
-        j += 6 + ssize
-    out += body[j:]        # any trailing bytes, untouched
+    out = _shift_body_formids(body, index_map, rec[:4])
 
     head = bytearray(rec[:_HEADER_SIZE])
     struct.pack_into('<I', head, 4, len(out))
@@ -459,11 +497,8 @@ class ChainedMasterIndex:
         return owner, own_id
 
     def _to_child(self, idx, formid: int) -> int:
-        """Translate one of `idx`'s own-space ids back into the child's space."""
-        for slot, cand in self._by_slot.items():
-            if cand is idx:
-                return (slot << 24) | (formid & 0x00FFFFFF)
-        return formid
+        """An id in `idx`'s space, restated in the child's as its records are."""
+        return _shift_formid(formid, self._index_maps.get(id(idx), {}))
 
     def __contains__(self, formid: int) -> bool:
         idx, own = self._route(formid)
@@ -471,6 +506,11 @@ class ChainedMasterIndex:
 
     def __len__(self) -> int:
         return len(self.formids())
+
+    def __bool__(self) -> bool:
+        """Whether any master defines a record, without `__len__`'s full-id walk."""
+        return any((f >> 24) & 0xFF == idx.own_index
+                   for idx in self._by_slot.values() for f in idx._offsets)
 
     def formids(self) -> set:
         return {(slot << 24) | (f & 0x00FFFFFF)
@@ -530,42 +570,27 @@ class ChainedMasterIndex:
         return tuple(out)
 
     def land(self, cell_formid: int) -> int:
-        """The LAND inside a cell, answered by the file that WINS the cell.
-
-        The answer is restated in the slot of whichever master supplied it: a
-        LAND that Tamriel.esp defines carries Tamriel.esp's index byte, while
-        one it merely inherits from Oblivion.esm keeps Oblivion's. Translating
-        through the answering index unconditionally moved every inherited LAND
-        into the overriding master's slot, where no such record exists.
-        """
+        """The LAND in a cell, from the file that wins it, in the child's ids."""
         idx, own = self._route(cell_formid)
         if idx is None:
             return 0
-        fid = idx.land(own)
-        if not fid:
-            return 0
-        # `fid` is in `idx`'s own converted space; its index byte names the
-        # file that DEFINES the land, which may be one of idx's own masters.
-        if (fid >> 24) == idx.own_index:
-            return self._to_child(idx, fid)
-        # Defined further down the chain: the byte already matches the child's
-        # numbering when that master occupies the same slot in both lists.
-        return fid
+        return self._to_child(idx, idx.land(own))
 
     def navms(self, cell_formid: int) -> list:
-        """The navmeshes inside a cell, answered by the file that WINS it.
-
-        Each id is restated in the slot of whichever master defines it, as
-        `land` does.
+        """The cell's navmeshes, from the file that wins it, in the child's ids.
 
         See: docs/commentary/tes5_import_navmesh.md#master-owned-cells
         """
         idx, own = self._route(cell_formid)
         if idx is None:
             return []
-        return [self._to_child(idx, fid) if (fid >> 24) == idx.own_index
-                else fid
-                for fid in idx.navms(own)]
+        return [self._to_child(idx, fid) for fid in idx.navms(own)]
+
+    def find_all_by_edid(self, signature: bytes, edid: str) -> list:
+        """Each master's own record with this signature + EditorID, in load order."""
+        found = ((idx, idx.find_by_edid(signature, edid))
+                 for idx in self._indices)
+        return [self._to_child(idx, fid) for idx, fid in found if fid]
 
     def find_by_edid(self, signature: bytes, edid: str) -> int:
         """Later masters win, matching load order."""

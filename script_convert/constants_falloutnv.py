@@ -1,4 +1,4 @@
-"""FO3/FNV script blocks Oblivion never emits.
+"""FO3/FNV script blocks, commands and actor values Oblivion never emits.
 
 `BLOCK_MAP.get(...)` returning None makes `assemble` drop the block body
 entirely, so a block type absent from the table is silent data loss. FO3/FNV
@@ -6,6 +6,7 @@ author eight Oblivion does not; five have a real Papyrus event, verified
 against `references/SkyrimCKWiki_210522/skyrim/<Event>_-_ObjectReference.html`.
 
 See: docs/commentary/script_convert.md#fo3fnv-script-blocks
+See: docs/commentary/script_convert.md#fallout-actor-value-names
 """
 
 _END = 'EndEvent'
@@ -37,6 +38,24 @@ FALLOUT_BLOCK_FILTER_PARAM = {
 FALLOUT_HANDLED_COMMANDS = frozenset({
     'setobjectivedisplayed', 'setobjectivecompleted', 'setobjectivefailed',
     'setquestdelay',
+})
+
+#: S.P.E.C.I.A.L. stats TES4_ATTRIBUTES lacks; read and written as TES4's attributes are.
+FALLOUT_ATTRIBUTES = frozenset({'perception', 'charisma'})
+
+#: FO3/FNV actor-value name -> Skyrim's, as conditions_falloutnv.FALLOUT_AV_TO_TES5 maps the index.
+FALLOUT_ACTOR_VALUE_MAP = {
+    'barter': 'Speechcraft', 'speech': 'Speechcraft', 'lockpick': 'Lockpicking',
+    'repair': 'Smithing', 'medicine': 'Restoration', 'unarmed': 'OneHanded',
+    'meleeweapons': 'OneHanded', 'guns': 'Marksman', 'smallguns': 'Marksman',
+    'bigguns': 'Marksman', 'energyweapons': 'Marksman',
+}
+
+#: FO3/FNV actor-value names with no Skyrim value: a read is inert, a write dropped.
+FALLOUT_UNMAPPED_ACTOR_VALUES = frozenset({
+    'actionpoints', 'bloodymess', 'damagethreshold', 'dehydration', 'empresist',
+    'energyresist', 'explosives', 'hunger', 'karma', 'radiationrads', 'radresist',
+    'science', 'sleepdeprevation', 'survival', 'turbo', 'xp',
 })
 
 #: FO3/FNV spellings of shared handlers: alias -> the handler's TES4 name.
@@ -73,10 +92,9 @@ FALLOUT_COMMAND_ROWS = {
     'hasbeeneaten': dict(
         emit='0', note='{f} - Skyrim has no cannibalism flag (read as 0)',
         flags='bare_bool cmp_bool zero_arg'),
-    #: FNV's abbreviation for GetIgnoreFriendlyHits; the shared row is a note.
-    'gifh': dict(
-        note='GetIgnoreFriendlyHits - Skyrim exposes only the setter',
-        flags='bare_bool zero_arg'),
+    #: FNV's abbreviation for GetIgnoreFriendlyHits.
+    'gifh': dict(emit='{ref}.IsIgnoringFriendlyHits()', subj='OBJREF',
+                 flags='bare_bool cmp_bool zero_arg'),
     'getfurnituremarkerid': dict(
         emit='0', note='{f} - Skyrim has no furniture marker id (read as 0)',
         flags='zero_arg'),

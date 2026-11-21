@@ -1,11 +1,13 @@
 # asset_convert/collision/collision.py — Havok collision
 
-**Code:** `asset_convert/collision/collision.py`, `asset_convert/collision/collision_constraints.py`, `asset_convert/collision/collision_winding.py`, `asset_convert/collision/collision_hulls.py`, `asset_convert/collision/collision_material.py`, `asset_convert/collision/collision_extract.py`, `asset_convert/collision/mopp.py`
+**Code:** `asset_convert/collision/collision.py`, `asset_convert/collision/collision_constraints.py`, `asset_convert/collision/collision_winding.py`, `asset_convert/collision/collision_hulls.py`, `asset_convert/collision/collision_material.py`, `asset_convert/collision/collision_stairs.py`, `asset_convert/collision/collision_extract.py`, `asset_convert/collision/mopp.py`
 
 ## Contents
 
 - [NIF bhkRigidBody field mapping (PyFFI ↔ newer nif.xml)](#nif-bhkrigidbody-field-mapping)
 - [NIF dynamic clutter physics (Havok)](#nif-dynamic-clutter-physics)
+- [Morrowind dynamic clutter: synthesizing Havok from nothing](#morrowind-dynamic-clutter)
+- [Morrowind stand-in boxes: a shelf's collision that ejects its own books](#morrowind-stand-in-boxes)
 - [MO_SYS_FIXED (7) statics simulated as clutter — "floating / spinning / on its side" (SOLVED 2026-07-28)](#mosysfixed-statics-simulated-as-clutter)
 - [Skyrim APPLIES rotation/translation on non-T bhkRigidBody (THE fundamental havok bug, found 2026-07-15)](#skyrim-applies-rotationtranslation-non-t)
 - [Hoisted collision dropped the child node's ROTATION (SOLVED 2026-08-27)](#hoisted-collision-dropped-child-nodes)
@@ -14,6 +16,9 @@
 - [Constrained objects: chains, swinging traps, gates, trigger phantoms (2026-07-15)](#constrained-objects-chains-swinging-traps)
 - [Activation pick region (HUD rollover "too big" on clutter) — SOLVED 2026-07](#activation-pick-region)
 - [NIF bhkMultiSphereShape (dead in Skyrim, fixed 2026-07-05)](#nif-bhkmultisphereshape)
+- [Stepped stairs need the stairs material on their treads](#stairs-material)
+- [Held bodies: pieces a script releases to fall](#held-bodies)
+- [A STAT with a simulated body ships as MSTT](#stat-simulated-mstt)
 
 ## NIF bhkRigidBody field mapping (PyFFI ↔ newer nif.xml)
 <a id="nif-bhkrigidbody-field-mapping"></a>
@@ -33,6 +38,141 @@
 - **Inertia tensor**: Must scale by `HAVOK_SCALE² = 0.01`. Oblivion inertia (2.3–8.8) is ~100× Skyrim (0.02–0.32) because inertia ∝ mass × distance² and collision shapes are scaled 0.1× for Skyrim Havok units.
   - The full ×0.01 is applied EXACTLY ONCE, in `_convert_collision` (dynamic + keyframed branches) and `_convert_blend_collision`. `scale_constraint_pivots` must NOT rescale again — a leftover ×0.1 there had every constrained body's inertia 10× too small (fixed 2026-07-15).
 - **Skyrim clutter standard values**: friction=0.50, restitution=0.40, linear_damping=0.0996, angular_damping=0.0498, max_linear_velocity=104.4, max_angular_velocity=31.57, deactivator_type=1, solver_deactivation=2
+
+## Morrowind dynamic clutter: synthesizing Havok from nothing
+<a id="morrowind-dynamic-clutter"></a>
+**Code:** `asset_convert/collision/clutter_plan.py`, `nif_converter_morrowind.build_collision`.
+
+A Morrowind NIF (4.0.0.2) carries no Havok data whatsoever — no `bhkCollisionObject`,
+no rigid body, no layer, no mass. There is nothing to translate, so unlike the
+Oblivion path every field is synthesized. `build_collision` originally shipped one
+static body (mass 0, `motion_system=5`, layer 1) over the RootCollisionNode geometry,
+which left every cup, ingredient and weapon welded to the world.
+
+- **Static vs dynamic is decided by RECORD TYPE, never the filename or the mesh.**
+  The rule is *anything that can be added to the player's inventory has physics*:
+  MISC / INGR / ALCH / APPA / WEAP / BOOK / KEYM / AMMO / SLGM, plus the wearables
+  ARMO / CLOT. ACTI / CONT / DOOR / STAT are placed fixtures. The plugin states
+  this, so `clutter_plan` maps model path -> record type straight from the export
+  text, exactly as `wearable_plan` does for biped slots.
+- **LIGH is NOT in the list, though a torch is carryable.** The record type covers
+  both carried torches and fixed fixtures -- chandeliers, lanterns, hanging
+  braziers -- and Tamriel Data's chandeliers (`pc_com_chandelier_01`, weight 0.0)
+  came out as 1 kg dynamic bodies hanging from a ceiling. Being an inventory item
+  is a property of the RECORD, not of the type, wherever a type spans both.
+- **A wearable contributes only its WORLD model.** ARMO/CLOT carry two meshes: the
+  biped model the armor path rigs to the body, and the world (`_GND`) model that is
+  the dropped item. Only the latter is a loose object. `_loose_item_mass` enforces
+  this structurally as well -- a tree with any skinned geometry never gets a body,
+  whatever the record says -- because a rigid body on a worn mesh would detach the
+  gear from the actor. Measured on Tamriel Data: 5,116 item models, of which only 2
+  are named as both a worn and a dropped mesh (tower shields).
+- **Mass is `DATA.Weight`**, the authored value, kept as-is per
+  [dynamic clutter physics](#nif-dynamic-clutter-physics). Weight 0 (quest items)
+  clamps to 0.1 kg — a mass-0 dynamic body is what Havok reads as immovable.
+- **A dynamic body cannot use the MOPP/`bhkCompressedMeshShape` the static path
+  builds**: Havok will not simulate concave triangle soup. Dynamic clutter gets a
+  `bhkConvexVerticesShape` over the same triangles, reusing the hull builder that
+  already serves Oblivion's clutter decomposition.
+- **Inertia** is the solid-body tensor over the hull's AABB in Havok units. The
+  Oblivion path scales an authored tensor by `_HAVOK_SCALE**2`; there is no authored
+  tensor here, so it is computed directly in Havok units and needs no rescale.
+
+**Vanilla census, `meshes/clutter`, 700 files / 248 layer-4 bodies with mass > 0:**
+
+| Field | Measured |
+|---|---|
+| mass | min 0.5, p50 8.0, p95 30.0, **max 100.0** |
+| `inertia.m_11` | min 0.00047, p50 0.217, max 30.96 |
+| `motion_system` | 3 (225), 2 (23) |
+| `quality_type` | 4 (248/248, zero exceptions) |
+| shape | ConvexVertices 118, Box 81, Capsule 22, Mopp 15, List 10, Sphere 2 |
+
+Max mass 100.0 is why `_MAX_MASS` clamps: Morrowind authors Stendarr's Hammer at
+weight 1000, which is a real authored value but ten times heavier than anything
+Havok simulates in vanilla. Convex shapes (ConvexVertices + List = 128 of 248)
+dominate; the 15 Mopp entries are the reason a synthesized dynamic body is built
+from `build_clutter_hull` rather than the static MOPP path.
+
+## Morrowind stand-in boxes: a shelf's collision that ejects its own books
+<a id="morrowind-stand-in-boxes"></a>
+**Code:** `asset_convert/collision/resting_items_plan.py`,
+`nif_converter_morrowind.collision_source`.
+
+Many Morrowind RootCollisionNodes are ONE closed box -- 8 corners, 12
+triangles -- over a whole model. `furn_com_bookshelf_01` collides as a single
+158 x 37 x 181 box. Morrowind never simulates items, so the books placed inside
+it never noticed; converted items are dynamic clutter
+([above](#morrowind-dynamic-clutter)), and Havok pushes every one out of the
+solid box.
+
+**The box's shape cannot say whether its volume is open.** Census of the 266
+single-box nodes in `Morrowind.esm`'s 6,342 meshes:
+
+- 224 stay inside the model's outline and cover its center -- bookshelves,
+  tables, benches, beds, wine racks -- but so do the ramps over
+  `ex_de_docks_steps` / `_01`.
+- 7 do not cover the model's center: they collide one part only, like a tree
+  trunk (`furn_web00`/`10` anchor the web, `in_cave_plant00`/`10` the stem).
+- 35 stick out past the model: `torchfire`, `chimney_smoke02` and `lavasteam`
+  are deliberate blockers around particles; the stair meshes
+  (`in_t_stairs_strt_256`, `in_cavern_stairs00`, `ex_ship_stair`) are ramps.
+- How much of the outline a box fills runs continuously from 0.0 to 1.0
+  (bookshelf 0.79, dock-steps ramp 0.88), and how far it sticks out runs
+  continuously through any tolerance (a tapestry 0.97 units, shack steps 1.15),
+  so every threshold is a tuning knob.
+
+**The authored answer is the placements.** An item whose origin lies inside a
+placed fixture's box proves the author treated that space as open, so a
+single-box collision with an item inside it is replaced by the collision the
+render geometry builds (the path a mesh with no RootCollisionNode already
+takes). Every other box -- ramps, anchors, blockers, and shelves nobody stocks --
+ships as authored. A false positive costs nothing: render-geometry collision is
+the shape the player sees -- unless the render mesh has nothing collidable.
+`editormarker_box_01` (an `MRK` root, used as an invisible blocker) is placed
+with an item inside it by a plugin mastering the Morroblivion patch; its render shapes are all markers, so
+replacing its box shipped no collision at all. A box is replaced only when the
+render mesh yields at least one collidable shape.
+
+Measured on `Morrowind.esm` (2,680 meshes with a RootCollisionNode, 289 of them
+a single 12-triangle node -- the 266 above plus those whose corners are not
+exactly 8 distinct points): **85 replaced** -- beds, benches, bookshelves, tables, stools, wine
+racks, altars, chests, closets, drawers, sacks, corpses and the
+`in_de_shack_02`-`05` interiors. Unchanged: `furn_web00`, the stair and
+dock-steps ramps, `torchfire`, `flora_tree_gl_01`, `in_r_l_int_bridge_02`. The
+one ramp replaced, `ex_de_shack_steps`, has an item placed on a step inside it.
+
+- **Placements come from the plugin AND the plugins that master it**
+  (`_dependents`: any `export/*/_HEADER.txt` or `export/*/*/_HEADER.txt`
+  naming it). The mesh converts with the plugin whose record names it, and that
+  plugin may place none of it: `Furn_De_R_Bookshelf_02` is a STAT the
+  Morroblivion compatibility patch defines (`029EE724`) and places 0 times;
+  the vanilla ESMs place it 235 times. Reading the patch alone kept the box.
+- The generated patch reads its source ESMs (Morrowind, Tribunal, Bloodmoon)
+  straight from the registered Data Files folder, as `export_patch` does
+  (`resting_items_morrowind`), never their exports: the patch is built before
+  any plugin placing its records, and the authored-mode Morrowind.esm export
+  masters nothing and carries its own FormIDs (the shelf is `00D736AB` there),
+  so a FormID join against it found 0 fixture models. Matching is by
+  Morrowind object id, which the patch keeps as EditorID; cells are keyed by
+  interior name or exterior grid; deleted references are skipped. 146 fixture
+  models in 2.6 s.
+- A raw FormID's index byte counts into ITS dump's master list, so every id is
+  compared as (owning plugin, object id): the byte names `Master[i]`, or the
+  dump itself when it equals the master count. Items are the CLUTTER/WEARABLE
+  records of every dump read and of each one's masters. A dependent overriding
+  the fixture's model is not followed; the fixtures are the plugin's own records.
+- Cost, measured under other load: Oblivion.esm 12.5 s (8 dependents) against 7.9 s own-only. Only a REFR whose
+  base is wanted is parsed; its base and cell are sliced out by `str.find`, and
+  fixtures are parsed in a second pass only in cells an item occupies.
+- `Morrowind.esm`: 312,901 REFRs, 264,524 of them fixtures and 35,734 items,
+  parsed in 0.9 s. Fixture-by-item pairs sharing a cell come to 4.3 million,
+  which is why the index is written once beside the record dump
+  (`resting_items.pkl`) and loaded per worker on first use instead of riding
+  in the per-task plan.
+- Placement frame: `tes5_import.navmesh.world.rot_matrix`, the transform the
+  navmesh already applies to these refs; the box is taken relative to the
+  converted root, whose own transform Skyrim replaces with the ref's.
 
 ## MO_SYS_FIXED (7) statics simulated as clutter — "floating / spinning / on its side" (SOLVED 2026-07-28)
 <a id="mosysfixed-statics-simulated-as-clutter"></a>
@@ -315,12 +455,22 @@ whichever variant matched the source version, which is why the write loops over
 
 **Code:** `asset_convert/collision/collision_winding.py`
 
+> **⚠ Steps 1-3 below were REPLACED in round 4** by the render-mesh twin/nearest
+> rule ([Morroblivion round 4](#morroblivion-collision-is-copied-render)), which
+> scores 99.87% against the Morrowind oracle where these scored far worse and
+> actively damaged correct input. `_orient_components`, `_component_sign`,
+> `_repair_inverted_walkables` and the welding they needed are DELETED. The
+> shipped steps are now **0 (authored normal, ungated)** and **the render-mesh
+> repair (gated)**. The rest of this section is kept for the false-positive
+> measurements, which still constrain any future detector.
+
 | Step | Question it answers | Gated |
 |---|---|---|
 | 0 — authored normal | Does this triangle contradict its own recorded normal? | no |
-| 1 — relative orientation | Do edge-neighbours traverse the shared edge in opposite directions? | yes |
-| 2 — absolute sign | Which way does this whole COMPONENT face? | yes |
-| 3 — walkable repair | Which way does this ONE floor triangle face? | yes |
+| ~~1 — relative orientation~~ | ~~Do edge-neighbours traverse the shared edge in opposite directions?~~ | removed |
+| ~~2 — absolute sign~~ | ~~Which way does this whole COMPONENT face?~~ | removed |
+| ~~3 — walkable repair~~ | ~~Which way does this ONE floor triangle face?~~ | removed |
+| render twin / nearest | Which render face is this collision face a copy of, or nearest to? | yes |
 
 Step 1 is exact and threshold-free: two triangles sharing an edge are
 consistently wound if and only if they traverse it in opposite directions, so a
@@ -377,6 +527,227 @@ Candidate visual faces are bucketed into an XY grid at `_FLOOR_XY` cell size so
 a collision face tests the handful of visual faces above and below it rather
 than all of them — the whole-mesh scan is O(collision × visual) and this runs
 inside the per-mesh worker.
+
+### <a id="morroblivion-collision-is-copied-render"></a>Morroblivion round 4 — the collision triangle IS a render triangle
+
+**Measured against the Morrowind authored `RootCollisionNode`**, which is the
+only ground truth for Morroblivion: 24 oracle-matched meshes, 12,882 collision
+triangles matched to an oracle face by exact vertex set (5,948 of them, 46%,
+wound against it).
+
+The per-triangle fields say nothing. Every candidate scores at chance against
+that key: `triangles[i].normal` (the round-3 signal) **53.8%** — it agrees with
+the winding in all 12,882 cases, so step 0 is inert here; every `welding_info`
+bit 50.2–53.8%; triangle-index parity 47.3/47.1; within-strip-run parity
+46.9/47.6. Morroblivion's exporter recomputed the normal from the winding, so
+the round-3 contradiction never exists.
+
+**The authored signal is the RENDER mesh, matched by identity rather than
+proximity.** Morroblivion built collision by copying render triangles, so:
+
+1. **Twin** — the collision triangle's vertex set IS a render triangle's
+   (quantized 0.02). That render face's winding is the answer. Resolves
+   **9,700 / 12,882 (75%)** with **0 genuine errors**.
+2. **Nearest surface** — otherwise the collision is an independent
+   simplification; the parallel, projection-overlapping render face at least
+   **vertex-set** distance decides. Resolves the remaining 3,181.
+
+Combined: **99.868%** (17 genuine errors; 6 further mismatches are answer-key
+artifacts where the oracle itself carries both windings on one vertex set).
+21 of 24 files are perfect; 15 of the 17 errors are in `exubmutombu03`, whose
+collision is a coarse remodel sharing no vertices with its render mesh.
+
+Three measurement traps, each of which cost a wrong conclusion:
+
+- **Node transforms must be applied to render vertices.** `NiTriShapeData`
+  vertices are in the shape's own frame; collision is in the root's.
+  `exuggu02` has 6 of 8 nodes translated, putting its render mesh at
+  x[-797..-217] against collision at x[-284..295] — 254 of its 300 triangles
+  read as unmatched until `get_transform(root)` is applied, then 300/300.
+- **Area voting among coincident faces is wrong.** A large distant face at
+  plane offset 0.0071 outweighs the exact coincident face at 0.0000. Switching
+  the fallback from area vote to nearest-vertex-set took 41 errors to 22.
+- **Proximity matching on centroids fails on coarse collision.** A 25–58 havok
+  unit collision triangle's centroid is ~6.7 units from the nearest render
+  centroid, against `_VIS_RADIUS` 0.30, so steps 2 and 3 abstain.
+
+Do NOT reach for a census of vanilla or Morroblivion meshes to support a claim
+here — collision-winding censuses over these trees have repeatedly produced
+confident wrong answers (a vanilla-Skyrim sweep reporting ~47% down-facing
+faces invites the conclusion that winding is irrelevant, which the oracle
+disproves). The oracle is the only admissible evidence.
+
+### <a id="round-4b-the-rule-must-abstain"></a>Round 4b — the rule MUST be able to abstain
+
+Round 4 as first shipped broke `inuaru08` (a cave arch): source raycasts **0
+fall-through**, the shipped output **152**. It had no abstain path, so on a
+coarse shell far from any render skin it flipped 30 triangles on what were
+coin flips — the two nearest candidates sat **within 1 unit of each other
+pointing opposite ways** (t8: dist 164.2 align -0.998 vs 165.1 align +0.999).
+Only 3 of its 48 horizontal faces are decidable at all by the directional skin
+test; 45 have no evidence.
+
+Three additions:
+
+- **Directional slab gate** (`_wrong_side_of_slab`) — a skin may only decide a
+  face it could BE: an up-facing face by a skin at or above it, a down-facing
+  face by one at or below. This is the rule `collision_winding_truth.py`
+  already documents as the THIN-SLAB TRAP; round 4 simply failed to carry it
+  over. These are thin PLANKS, so both skins are real surfaces a thickness
+  apart, and raw proximity picks between them at random.
+- **Consensus abstain** (`_CONSENSUS_MARGIN` 0.05) — when the candidates within
+  5% of the nearest disagree, return None and leave the source winding alone.
+- **`_SLAB_EPS` IS IN GAME UNITS, AND THIS CODE IS IN HAVOK UNITS.** The 0.005
+  slack was copied from `collision_winding_truth.py`, which works in game
+  units; the repair works in havok units (7x smaller), so the tolerance meant
+  to absorb float noise was effectively ZERO. The gate then rejected the truly
+  coincident skins 1.6-3.8 units below a near-flat face and left only a face
+  **7x further away** to decide it unopposed — `inuaru09` lost 3 cells to
+  exactly that. At **1.0 game unit** it is right, and fixing it improved BOTH
+  metrics at once: oracle wrong **20 -> 12**, cells lost **22 -> 18**, gained
+  518 -> 527. It also dissolved an apparent tradeoff (dz 8 vs 10) that was
+  never real — raising dz had only been compensating for the broken gate.
+- **Absolute slab thickness** (`_MAX_SLAB_DZ`, 8 game units) — a plank is
+  THIN, so a skin further than this along z is a different surface even when
+  it is on the side the directional test wants. `exuvelothiustriderportu01`
+  lost 87 of 96 standable cells to a skin 46 units above it: its authored
+  oracle stands at z 66.9 with 196 cells, the repair put it at z -138.3 with
+  12. Measured over `morro`, 8 beats both 10 (88 lost) and uncapped (94).
+- **Relative distance cap** (`_MAX_MATCH_WIDTHS` 2.0) — a winner further than
+  two of the collision triangle's own mean edge lengths is a DIFFERENT
+  surface. Relative, not absolute, so it scales from a 26-unit plank to a
+  1000-unit floor slab. On `morro/i` by raycast this removes every regression:
+  standable cells **lost 105 -> 0**, net **+288 -> +393**, keeping all 393
+  gains.
+
+Result: `inuaru08`/`09`/`10` lose **0 standable cells**, and the oracle key
+wrong answers go **41 -> 12** (81 abstaining). Over 60 `morro` meshes,
+standable cells **lost 138 -> 18, gained 527, net +509**, regressing files
+13 -> 6. Abstaining is the right trade: a wrong flip is a hole in the floor,
+an abstention is the source winding, which is mostly right.
+
+### <a id="round-4c-the-render-mesh-can-be-wrong-too"></a>Round 4c — the render mesh is not always an oracle
+
+Checking the SHIPPED files (not a simulation) found two more, both invisible
+to the oracle key because the key only covers 24 meshes:
+
+- **`inuvelothismalludju01` lost all 62 standable cells.** Its render mesh has
+  **0 up-facing and 40 down-facing** horizontal triangles — the visible
+  geometry is itself wound backwards, so it cannot be the orientation oracle.
+  64 of its 129 collision faces twin-match a render face pointing the opposite
+  way, and the twin rule dutifully inverted a floor that was correct.
+  `_render_states_a_floor` now refuses a render mesh with no up-facing floor
+  at all. Across the whole oracle corpus every mesh has real up-faces (lowest
+  ratio 0.05, `furnucomushelfu01`), so this is categorical, not a threshold.
+- **`inudweuend00uexp`'s "196 of 196 lost" was a MEASUREMENT bug**, not a
+  pipeline one: source and shipped are identical (2 triangles, normal
+  (0,-1,0), a vertical wall). The probe counted vertical faces as floors
+  because `-0.0 <= 0`. A standable-cell probe must require a real upward
+  slope (`n[2] > 0.05`), not merely a non-negative one.
+
+**Ranking candidates by |dz| instead of vertex distance is WORSE** — tried
+because the arch family's bad winners sat at dz +6.93 while a dz +1.27 face
+pointed the other way. Measured: cells lost **26 vs 18**, net +491 vs +509,
+abstentions 154 vs 81, oracle unchanged at 12 bad. Rejected; whole-triangle
+vertex distance stays.
+
+**Not every "lost" cell is a defect.** `inumusewerucapu02` loses all 31 of
+its standable cells, and that is CORRECT: its authored Morrowind collision
+has 0 up-faces and 0 standable cells of its own — a sewer cap is a ceiling.
+Check the oracle before treating a loss as a regression. The `inuaru*` arch
+family is the opposite case: 18 cells lost of 653 with **0 gained**, so the
+repair has nothing to offer there and every flip is neutral or harmful; they
+are the regression fixture in `TestWindingRepairNeverRemovesFloor`.
+
+**What the cap does NOT fix**: `barracks01` (FNV) stays at -117 net. Its
+collision triangles are over 1000 units across against a 6423-triangle render
+mesh, so two triangle-widths is a huge allowance and the cap never binds; its
+15 bad up-face flips are decided by render faces 469-739 units away that all
+agree with each other, so the consensus check passes too. Left as measured
+rather than tuned away with an absolute threshold, which would cost the
+Morroblivion gains. FNV overall is still net **+288**.
+
+**FO3/FNV get the same rules** — no special case. The first FNV numbers said
+otherwise (0 -> 150) but were measured with a scorer that CALLS
+`_nearest_says_inverted`, so adding the slab gate moved the instrument and the
+before/after were not comparable across runs (the "before" itself shifted
+815 -> 728). Re-measured two ways, gated wins on both: residual inversions
+**137 vs 150**, and by raycast — which shares no code with the repair —
+**146 standable cells lost vs 205**. Score a winding change with a raycast,
+never with the repair's own predicate.
+
+**A raycast probe must ignore down-facing faces.** Taking the highest hit of
+any orientation counts a legitimate underside sitting above the walkway as a
+fall-through, which reported the ramp as 900/900 broken when it was correct.
+The engine's question is "descending from above, is there an up-facing face to
+land on?". With that fixed, the repaired ramp's walkable surface is
+z -379.7..-132.3 over 900 cells — **identical to the authored Morrowind
+collision**, while the Morroblivion source floats ~145 units above its own
+visible ramp (render walkable z -384.0..-30.2).
+
+**Scope.** The render-mesh repair sits behind the same `winding_fix_enabled()`
+gate the removed steps 1-3 did, and `WINDING_FIX_DEFAULT_PLUGINS` holds only
+`morrowind_ob`, so it is unreachable for Oblivion, Nehrim, Morrowind (native
+mode) and plugin ESPs — measured per plugin, flips 0 for each. Those keep step
+0 alone, which is what took Nehrim dungeons 2710 inverted -> 14. FO3/FNV still
+reach it through `is_fallout_source()`.
+
+**It supersedes step 0 where it reaches a verdict**, because a normal the
+Morroblivion exporter recomputed from the winding is not evidence, while the
+render face the collision was copied from is. Step 0 still runs first and is
+the whole repair when the gate is off or the node has no render geometry.
+
+Re-measured on the PRODUCTION soups (`_shape_tri_soup` +
+`_bake_body_transform_into_tris` + `_visual_tri_soup`, i.e. the exact inputs
+`repair_inverted_floors` receives): **3,092 / 3,106 correct (99.55%), 0
+undecided**, same failure set. (That figure predates round 4b; the shipped
+rule scores 20 wrong on the oracle key with 96 abstaining.)
+
+**Score a winding change by RAYCAST, not by the repair's own predicate.** The
+first FNV numbers here were measured with a scorer that calls
+`_nearest_says_inverted`, so each rule change moved the instrument and the
+before/after were not comparable between runs — the "before" itself drifted
+815 -> 728 -> 630. The standable-cell raycast in `walk2.py` shares no code
+with the repair and is the metric that matched the user's in-game report.
+
+### <a id="the-render-oracles-grid"></a>The nearest rule's grid: the same verdicts, a fraction of the work
+
+From issue #94 (fork commit `b2498fdf`). `_nearest_says_inverted` used to
+scan every render face for every collision face without a render twin.
+`RenderOracle` builds the render side once per call, on first use (a mesh
+that never reaches the render repair builds nothing): the faces, the twin
+index, and a grid of the faces' centers with the median face width as cell
+edge. The nearest rule is handed only the faces whose center lies within
+`(_MAX_MATCH_WIDTHS * width * (1 + _CONSENSUS_MARGIN) + 1e-9) / 3` of its
+own, in the original face order.
+
+**Why the verdicts cannot change.** A face's vertex-set distance is at least
+three times the distance between the two centers: the corner distances sum
+to at least the length of the summed corner offsets, which is three times
+the center offset. A face beyond the reach therefore has a vertex-set
+distance beyond `_MAX_MATCH_WIDTHS * width` and beyond the consensus limit
+of any nearest candidate within that cap, so it can neither be the nearest
+nor join the agreement check. If the true nearest is beyond the cap, the
+result is None either way. `_REACH_SLACK` widens the reach by a millionth
+so float rounding never drops a face. A query spanning more cells than are
+occupied reads every cell. Cell size and slack only decide how much work is
+skipped, never a verdict.
+
+**Measured** by replaying every mesh-collision body of randomly sampled
+architecture/dungeon NIFs through the full-scan and grid versions, render
+repair forced on, comparing `repair_inverted_floors` results with `==`:
+
+| Sample | Bodies | Results differing | CPU full scan -> grid |
+|---|---|---|---|
+| Oblivion.esm, 150 NIFs | 119 | 0 | 150.6 s -> 18.5 s (8.1x) |
+| Morrowind_ob.esm, 150 NIFs (`morro`, `morroblivion`) | 99 | 0 | 26.0 s -> 4.8 s (5.4x) |
+| Nehrim.esm, 120 NIFs | 80 | 0 | 161.9 s -> 14.6 s (11.1x) |
+| FalloutNV.esm, 120 NIFs | 103 | 0 | 29.5 s -> 6.2 s (4.7x) |
+
+The slowest single body, `leyawiinhouseinteriorupper11.nif`, went from
+23.6 s to 1.95 s. `tests/test_collision_winding_oracle.py` checks the grid
+against a full scan on random collision/render pairs, including a face
+whose reach spans every occupied cell.
 
 ### <a id="welding-is-per-group"></a>Welding is scoped PER GROUP
 
@@ -607,19 +978,79 @@ local space (both `center` fields are already in Skyrim Havok units by then).
 Frames are axis-aligned — twist = X, plane = Y, motor = Z — the orthonormal
 basis the 2010 layout requires, since a zero motor ships a singular basis.
 
+Dismemberment on death is not a body-part-data flag: a census of all 35 vanilla
+Skyrim BPTD records finds ZERO with BPND `Severable` (byte 4 bit 0) or
+`Explodable` (bit 3) set (the Draugr head's `0x32` is IK Data / Is Head /
+Headtracking with a 50 degree tracking angle). Oblivion drops a constraint-less
+`bhkRigidBody` as an independent body on death (how its skeleton sheds a head);
+Skyrim needs a connected constraint island or the body never collapses, which is
+why every orphan gets the joint above. Havok units are 0.1 of game units while node
+`translation` is not scaled, so any pivot mapped between body frames after
+`convert_all_collisions` mixes the two spaces (an unscaled mapping shipped
+`pivot_b` 240x too large). Check a synthesized joint in WORLD space: `pivot_a`
+through the child node's world transform and `pivot_b` through the parent's must
+coincide; authored joints show large apparent errors under the same check and
+must not be "fixed". A `bhkBreakableConstraint` wrapper (threshold 25.0) and a
+nearest-body re-anchor of over-long joints were tried; the re-anchor gave no
+in-game gain and crashed the goblin and grummite builds (`BrokenProcessPool`), and
+neither exists in the tree now.
+
 ## <a id="nested-and-multiple-collision"></a>Nested and multiple collision
 
-**Code:** `asset_convert/collision/hoist.py`
+**Code:** `asset_convert/collision/collision.py` (`collision_owner`,
+`hoist_collision`), `asset_convert/nif/nif_converter.py`
+(`_hoist_root_collision`), `asset_convert/collision/collision_falloutnv.py`
+(`merge_static_parts`)
 
 Skyrim reads the `bhkCollisionObject` on the root BSFadeNode. Oblivion and
-FO3/FNV meshes hang collision off child NiNodes, sometimes several (an SCOL has
-one per part) and sometimes two levels down. `hoist_collision()` moves every
-descendant collision object onto the root, carrying each part's transform
-relative to the root: one part goes into its body (`bhkRigidBodyT`) or, for a
-phantom, a `bhkTransformShape`; several static parts (`MO_SYS_FIXED`) merge
-into one root body holding a `bhkListShape` of transform-wrapped shapes. When
-the parts cannot be merged the first is hoisted and the rest are counted in
-`PARTS_DROPPED` for the conversion report.
+FO3/FNV meshes hang collision off child NiNodes, sometimes several and
+sometimes several levels down. `hoist_collision()` moves ONE of them, the
+first `collision_owner()` finds depth-first, onto the root; any others stay
+on their own nodes. For an FO3/FNV source, `merge_static_parts()` runs first
+and, when every collision part is a fixed packed body, merges them all into
+one root body instead.
+
+<a id="every-collision-owner"></a>**The animation gate checks the node the
+hoist will move.** `_hoist_root_collision` skips the hoist when that node is
+moved by animation, so a swinging part keeps its collision on the node its
+animation drives. The gate used to run its own search, reverse depth-first,
+while the hoist searched forward. Where the two met different owners the gate
+approved a still frame and the hoist then moved the moving leaf's collision
+onto the static root: the leaf swung open and its collision stayed shut.
+Census of every exported mesh with two or more collision owners, one of them
+animated (unconstrained): the hoist took an animated owner past a still check
+in 14 Oblivion meshes (the five `ruininteriors/doors` gates, `rfswitch01`,
+`arfloorsmasher01`, `obturretbig01`, `obminetrap01`, the siege crawler
+activator, the Kvatch `postsmash01`/`woodpilecrumble01`, `blackwoodpump02`, a
+citadel ground plate), 12 Nehrim and 22 FalloutNV (`nv_fencepickburntgate01`,
+the vault sliding doors, office doors, `junkdoor`, `vendortrunk01`). Both now
+call `collision_owner()`. The reverse case also changes: 17 Oblivion, 10
+Nehrim and 14 FalloutNV meshes (torture cages, display cases, door frames,
+fridges) where the old gate hit a moving part first and skipped the whole mesh
+now hoist their first, still part, as the 40 Oblivion meshes whose two searches
+already agreed on a still part always did.
+
+<a id="nested-owner-transform"></a>**A nested owner carries its whole
+transform relative to the root** (`_frame_in_root`). The hoist baked only the
+owner's own local transform, so an owner under a moved parent lost that
+parent's offset. `ctorturecage01`'s wall sits on `wall02` (z -296.7) under
+`chain01` (z -798.1): hoisted, its collision landed 798 units above the cage.
+`arwelkydcage01`'s cage collision sat at z -93..1 while the cage hangs at
+-522..-428. A direct child is still baked from its own node, so its output is
+byte-identical; only a nested owner under a moved ancestor changes. Census:
+30 Oblivion, 33 Nehrim and 19 FalloutNV meshes have one; the animated ones
+and creature skeletons never reach the hoist.
+
+**The extractor applies a body's own transform** (`collision_extract._body_transform`).
+It placed a body by its node chain only, on the assumption that conversion
+folds every `bhkRigidBodyT` into the shape. That holds for CMS, which
+`_bake_body_transform_into_tris` folds and demotes to a plain body, but not
+for convex hulls and primitives, which keep the transform on the body. So
+every hoisted non-CMS body with an offset reached the navmesh at its owner's
+origin: the hoisted cage wall extracted at z -6..222 while the converted file
+holds it at -1100..-873. The body transform now applies before the node
+chain; a CMS body carries none, so its extraction is unchanged. The fix bumped
+`COLLISION_SCHEMA_VERSION` to 7 (`TESCOL10`).
 
 ## <a id="collision-extraction-scale"></a>Collision extraction scale
 
@@ -646,3 +1077,335 @@ the CMS path, measured 0.997-1.010 on the same test and were never affected.
 collision shape and were all extracted undersized.
 
 <a id="body-placement"></a>**A rigid body is placed at its OWNING NODE's world transform** (`collision_from_data`, `_body_placements`). The extractor read every `bhkRigidBody` out of `data.blocks` and emitted its triangles in the body's own frame, on the stated assumption that conversion moves collision to the root node. That holds for most meshes but not all: `tes4/dungeons/chargen/prisonsecretwall01.nif` keeps its two boxes on the child nodes `bed` (translation 12.8, 170.0, -125.8) and `wall` (-61.6, 214.7, -64.0), so both were emitted ~200u from where they belong -- a phantom 171x94x227u box at the mesh origin that the navmesh then built against, while IN GAME the collision sits correctly because the engine honours the node chain. The walk accumulates rotation, uniform scale and translation per node and records a placer only for a chain that is not the identity, so the common root-mounted body pays nothing. The shape's own transform is already baked in by `_primitive_tris` / `decode_cms` and is not re-applied.
+
+<a id="transparent-layer"></a>**Layer 3 (OL_TRANSPARENT) is invisible collision and blocks actors** (`_PATHING_LAYERS`). The extractor drops a body whose layer is not on that whitelist, and layer 3 was left off along with clutter, biped and trigger. But transparent is the layer Oblivion's invisible walls and walkways are authored on: `dungeons/misc/collisionbox01.nif` (STAT `CollisionBox01`) is a single `bhkBoxShape` on layer 3, and in Nehrim's `SchattenrufMinePart02` a long pathgrid edge runs over placed `CollisionBox01` references. With the layer dropped the box extracted to nothing and the navmesh never saw the floor the pathgrid was authored on. It is now whitelisted and the box yields 4 walkable + 8 blocking triangles. The conversion keeps the layer (Skyrim's layer 3 is also L_TRANSPARENT), so the converted mesh reads the same. The fix bumped `COLLISION_SCHEMA_VERSION` to 6 (`TESCOL09`); `tools/navmesh/rescan_mesh_caches.py` refreshes existing caches without an import.
+
+## <a id="keyless-transform-stubs"></a>Keyless transform stubs must not count as animation
+
+**Code:** `asset_convert/collision/collision_anim.py` (`node_transform_is_animated`)
+
+Oblivion's exporter writes a `NiTransformController` entry into the `Idle`
+sequence for the root and `NonAccum` node of nearly every mesh, whether or not
+the node ever moves. On a static the entry's `NiTransformInterpolator` has
+`data = None` -- no rotation, translation or scale keys at all -- so it only
+restates the node's fixed base transform.
+
+`_hoist_root_collision` skipped any mesh whose root owned a
+`NiControllerManager`, which those stubs guarantee. The collision then stayed
+on the child `NonAccum` node instead of moving to the root, where Skyrim
+expects a static's `bhkCollisionObject` (vanilla `candlehornfloor01.nif` puts
+it on the root `BSFadeNode`).
+
+Measured over 500 source NIFs that keep collision on a child node: 13 carry
+REAL transform keys (a correct skip), 6 are keyless stubs (a wrong skip), and
+28 have no transform entry at all. In converted output, 21 of 400 meshes
+(5%) kept collision on a child while their body was not keyframed.
+
+`ctrapswingmacelong01.nif` is the case that proves the test must be the KEYS
+and not the entry: its transform interpolators are keyless stubs too, because
+the mace swings on a `bhkRagdollConstraint` rather than an animation. It stays
+unhoisted through the separate `has_constraints` gate, not this one.
+
+This was found while chasing the Bosmora Temple doorway CTD but did NOT cause
+it; the cause is [float32-collinear triangles](#float32-collinear-triangles).
+
+## <a id="float32-collinear-triangles"></a>A triangle collinear at float32 precision crashes the crosshair pick
+
+**Code:** `asset_convert/collision/cms_builder.py` (`_float32_collinear`, called from `_quantize_bucket` and `_add_big_tris`)
+
+Havok's closest-point-on-triangle (`hkpCollideTriangleUtil`, cache setup at
+1.6.1170 RVA `0xc79720`) computes `det = |Q|^2 |R|^2 - (Q.R)^2` in float32 and
+stores `1/det` with no guard. For `inumhudoorjambu02.nif` shape key
+`0x00040054` -- vertices (-0.7607, 0.1783, 0.0004), (-1.4857, 0.1783, -1.8286),
+(-0.5627, 0.1783, 0.5014), a 2.5 hu sliver 0.0004 hu tall -- the exact det is
++1.17e-6 but the float32 replay gives **-1.9e-6**, so `1/det = -524288` and the
+engine sees the triangle inside out. Every one of the six crash logs carries
+that key at `+0x38` (`shapeKeyB`) of both garbage collector entries:
+`0x40054 = (chunk 0 + 1) << 18 | index offset 84`.
+
+Census, float32 det at all three corners: vanilla
+`references/Skyrim Meshes/meshes/architecture` **0 of 174,261** triangles (439
+meshes) are non-positive; converted `Morrowind_ob.esm/.../morro/i` had 7 of
+302,423. Thinness alone is NOT the invariant -- vanilla ships 13 triangles with
+altitude under the 0.001 hu CMS quantum (`hhlgbaylangle` 0.000433) and all of
+them keep a positive float32 det.
+
+The builder drops such a triangle where it already drops ones collapsed by
+quantization, testing the vertices as the engine decodes them. The hole is
+narrower than the 0.005 hu shell radius.
+
+### How the bad triangle becomes a crash
+
+The crosshair pick (`CrosshairPickData::Pick`, 1.6.1170 RVA `0x402c60`) sweeps
+a phantom with `hkpWorld::linearCast` (string `TtworldLinCast`
+at 1.6.659 RVA `0xab20dc`), which fills an `hkpAllCdPointTempCollector`, then sorts
+the hits with a recursive introsort (`0x77a790`, entered via `sort(hkArray&)`
+at `0xe42610`). Elements are `0x40` bytes and the sort key is the float at
+`+0x1C`. The partition loop at `0x77a831` scans downward with `comiss` + `jb`
+and no bound check, and `comiss` sets CF=1 for unordered operands -- so a NaN
+PIVOT makes `jb` always taken and the scan runs off the array. A NaN merely
+present in the data terminates normally; only the pivot is fatal.
+
+Measured from `crash-2026-09-20-21-07-16.log`: `R13 = 2` (3 elements), array
+base `R15 = RSP+0x750`. Element 2 is a real hit (position 63.75, 62.46,
+227.39; normal -0.999978, 0.00667, 0.00333; key 0.5656), while elements 0 and
+1 hold `0xFFFFFFFF` geometry with live heap pointers at `+0x20`/`+0x30`. The
+midpoint `(0+2)>>1 = 1` is therefore the NaN element, and
+`R15 + 0x1C + (-16080 * 0x40)` lands exactly on the faulting address `RCX`.
+Windows reports `EXCEPTION_STACK_OVERFLOW` because the underrun walks about
+1 MB below `RSP` into the stack guard page.
+
+## <a id="keyframed-velocity-caps"></a>Keyframed doors need the UNLIMITED velocity cap
+
+**Code:** `asset_convert/collision/collision.py` (keyframed branch of `_convert_collision`)
+
+A keyframed body is moved by the engine, not the solver, so vanilla removes the
+solver's velocity ceiling on it: `max_linear_velocity` and
+`max_angular_velocity` are both `1000002.0`.
+
+Census of `references/Skyrim Meshes/meshes` (2000 NIFs, 78 keyframed bodies):
+every one of the 37 CLAMPED bodies (104.4 / 31.57) is a `bhkCapsuleShape` in a
+`skeleton.nif` -- an actor ragdoll bone. Every non-skeleton keyframed body --
+`wrcastledoor01`, `shouseintdoor01`, `ruinsmediumdoor01`, `dweptndoor01`,
+`riftenrwdoorspecial01`, `spatiogate01`, `rtmercerramp01`,
+`trapstonepressureplate01` and the rest -- uses `1000002.0`. There is no
+vanilla door with 104.4.
+
+Our keyframed branch wrote the ragdoll pair onto everything, so 0 of the
+converted doors carried the unlimited cap: `inumhudooru02`, `inuciudooru01`,
+`exusudoorudouble`, `inumhujaildooru01` and ~30 more all shipped 104.4.
+
+The skeleton case is handled separately in `_convert_blend_collision`, which is
+why the door branch can take the unlimited pair unconditionally.
+
+## <a id="stairs-material"></a>Stepped stairs need the stairs material on their treads
+
+**Code:** `asset_convert/collision/collision_stairs.py`, `_shape_tri_soup` / `cms_builder.build_cms_collision` (per-triangle materials)
+
+**Symptom:** Oblivion stairs, and Morroblivion's stepped stairs, are not smoothly
+walkable by the player or NPCs; Morrowind.esm stairs are.
+
+**Mechanism.** A Skyrim MATT record has a `Stair Material` flag (FNAM bit 0).
+The CK wiki: it "allows proper IK movement when walking up or down stair
+collision. (Note: Failing to do this will result in stuttering)". The CK names
+the lookup `bhkUtilFunctions::GetMaterialIsStairs()`. Oblivion's own character
+controller climbed steps without any marker, so its authors never set one.
+
+**Vanilla does one of two things** (census of the 75 `*stair*` NIFs under
+`references/Skyrim Meshes/meshes/architecture`):
+
+- stepped collision with a stairs material on the treads (`hhstairs01`: 24u
+  rises, all StairsStone; `walkwaystairs*`, `rtcanalsstairs01`,
+  `whintstairs01`). Stairs material sits on 6.95M u² of flat treads.
+- a ramp with a plain material (`sovintstairsmain01/02`, `wrcastlestairs01`,
+  `wrpondstairs01/02`).
+
+Stairs material on a ramp is also legal: `mrkdocksideplatforms03stairs` is a 40°
+StairsStone ramp. Do not strip it.
+
+**What we shipped.**
+
+- Oblivion: **150 of 155** `*stair*` NIFs carry no stairs material and no
+  OL_STAIRS layer, and their collision is stepped (`castlestairs01`: 12-13u
+  rises, HAV_MAT_STONE). Stepped + plain = the stutter.
+- Morroblivion: 27 of 78 `*stair*` NIFs are stepped, 19 of those with no stairs
+  material (`exutustair*`, `exuimpuwallustairs*`, `inudaeuhallulstair*`). Their
+  Morrowind.esm originals (`ex_t_stair_01`, `ex_imp_wall_stairs_01`,
+  `in_dae_hall_l_stairs_01`) are RAMPS, which is why Morrowind.esm works. The
+  Morroblivion ramps are the same ramps and material as Morrowind's.
+- Every packed shape lost its per-sub-shape materials: `_shape_tri_soup` took
+  `sub_shapes[0]` for the whole shape and the CMS held one material
+  (`inucustairuplainutallu01`: source parts 24/9/0/12 all shipped StairsWood).
+
+**Fix.** Triangles keep their own sub-shape's material (the CMS carries one
+chunk material per distinct value, and a chunk or big tri indexes it, as
+vanilla does: `wrjorvaskr01` big tris index 0 of [Wood, StairsStone]).
+`cms_builder.build_cms_collision` then runs `stairs_materials`, so every static
+CMS the converter writes (TES4 mesh collision, Morrowind render-geometry
+collision, SpeedTree) gets it. It switches the treads of every stepped flight
+to the stairs variant of their material, using TES4's own enum pairing
+(i → i + 15):
+
+- a tread is up-facing triangles tilted < 10°, joined when they touch and sit
+  < 4u apart in height (a nosing lip, a rug);
+- two treads are one step apart when they rise 4-48u (Morroblivion's
+  `exutustairu01` rises 31-44u), sit no farther apart horizontally than 8u plus
+  the rise (a riser at 45° or steeper: `exutustairu90ulushort`'s chamfered
+  risers leave 28-32u between 32u steps), and share at most half
+  the smaller tread's footprint. Overlap is summed per TREAD, not per
+  triangle: a shelf board is a quad split on its diagonal, and the halves of
+  two stacked boards touch along it without overlapping;
+- a flight needs at least two inner treads (a step both below and above), so
+  a bed's mattress-pillow-headboard (one inner) is not one;
+- only treads up to twice the flight's median inner tread are tagged, which
+  leaves a room floor or a wide landing at a flight's foot or head plain;
+- the RISERS are tagged too: every non-level face whose height lies within
+  one step of the flight (± 4u), within 8u of one of its treads and within
+  8u plus the rise of the other (a chamfered step's riser sits a rise from
+  the lower tread). The steps onto the floor above and below count. Vanilla
+  does the same: on the 43 vanilla stair NIFs with stairs treads, short
+  (≤ 40u) vertical faces carry 3.17M u² of stairs material against 1.63M
+  plain, and pure stair pieces (`hhstairs01`, `whintstairs01`,
+  `rttempleplazastairs01`, `skyhaventmpextplatstairmid01`) have no plain
+  riser at all. Tagging treads alone made `anvilhousemcinterior02`'s lower
+  flight easier but the player still caught on the steps in-game; tagging the
+  risers as well cured it (confirmed in-game).
+- the two ENDS of a flight are tagged too. Tagging only what lies between two
+  treads of one mesh left the first and last step hard to climb, worst for
+  NPCs (fixed, confirmed in-game):
+  - the first riser climbs from a floor another mesh owns, so no step band
+    covered it (`arstairs01` -1→19, `stackstairsmid01` -63→-52,
+    `bravilintstair01` -111→-91). Faces up to 48u below any tread and within
+    8u of it are now tagged. Vanilla pure stair pieces tag the same faces
+    (`whintstairs01`, `rifrmsmsecondfloorstair01`: floor→first tread riser is
+    stairs);
+  - the landing above the top tread is left plain by the twice-the-median
+    rule, so the edge a climber steps over last was plain. Landing triangles
+    within 8u plus the rise of the top tread are now tagged. Vanilla puts a
+    stairs strip on the landing edge (`rtdockstairsturn01`: ~2,350u² of
+    stairs on otherwise plain landings) or tags the whole landing
+    (`whintstairs01`, 27,525u²). Tagging is per triangle, so a landing made of
+    a few big triangles is tagged whole (`stackstairsmid01`: 162,452u²).
+
+  Why a plain face there matters: the CK's `bhkCharacterController::IsStep`
+  returns true at once when the contacted triangle's material is stairs, and
+  otherwise falls back to its raycast step test, the path that stutters.
+
+<a id="first-step-off-the-floor"></a>**The first step off the floor counts.**
+A tread whose step below is the floor the mesh stands on (z 0, owned by
+another mesh) used to have no step below in the flight count, so a two-step
+piece (floor, one tread, a landing) was never a flight. Oblivion's
+`sewerRoomWallMid02` is exactly that: two 14.7u risers into a tunnel, all
+plain stone. In the Waterworks (ImperialSewersElvenGardens03) Baurus walked
+into the first riser and stood there for good (5 of 9 runs of
+mq05_sewer_plan); live, his controller reported flat support and a full
+walking velocity into the riser; given a 70u run-up he climbed it. Vanilla
+tags such steps: Ratway's `riftenrwroombstairs01` treads and risers are
+StairsStone.
+
+`_grounded` now gives a tread that step when a near-vertical face runs from
+z 0 up to it and its rise off the floor matches the next step up (± 4u).
+Such a flight needs only one inner tread and takes its size limit from its
+smallest inner tread, so a wide landing stays plain; a flight that already
+qualified keeps its old limit. Its tread must be at least 256u²: real ones
+are 645u² and up, a statue's ledges (`minotaurhead01`) 3-30u².
+The rise test is what keeps beds out: `middlesinglebed01`'s mattress is 37u
+off the floor but 7u below its pillow. Census of all 10,126 Oblivion meshes
+(temp/grounded_census.py): 37 change, none loses a tag -- the Ayleid hall kit
+(`arwhall*`, `arrm*`: side strips 10u off the floor, the raised centre 14u
+higher), castle transitions, `kvatchinthallwayentrya`, two Cheydinhal
+interiors, the SE10 aqueduct pieces, `sewerroomwallmid02`.
+
+Measured on converted output: every flight in `castlestairs01`,
+`bravilintstair01`, `stackstairsmid01`, `kvatchspiralstair01`, `arstairs01`,
+`exutustairu01`, `exuimpuwallustairsu01`, `inudaeuhallulustairsu01` and vanilla
+`hhstairs01` / `walkwaystairs8` is tagged; the Morrowind-style ramp
+`inutustairsustrtu256` and Oblivion's authored ramp `rfwstairs01` get nothing.
+In `furniture/` (142 NIFs) only `middlebrewersteps01` (real steps),
+`middlechair04/05` and `middledesk01` are tagged. After a rebuild, 90 of the
+101 stepped `*stair*` NIFs in Oblivion, 26 of 27 in Morroblivion and 2 of 4 in
+Morrowind.esm carry the stairs material. The misses are two-step pieces (one
+inner tread, the same shape as a bed) and the Telvanni pod stair, whose 4u
+rises make it a ramp. The Anvil interiors (76 NIFs) tag only their
+built-in staircases, at 0.00-0.02 s per mesh.
+
+## <a id="held-bodies"></a>Held bodies: pieces a script releases to fall
+
+Oblivion authors a piece that breaks off and falls as an MO_SYS_KEYFRAMED (6)
+body with real mass. It stays rigid until the object's script runs
+`playgroup`, then Havok drops it. We ship it keyframed but KEEP its mass (and its
+authored layer); the converted script's `TES4Polyfill.ReleaseBreakaway` then
+switches it to `Motion_Dynamic`. A mass-0 body switched to dynamic just hangs
+there, and a body shipped as a fixed static can never be released at all.
+
+The authored indicator is the collision LAYER plus whether a clip really moves
+the body. The artist picks the layer in the exporter, so it is a statement of
+intent. Census of every ms=6 + mass>0 body in the 293 Oblivion and 322 Nehrim
+meshes that have both a clip and a rigid body ("moved" = a clip's keys change
+the transform; "pinned" = keys hold one pose; "undriven" = in no clip):
+
+| Layer | Clip | Meshes | Ship as |
+|---|---|---|---|
+| 10 OL_PROPS | moved, pinned or undriven | mwallplankbreakaway01, idcrumblewall01, cpbrick01-15, cpgenericbrick01-03, cplog01/02, artrapbridgecrumble (1 pinned + 6 undriven), obeliskbarrier01, roperock01 | held |
+| 14 OL_TRAP | pinned or undriven | ctrapcavein01 (22 pinned + 2 undriven rocks), ctraplogs01 (1 + 5 logs), statuedagoncrumble01 (1 + 17), arcrumblewallmalada01 (7), siegecrawlerdeath / deidricseigecrawleractivator debris | held |
+| 14 OL_TRAP | moved | ruinshallnxceilingtrapa, ruinsroomceilingtrapa/b, ruinsroomcolmatrap, ruinshallwcolumna03trap, spiketrap, cprollingrock01, artrapbridgeblade01 | keyframed, mass 0 |
+| 2 / 3 anim-static | any | gates, portcullises, arpitstairs, dreamstairs, arenclosedcircle01 | keyframed, mass 0 |
+
+Gates swing and portcullises slide precisely because they are NOT on the props
+or trap layer. The old rule required layer 10 AND an animated node, or a
+constraint island. ctrapcavein01 and ctraplogs01 have zero constraints and sit
+on layer 14, so their rocks and logs shipped mass-0 keyframed (clip members) or
+fixed static (the rest). The Schattenruf mine cave-ins and log trap played
+their sound, and nothing fell.
+
+Held bodies are also never hoisted onto the root: `hoist_collision` takes the
+first child collision, which for ctraplogs01 was one loose log. Released, it
+would have carried the reference's root node with it.
+
+Constrained trap islands (ctrapswingmacelong01, ctrapswingloglong01) are
+the other held case, keyed on the constraints (`_node_is_held_trap`).
+
+### <a id="motion-system-cases"></a>How an Oblivion MO_SYS_KEYFRAMED (6) body converts
+
+Oblivion's ms=6 means different things depending on context; `_convert_collision`
+decides per body:
+
+1. **Driven by animation** (gate leaves in Open/Close sequences, animated
+   display-case lids): Skyrim KEYFRAMED, mass 0, layer 2, like vanilla
+   farmhouseanimdoor01. Keyframed is only valid on animated nodes: a keyframed
+   body with anim flags (137/142) on a non-animated object flips the engine into
+   the baked/anim-static path and the whole compound acts welded solid.
+2. **Anchors** (constrained-island anchors: cellchain01 root, cellChainMiddle,
+   mass=100 "Unyielding"; unyielding props): STATIC, mass 0. Vanilla
+   chain/noose/trap anchors are always static mass-0 bodies (NooseRopePiece01
+   root, trapmace Base01), never keyframed.
+3. **Breakaway pieces** ([held bodies](#held-bodies)): mwallplankbreakaway01's 8
+   planks, whose clip only creaks them off their mounting (15.19 deg, zero
+   translation keys). The visible break is Havok letting them fall. Forced onto
+   the plain keyframed path (mass zeroed), the planks tilted and then hung in the
+   half-broken pose as a solid wall. Shipped dynamic instead, they dropped the
+   instant the cell loaded. They ship KEYFRAMED, like Oblivion's
+   `Unyielding = 1`, but keep their mass, so the script-side
+   `SetMotionType(Motion_Dynamic)` hands Havok a body that can fall.
+4. **Held trap islands** (ctrapswingmacelong01's chain + mace,
+   ctrapswingloglong01): ms=6 bodies with mass in a CONSTRAINED island. The old
+   "mass>0 and owns a constraint → dynamic" rule made every swinging trap swing
+   freely on cell load. Oblivion authors the whole island `Unyielding = 1`: held
+   rigid until the trap script fires, exactly like a breakaway piece. Skyrim's
+   trapmace01 ships its links dynamic (ms=3, quality 4) because a Skyrim trap has
+   no script-held phase; ours reproduces Oblivion's held phase instead.
+
+## <a id="stat-simulated-mstt"></a>A STAT with a simulated body ships as MSTT
+
+Oblivion simulates a dynamic body even on a STAT reference: the log trap in
+Nehrim's Schattenruf mine knocks the loose `MiddleChestBrokenTop03` lid (a STAT,
+one free 10 kg body on OL_CLUTTER) off its chest. Skyrim never simulates a
+body on a STAT, only on MSTT/ACTI. Skyrim.esm census: 122 of 671 readable MSTT
+models carry a free dynamic body (`NorHavoKDebris01-04`, the bloody bones,
+`WagonWheel`, the oil barrels); the 208 STATs that do are things meant to stay
+frozen (load-screen art, first-person weapons, `RuinsPot05StaticIce`, a STAT
+twin of a havok pot).
+
+`physics_flags_from_data` bit 0 marks such a mesh and `items.convert_STAT`
+writes the base as MSTT (FormID unchanged, so placed REFRs keep resolving).
+Vanilla routes all such content through MSTT (every swinging inn sign, e.g.
+SignBraidwoodInn01, MSTT DATA=0) or ACTI (TrapBoneAlarmHavok01). Bit 0 originally covered only
+constrained islands (PrisonCellChains01, the root/chain dolls); free bodies were
+added as bounds schema 4. Measured before the change: 73 Nehrim STAT bases
+(993 refs, 23 persistent) and 41 Oblivion bases (2,109 refs, 28 persistent)
+carry a simulated body, the constrained ones among them already MSTT.
+
+Never widen it to "the mesh has an animation graph". That was tried on
+2026-08-18 and reverted: promoting every BGED-bearing STAT moved 107 Oblivion
+bases / 4,568 placed refs and crashed on save load with a null TESObjectREFR in
+the ExtraPromotedRef / QueuedPromoteQuestTask path (SKChamberSecretDoor,
+NightMotherBaseRef). The premise was wrong anyway: 94 vanilla STATs carry a
+BGED, including self-animating scenery (WRJovaskrBanner02 → IdleRandomized.hkx,
+PowShrine01, SFarmhouseMill), so the record type is not what stops an animation.
+
+**Retyping a STAT to MSTT does NOT by itself crash a save load.** The
+simulated-body widening retyped 73 Nehrim bases (993 refs, 23 persistent) and an
+existing save loaded cleanly in-game (2026-09-26). So the 2026-08-18 crash came
+from something specific to that BGED set (its quest-referenced refs such as
+NightMotherBaseRef, or the animation graphs themselves), not from the record
+type change. Its cause is still unisolated.

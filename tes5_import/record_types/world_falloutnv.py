@@ -31,10 +31,15 @@ FALLOUT_ONLY_SIGS = ('NAVM', 'TERM', 'MSTT', 'IDLM', 'PWAT', 'CCRD', 'REPU')
 _IS_FALLOUT_SOURCE = []
 
 
+def is_fallout_export(by_type: dict) -> bool:
+    """True when these exported records came from FO3/FNV."""
+    return any(by_type.get(sig) for sig in FALLOUT_ONLY_SIGS)
+
+
 def register_fallout_source(by_type: dict):
     """Detect and record whether this run's source plugin is FO3/FNV."""
     _IS_FALLOUT_SOURCE.clear()
-    if any(by_type.get(sig) for sig in FALLOUT_ONLY_SIGS):
+    if is_fallout_export(by_type):
         _IS_FALLOUT_SOURCE.append(True)
 
 
@@ -53,22 +58,17 @@ def marker_substitute(name_raw: int):
 #: TES5 PNAM bits: land, LOD, map, water, climate, sky cell (bit 5 is FO3-only).
 TES5_PARENT_USE_MASK = 0x5F
 
-#: What a child worldspace borrows when its source authored no PNAM: the map.
-DEFAULT_PARENT_USE = 0x04
-
 #: DATA bits TES4, FO3/FNV and TES5 all define: Small World, Can't Fast Travel.
 _SHARED_WORLD_FLAGS = 0x03
 
 
-def parent_use_flags(rec: dict) -> int:
-    """PNAM for a child worldspace: the authored FO3/FNV bits, else the map.
+def parent_use_flags(rec: dict):
+    """PNAM for a child worldspace: the authored FO3/FNV bits, else None.
 
     See: docs/commentary/tes4_export_falloutnv.md#child-worldspaces
     """
     flags = get_int(rec, 'PNAM.Flags', None)
-    if flags is None:
-        return DEFAULT_PARENT_USE
-    return flags & TES5_PARENT_USE_MASK
+    return None if flags is None else flags & TES5_PARENT_USE_MASK
 
 
 def world_map_offset(rec: dict) -> tuple:

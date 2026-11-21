@@ -29,18 +29,10 @@ Durations are cached to `<export>/voice_durations.json` because a full scan is
 import json
 import os
 import re
+from asset_convert.audio.mp3_length import mp3_duration
+from asset_convert.game_paths import find_nocase
 from output_layout import assets_for
 from concurrent.futures import ThreadPoolExecutor
-
-# MPEG-1 Layer III bitrate table (kbps), index 0/15 invalid.
-_BITRATES_V1_L3 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224,
-                   256, 320, 0]
-# MPEG-2/2.5 Layer III bitrates
-_BITRATES_V2_L3 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144,
-                   160, 0]
-_SAMPLE_RATES = {3: [44100, 48000, 32000],    # MPEG-1
-                 2: [22050, 24000, 16000],    # MPEG-2
-                 0: [11025, 12000, 8000]}     # MPEG-2.5
 
 # Oblivion voice filenames: <quest>_<topic>_<infofid>_<n>.mp3
 _VOICE_NAME_RE = re.compile(
@@ -48,60 +40,6 @@ _VOICE_NAME_RE = re.compile(
     r'_(?P<resp>\d+)\.mp3$')
 
 CACHE_NAME = 'voice_durations.json'
-
-
-def mp3_duration(path: str) -> float:
-    """Duration in seconds by summing MPEG frame durations. 0.0 if unreadable.
-
-    Frame-walking rather than trusting a header: Oblivion's files are CBR but
-    carry ID3 tags and occasional garbage between frames, and there is no
-    Xing/Info header to read a frame count from.
-    """
-    try:
-        with open(path, 'rb') as f:
-            data = f.read()
-    except OSError:
-        return 0.0
-    p = 0
-    if data[:3] == b'ID3' and len(data) >= 10:
-        size = ((data[6] & 0x7F) << 21 | (data[7] & 0x7F) << 14 |
-                (data[8] & 0x7F) << 7 | (data[9] & 0x7F))
-        p = 10 + size
-    total = 0.0
-    n = len(data)
-    while p + 4 <= n:
-        if data[p] != 0xFF or (data[p + 1] & 0xE0) != 0xE0:
-            p += 1
-            continue
-        ver = (data[p + 1] >> 3) & 3       # 3=MPEG1, 2=MPEG2, 0=MPEG2.5
-        layer = (data[p + 1] >> 1) & 3     # 1 = Layer III
-        br_i = (data[p + 2] >> 4) & 0xF
-        sr_i = (data[p + 2] >> 2) & 3
-        pad = (data[p + 2] >> 1) & 1
-        if layer != 1 or br_i in (0, 15) or sr_i == 3 or ver == 1:
-            p += 1
-            continue
-        rates = _SAMPLE_RATES.get(ver)
-        if not rates:
-            p += 1
-            continue
-        sr = rates[sr_i]
-        if ver == 3:
-            bitrate = _BITRATES_V1_L3[br_i] * 1000
-            spf = 1152
-        else:
-            bitrate = _BITRATES_V2_L3[br_i] * 1000
-            spf = 576
-        if not bitrate:
-            p += 1
-            continue
-        frame_len = int((spf / 8 * bitrate) / sr) + pad
-        if frame_len <= 0:
-            p += 1
-            continue
-        total += spf / sr
-        p += frame_len
-    return total
 
 
 def scan_voice_durations(export_dir: str, use_cache: bool = True,
@@ -115,8 +53,9 @@ def scan_voice_durations(export_dir: str, use_cache: bool = True,
     fallback for a `Say()` whose response cannot be known statically.
     """
     cache_path = os.path.join(export_dir, CACHE_NAME)
-    voice_root = str(assets_for(export_dir) / 'sound' / 'voice')
-    if not os.path.isdir(voice_root):
+    voice_root = find_nocase(assets_for(export_dir), 'sound', 'voice',
+                             kind=os.path.isdir)
+    if voice_root is None:
         return {}
     if use_cache and os.path.isfile(cache_path):
         try:
@@ -201,3 +140,9 @@ def scan_voice_durations(export_dir: str, use_cache: bool = True,
     except OSError:
         pass
     return durations
+
+
+def info_seconds(durations: dict, formid) -> float:
+    """An INFO's measured line length, 0.0 if unvoiced; voice files use index 00."""
+    fid = int(formid, 16) if isinstance(formid, str) else int(formid)
+    return float((durations or {}).get(f'info:{fid & 0xFFFFFF:08X}') or 0.0)

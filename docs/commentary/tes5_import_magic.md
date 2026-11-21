@@ -1,14 +1,23 @@
 # tes5_import/record_types/magic.py - magic conversion
 
-**Code:** `tes5_import/record_types/equipment.py`, `tes5_import/record_types/magic.py`, `tes5_import/generated/vanilla_mgef_data.py`, `asset_convert/character/skyrim_overrides.py`
+**Code:** `tes5_import/record_types/equipment.py`, `tes5_import/record_types/magic.py`, `tes5_import/record_types/magic_variants.py`, `tes5_import/record_types/magic_art.py`, `tes5_import/generated/vanilla_mgef_data.py`, `asset_convert/character/skyrim_overrides.py`
 
 ## Contents
 
 - [The problem Phase 1 solved](#problem-phase-1)
 - [The four defects, in priority order](#four-defects-priority-order)
 - [Path to complete conversion](#path-complete-conversion)
+- [Casting type and delivery follow the owner](#owner-casting-type)
+- [An Ability draws almost no hit visuals](#ability-hit-visuals)
+- [Effect families: HasMagicEffect tests a keyword](#effect-families)
+- [Magic art](#magic-art)
+- [Effect shader particle counts](#effect-shader-particles)
+- [Impact data](#impact-data)
+- [Menu display object](#menu-display-object)
 - [Rules for working in this area](#rules-working-this-area)
 - [Enchantment charge (ANAM to EAMT)](#enchantment-charge-eamt)
+- [Weapon skill and stagger](#weapon-skill-and-stagger)
+- [No Magnitude makes a value modifier apply 1.0](#no-magnitude-forces-one)
 
 Status as of 2026-07-31. Measured with `python tools/audit/magic_audit.py export/<Plugin>`
 (written alongside this doc; re-run it after every change in this area).
@@ -308,17 +317,18 @@ Verification: `magic_audit.py` unmapped count → 0; no record falls back to
 filler; dump a converted summon MGEF and diff its DATA field-by-field against
 `SummonFlameAtronach` from the Skyrim.esm dump.
 
-### Phase 2 — Wire the art back in
+### Phase 2 — Wire the art back in — DONE (user-confirmed in-game)
 
-1. **`ARTO` writer** — one art object per distinct MGEF `Model.MODL`; point
-   `Casting Art` (92) / `Hit Effect Art` (96) at it. The meshes are already
-   converted in `output/.../meshes/tes4/magiceffects/`.
-2. **Sounds** — emit `SNDD` from the four TES4 sound FormIDs (casting/bolt/hit/
-   area) via the existing SOUN→SNDR conversion.
-3. **`ESCE`** — counter effects are MGEF→MGEF references; trivially convertible
-   once MGEF records exist (41 effects carry them). The count field at offset 20
-   must match.
-4. Complete the `EFSH` DATA beyond offset 44.
+Covered in the sections below:
+
+- [Magic art](#magic-art): the ARTO, PROJ, EXPL and STAT companions, and the
+  SNDD sounds.
+- [Casting type and delivery follow the owner](#owner-casting-type).
+- [Effect shader particle counts](#effect-shader-particles).
+- [Impact data](#impact-data).
+- [Menu display object](#menu-display-object).
+
+ESCE counter effects landed with Phase 1.
 
 ### Phase 3 — Projectiles and delivery — DONE 2026-08-01 (projectile half)
 
@@ -376,11 +386,10 @@ SPEL, Nehrim 366 + 263 — **1,291 records that all previously carried a null
 projectile, now 0 exceptions.** Projectiles are assigned selectively (159/349
 Nehrim MGEFs, 161/323 Oblivion), not blanket-applied.
 
-Still open in this phase: a **`PROJ` writer** so effects fly their own TES4
-`DATA.ProjectileSpeed` art rather than borrowing a vanilla bolt, and `EXPL` for
-area effects (TES4 `Area` is packed into EFIT but no explosion is ever created).
-`aimed_variant` still covers effects that resolve to a *vanilla* projectile-less
-MGEF, so it cannot be retired yet.
+The `PROJ` and `EXPL` writers have since landed ([Magic art](#magic-art)).
+`aimed_variant` is retired: every effect slot, filler included, is now cloned
+onto its owner's delivery, and `fit_delivery` gives any Aimed clone a
+projectile ([Cleanup](#phase-5-cleanup)).
 
 ### Phase 4 — Script effects (`SEFF`) — DONE 2026-07-31 (with Phase 1)
 
@@ -421,7 +430,37 @@ Two script-side gaps had to be closed for these to be more than inert records
   `OnEffectFinish` when the script has none), so the resistance cannot outlive
   the effect. `SetGhost`/`SetInvulnerable` were rejected: they suppress ALL
   damage, so a levitation scroll would grant temporary immortality — a worse
-  defect than the one being fixed.
+  defect than the one being fixed. The suppression is now a falling-damage
+  perk window, not DamageResist
+  ([fall damage is a perk](script_convert.md#fall-damage-is-a-perk)).
+
+### <a id="script-effect-index"></a>A script entry is numbered by the effect it follows
+
+A TES4 script effect's `SCIT` follows the `EFID` + `EFIT` of the effect it
+belongs to. `emit_effects` writes it as `ScriptEffect[i]` with `i` that effect's
+index, and every reader asks by effect index (`equipment._slot_mgef`,
+`magic_variants.build_seff_variants`, `object_scripts.build_magic_effect_script_plan`,
+`morroblivion_magic._script_effects`).
+
+The exporter used to number the entries 0, 1, ... in the order they occur. A
+record whose script effect is not its first effect then had its script under
+index 0 and none at the script effect's own index: the effect was pointed at
+the plain script-less `SEFF` record and its script was converted for nothing.
+Counted on the game's files: Oblivion.esm 28 of 143 script effects (23 spells,
+4 enchantments, 1 potion), Knights.esp 1 of 7, DLCBattlehornCastle.esp 1 of 1,
+DLCSpellTomes.esp 1 of 1, the Unofficial Oblivion Patch 3 of 13. No record in
+those files has two script effects behind a plain one, the shape that would
+have handed the first script effect the second one's script.
+
+A `SCIT` is 4, 12 or 16 bytes: the script alone, or the script with its school
+and visual. The exporter skipped the 4-byte form, so those effects lost their
+script the same way: 5 more in Oblivion.esm (`MS10ParalyzeSpell` and four test
+spells; a sixth names no script). `ScriptEffect[i].School` and `.Visual` are
+written only when the entry holds them; nothing reads either.
+
+With both, 140 of Oblivion.esm's 143 script effects find a script against 107
+(the other three name a null script), and 93 scripts are reached by an effect
+against 76.
 
 <a id="bound-items"></a>
 ### Bound items — DONE 2026-08-07 (user-confirmed in-game)
@@ -511,26 +550,360 @@ vanilla's own majority choice per type:
 keeps them out** — the *spell type* is, which the engine handles. All 13 vanilla
 diseases carry `ETYP=EitherHand`, so omitting it for them would be the deviation.
 The field that does track "not menu-facing" is `MDOB` (the menu icon): diseases
-are the only type with zero (0/13). We emit no `MDOB` anywhere, which is
-consistent with diseases and a cosmetic gap elsewhere, not a functional one.
+are the only type with zero (0/13). Every other spell type now gets one
+([Menu display object](#menu-display-object)).
 
 The same trap was already known for `SCRL`, where the converter has always
 written `ETYP` — `convert_SPEL` was simply never given it.
 
-### Phase 5 — Cleanup
+<a id="phase-5-cleanup"></a>
+### Phase 5 — Cleanup — DONE
 
-No record loses all its effects any more (audit: 0 for both plugins), so the
-`_FILLER_EFFECTS` machinery in `record_types/equipment.py` is now dead weight
-for its original purpose. It is **deliberately left in place**: it is still the
-only thing standing between a null `EFID` and an inventory-menu crash if a
-future plugin uses an effect code no export has seen, and INGR still needs
-`pad_to=4` regardless. Delete the `filler_dur` duration-faking path — that one
-existed only so a dropped `SEFF` still answered `HasMagicEffectByID`, and SEFF
-is no longer dropped.
+- **`tes5_import/actors/magic_effects.py` is deleted.**
+  - `aimed_variant`, `has_projectile` and `set_tes4_effect_names` are gone,
+    and so is the projectile registry in `magic.py` that fed them.
+  - Built Oblivion.esm had **0** aimed clones left before the removal. Every
+    aimed slot already reached a projectile through `delivery_variant`.
+- **Vanilla effects clone like ours.** `magic_variants._parts_of` falls back
+  to `vanilla_mgef_data.py` for a vanilla FormID. This covers the filler
+  effects and the `MGEF_CODE_TO_SKYRIM` fallback, so the same
+  `delivery_variant` fits them to their owner.
+- **Fillers take the owner's pair.** The filler for a dropped effect is now
+  cloned onto the owner's casting type and delivery. Before, an Aimed spell
+  whose only effect dropped carried a Self filler, the null-projectile crash
+  above. The fillers are still needed: Oblivion.esm has 6 spells whose only
+  codes (`RSWD`, `DUMY`) no Oblivion MGEF defines, and 36 ingredients padded
+  to 4 effects.
+- **`filler_dur` is deleted.** It kept a dropped effect's duration on the
+  filler only so a dropped `SEFF` still answered `HasMagicEffectByID`, and
+  SEFF is no longer dropped.
+- **`bound_item_assoc` checks the archetype.** It returned the Assoc. Item of
+  any effect, so a summon on an ability would have been scripted as a bound
+  item. It now answers only for archetype 17.
 
-Also still open: `magic_effects.aimed_variant()` should retire once Phase 3
-gives every aimed item's own effects a projectile (its clones are now the only
-consumer of `vanilla_mgef_data.py`).
+## <a id="owner-casting-type"></a>Casting type and delivery follow the owner
+
+**Code:** `tes5_import/record_types/magic_variants.py` (`delivery_variant`), `record_types/equipment.py` (`_slot_mgef`)
+
+Skyrim keeps the casting type (Constant, Fire and Forget, Concentration) and
+the delivery (Self, Contact, Aimed, ...) on the MGEF. The engine applies an
+effect the way *the effect* says, whatever the spell holding it says.
+Oblivion has neither field: the item decides.
+
+**The rule, from a census of every vanilla effect slot:** casting type and
+delivery match the owner on **2,138 of 2,146** slots.
+
+| Owner | Effect casting type / delivery |
+|---|---|
+| Ability | Constant / Self |
+| Disease | Constant / Contact |
+| Apparel enchantment | Constant / Self |
+| Potion, poison, ingredient | Fire and Forget / Self (803 of 803) |
+| Scroll (owner cast type 3) | Fire and Forget, the owner's delivery |
+| Weapon enchantment | Fire and Forget / Contact |
+| Spell, power, staff | the owner's casting type and delivery |
+
+**This was the "effects die after a few milliseconds" bug.** On the build
+before the fix, 3,097 of about 4,300 effect slots did not match their owner.
+Every ability carried Fire-and-Forget effects, so the engine applied them
+once and they expired at once. Script-called spells died the same way.
+
+Each slot is re-pointed at a clone of its MGEF carrying the owner's pair.
+`delivery_variant` returns the effect itself when it already matches.
+Otherwise it writes one clone per (source, casting type, delivery, burst),
+hashed at site `MGEF_DELIVERY`, so existing FormIDs are untouched. A spell
+whose effects have different ranges gives each effect its own TES4 range; the
+spell takes Aimed if any effect is, else Target Actor, else Self
+(`owner_delivery`).
+
+**Touch is Target Actor, not Contact.** The CK wiki's Magic Effect page:
+Contact "only works for Weapons". None of the 70 vanilla Contact spells is
+hand-cast by the player, so a converted Touch spell appeared in the menu but
+never cast. Skyrim's hand-cast touch spells (Heal Other, Soul Trap, Fade
+Other, the Daedra commands: 19 spells) are Target Actor with a 0 range. A
+weapon enchantment is fixed to Contact, the one owner that fires it. Changing
+this renumbered every Touch copy (the delivery is in the `MGEF_DELIVERY` key).
+The base MGEF follows (`_delivery_and_cast`).
+
+### <a id="ability-hit-visuals"></a>An Ability draws almost no hit visuals
+
+**Code:** `tes5_import/record_types/magic_variants.py` (`ability_variant`), `record_types/equipment.py` (`_slot_mgef`)
+
+Skyrim draws a Constant effect's hit shader and hit art for as long as the
+effect lasts. Vanilla uses this on purpose: 47 of Skyrim.esm's 265 Constant
+MGEFs carry a hit shader (`AbOnFire`, `AbGhostFire`, `dunSaarthalFlameFX`).
+Oblivion does not, so a straight copy set Agronak gro-Malog permanently on
+fire: `AbArenaAgronak` holds two magnitude-0 Fire Damage effects. On the
+build before the fix, 86 of 150 Constant copies in Oblivion.esm carried a
+hit shader.
+
+**Oblivion.exe** (Nehrim install, VAs): `ActiveEffect::Update` (`0x68e670`)
+draws an effect's visuals on first apply unless:
+
+- the active effect's flag `0x1` (`+0x14`) is set;
+- the MGEF flag bit 27, "No hit effect", is set (already converted);
+- the owner's spell type (`+0x28`, from the item's vtable slot 6: a spell
+  returns its `SPIT.Type`, an enchantment always 6) is 4, Ability, and
+  either `0x41b950(effect code)` returns 0 or the magnitude is 100 or more.
+  `0x41b950` is nonzero only for `FISH`, `FRSH`, `LISH`, `SHLD`, `REDG`,
+  `RSNW`. Otherwise it sets flag `0x4`, which the visuals builder (`0x69d9f0`)
+  reads as "no hit model": only the shader plays.
+
+So an Ability slot points at a copy with hit art cleared, and its hit shader
+cleared too unless the code is one of the six under magnitude 100. The copies
+are hashed at site `MGEF_ABILITY` on (source, keeps shader). Enchantments and
+diseases are untouched: this gate does not reach them.
+
+**Not for Morrowind or Fallout.** OpenMW plays an Ability's effects, looping
+(`mwmechanics/spelleffects.cpp`, `playEffects`), so a slot carrying
+`MorrowindIndex` keeps its visuals. FO3/FNV's rule is unmeasured, so a
+Fallout source keeps them too. A filler we add to an empty Ability has no
+authored visuals anywhere, so it always loses them.
+
+### <a id="creature-attack-spells"></a>A creature's touch spell rides its melee attacks, as Contact
+
+**Code:** `tes5_import/actors/creature_races.py` (`creature_touch_attack_spell`), `record_types/equipment.py` (`attack_spell`)
+
+Vanilla's melee casters name a spell as each attack's ATKD Attack Spell: the
+flame atronach's four ordinary `attackStart_*` entries name
+`crAtronachFlameMeleeAttack` (109 attack entries in Skyrim.esm carry one), and
+that spell is Contact (`SPIT` delivery 1). The TES4 analogue is a creature's
+castable Touch spell with no Target effect. The same spell can also be a
+player's (`StandardParalyze3Journeyman`, Morrowind's `frostbite`), which must
+be Target Actor. So the attack names a Contact copy, `<EditorID>Attack`,
+hashed at site `SPEL_ATTACK` on the spell's EditorID. Its effect copies carry
+the Contact key every Touch copy had before, so they keep their FormIDs.
+Measured on the built plugins: 9 such spells in Morrowind_ob, 24 in
+Tamriel_Data, 17 in TR_Mainland, 6 in Oblivion.esm.
+
+Measured on the rebuilt Oblivion.esm:
+
+- 600 of 601 ability slots are Constant/Self.
+- All 1,782 worn-enchantment slots match.
+- Every spell slot matches.
+- What still differs is intended: the scroll ENCH records, and the Self half
+  of mixed-range spells.
+
+**Dual casting needs nothing extra.** 944 of 950 vanilla effects carry no Dual
+Cast Art. Dual Cast Scale 1.0 and the either-hand `ETYP` were already written.
+
+## <a id="effect-families"></a>Effect families: HasMagicEffect tests a keyword
+
+**Code:** `tes5_import/record_types/magic.py` (`settle_family_keywords`), `record_types/magic_variants.py` (`_emit`), `tes5_import/base/conditions.py` (`_effect_family`), `script_convert/commands.py` (`has_magic_effect`, `is_spell_target`)
+
+One source effect becomes several MGEFs: the base, a copy per owner casting
+type and delivery, per actor value, per script, and scripted bound items.
+A spell carries a copy, but `HasMagicEffect` compares one exact MGEF. So a
+script asking for the base effect never saw the copy on the actor.
+
+The failure that exposed it: New Vegas's `GenericScript` ends with
+`If Player.HasMagicEffect Concussion == 0` → `CastImmediateOnSelf
+PlayerConcussed`. The spell is Fire and Forget / Self, so its effect is the
+copy `TES4ConcussionFFSelf`, not `Concussion`. The test never passed, and the
+converted poll re-cast the spell every 0.5 s. The player piled up dozens of
+"Concussion" and "Reduced Perception" entries, each 315,360,000 s (87,600 h).
+
+**The fix:** every MGEF a plugin can reference gets one keyword,
+`TES4FX_<effect EditorID, lowercase>`. The base and every copy carry it in
+`KWDA`.
+- The keyword is written in the magic pre-scan, before any record converts. It
+  is hashed at site `KYWD_MGEF_FAMILY` on the effect's EditorID, so no existing
+  FormID moves.
+- A master's effect adopts the master's keyword by EditorID. A dependent
+  plugin writes keywords only for its own effects that the masters lack.
+- Scripts: `HasMagicEffect X`, where X is an MGEF, becomes
+  `HasMagicEffectWithKeyword(TES4FX_x)`. The property binds through
+  `WELL_KNOWN_PROPERTIES`. Any other argument keeps the plain call.
+- `IsSpellTarget S` tests the family of S's first effect that has an MGEF
+  record. It used to test the vanilla Skyrim alias of that effect, which no
+  converted spell carries since MGEF became a converted record, so it always
+  read false.
+- Conditions: `HasMagicEffect` (214) on an effect with a family becomes
+  `HasMagicEffectKeyword` (699) with the keyword.
+
+Not yet confirmed in-game.
+
+## <a id="magic-art"></a>Magic art
+
+**Code:** `tes5_import/record_types/magic_art.py`; meshes in [asset_convert_magic_art.md](asset_convert_magic_art.md#phase-meshes)
+
+Each TES4 MGEF's `Model.MODL` is split per phase on the asset side. The import
+writes one companion record per phase the **source** NIF authors, keyed on the
+authored model path, so effects sharing a mesh share the record:
+
+| MGEF DATA field | Companion | Mesh | Values with no Oblivion source |
+|---|---|---|---|
+| Casting Art (92) | ARTO, DNAM 0 | `_cast` | - |
+| Hit Effect Art (96) | ARTO, DNAM 1 | `_hit`, else `_summon` | - |
+| Projectile (72) | PROJ, Missile | `_projectile` | FireboltProjectile01's fade 0.5, impact force 1.5, collision radius 10, relaunch 0.25, VNAM 1 |
+| Explosion (76) | EXPL | `_area` | FireBallExp01's radius 320, image-space radius 1024, flags 0x41, sound level 1; force 0 |
+
+A few PROJ and EXPL fields do have Oblivion sources:
+
+- **Projectile speed** is 1000 × `DATA.ProjectileSpeed`. 1000 is Oblivion.exe's
+  `fMagicProjectileBaseSpeed` default, and no plugin overrides it.
+- **Projectile range** is 10000, Oblivion.exe's `fMagicProjectileMaxDistance`.
+- **Projectile light** is `DATA.Light`, and its sound is the `BoltSound` SNDR.
+- **Explosion sound** is the `AreaSound` SNDR.
+
+An explosion is written only for an effect slot with a TES4 area on an aimed
+delivery. That area burst belongs to that use of the effect alone, so it is
+part of the `delivery_variant` key.
+
+**Sounds** go in `SNDD`: the casting sound as Release (3) and the hit sound as
+On Hit (5). An SNDR exists only for a SOUN carrying `FNAM.Filename`; its FormID
+is `derive_formid('SNDR', soun)`.
+
+Measured on Oblivion.esm, out of 703 emitted effects:
+
+| Field | Effects |
+|---|---|
+| casting art | 581 |
+| hit art | 564 |
+| an explosion | 44 |
+| their own projectile | 182 |
+| an SNDD | 702 |
+
+## <a id="master-effects"></a>A master's effect keeps its master's art
+
+**Code:** `tes5_import/record_types/magic.py` (`_fill_art`), `magic_art.py` (`master_effect_data`, `_master_sound_set`)
+
+A dependent plugin rebuilds its copies of a master's effects (per delivery,
+per actor value) from the master's EXPORT record. Two parts of that record
+cannot be resolved from the child:
+
+- **Art.** `magic_art` finds an effect's phases by reading its source NIF
+  from the CURRENT plugin's mesh tree; the master's effect meshes are in the
+  master's. Measured on Morrowind_ob.esm: **all 535** of its copies of
+  Oblivion.esm's effects had no casting art, no hit art and no sound set, so
+  a Morroblivion spell that needed a copy showed nothing in the hand. One that
+  could use Oblivion's effect directly (Frost Bolt → `FRDG`) showed Oblivion's
+  art.
+- **FormIDs.** Its SOUNs are numbered in the master's own master list.
+
+The same goes for the effect's own FormID, so `register_mgef_formids` finds a
+master's effect by EditorID in the master's converted plugin
+(`find_by_edid`). Taking the export's FormID was correct only where the
+master's list happens to line up with the child's (Morrowind_ob over
+Oblivion.esm). Elsewhere it named a record that does not exist. Tamriel_Data's
+patch effects became Tamriel_Data's own index: 295 of 1,000 effect slots,
+238 spells. TR_Mainland's became Tamriel_Data's: 180 spells. Skyrim drops such
+a spell from the magic menu. Every slot whose delivery matched the master's
+effect pointed at the bad id, and the copies were keyed on it. The fix
+renumbered those copies.
+
+So a copy of a master's effect takes Assoc. Item, Casting Art, Hit Effect Art
+and Projectile from the master's converted MGEF (`find_by_edid`, then
+`record`, which restates `DATA` 8/72/92/96 and `SNDD` in the child's ids), and
+its SNDD likewise. These REPLACE the rebuilt values rather than filling gaps: a
+rebuilt Assoc. Item is numbered in the master's own list, so in TR_Mainland it
+can name the wrong file's record. Routing a bound item to the script stand-in
+types the item the same way (`master_signature`), since `known_sigs` keys a
+master's records by the master's export ids. None of those fields is part of a
+variant key, but routing is: bound armor, and any bound effect on a never-cast
+spell, now becomes a `...Scripted` copy. Measured: 2 Tamriel_Data and 5
+TR_Mainland `...BoundXConstantSelf` copies, all with no item before, were
+replaced by scripted ones.
+The effect's area burst (Explosion) still comes only from the plugin's own
+meshes, because adding it would change the `MGEF_DELIVERY` key.
+
+## <a id="effect-shader-particles"></a>Effect shader particle counts
+
+**Code:** `tes5_import/record_types/world.py` (`convert_EFSH`)
+
+EFSH DATA offsets 124 and 128 are ratios (0 to 1) in TES4. TES5 reads them as
+**counts**: Full Particle Birth Ratio and Persistent Particle Count. Vanilla
+writes 40 to 150 for these.
+
+Copied as-is, a ratio of 1.0 spawned about one particle, so hit shaders barely
+showed. Bethesda's own port of `LifeDetected` maps 1.0 to 300, and that factor
+is `EFSH_PARTICLES_PER_RATIO`. After it, all 102 Oblivion EFSH records carry
+counts of 100 or more.
+
+## <a id="impact-data"></a>Impact data
+
+**Code:** `tes5_import/record_types/magic.py` (`fit_delivery`, `IMPACT_BY_PROJECTILE`)
+
+Oblivion has no impact data sets, so the decals and impact sounds a bolt
+leaves on the world are borrowed from vanilla. Vanilla puts an impact set on
+140 of 199 Aimed and 34 of 36 Target Location effects. It follows the
+projectile, and each vanilla bolt's MGEFs almost always share one set:
+
+| Vanilla projectile | Impact set | MGEFs flying it that carry the set |
+|---|---|---|
+| FireboltProjectile01 | MAGFirebolt01ImpactSet | 12 of 20 |
+| FlamesProjectile | MAGFlames01ImpactSet | 6 of 7 |
+| FrostIcicleProjectile01 | MAGFrostBolt01ImpactSet | 5 of 6 |
+| FrostSprayProjectile01 | MAGFrost01ImpactSet | 4 of 4 |
+| ShockBoltAim | MAGShock02ImpactSet | 5 of 5 |
+| ShockBoltConAim | MAGShock01ImpactSet | 11 of 12 |
+| AbsorbBeam01 | MAGAbsorbRedImpactSet | 8 of 8 |
+| SpiderSpitProjectile | MAGSpiderSpitImpactSet | 6 of 6 |
+| Illusion01Projectile | MAGIllusionImpactSet | 13 of 14 |
+| IllusionNeg01Projectile | MAGIllusionNegImpactSet | 10 of 14 |
+| ReanimateProjectile | MAGReanimatelImpactSet | 10 of 11 |
+| TurnUndeadProjectile | MAGTurnUnlImpactSet | 10 of 10 |
+| HealFakeProjectile, ParalyzeProjectile | none (the majority) | - |
+
+`fit_delivery` gives every aimed MGEF the impact set of the vanilla bolt its
+element and school call for. It does this even when the effect flies its own
+Oblivion projectile, so a converted fireball leaves the Firebolt scorch.
+Non-aimed deliveries get none, matching the projectile rule.
+
+## <a id="menu-display-object"></a>Menu display object
+
+**Code:** `tes5_import/record_types/magic.py` (`menu_display_object`), `magic_variants.menu_object`, `equipment.convert_SPEL`
+
+`MDOB` names the STAT the magic menu shows for a spell or an effect.
+Census of Skyrim.esm:
+
+- **SPEL:** every type carries MDOB except Disease (0 of 13). That is 342 of
+  407 spells, 28 of 28 powers, 3 of 3 lesser powers, 122 of 250 abilities and
+  112 of 115 shouts. All 618 targets are STATs.
+- **MGEF:** 835 of 950 carry one. `MagicHatMarker` (0x000435A5) is the most
+  common: 646 MGEFs and 275 spells.
+- **The specific art lives on the spell.** 292 of 618 spells show different
+  art from their first effect.
+
+**Menu art is vanilla Skyrim's, picked the way vanilla picks it.** Our own
+Cast-phase meshes were invisible and then flickered in the menu
+([asset_convert_magic_art.md](asset_convert_magic_art.md#menu-art)).
+
+The rule comes from vanilla spells of types 0, 2 and 3, grouped by their first
+effect. The first rule that matches wins:
+
+1. **By archetype.** The vanilla majority for that archetype:
+
+   | Archetype | Menu STAT |
+   |---|---|
+   | Summon | MAGINVSummon (16 of 17) |
+   | Reanimate | MAGINVReanimate (18 of 19) |
+   | Turn Undead | MAGINVTurnUndead (10 of 11) |
+   | Invisibility | MAGINVInvisibility (6 of 6) |
+   | Paralysis | MAGInvParalyze (6 of 7) |
+   | Bound Weapon | MAGINVBoundWeapon (5 of 5) |
+   | Detect Life | MAGInvDetectLife |
+   | Light | MAGINVLightSpellArt |
+   | Telekinesis | MAGINVTelekinesis |
+   | Calm, Rally | MAGINVIllusionLight01 |
+   | Demoralize, Frenzy | MAGINVIllusionDarkt01 |
+   | Command Summoned, Soul Trap | MAGINVBanish |
+
+2. **By element (resist actor value).**
+   - Fire: FireballInvArt (52 of 59 Destruction fire spells).
+   - Frost: IceSpellArt.
+   - Shock: ShockSpellArt.
+   - Magic: MAGINVAbsorb.
+3. **By school.** Alteration (and Mysticism, which folds into it): MAGINVAlteration
+   (10 of 11). Restoration: HealSpellArt (15 of 19).
+4. **Otherwise** `MagicHatMarker`.
+
+A spell takes the art its first **written** effect calls for: the clone the
+slot resolved to, filler included. Every type gets one but Disease. Each
+converted MGEF (base, per-AV and script variants) carries the same rule's
+answer.
+
+No STAT is written, so no FormID is derived for menu art.
 
 ## Rules for working in this area
 <a id="rules-working-this-area"></a>
@@ -615,3 +988,358 @@ armor record has no TES5 counterpart and is correctly discarded.
 The u16 clamp is real, not defensive: the field is 2 bytes on disk, so an
 authored `ANAM` above 65535 must saturate rather than wrap to a near-zero
 pool.
+
+## <a id="weapon-skill-and-stagger"></a>Weapon skill and stagger
+
+**Code:** `tes5_import/record_types/equipment.py` (`convert_WEAP`),
+`tes5_import/base/equivalents.py` (`WEAPON_ANIM_SKILL`, `WEAPON_ANIM_STAGGER`,
+`weapon_skill_stagger`), tested by `tests/test_weapon_skill_stagger.py`.
+
+In the 100-byte SSE WEAP `DNAM`, offset 76 is the weapon's governing SKILL, an
+int32 actor-value index, and the stagger is the FLOAT at offset 96 (xEdit
+`wbDefinitionsTES5.pas`, WEAP `DNAM`: `Skill` is an `itS32`, `Stagger` the last
+float). `convert_WEAP` wrote a table named `WEAPON_ANIM_STAGGER` as one BYTE at
+offset 76 (5 Normal, 6 Ragdoll, 7 Large Ragdoll, 0 None) and nothing at 96.
+Read as a skill, that gave every converted bow, staff and firearm actor value 0
+and every dagger actor value 5, and left every weapon with stagger 0.0. The
+table's 6 and 7 happen to be OneHanded and TwoHanded, so the other melee types
+already parsed to the right skill.
+
+Both fields are now written per Skyrim animation type. `convert_WEAP` is the
+only WEAP `DNAM` writer in the tree: Oblivion, FO3/FNV and Morrowind weapons all
+go through it. An override keeps its master's converted `DNAM` unless the plugin
+changes a field that lands in it; then convert-and-diff substitutes this
+converter's whole `DNAM`.
+
+The values are a census of the real Skyrim.esm (2,484 WEAP, all with a 100-byte
+DNAM), by `DNAM` offset 0, value × count:
+
+| Animation type | Skill at 76 | Stagger at 96 | Written |
+|---|---|---|---|
+| 0 HandToHand | 6 ×17, −1 ×1 | 0.0 ×17, 1.0 ×1 | no row: −1, 0.0 |
+| 1 Sword | 6 ×373, 7 ×3 | 0.75 ×367, 0.0 ×7, 1.25 ×2 | 6, 0.75 |
+| 2 Dagger | 6 ×292 | 0.0 ×288, 0.25 ×4 | 6, 0.0 |
+| 3 WarAxe | 6 ×305 | 0.85 ×293, 0.0 ×12 | 6, 0.85 |
+| 4 Mace | 6 ×285 | 1.0 ×282, 0.0 ×3 | 6, 1.0 |
+| 5 GreatSword | 7 ×303 | 1.1 ×298, 1.5 ×3, 0.75 ×2 | 7, 1.1 |
+| 6 Battleaxe / Warhammer | 7 ×577 | 1.15 ×298, 1.25 ×277, 0.85 ×2 | 7, 1.15 |
+| 7 Bow | 8 ×254, 7 ×3 | 0.0 ×257 | 8, 0.0 |
+| 8 Staff | 20 ×23, 19 ×14, 21 ×12, 22 ×9, −1 ×5, 7 ×5, 18 ×3 | 0.0 ×71 | −1, 0.0 |
+| 9 Crossbow | none in Skyrim.esm (Dawnguard.esm: 8 ×36) | none in Skyrim.esm (Dawnguard.esm: 0.75 ×36) | 8, 0.0 (the bow's) |
+
+6 is OneHanded, 7 TwoHanded, 8 Marksman, 18–22 the magic schools, −1 none.
+
+- **Type 6 is two weapons.** Battleaxes carry 1.15 and warhammers 1.25: 294 of
+  the 298 records with 1.15 have `battleaxe` in their EditorID, 273 of the 277
+  with 1.25 have `warhammer`. The converter picks axe or mace from the mesh name
+  for one-handed blunt weapons only; a two-handed one is type 6 either way, so
+  it takes the battleaxe's 1.15, the more common value.
+- **A staff takes −1.** 61 of the 71 vanilla staves carry a magic school, 5
+  carry TwoHanded and 5 carry −1. The converted staff's school is not read at
+  this point, so it takes the value vanilla writes for no skill.
+- **Type 0 has no row.** No path emits it: `_weapon_anim_type` returns 1 to 8
+  from the TES4 type and the mesh name, or 9 for an FO3/FNV firearm. The 17
+  vanilla type-0 records with skill 6 are trap darts and effect weapons
+  (`TrapDartWeapon…`, `FXdustDrop…WEP`, `GasTrapDummy`); the real `Unarmed`
+  (`000001F4`) carries −1 and 0.0.
+- **An animation type in neither table** takes −1 and 0.0
+  (`weapon_skill_stagger`), which is `Unarmed`'s pair.
+- **The crossbow's stagger is the bow's, not vanilla's.** All 36 crossbows of
+  Dawnguard.esm carry 0.75. Type 9 is written only for a converted firearm,
+  and whether each shot of one should stagger has not been decided.
+- **`tools/esm/tes5_esm_reader.py` prints the same layout** (`DNAM.Skill`,
+  `DNAM.Stagger`); it used to print offset 76 as a stagger enum and offset 96
+  as `ColorRemapIdx`.
+- **Unconfirmed in game.** The bytes are checked by parse-back
+  (`tests/test_weapon_skill_stagger.py`); which skill a converted weapon then
+  uses, what −1 does to a staff, and how the stagger feels have not been looked
+  at in Skyrim.
+
+## <a id="power-affects"></a>Power Affects Magnitude / Duration
+
+**Code:** `tes5_import/record_types/magic.py` (`_power_affects`)
+
+TES5 MGEF flags `0x200000` and `0x400000` decide what skill, perks, alchemy
+effectiveness and dual-casting scale. Neither TES3 nor TES4 has them, and the
+import set neither, so a potion brewed from converted ingredients ignored the
+player's Alchemy and every perk: `AlchemyMenu::ModEffectivenessFunctor`
+(`0x906e90` on 1.6.1170) applies entry point 66 and the skill factor only
+behind those two bits.
+
+Census over the 950 MGEFs of Skyrim.esm: an effect WITH magnitude carries
+Power Affects Magnitude (438 + 151) far more than Duration (100 + 14, mostly
+summon, bound, invisibility and paralysis archetypes, which the import already
+marks No Magnitude); an effect with NO magnitude carries Power Affects
+Duration (87 of 94). Both at once is 4 records. So the rule is magnitude when
+the effect has one, else duration when it has one. The rest are authored
+one-offs -- perk abilities, diseases, fixed-strength armor spells -- that a
+converted effect has no field to express.
+
+## <a id="no-magnitude-forces-one"></a>No Magnitude makes a value modifier apply 1.0
+
+**Code:** `tes5_import/record_types/magic.py` (`magnitude_flag_allowed`), `tes5_import/base/owned_records.py` (`_MGEF_FALL_FLAGS`)
+
+**The engine ignores the authored magnitude of a No Magnitude value modifier.**
+The `ValueModifierEffect` constructor (1.6.1170 `0x5d8210`) tests MGEF flag
+`0x400` and, when set, stores `1.0` as the effect's magnitude. It also forces an
+actor value outside 0..0xA4 to Health (0x18). `PeakValueModifierEffect`
+(`0x5cb2d0`) and `DualValueModifierEffect` (`0x5b7ce0`) both call it.
+`GetMagnitude` (`0x5ac570`) returns that stored value, and the per-frame update
+(`0x5d8780`) adds magnitude × frame time to the actor value.
+
+**Vanilla uses the flag on value modifiers only for on/off actor values.** Of
+Skyrim.esm's 461 value-modifier MGEFs, 19 carry No Magnitude: 10
+Invisibility, 6 Water Breathing / Water Walking, and three one-offs
+(`NN01PerkEffect`, `ArmorFFSelf100`, `VoiceDragonrendEffectScript`). Every
+Oblivion and Nehrim spell authors magnitude 0 on its no-magnitude effects, so
+1.0 is right exactly where 1 means "on".
+
+**The rule:** a value-modifier archetype keeps No Magnitude only on Paralysis,
+Invisibility, Night Eye, Water Breathing or Water Walking; anywhere else the flag
+is dropped and the authored magnitude applies.
+
+**Found through the Shivering Isles Gatekeeper.** Its script calls
+`ResetFallDamageTimer` every frame, which casts `TES4NoFallDamage` on every poll
+(about every 0.37 s). That effect was a No Magnitude value modifier on Health,
+so each 10 s cast healed 1 HP/s. About 27 copies overlapped, for roughly
+28 HP/s of extra healing, measured in game. The bone arrows' weakness (Damage
+Health 8/s, paired with his Regeneration 8/s on every level) could never catch
+up.
+
+**Still open:** Silence (`SLNC`, Peak Magicka) and Stunted Magicka (`STMA`, Peak
+MagickaRate) have no authored amount. They now apply 0 instead of the engine's
+1, and neither works until each gets a real Skyrim mechanism.
+
+## <a id="resist-paralysis"></a>Resist Paralysis is a keyword, never the Paralysis actor value
+
+**Code:** `tes5_import/record_types/magic.py` (`effect_keywords`, `PARALYSIS_CONDITIONS`)
+
+Skyrim's `Paralysis` actor value is not a resistance. Any value above 0 means
+the actor *is* paralyzed. The import used to map Oblivion's Resist Paralysis
+(RSPA, and Morrowind effect 99) to a Peak Value Modifier on it, so an ability
+authored as "Resist Paralysis 100%" paralyzed its owner for good. Measured
+live (2026-09-25) on the Shivering Isles Gatekeeper `SE02Gatekeeper6`, whose
+`SEAbGKMagicResistance6` carries RSPA 100: Paralysis 100, entirely a Temp
+modifier from `TES4RSPAConstantSelfAbility`. He lay stiff and never acted.
+Paralysis effects also named Paralysis as their resist value.
+
+Vanilla has no paralysis resistance at all, only immunity. Races and actors
+carry the `ImmuneParalysis` keyword (0xF23C5). All 19 Paralysis-archetype
+MGEFs in Skyrim.esm have ResistValue -1; 17 carry
+`HasKeyword(ImmuneParalysis) == 0` and 15 `HasKeyword(ActorTypeDragon) == 0`.
+No vanilla MGEF carries the keyword itself.
+The import now does the same:
+
+* RSPA and Morrowind 99 become a script-archetype effect with no script,
+  whose only job is to carry `ImmuneParalysis`. Every clone carries it too
+  (`magic_variants._emit`).
+* Every Paralysis-archetype effect gets vanilla's two conditions plus
+  `HasMagicEffectKeyword(ImmuneParalysis) == 0`, and no resist value.
+  `HasKeyword` checks only the actor's base record, so without the third
+  condition an ability-granted immunity would do nothing.
+
+Oblivion's partial resist (a percent chance to shrug a paralysis off) has no
+Skyrim equivalent, and any magnitude now grants full immunity. Every creature
+and quest ability in Oblivion.esm authors 100; the partial values (10-60%)
+are only on enchantments and ingredients.
+
+## <a id="sun-damage"></a>Sun Damage burns only outdoors by day
+
+**Code:** `tes5_import/record_types/magic.py` (`mgef_tail`, `SUN_CONDITIONS`)
+
+Oblivion's Sun Damage (SUDG) and Morrowind's effect 135 hurt only in
+sunlight; the engine gates them. Skyrim has no sunlight archetype, so SUDG
+converts to a Health value modifier. On an ability, Skyrim applies that every
+second wherever the owner stands. Measured headless (2026-10-30) on Tamriel
+Rebuilt's Velyn Alari in Sadalvel Ancestral Tomb: his script adds Morroblivion's
+`vampire sun damage` (Morrowind_ob `0vampireSsunSdamage`, SUDG 5), and his
+113 health ran out in about 20 s, indoors and out of combat. Removing that one
+spell by console stopped the drain at once.
+
+Every Sun Damage effect now carries the window Skyrim.esm puts on its own
+vampire sun-damage spells: `IsInInterior == 0`, `GameHour >= 5`,
+`GameHour <= 19`. Vanilla's fourth condition excludes one Skyrim worldspace
+(0x2EE41) and has no TES4 or TES3 counterpart.
+
+Sources carrying it: Oblivion.esm's player vampirism abilities
+(`Vampirism50/75/100`), one test spell and one constant enchantment
+(`DBenAppHands`); three Nehrim item enchantments; Morrowind_ob's vampire spell
+and Mantle of Woe enchantment; Morrowind.esm's `vampire sun damage`. Before
+this, each drained its owner or wearer nonstop.
+
+## <a id="morrowind-effects"></a>Morrowind effects key on an index, not a code
+
+**Code:** `tes5_import/record_types/magic_morrowind.py`
+
+Morrowind has no four-character effect codes: its 143 effects are an
+engine-fixed table addressed by index, so `EFFECT_ARCHETYPES` cannot describe
+them and must not be extended to try. `MW_EFFECT_ARCHETYPES` is the parallel
+table, keyed by index, and nothing in it is reachable from the Oblivion path --
+`convert_MGEF` consults it only for a record carrying `MorrowindEffectIndex`.
+
+The export writes each effect's EditorID (`MW014FireDamage`) as the `EFID`,
+and `register_mgef_formids` already indexes `_code_to_fid` by EditorID, so
+`_resolve_mgef` resolves Morrowind effects with **no change at all**.
+
+### Most are native; 9 await the runtime
+
+Most Morrowind effects are ordinary Skyrim ones -- fire damage is fire damage.
+The mapping was checked against `wbActorValueEnum` and against real vanilla
+records, which turned up actor values the Oblivion tables never needed and so
+never defined:
+
+| Effect | Actor value | Vanilla record proving it |
+|---|---|---|
+| Blind | 84 Blindness | `AbBlind` |
+| Sound | 92 Movement Noise Mult | `AbVampireMuffle` |
+| SpellAbsorption | 83 Absorb Chance | `RaceBretonAbsorbSpellChance` |
+| Reflect | 163 Reflect Damage | `PerkReflectBlows` |
+| Jump | 62 Jumping Bonus | `wbActorValueEnum` |
+
+Vampirism (index 133) is the instructive case, and it cuts both ways. Skyrim
+ships an entire vampire system, so reimplementing one would be waste -- but
+`VampireChangeEffect` is **archetype 1 (Script)** with a null Assoc. Item: the
+transformation lives in attached Papyrus, not in the archetype, so copying the
+archetype alone would convert to a no-op. What Skyrim *does* model natively is
+the drain, as `DisDamageHealthVampire` (archetype 34 on Health), and that is
+what Vampirism and Corprus map to. Attaching the full vampire quest chain is
+runtime work, not record work.
+
+The 13 with no Skyrim mechanism carry `NATIVE_NONE`. Eight convert as a
+script-less Script effect that MorrowindRuntime acts on: Mark, Recall and the
+two Interventions ([teleport effects](morrowind_runtime.md#teleport-effects)),
+and SwiftSwim, Levitate, SlowFall and Sanctuary (below). The other five (Disintegrate
+Weapon/Armor 37/38, Detect Enchantment/Key 65/66, ExtraSpell 126) still
+convert as an inert Value Modifier: present, addressable by a script, doing
+nothing.
+
+The five attribute effects (Drain, Damage, Restore, Fortify, Absorb Attribute;
+`MW_ATTRIBUTE_EFFECTS`) are Script effects too, but keep one variant per
+attribute, because MorrowindRuntime sums them onto the attributes it keeps
+([attribute effects](morrowind_runtime.md#attribute-effects)). They no longer
+land on stand-in actor values. `mw_needs_runtime` counts them, so Morroblivion's
+gap patch restores each Morroblivion record whose vanilla effects carry one,
+as it does for the teleports.
+
+<a id="runtime-effects-read-the-active-effect-list"></a>
+### SwiftSwim, Levitate, SlowFall and Sanctuary
+
+**Code:** `magic_morrowind.py` (`MW_RUNTIME_EFFECTS`, `MW_EFFECT_PERKS`, `register_effect_perks`), `magic.py` (`_morrowind_perk`), `tes_runtime/morrowind/plugin/game_calls_flight.cpp`, `game_calls_sanctuary.cpp`
+
+Levitate and SlowFall are confirmed in game. Sanctuary is untested.
+🛑 **SwiftSwim is NOT confirmed: re-check it.** With 60 points the runtime
+reads the effect and scales the stroke ×1.60, yet swimming feels no faster
+([the open lead](morrowind_runtime.md#levitate-and-slowfall)).
+
+The magic-effect apply sink reports only when an effect *starts*, and these
+four last. None of them needs an end signal: each is an effect the engine's
+own active-effect list holds, magnitude and all, for as long as it lasts.
+
+| Effect | Converts as | What acts on it | OpenMW source |
+|---|---|---|---|
+| SwiftSwim 1 | script-less Script effect | MorrowindRuntime swim stroke | `actor.hpp`: swim speed × (1 + 0.01 × magnitude) |
+| Levitate 10 | script-less Script effect | MorrowindRuntime flight | `npc.cpp` `getMaxSpeed`, `worldimp.cpp` `isFlying` |
+| SlowFall 11 | script-less Script effect + PERK `MWSlowFallPerk` | the perk, and MorrowindRuntime | `movementsolver.cpp`, `mtphysics.cpp` |
+| Sanctuary 42 | script-less Script effect + PERK `MWSanctuaryPerk` | the perk, on a rank MorrowindRuntime sets | `creaturestats.cpp` `getEvasion`, `combat.cpp` `getHitChance` |
+
+🛑 **No effect parks its state on a vanilla actor value, obsolete or not.**
+The first build put Levitate, SlowFall and Sanctuary on the limb conditions
+(50-52). Those carry an implicit engine base (they are on the CK wiki's Actor
+Value notes list), and the exe still carries Fallout's limb damage
+(`fCombatPlayerLimbDamageMult`). So Levitate read as always on and overwrote
+every jump: the player could not jump at all. Instead, the runtime sums a
+runtime-carried effect's magnitude straight off the actor's active-effect list
+(`ActiveMagnitude`). A perk reads a rank in a converter-owned faction.
+
+**SwiftSwim** is runtime-carried; the stroke scaling is in
+[Levitate and SlowFall](morrowind_runtime.md#levitate-and-slowfall).
+🛑 **SpeedMult gated on `IsSwimming` does not work.** The first two builds
+converted it as vanilla Frost Slow turned around: a Peak Value Modifier on
+SpeedMult with an MGEF condition `IsSwimming == 1`. In game the player's
+SpeedMult stayed at 100 for the potion's whole run, swimming included, so the
+refresh (`ModActorValue` CarryWeight ±0.1, the CK wiki's recipe) was never
+the problem: the gated effect never switched on. No vanilla MGEF gates on
+`IsSwimming`; all 27 live-state MGEF conditions are `IsInInterior`.
+
+**Sanctuary** is vanilla `DeftMovement`'s dodge: a Mod Incoming Damage entry
+(36, Multiply Value, 3 tabs) that rolls `GetRandomPercent` and multiplies the
+hit by 0. A roll cannot compare against a magnitude, so `MWSanctuaryPerk`
+carries one entry per point, 1 to 100. Each entry tests
+`GetFactionRank(MWSanctuaryFaction) == k`, then rolls `GetRandomPercent < k`,
+and rank 100 always dodges. MorrowindRuntime holds each holder's rank at its
+summed Sanctuary, capped at 100: OpenMW adds `min(100, Sanctuary)` to evasion,
+so stacked Sanctuaries add. OpenMW's evasion lowers weapon hit chance only,
+and Mod Incoming Damage fires on weapon hits only. The faction is hidden and
+rankless; `effects_formid.txt` names it for the runtime
+([Sanctuary](morrowind_runtime.md#sanctuary)).
+
+**SlowFall's damage** is exact: OpenMW calls `land()` every step while
+SlowFall is above 0 (`mtphysics.cpp`), so no fall under it ever hurts.
+`MWSlowFallPerk` carries the same unconditioned zeroing entry as
+`TES4NoFallDamagePerk` (`owned_records.FALL_DAMAGE_ENTRY`). It is a separate
+perk so that a converted `RestoreFallDamage` dispelling its spell cannot also
+remove SlowFall's protection. The slower drift down is the runtime's job
+([Levitate and SlowFall](morrowind_runtime.md#levitate-and-slowfall)).
+
+**PerkToApply** is how an effect gives its target a perk; vanilla does this
+on 9 MGEFs. `register_effect_perks` adopts a master's perk and faction by
+EditorID, else writes them, before any MGEF or variant is built. Every
+delivery clone copies the base DATA, so every clone applies the same perk.
+
+Open question for the first in-game test: whether the engine refcounts a perk
+applied by two overlapping effects.
+
+<a id="morrowind-borrowed-art"></a>
+### Art is borrowed from vanilla Skyrim
+
+**Code:** `tes5_import/record_types/magic_art_morrowind.py`, `magic.py` (`_borrow_art`), `tes4_export/record_types/morrowind_magic.py` (`_emit_sounds`)
+
+A TES3 effect names its visuals by the ID of a shared VFX record (`CVFX`
+cast, `BVFX` bolt, `HVFX` hit, `AVFX` area) and tints them per effect with a
+particle texture (`PTEX`). OpenMW swaps that texture in wherever the mesh
+uses its first root `NiTexturingProperty` (`nifloader.cpp`, `mwrender/util.cpp`).
+In Morrowind.esm's 137 effects:
+
+| Job | Distinct VFX records | Effects using one |
+|---|---|---|
+| Cast | 15 | 134 |
+| Bolt | 9 | 113 |
+| Hit | 17 | 105 |
+| Area | 11 | 116 |
+| Particle texture | 35 | 137 |
+
+Morrowind splits its art by school the way Skyrim does, so each cast and hit
+VFX ID maps to the vanilla effect that does the same job. The converted
+effect copies that effect's Casting Art and Casting Light (cast) or Hit
+Effect Art and Hit Shader (hit); vanilla fire, frost and shock burn their
+targets through the hit shader, not hit art. Fire, Shock and Frost Damage
+(engine indices 14 to 16) take their element's own vanilla effect instead:
+TES3 draws them through the generic destruction meshes, told apart only by
+the texture. The donors' DATA is baked into `vanilla_mgef_data.py`.
+
+- **Bolts** already come from the element/school projectile rule, which
+  splits the same way Morrowind's 9 bolt records do.
+- **Area explosions are not written yet.** An explosion is part of the
+  `MGEF_DELIVERY` variant key, so adding one renumbers existing variant
+  FormIDs ([FormID drift](../../CLAUDE.md#formid-drift)).
+- **What does not map:** Mysticism has no Skyrim school (Soul Trap's art
+  stands in); Levitate borrows Waterbreathing, Poison the Absorb Stamina hand
+  and the generic damage hit; the 35 per-effect tints are lost.
+
+**Sounds.** Only 14 of the 137 effects author `CSND`/`BSND`/`HSND`/`ASND`.
+An unset one plays the school's default, the SOUN `"<school> cast"` (and
+`bolt`, `hit`, `area`) (OpenMW `mwworld/store.cpp`, `spellcasting.cpp`), so
+the export writes that. In Morroblivion mode the effects live in the
+compatibility patch and their SOUNs in Morrowind_ob.esm, so `magic_art._sndr`
+resolves a master's SOUN through `master_sound_descriptor`, the same way the
+ACTI/CONT/DOOR/LIGH slots do.
+
+**A dependent plugin inherits a master effect's sounds from the master's
+conversion.** TR_Mainland and Tamriel_Data define no MGEF; their per-delivery
+copies are rebuilt from the patch's EXPORT record, whose SOUN FormIDs are
+numbered in the patch's own master list (`Oblivion, Morrowind_ob`) and mean
+nothing in the child's. `load_master_export` re-keys only each record's own id,
+not the ids inside it. So `sound_set` takes a master effect's SNDD from the
+master's converted MGEF (`find_by_edid`, then `record`, which restates it in
+the child's ids; `SNDD` is in `_FORMID_FIELDS_BY_SIG`). Before this, every copy
+shipped with no sound set at all: 0 of TR_Mainland's 404 MGEFs carried an SNDD.

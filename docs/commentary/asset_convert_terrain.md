@@ -11,6 +11,9 @@
 - [Object LOD: `_lod` in FO3/FNV, `_far` in Oblivion](#object-lod-suffix-differs-by-game)
 - [Prescreening the LODGen input](#prescreening-the-lodgen-input)
 - [`write_lodgen_input`: master modes and `only_cells`](#write-lodgen-input-master-modes)
+  - [The input file's shape, and the per-base memo](#lodgen-input-shape)
+  - [The scan reads each reference's enable parent](#enable-parent-scan)
+  - [Object LOD lists the new-game state](#object-lod-selection)
 - [Terrain LOD invents ground over cells that own no LAND](#lod-invents-terrain-over-cells-with-no-land)
 - [GENERATED `_far.nif` belong to the LOD mod](#generated-far-nif-belong-to-the-lod-mod)
   - [Why one LOD folder, not one per plugin](#one-lod-folder-not-one-per-plugin)
@@ -21,6 +24,8 @@
 - **GRAS record invariants (the working-example pattern)**: every working GRAS record — vanilla Skyrim.esm, USSEP, Beyond Skyrim's BSHeartland.esm, Skyrim Extended Cut, Legacy Orsinium (all dumpable from the install with tools/esm/tes5_esm_reader.py) — has (1) **OBND all ZEROS**, never computed mesh bounds, (2) **MODT present** (BSHeartland proves a 12-byte version-2 stub `02000000 00000000 00000000` suffices), and (3) **the model under `meshes\landscape\grass\`** — 45/45 surveyed MODL paths contain `landscape\grass\`; nothing outside it is known to work (same kind of hardcoded naming contract as the `NPC Root [Root]` bone). convert_GRAS builds the record manually to honor all three (MODL via `grass_profile.grass_model_dest()` → `landscape\grass\tes4_<basename>.nif`, flattened — TES4 grass basenames are collision-free), and `grass_profile.run()` copies each converted grass NIF there (sources under tes4\ stay for FLOR/STAT sharing). BSHeartland also shows GRAS DATA density up to 80 and TES4-style values are fine; LTEX INAM (SSE "Is Snow" flag) is optional.
 - **Grass NIFs with Vertex_Alpha + low VC alpha look invisible/ghosted in NifSkope — that is normal and matches vanilla** (vanilla grass VC alpha avg ~0.15; NifSkope multiplies it into the alpha test, the in-game grass shader uses it as wind weight instead). Don't diagnose grass visibility in NifSkope. Alpha-test thresholds are clamped to the vanilla grass envelope (≤100; Oblivion used up to 128).
 - **GRAS DATA Density/PositionRange — placement parity with the source engine.** <a id="grass-placement-parity"></a> The first grass CTD hunt clamped Density ≤80 / PositionRange ≤32 on the theory that raw TES4 values over-instance the planter; the real crash causes turned out to be #2 and #3 below, and the clamp actually made things WORSE, because the clamp direction was backwards. Disassembly of all three planters (Oblivion.exe `0x4ea8a0`, FalloutNV shares the engine, CreationKit.exe `bgsgrassmanager.cpp` at `0x124ad00`) shows the SAME rule: per land quad the grid is `n = min(2048 / PositionRange, 2048 / iMinGrassSize)` cells per side, one candidate per cell jittered inside it, placed with probability `Density% × layer-blend` (Skyrim: `rand(0..32767) < weight × 32768`). The only differences are the ini default — **iMinGrassSize is 80 in Oblivion_default.ini and Fallout_default.ini, 20 in Skyrim** — and that Oblivion/FNV divide the 3×3 weight grid by `n_capped / n_wanted` (i.e. boost density by `80 / PositionRange`, saturating at 100%) when the cap bites, which Skyrim never does. So an Oblivion record with PositionRange 40 / Density 40 plants 25×25 cells at 80% (500/quad) in Oblivion, while the old clamp (PositionRange 32) planted 64×64 at 40% (1,638/quad); FNV `NVGreenGrass02` (PositionRange 17, Density 35) is 625/quad in FNV vs 10,404 × 35% = 3,641/quad. That 3-6× pile-up of 120-180-unit-wide clumps is what reads in-game as "grass twice as big" — the per-instance size is provably identical: both vertex shaders compute `pos × (1 + heightDelta × ScaleMask)` (Oblivion `GRASS2020.vso` CTAB names `c2 ScaleMask`, writer at `0x7e912f` = (1,1,1) uniform / (0,0,1); Skyrim `RunGrass` `InstanceData4.y × ScaleMask + 1`), both planters draw `heightDelta = HeightRange × rand(-1..1)` (Oblivion `0x7c4f50` ×100 into `InstanceData.w`; CK `0x124bb0e`), and neither pixel shader uses vertex alpha for the alpha test (wind weight only). Fix in `convert_GRAS`: `PositionRange_out = max(PositionRange, 80)` and `Density_out = min(100, Density × 80 / PositionRange)` when PositionRange < 80, which reproduces the source grid and its density compensation exactly under Skyrim's default iMinGrassSize. Mesh geometry, textures and alpha thresholds are unchanged by conversion (bbox of every converted grass NIF equals its source; textures are byte copies). Per-cell grass lists: `python tools/esm/cell_grass.py export/Oblivion.esm --wrld Tamriel --cell X,Y`.
+- **Correction: Skyrim's grid is per 256-unit block, not per quad.** SkyrimSE.exe 1.6.1170 fills a quad as 8×8 blocks of 256 units with `min(floor(256/PositionRange), floor(256/iMinGrassSize))` candidates per block side, so a quad gets `64 × floor(256/PositionRange)²`, not `floor(2048/PositionRange)²`. At PositionRange 80 the two agree to 0.92× (Oblivion's converted records), so the parity fix above stands; above 128 Skyrim lays one candidate per block. A vertex's weight is the full Density wherever its texture shows at all (`fTexturePctThreshold` 0). Addresses and measurements: [tes4_export_morrowind.md](tes4_export_morrowind.md#groundcover-density).
+- **A groundcover plugin's grass model may be a master's mesh.** `grass_profile.run` looks a GRAS model up in the plugin's own converted meshes, then each direct master's, and profiles only the `landscape\grass\` copy, so the master's static mesh is untouched; a model a master already places is left to it. The step runs even when the plugin ships no meshes of its own (Sky_Main_Grass.esp names Tamriel_Data's).
 - **FNV grass textures**: all 17 FNV grass NIFs carry their diffuse as the single `File Name` of a `TallGrassShaderProperty` (no NiTexturingProperty, no BSShaderTextureSet), so `collect_shader_inputs` must read that property or the shape falls back to `Textures\white.dds`.
 - **Grass CTD root cause #2 — Oblivion meshes with NO triangle data (SOLVED 2026-07-10)**: several vanilla Oblivion grass meshes (GroundCoverMediumGrass01/LongGrass01, GroundCoverPineappleWeed*, GroundCoverWildPlant*, ms14longgrass01) ship NiTriShapeData with `has_triangles=False` — Num Triangles is set but the index array is ABSENT (only `Oblivion - Meshes.bsa` has them; no intact alternates exist). Oblivion's grass renderer tolerated it; Skyrim's planter dereferences the missing data → **region-specific CTD with no log** (Heartland/Cheydinhal cells). Several others (JMMediumGrass*, brmediumgrassyellow01, groundcoverfern01, oblivionmoldroots01) carry legacy vertex **match groups** (no vanilla Skyrim mesh has any) → same crash in Bruma cells. Fix: `asset_convert/nif/tri_reconstruct.py` — blade triangles are reconstructed from the 3-UV-role pattern (base-left/base-right/tip; tip role = highest avg z; each blade pairs a tip with the base pair whose midpoint it tops; winding from stored normals), and match groups are cleared on every converted shape. Both run inside `_convert_strips_or_shape`, so FLOR/STAT meshes sharing these sources heal on full re-runs. Diagnosis method: `tools/esm/cell_grass.py` per-cell grass lists × working-vs-crashing region diff → the defective meshes were exactly the types unique to crashing regions. A mesh with `has_triangles=False` also renders as NOTHING in NifSkope (that was the real cause of the "invisible in NifSkope" report, not vertex alpha).
 - **Grass CTD root cause #3 — intermediate NiNode wrapper on rotated sources (SOLVED 2026-07-10)**: Skyrim's grass instancer (`AddCellGrassTask` → `BSMultiStreamInstanceTriShape`) requires grass geometry as a **direct child of the BSFadeNode root** — every working grass NIF (vanilla + converted `gcgorsegrass`/`gclonggrass`) is flat `BSFadeNode → NiTriShape`. But the generic converter's Pass-6c wraps geometry in an inner NiNode whenever the **source root carries a non-identity rotation** (it bakes the rotation into a child NiNode because Skyrim honors child-NiNode rotation but ignores BSFadeNode root rotation for statics). The grass path never traverses that inner node → dereferences garbage (`rdi=0x0001000100010001`, `movzx ecx,[rdi+0x32]`) → **CTD** on any cell spawning the type. Hit TES4 **BWCattail01/02/03** (their source roots are rotated; the crash object was `BWCattail02` with a nested `NiNode "BWCattail02"`). Fix: `grass_profile._flatten_grass_root()` (runs inside `apply_grass_profile`) bakes each plain NiNode wrapper's transform into its geometry's verts+normals and re-parents the geometry onto the root, dropping the empty NiNode — world-space geometry preserved (verified: Z height extent unchanged). Only collapses bare NiNode wrappers holding pure geometry (no collision/controller/extra-data). Diagnosis: crash log named `tes4_bwcattail02.nif` + `BSFadeNode`/`NiNode` both named "BWCattail02"; block dump vs a working converted grass NIF showed the extra nesting; source root rotation identity=False (vs gcgorsegrass identity=True, which stayed flat).
@@ -199,7 +204,7 @@ confirms SW is REAL, not centered, and that `maxLOD` is not always 32. Guarded b
 ### Distant LOD generation (one-click, rebuilt 2026-07-06) — `convert.py` Phase 8 `phase_lod`
 Two pieces, both native, both re-enabled in the pipeline (`generate_lod` + `generate_terrain_lod`).
 
-**Terrain LOD** (`asset_convert/lod/terrain_lod.py` + `terrain_lod_textures.py`): per-tile `.btr` heightmap NIF + composited diffuse `.dds` + heightmap-derived BC5 normal `.dds`, LOD levels 4/8/16/32. TES4Tamriel = 1301 tiles.
+**Terrain LOD** (`asset_convert/lod/terrain_lod.py` + `terrain_lod_textures.py`): per-tile `.btr` heightmap NIF + composited diffuse `.dds` + heightmap-derived DXT1 normal `.dds`, LOD levels 4/8/16/32. TES4Tamriel = 1301 tiles.
 - **The old diffuse was the bug**: it upscaled raw LAND VCLR vertex colors → a blurry color grid (why distant terrain looked wrong). FIX: `terrain_lod_textures.composite_cell()` composites the REAL landscape textures — resolve LTEX FormID→diffuse via `build_ltex_texture_map` (LAND BTXT/ATXT → LTEX.TNAM → TXST.TX00 = `tes4\landscape\*.dds`), then per quadrant blend base + alpha layers using the ATXT/VTXT opacity grid (17×17, pos=row*17+col, sorted by ATXT layer index), ×VCLR shading at 0.4 strength (full x2 caused hard cell seams). Landscape UV repeats every 2 cells.
 - **Compositor orientation contract (fixed 2026-07-09 — the "large single color areas" bug was three separate defects):**
   1. **Quadrants with no BTXT base layer** (22.6% of Tamriel quadrants, whole sea floor) rendered flat grey-128. The engine's default for unpainted land is `Landscape\Default.dds` → `DEFAULT_LAND_TEXTURE = tes4\landscape\default.dds`. Cells with NO LAND record now also composite (default texture) instead of a flat fill.
@@ -210,7 +215,8 @@ Two pieces, both native, both re-enabled in the pipeline (`generate_lod` + `gene
 - **Land UVs are REQUIRED and meaningful** (fixed 2026-07-09): vanilla maps the tile texture across the tile with `u = x/4096`, `v = 1 − y/4096` (v=0 = NORTH edge = DDS row 0). "UVs are irrelevant for terrain .btr" was only true of how xLODGen *reads* them — the ENGINE samples them. All-zero UVs make every triangle sample one texel → each tile renders as a single flat color → the in-game/world-map "hard-edged checkerboard, one color per tile" symptom. Water shape has NO UVs (num_uv_sets=0), matching vanilla.
 - **LOD water (added 2026-07-09, vanilla-exact)**: child[1] = `BSMultiBoundNode` named `WATER` (scale 1) → one shape with an independent flat quad per water cell (4 verts/2 tris each, cell-local size 4096/level, Z = water height / level, NO shader/UV/normals — the engine textures it from WRLD NAM3). LOD4 uses `BSSegmentedTriShape` with EXACTLY 16 segments (fixed 4×4 grid, column-major sx*4+sy, so the engine can hide quads over loaded cells); LOD8/16/32 use plain `NiTriShape`. Segment binary layout (nif.xml `BSGeometrySegmentData`): `flags:byte=0, start_index:uint (tri-POINTS, 0 when segment empty), num_primitives:uint`; PyFFI's `BSSegment` fields are misaligned over the same 9 bytes — write `internal_index = start<<8` and `flags.bsseg_water = 1` (== num_prims 2 << 8). WATER AABB: XY = quad bbox in world units rel. tile origin; Z spans [min water height, max(max height, 0)]. Water cells = CELL HasWater (DATA bit 0x02) AND terrain dips below the cell water height (XCLW override valid only in ±1e9, else WRLD DNAM default).
   - **The old CTD** (BSMultiBoundNode "Water" → null deref): the engine's LOD-water path derefs the worldspace's WATR via **WRLD NAM3** — the fix is NOT to avoid the node, it's to write NAM2/NAM3 = Skyrim.esm DefaultWater (0x18) + NAM4 (LOD water height, 0 for Oblivion) in `convert_WRLD`. Also: TES4 CELL XCLW `-2147483648.0` = "use default" sentinel — must be OMITTED on conversion, not written as a literal height.
-- Normal map derived from the heightmap gradient (`_heightmap_normal_rgb` + real BC5 via `_encode_bc4_block`), replacing the old flat normal so distant terrain is lit.
+- **Sparse ocean cells (2026-10-15):** missing CELL records inherit WRLD DNAM water height; an explicitly dry CELL still suppresses water. The queue covers the finite extent of LAND and CELL water records and includes water-only tiles. Missing LAND uses DNAM's default land height to determine whether water is visible. Water-only BTRs keep an empty, zero-triangle land shape at child[0] and WATER at child[1]; the root culling bounds include the water surface. This preserves the absence of authored ground while filling holes in distant oceans. Functional generation and NIF round-trip tests cover levels 4/8/16/32, dry cells, custom water heights, selection filtering, and worlds with no LAND, including the shared-memory worker path. After regenerating and installing terrain LOD, the user confirmed in game that the distant-water gaps were fixed (2026-10-15).
+- Normal map derived from the heightmap gradient (`_heightmap_normal_rgb`, written as full-RGB DXT1 by `write_normal_dds`), replacing the old flat normal so distant terrain is lit. Layout and evidence: [Terrain-LOD normal tiles](#terrain-lod-normal-layout).
 - Debug single tiles without a full run: `python tools/lod/terrain_lod_render.py` (rebuilds specific tiles in-process, reports water quads, dumps diffuse PNG). `python -m tools.lod.terrain_lod_tex_probe [--cell X Y]` audits LTEX→TXST→dds resolution and per-cell layers.
 - Validate with `python tools/lod/terrain_lod_render.py --esm output/oblivion.esm/oblivion.esm --worldspace TES4Tamriel --cell X Y --radius R` → side-by-side hillshade + composited diffuse (the primary iteration tool; do NOT byte-match vanilla .btr). `tools/lod/lod_nif_inspect.py` dumps .btr/.bto geometry+shader.
 - **🔴 A worldspace a MASTER defines is ALWAYS sourced from that master, with the plugin as an OVERLAY — never from the plugin alone, however much terrain it adds** (2026-08-11, Tamriel.esp). `convert.py::_records_esm` used to hand record ownership to whichever file held the *bulk* of the LAND records. That silently inverts for a plugin which **extends** a master's worldspace rather than patching it: Tamriel.esp adds a landmass around Cyrodiil (99,910 LAND vs Oblivion.esm's 31,823), won ownership, and every tile was then built from the plugin ALONE — all of the master's own terrain was missing from the heightmap and `fill_missing` edge-extended it into flat plateaus. Symptom: tile-sized discontinuities along the vanilla border, **worst at level 32** where one tile spans 32×32 cells (tile `32.0.-32` had 86 of 1024 cells and encoded world Z `4096..16416` instead of `-4576..20152`; tile `32.0.0` had ZERO cells and rendered dead flat). The tell is that the only level-32 tiles that looked *correct* were the two the plugin never regenerated, so the master's copy survived. Record COUNT never distinguished "patches a worldspace" from "extends a worldspace" and must not decide ownership — the overlay path already expresses "master's terrain + this plugin's edits" correctly and is what the DLC/override case always used. Verify with `Parsing LAND records from <master>, <plugin>` in the run log and a LAND count ABOVE the plugin's own (110,095 vs 99,910 here); a single-file parse line means the bug is back.
@@ -227,6 +233,7 @@ Two pieces, both native, both re-enabled in the pipeline (`generate_lod` + `gene
   - The mesh is not at fault — repairing `LeyawiinHouseLower01`'s tangent flag and recomputing its missing normals each made 2.2 crash *earlier*. Don't chase the mesh; the bug is inside LODGen.
 - **A plugin's LOD bakes its MASTERS' models too**, and those textures were only converted into the master's output (Morrowind_ob places Oblivion architecture in its own worldspace → 117 `.bto`-referenced textures missing). `_fill_missing_lod_textures(master_tex_roots=…)` copies them in, and the normal-map synthesis prefers a master's real `_n.dds` over a flat fallback. Note `master_dirs` is set only when a master owns the WORLDSPACE, so the texture fallback uses its own `master_texture_dirs` argument (always this plugin's masters) — do not conflate the two.
 - **Terrain LOD texture lookup is independent of the dependency chain.** <a id="terrain-lod-texture-lookup"></a> Tamriel Rebuilt's terrain LOD baked flat grey (RGB 132/130/129, std 1.2) on 137 of 1,037 WrldMorrowind level-4 tiles, and partly grey on far more: TR's terrain names vanilla Morrowind land textures (`tes4\Tx_*.dds`, 31k of 61k TR base layers) that only `Morrowind-Morroblivion-Compatibility.esp\textures` ships, and that patch has NO masters, so it was never a "supplier" of the worldspace and its tree was never on the compositor's root list; `load_texture_rgb` then returned its 128 fallback. `create_lod._all_plugin_dirs` now hands every converted plugin tree to both the terrain compositor (`extra_texture_roots`) and the object-LOD fill (`master_texture_dirs`), which also stops `_fill_missing_lod_textures` re-synthesizing `tes4\default_n.dds` (Oblivion.esm ships it, and Oblivion.esm is the owner's MASTER, not a dependent). Suppliers still scope MESHES. Two latent defects fixed in the same pass: `build_ltex_texture_map` keyed LTEX/TXST by raw per-file ids and resolved TNAM per file, so an override LTEX (the grass plugin's 180) landed with an empty diffuse and 32 TR layers naming Morroblivion textures at TR's index byte missed; ids are now load-order-normalized through `formid_remap_table` (LAND layer ids included, via `decode_land_layers(remap=...)`) and TNAM resolves against the union of every listed file's TXST. NOT yet in-game verified.
+  - On each root, in order, `load_texture_rgb` looks the file up as the TXST spells it, then ignoring case (`game_paths.find_nocase`, [case-blind lookups](asset_convert_texture.md#case-blind-lookups)): the converted tree spells its land textures lowercase, so on a case-sensitive filesystem the exact join alone found none of Oblivion.esm's 166 and every tile came out grey.
 - `_promote_lod_textures` copies .bto-referenced textures to the textures root AND synthesizes missing NORMAL maps (`_a_n.dds` atlas normals + any missing `_n.dds`) from the source normal or a flat normal — LODGen writes atlas diffuse but not atlas normals, so object LOD would render unlit without this.
 
 **World map** uses terrain LOD (all levels incl. LOD32) + object LOD. WRLD NAM0/NAM9 bounds are RAW float world units (NOT /4096) and MNAM map dims must be correct — both verified in the output ESM.
@@ -348,6 +355,21 @@ Both layouts are now scanned. The tile count is only a relative weight used to
 rank worldspaces, so every file under a worldspace's directory counts,
 `blocks` and `normals` subfolders included.
 
+The LOD phase never guesses the worldspace from the plugin filename (Oblivion.esm
+is `TES4Tamriel`, Nehrim.esm `NehrimWorldspace`, not `Nehrim`): guessing produced
+"Worldspace 'Nehrim' not found" and collected every worldspace's LAND. The shipped
+set mirrors vanilla (Nehrim shipped LOD for ONLY `NehrimWorldspace`; vanilla
+Oblivion for 17 worldspaces: Tamriel, the Oblivion and Daedric realms, Kvatch, the
+Bruma gate, Pale Pass...) and naturally excludes child worldspaces (Anvil, Bravil,
+the IC districts), whose few overlay LAND records render in the parent's LOD grid.
+`generate_lod` looks worldspaces up by EditorID in the CONVERTED ESM, where the
+importer has renamed `Tamriel` to `TES4Tamriel` so it cannot override Skyrim's
+Tamriel, while the scan reads EDIDs from the raw export; `shipped_lod_worldspaces`
+applies the same rename before returning or the lookup misses.
+`detect_terrain_worldspaces(esm, include_children=False)` (LAND-owning ROOT
+worldspaces, WNAM-parented children excluded) is only the fallback when no shipped
+LOD assets exist; a configured `worldspaceEditorID` wins over both.
+
 
 ## <a id="write-lodgen-input-master-modes"></a>`write_lodgen_input`: master modes and `only_cells`
 
@@ -378,6 +400,147 @@ almost all of them -- **ElsweyrAnequina fed 189,702 references to bake 997 tiles
 and kept 127; DLCBattlehornCastle kept 8.** The refs are still needed
 (`replace_tiles` means rebuilt tiles must carry the master's objects), just only
 within the surviving tiles' footprint.
+
+### <a id="lodgen-input-shape"></a>The input file's shape, and the per-base memo
+
+**Code:** `asset_convert/lod/lod_gen.py` (`write_lodgen_input`, `_lod_candidate`,
+`_resolve_base_entry`, `_reference_lines`, `_write_input_file`)
+
+A row is the 9 REFR fields (FormID, flags, X/Y/Z, rotation in DEGREES -- the
+ESM stores radians, LODGen expects degrees -- and scale) followed by the base
+half (`_resolve_base_entry`: EditorID, flags, blank, model, lod4, lod8, lod16).
+`_drop_lodgen_refs` depends on the EditorID sitting at field 9.
+
+`_lod_candidate` decides per REFERENCE. The worldspace test accepts the REFR's
+own WRLD or its parent CELL's. The footprint test -- the cells whose objects can
+still reach a tile that survives pruning -- uses the REFR's position, not its
+parent CELL record: an override plugin's refs are merged from two files and a
+ref's own cell is not always present in `cells`, while its X/Y always place it
+on the grid (a cell is 4096 units; floor division is correct for negatives).
+`_screenable_mesh_paths` repeats the same tests in its own loop for the
+prefetch.
+
+The base half is memoised per BASE: Tamriel has 180,702 LOD references but only
+about 900 distinct bases, and resolving a base's LOD tiers stats several files
+while screening its meshes parses them. Doing that per reference instead of per
+base is what made the loop appear to hang.
+
+`_resolve_base_entry` answers two questions from two lists: `owned_meshes`
+(from `master_dirs`) -- does a master already SHIP LOD for this base? then skip
+it -- and `master_meshes` (from `master_mesh_dirs`) -- where can this base's
+meshes be SOURCED from? The skip is valid only when this plugin's tiles sit
+ALONGSIDE the master's: under `replace_tiles` it deleted every tree, rock and
+building from the rebuilt tiles (74 KB against the master's 9.8 MB). A mesh may
+be listed only if it exists in THIS output dir: a path that resolves in some
+other plugin's tree makes LODGen abort with "file not found" (exit 404) and no
+tiles at all get baked. So the FULL model is staged as well as the LOD meshes --
+LODGen falls back to it, and screening reads a missing file as unsafe and drops
+the object, which is how ElsweyrAnequina lost 882 meshes' worth of object LOD
+while their `_far.nif` files sat in the tree, readable. One mesh LODGen cannot
+parse aborts the whole worldspace, so each listed mesh and the full model are
+screened before the base is listed.
+
+Header: `CellSW` must equal the SW stored in `LODSettings/<WRLD>.lod`, so the
+effective SW that `write_lod_settings` returned (`cell_sw`) is used when given
+and the raw MNAM values otherwise. `PathData` is our output directory, so that
+LODGen finds the extracted `_far.nif` meshes there rather than looking in the
+Skyrim SE Data folder; it must end in a backslash or LODGen joins without a
+separator. `PathData` and `PathOutput` are resolved to absolute paths: LODGen is
+started with its own folder, `external\lodgen`, as the working directory
+(`_invoke_lodgen`), so a relative `PathData` would fail its Data-directory
+existence check and a relative `PathOutput` would write the `.bto` under that
+folder.
+
+### <a id="enable-parent-scan"></a>The scan reads each reference's enable parent
+
+**Code:** `asset_convert/lod/esm_scan.py` (`_read_xesp`, `_read_ref`)
+
+`parse_esm` returns `ref['xesp'] = (parent, opposite)` for a REFR that carries
+an XESP subrecord and `None` for one that does not. The parent FormID is
+normalized into the same global index space as `form_id`, so a parent placed
+by another plugin is found by its id whatever index byte each file gives it.
+`opposite` is flags bit 0, "Set Enable State to Opposite of Parent", and no
+other bit is read: the importer writes the field as `<II` parent + flags
+(`tes5_import/record_types/world.py`) and a converted Oblivion.esm holds only 0
+and 1 there, but in the five Skyrim SE masters (Skyrim, Update, Dawnguard,
+HearthFires, Dragonborn; winning records) 6,269 of 32,892 REFR XESP fields
+hold some other value, so the whole field must never be compared.
+
+Measured on one converted Oblivion.esm: **8,670 of 1,025,412 scanned REFRs
+carry XESP**, 1,489 of them with the opposite bit. 8,515 of the parents are
+scanned REFRs themselves; the other 155 are ACHR records, which the scan does
+not read, so a reader of `xesp` finds no record for them. Knights.esp has 995
+in 6,795 REFRs and DLCFrostcrag.esp 491 in 1,055.
+
+### <a id="object-lod-selection"></a>Object LOD lists the new-game state
+
+**Code:** `asset_convert/lod/lod_gen.py` (`_refs_on_at_game_start`,
+`_initially_enabled`)
+
+**The rule.** A LOD-flagged reference that the plugin's records leave OFF at new
+game is not listed. A reference without an enable parent is off when it carries
+Initially Disabled (0x800). A reference with an enable parent takes its parent's
+state, inverted when its `opposite` bit is set, and so on up the chain; for such
+a reference only the chain is read. `_initially_enabled` walks the chain
+iteratively with no depth cap and memoises every reference it passes, so the
+answer does not depend on which reference of a chain is asked first. Anything
+that cannot be resolved stays listed, as every reference was before: a parent
+that is not a scanned REFR (an actor, the player), a parent none of the merged
+files defines, a cycle.
+
+`_refs_on_at_game_start` filters the reference list once, before the prefetch
+and the row loop, so neither screens or stages a mesh that only a left-out
+reference uses. It prints `Object-LOD selection: N LOD-flagged reference(s) off
+at game start left out, K kept with an unresolved enable parent`. N counts
+references that pass `_lod_candidate`, before their base is resolved, so it can
+exceed the number of rows that go.
+
+**What it drops**, measured on one converted Oblivion.esm with no other plugin
+(LODGen not run). TES4Tamriel has 180,702 LOD-flagged references; **1,043 are
+off at new game: 4 by their own flag and 1,039 through an enable parent**, 8 of
+which carry the flag too. 1,023 are STAT and 20 TREE. By model folder:
+`rocks\oblivionplane` 551, `oblivion\clutter` 226, `architecture\kvatch` 160,
+`oblivion\architecture` 49, `speedtrees` 20, and 37 in eight other folders. The
+1,039 hang off 88 chain roots; 83 of those are also the enable parent of a door
+reference, 80 of them an `OblivionGatetoOblivion`, and 924 of the 1,039 are
+under those 83: the scenery of Oblivion-gate sites. **The input goes from
+180,635 rows to 179,629**, 1,006 fewer: 37 of the `rocks\oblivionplane`
+references have a base that was never listed. SEWorld goes from 17,071 rows to
+17,067: four `effects\seflamesofagnon*` meshes under three parents. The other
+16 worldspaces that get LOD have no such reference and their input is
+byte-identical. No tile at level 4, 8 or 16 loses its last row (TES4Tamriel
+725 / 199 / 56 tiles and SEWorld 92 / 31 / 13, before and after). No chain
+among these references is deeper than three links, none is unresolved, and none
+has its own flag set while its chain leaves it on. With Knights.esp and
+DLCFrostcrag.esp overlaid the same 1,043 go (180,784 rows to 179,778).
+
+**Limit.** Parents are read only from the files merged for this worldspace: its
+owner and the dependents that place something in it (see
+[Overlay scoping](#lod-suppliers-vs-contributors)). A dependent that changes a
+parent elsewhere and places nothing in the worldspace is not overlaid, so its
+change is not seen. In the measured data no left-out plugin overrides a member
+of such a chain (52 worldspace-and-plugin pairs).
+
+**The trade-off.** Object LOD is static: a tile holds one set of objects
+whatever the state of the game. Until this rule every state was listed at once,
+so the before and the after of a scripted change were both drawn at distance
+from the first minute. Bethesda's own tiles do the same where it can be
+measured: of the LOD-capable references under Skyrim SE's shipped level-4
+object tiles (records of Skyrim, Update and Dawnguard), 33 have an enable
+parent or their own Initially Disabled flag, and all 33 are in the tiles -- 27
+that the same reading of the records leaves on and 6 that it leaves off. (Each
+reference's LOD mesh was placed and matched against the tile's vertices within
+0.05 units; 17,245 of 17,778 plain references are found that way, 97.00 %, and
+none of them once shifted.) With this rule the LOD shows the new-game state
+only. An object a quest or script switches ON later is missing at distance from
+then on, and one it switches OFF stays: 666 of TES4Tamriel's kept references
+are the `opposite` children of an off parent (312 Great Forest rocks, 151
+trees), on at new game and off once that parent is enabled. xEdit's Skyrim pass
+(`wbGenerateLODTES5`, `Core/wbLOD.pas` lines 2779-2790 on branch `dev-4.1.6` @
+`9fb01688`) draws the line elsewhere: it skips a reference that is Initially
+Disabled or Deleted, and a non-VWD reference that has any enable parent. By
+those two tests it would also skip 521 references kept here, all on at new
+game, and list 14 VWD trees left out here.
 
 
 ## <a id="prescreening-the-lodgen-input"></a>Prescreening the LODGen input
@@ -529,6 +692,33 @@ tree to flatten detail-overlay alpha, which cost 401.6 MB of mipless
 uncompressed DDS and put 192 paths in two mods at once; that fix has been
 removed entirely. See
 [asset_convert_shader.md](asset_convert_shader.md#detail-overlay-diffuses).
+
+### <a id="the-bake-never-writes-a-plugin-folder"></a>The bake never writes into a plugin's folder
+
+Everything the bake GENERATES goes here, textures included: the opaque
+`<name>_lod.dds` overlay copies, rendered tree billboards, and the flat
+`<tree>_n.dds` billboard normals. Each has a path of its own, so none shadows a
+plugin file. Plugin folders are read-only inputs (`find_texture` searches
+`tex_roots` in order; only `tex_roots[0]`, this mod, is written).
+
+They used to land in `output/<plugin>/textures/`. That tree is what `--pack-only`
+archives, and the bake runs after it, so a BSA install lacked them while a loose
+install had them: the "missing rock / distant tree texture" reports. Measured in
+the plugin folders before the move: Oblivion 25 `_lod` copies (18 rocks) and 117
+flat normals, FalloutNV 130, TWMP 72, Unique Landscapes 63, ElsweyrAnequina 41,
+Morrowind_ob 16. `tools/lod/render_tree_billboard.py` writes here for the same
+reason.
+
+### <a id="render-a-missing-billboard"></a>A tree without a billboard gets one rendered, never decimated
+
+Decimating a canopy is catastrophic at LOD scale: the card is 8 verts, the
+decimated tree is 25-330 KB, and it is baked once per placement. Censused across
+the load order, 113 such trees accounted for 3.35 GB of baked geometry that
+becomes 0.05 GB as cards (63x lighter); `dementiatree10l` alone, 8,006
+placements in one level-16 tile, drove that tile to 663 MB. So
+`_far_nif_worker` renders the missing billboard and decimates only if rendering
+fails. The render resolves leaf textures against every sibling output folder, so
+a plugin's trees find their master's textures.
 
 Measured before the change. Scanning 28,828 non-`_far` files (meshes, `.bto`
 tiles, records) across FalloutNV, Oblivion and AutoConvertLOD for any reference
@@ -1287,6 +1477,51 @@ test for Bethesda's own top-level `Architecture` mesh folder (the record type
 cannot help: 4,253 of the LOD-flagged bases are STAT, 119 TREE, 10 MSTT).
 Not shipped pending an in-game look at the authored rule alone.
 
+## <a id="terrain-lod-normal-layout"></a>Terrain-LOD normal tiles are model-space: R = east, G = up, B = north
+
+**Code:** `_heightmap_normal_rgb` in `asset_convert/lod/terrain_lod.py`,
+`write_normal_dds` in `asset_convert/texture/dds_codec.py`.
+
+The terrain `.btr` we write has no vertex normals and sets
+`Model_Space_Normals`, so the surface direction comes from its `_n.dds` alone.
+Vanilla's tile stores all three axes of a model-space normal, each as
+`n * 0.5 + 0.5`: **R = east, G = up, B = north**, image row 0 = north like the
+diffuse tile.
+
+Measured on 10 vanilla `tamriel.<level>.<x>.<y>` tiles read from the SSE BSAs
+with `read_bsa_files` (`4.0.0`, `4.-4.0`, `4.8.-12`, `4.-20.4`, `4.12.8`,
+`4.24.-8`, `8.0.0`, `8.8.8`, `16.0.0`, `32.0.0`):
+
+- **Format.** All 10 `_n.dds` are DXT5, 256×256, 8 mips, alpha 255 on every
+  texel. Read as a three-channel vector the texels are unit length (tile mean
+  0.979–1.000). G never drops below 125; R and B span 0–255.
+- **Shader.** All 10 `.btr` use shader type 18 with flags1 `0x80401000`, which
+  has `Model_Space_Normals` (bit 12) set — the flag `terrain_nif.py` writes.
+- **Axes.** Normals were rebuilt from Skyrim.esm's own LAND heights
+  (`parse_land_records` + `_assemble_tile`) by plain finite differences —
+  column = east, row = north, rows then flipped so row 0 = north — and resized
+  to the tile's 256 px. R follows east at r = 0.873–0.977, G follows up at
+  0.845–0.980, B follows north at 0.890–0.976. Of the 96 ways to read a tile
+  (6 channel orders × 4 sign choices for the two horizontal axes × 4 image
+  mirrorings) this one has the lowest mean absolute error on 10 of 10 tiles:
+  2.94–11.40, against 11.57–29.28 for the runner-up.
+
+The converter used to write north in G and up in B, then encode BC5, which
+stores only R and G. Baked from the same Skyrim.esm heights, those tiles decode
+with blue = 0 on every texel. Read in the layout above that is a normal lying
+on its side and pointing south (north = −1.00 on all 10 tiles), with "up" taken
+from the north slope: above zero on only 44–76% of texels, with a tile mean
+between −0.08 and +0.27. Tiles written now have up above zero on 100% of
+texels (tile mean 0.62–0.97) and correlate with vanilla's, channel for channel,
+at R 0.861–0.952, G 0.782–0.897, B 0.879–0.956 — at the sizes the converter
+ships, each pair compared at the smaller of the two sizes.
+
+The tile is written as DXT1 with mips: vanilla's alpha is constant, and DXT1 is
+the same color block without the alpha block. All of this is measured on
+files; the shader was not read and no in-game comparison is recorded here.
+Tiles baked earlier keep the old layout until terrain LOD is rebuilt
+(`tools/release/create_lod.py --worldspaces <EDID>`).
+
 ## The DDS block codec
 <a id="dds-block-codec"></a>
 
@@ -1565,6 +1800,27 @@ cells), counting each baked tile's footprint against cells that own a LAND:
 At level 32 HALF the baked footprint is invented. The coarser the level the
 further a tile reaches past the landmass, because the footprint grows as
 `level^2` while the real cells do not.
+
+**The queue's cell range is inclusive.** `_queue_tiles` used to end a level at
+`((max + level - 1) // level) * level`, which is the tile that HOLDS the last
+cell only when that cell is not on a tile boundary: a max cell that is an exact
+multiple of the level lost its tile row or column, and a max cell of 0 lost it
+at every level (one LAND cell at (0, 0) queued nothing). It now ends at
+`(max // level + 1) * level`. Measured on a converted Oblivion.esm by queueing
+each worldspace both ways, every earlier tile still queued:
+
+| worldspaces | LAND cells | tiles before | tiles after |
+|---|---|---|---|
+| the 18 a default `create_lod.py` run bakes | 25,976 | 2,507 | 2,530 |
+| all 51 root worldspaces that own LAND | 29,837 | 3,274 | 3,302 |
+
+The new tiles are all level 4: MS13CheydinhalOblivionWorld 11, DABoethiaRealm
+7, OblivionRD006 3 and MS14World 2 in a default run, plus Toddland 3 and
+TestGnarlWorld 2, which are baked only when named. All 28 lie inside the
+worldspace's `.lod` grid. Tamriel's LAND runs -64..69 by -69..59, neither
+maximum on a tile boundary, so it gains nothing. Baking DABoethiaRealm,
+MS14World and OblivionRD006 before and after leaves the 321 earlier files
+byte-identical and adds 36 (12 tiles). Not checked in game.
 
 Worked example — TES4 cell (30,-60), which no plugin owns. TR's TES3 source
 stops at TES3 x=14, and a TES3 cell splits into four TES4 cells, so TES4 x=30

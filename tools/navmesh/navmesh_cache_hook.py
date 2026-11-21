@@ -51,6 +51,7 @@ mistake surfaces before the release rather than after.
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import re
 import subprocess
@@ -61,9 +62,24 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from tools.navmesh import navmesh_cache as nc
 
 #: Sources whose bytes feed the cache tag; a test asserts they match pool.
-NAVMESH_PATHS = ('tes5_import/navmesh/',)
-#: Under the prefix but NOT a tag source -- see pool._TAG_EXCLUDE.
-NAVMESH_EXCLUDE = ('tes5_import/navmesh/edge_links.py',)
+NAVMESH_PATHS = ('tes5_import/navmesh/', 'native/src/navgrow/')
+
+
+def _tag_exclude() -> tuple[str, ...]:
+    """pool._TAG_EXCLUDE as repo paths, read from source so the hook stays import-free."""
+    pool = os.path.join(nc.repo_root(), 'tes5_import', 'navmesh', 'pool.py')
+    with open(pool, encoding='utf-8') as fh:
+        tree = ast.parse(fh.read())
+    for node in tree.body:
+        if (isinstance(node, ast.Assign)
+                and getattr(node.targets[0], 'id', None) == '_TAG_EXCLUDE'):
+            names = ast.literal_eval(node.value.args[0])
+            return tuple(sorted('tes5_import/navmesh/' + n for n in names))
+    raise LookupError('_TAG_EXCLUDE not found in ' + pool)
+
+
+#: Under the prefix but NOT a tag source -- mirrors pool._TAG_EXCLUDE.
+NAVMESH_EXCLUDE = _tag_exclude()
 
 #: Non-tag files that change caching. See: docs/commentary/tes5_import_navmesh.md#what-gates-a-push
 NAVMESH_FUNCS = {
@@ -125,6 +141,24 @@ def changed_paths(base: str, head: str) -> list[str]:
     return [p for p in out.splitlines() if p]
 
 
+def feeds_tag(path: str) -> bool:
+    """True when the file's bytes enter the published tag: a top-level navmesh .py, or a native source.
+
+    The published cache is the corridor's, whose tag hashes
+    `tes5_import/navmesh/*.py` only (pool.tag_sources); the experimental
+    `lattice/` package feeds only its own local cache and never gates a push.
+    """
+    if path in NAVMESH_EXCLUDE:
+        return False
+    for prefix in NAVMESH_PATHS:
+        if prefix.endswith('/') and path.startswith(prefix):
+            rest = path[len(prefix):]
+            return '/' not in rest and rest.endswith(('.py', '.cpp', '.h'))
+        if path == prefix:
+            return True
+    return False
+
+
 _HUNK_FUNC = re.compile(r"^@@ .*? @@\s*(?:def\s+)?([A-Za-z_]\w*)")
 
 
@@ -136,9 +170,7 @@ def touches_navmesh(paths: list[str], base: str = None,
     NAVMESH_FUNCS only count when a hunk lands in one of the listed functions --
     otherwise an unrelated dialogue fix in import_main.py would block the push.
     """
-    hits = [p for p in paths
-            if any(p.startswith(n) or p == n for n in NAVMESH_PATHS)
-            and p not in NAVMESH_EXCLUDE]
+    hits = [p for p in paths if feeds_tag(p)]
     for path in paths:
         funcs = NAVMESH_FUNCS.get(path)
         if funcs and (base is None

@@ -14,7 +14,8 @@ import struct
 from .record_types.common import escape_value
 from .record_types.falloutnv import (EFFECT_TYPES, FALLOUT_BASE_EXPORTERS,
                                      MGEF_EDITOR_IDS, SUPERSEDED_ACTOR_KEYS,
-                                     SUPERSEDED_EFFECT_KEYS, export_deltas)
+                                     SUPERSEDED_EFFECT_KEYS, SUPERSEDED_IDLE_KEYS,
+                                     export_deltas)
 from .record_types.quest_falloutnv import SUPERSEDED_QUEST_KEYS
 from .tes4_reader import Record, get_string, get_subrecord, read_group_records
 
@@ -23,6 +24,9 @@ _TEXTURE_SETS = {}
 
 #: Source path whose TXST records this process has already indexed.
 _INDEXED_SOURCE = [None]
+
+#: TES4-layout CSTY keys; FO3/FNV lay CSTD and CSAD out differently, so they would be misread.
+_TES4_COMBAT_STYLE_KEYS = ("CSTD.", "CSAD.")
 
 #: LTEX ICON is relative to Textures\\Landscape\\; FO3/FNV TX00 spells that prefix out.
 _LANDSCAPE_PREFIX = 'landscape' + chr(92)
@@ -41,6 +45,10 @@ def superseded_keys(rec: Record) -> tuple:
         return SUPERSEDED_EFFECT_KEYS
     if rec.type == "QUST":
         return SUPERSEDED_QUEST_KEYS
+    if rec.type == "CSTY":
+        return _TES4_COMBAT_STYLE_KEYS
+    if rec.type == "IDLE":
+        return SUPERSEDED_IDLE_KEYS
     return ()
 
 

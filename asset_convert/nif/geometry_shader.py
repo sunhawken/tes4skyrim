@@ -17,15 +17,19 @@ from asset_convert.nif.shaders import (ALPHA_BLEND_ENABLED, ALPHA_DST_ONE,
                                        DEFAULT_DIFFUSE_TEXTURE,
                                        DEFAULT_GLOSSINESS,
                                        default_normal_texture,
-                                       LIGHTING_EMISSIVE_ONLY, SPEC_STRENGTH,
+                                       LIGHTING_EMISSIVE_ONLY,
+                                       REFRACTION_STRENGTH, SPEC_STRENGTH,
                                        apply_fx_soft_effect, apply_glow,
                                        apply_parallax,
                                        attach_tex_transform_ctrls,
                                        collect_shader_inputs, collect_uv_ctrls,
                                        has_spec_mask, plan_flipbook_atlas,
-                                       resolve_normal_for)
+                                       resolve_texture, resolve_normal_for)
+from asset_convert.nif.morroblivion_textures import substitute
 from asset_convert.nif.nif_flags import NIF_FLAGS
-from asset_convert.nif.tex_paths import rewrite_tex_path
+from asset_convert.nif.tex_paths import (path_bytes, path_text,
+                                         rewrite_tex_path)
+from asset_convert.nif.uv_transform import apply_static_uv
 from asset_convert.nif.tri_reconstruct import (UnreconstructibleGeometry,
                                                clear_match_groups,
                                                fix_missing_triangles)
@@ -52,9 +56,6 @@ _SKY_MESH_TYPES = {
     'clouds_oblivion.nif':  SKY_CLOUDS,
     'atmosphere.nif':       SKY_BASE,
     'sky.nif':              SKY_BASE,
-    'sunbeam01.nif':        SKY_SUNGLARE,
-    'sunbeam02.nif':        SKY_SUNGLARE,
-    'sunbeam03.nif':        SKY_SUNGLARE,
 }
 
 
@@ -217,8 +218,9 @@ def _normal_slot(diffuse, authored_normal, fix_textures, stats):
     """
     base = diffuse.rsplit('.', 1)[0] if '.' in diffuse else diffuse
     if authored_normal:
-        return (rewrite_tex_path(authored_normal) if fix_textures
-                else authored_normal.decode('utf-8', errors='replace'))
+        return (resolve_texture(rewrite_tex_path(authored_normal), stats)
+                if fix_textures
+                else path_text(authored_normal))
     if stats is None:
         return base + '_n.dds'
     found = resolve_normal_for(diffuse, stats)
@@ -230,6 +232,19 @@ def _normal_slot(diffuse, authored_normal, fix_textures, stats):
         stats['spec_normal_from_base'] = \
             stats.get('spec_normal_from_base', 0) + 1
     return found
+
+
+def _upgraded_diffuse(diffuse_path, stats):
+    """Morroblivion's higher-res twin for this diffuse, or the original.
+
+    See: docs/commentary/asset_convert_texture.md#morroblivion-texture-substitution
+    """
+    twin = substitute(diffuse_path)
+    if twin is None:
+        return diffuse_path
+    if stats is not None:
+        stats['mw_texture_upgraded'] = stats.get('mw_texture_upgraded', 0) + 1
+    return twin
 
 
 def _fill_texture_slots(tex_set, diffuse_path, authored_normal,
@@ -246,11 +261,13 @@ def _fill_texture_slots(tex_set, diffuse_path, authored_normal,
             stats['untextured_diffuse_defaulted'] = (
                 stats.get('untextured_diffuse_defaulted', 0) + 1)
         return
-    diffuse = (rewrite_tex_path(diffuse_path) if fix_textures
-               else diffuse_path.decode('utf-8', errors='replace'))
-    tex_set.textures[0] = diffuse.encode('utf-8')
-    tex_set.textures[1] = _normal_slot(
-        diffuse, authored_normal, fix_textures, stats).encode('utf-8')
+    diffuse_path = _upgraded_diffuse(diffuse_path, stats)
+    diffuse = (resolve_texture(rewrite_tex_path(diffuse_path), stats)
+               if fix_textures
+               else path_text(diffuse_path))
+    tex_set.textures[0] = path_bytes(diffuse)
+    tex_set.textures[1] = path_bytes(_normal_slot(
+        diffuse, authored_normal, fix_textures, stats))
 
 
 def _build_texture_set(diffuse_path, authored_normal, fix_textures, stats):
@@ -325,7 +342,7 @@ def _flip_frames(flip_ctrl, fix_textures):
     if flip_ctrl is None:
         return []
     return [(rewrite_tex_path(s.file_name) if fix_textures
-             else s.file_name.decode('utf-8', errors='replace'))
+             else path_text(s.file_name))
             for s in flip_ctrl.sources if s is not None and s.file_name]
 
 
@@ -338,8 +355,9 @@ def _atlas_controller(eff_shader, flip_ctrl, atlas):
     See: docs/commentary/asset_convert_shader.md#flipbook-to-atlas
     """
     atlas_path, n_pad, n_real = atlas
-    eff_shader.source_texture = atlas_path.encode('utf-8')
+    eff_shader.source_texture = path_bytes(atlas_path)
     eff_shader.uv_scale.u = 1.0 / n_pad
+    eff_shader.uv_offset.u = 0.0
     delta = float(getattr(flip_ctrl, 'delta', 0.0) or 0.0)
     if delta <= 0.0:
         span = float(flip_ctrl.stop_time) - float(flip_ctrl.start_time)
@@ -403,15 +421,11 @@ def _build_effect_shader(ts, tex_set, si, flip_ctrl, diffuse_path,
     frames = _flip_frames(flip_ctrl, fix_textures)
     atlas = plan_flipbook_atlas(frames, stats) if len(frames) >= 2 else None
     if frames:
-        effective_path = frames[0].encode('utf-8')
+        effective_path = path_bytes(frames[0])
     else:
         effective_path = tex_set.textures[0] if diffuse_path else b''
 
     eff_shader = NifFormat.BSEffectShaderProperty()
-    eff_shader.uv_offset.u = 0.0
-    eff_shader.uv_offset.v = 0.0
-    eff_shader.uv_scale.u = 1.0
-    eff_shader.uv_scale.v = 1.0
     esf1 = eff_shader.shader_flags_1
     esf1.slsf_1_own_emit = 1
     esf1.slsf_1_z_buffer_test = 1
@@ -424,6 +438,7 @@ def _build_effect_shader(ts, tex_set, si, flip_ctrl, diffuse_path,
         esf1.slsf_1_vertex_alpha = 1
     eff_shader.source_texture = effective_path
     eff_shader.texture_clamp_mode = 3
+    apply_static_uv(eff_shader, si.base_map)
 
     authored = _effect_emissive(eff_shader, si)
     if apply_fx_soft_effect(eff_shader, si.alpha_prop,
@@ -469,6 +484,16 @@ def _set_emissive(shader, sf1, r, g, b, animated):
     shader.emissive_multiple = 1.0
 
 
+def _make_refractive(shader, sf1):
+    """Convert the lighting preset into a refraction distortion surface.
+
+    See: docs/commentary/asset_convert_shader.md#refraction-surfaces
+    """
+    sf1.slsf_1_refraction = 1
+    sf1.slsf_1_fire_refraction = 1
+    shader.refraction_strength = REFRACTION_STRENGTH
+
+
 def _build_lighting_shader(ts, tex_set, si, has_double_sided):
     """The BSLightingShaderProperty preset every ordinary world surface gets.
 
@@ -492,10 +517,11 @@ def _build_lighting_shader(ts, tex_set, si, has_double_sided):
         sf2.slsf_2_double_sided = 1
     if ts.data.has_vertex_colors:
         sf2.slsf_2_vertex_colors = 1
+    if si.is_refraction:
+        _make_refractive(shader, sf1)
 
     shader.texture_clamp_mode = 3
-    shader.uv_scale.u = 1.0
-    shader.uv_scale.v = 1.0
+    apply_static_uv(shader, si.base_map)
     shader.texture_set = tex_set
 
     _set_emissive(shader, sf1, si.emissive_r, si.emissive_g, si.emissive_b,
@@ -547,10 +573,8 @@ def _carry_alpha(ts, tex_set, si, stats):
     ts.bs_properties[1] = alpha_prop
     diffuse = tex_set.textures[0] if tex_set.textures else None
     if diffuse and stats is not None:
-        if isinstance(diffuse, bytes):
-            diffuse = diffuse.decode('utf-8', errors='replace')
         stats.setdefault('_alpha_opacity_diffuse', set()).add(
-            diffuse.replace('/', '\\').lower())
+            path_text(diffuse).replace('/', '\\').lower())
 
 
 def _mark_skinned(ts):
@@ -603,7 +627,8 @@ def process_geometry(strips_or_shape, fix_textures, stats=None, sky_type=None,
     if norm_tex_ref is not None:
         _record_overlay(tex_set, si.tex_apply_mode, stats, norm_tex_ref)
     _carry_alpha(ts, tex_set, si, stats)
-    attach_tex_transform_ctrls(ts.bs_properties[0], si.tex_transforms)
+    attach_tex_transform_ctrls(ts.bs_properties[0], si.tex_transforms,
+                               si.base_map)
     _mark_skinned(ts)
 
     if hasattr(ts, 'data') and ts.data is not None:

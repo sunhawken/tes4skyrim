@@ -105,11 +105,7 @@ class Call(Expr):
     name: str
     args: tuple[Expr, ...] = ()
     receiver: Expr | None = None
-    #: The argument list opened with a COMMA (`StopCombat, Player`).  For a
-    #: command that takes no arguments the token after that comma is the
-    #: RECEIVER, not an argument -- `StopCombat, Player` means Player's
-    #: combat, the same as `Player.StopCombat`.  Recorded because the comma is
-    #: the only thing that says so, and dropping it acted on the wrong actor.
+    #: The argument list opened with a COMMA (`StopCombat, Player`); a zero-arg command discards it.
     leading_comma: bool = False
 
 
@@ -123,6 +119,19 @@ class Raw(Expr):
     emitter is a bug worth reporting, not a crash.
     """
     text: str
+
+
+@dataclass(frozen=True)
+class Missing(Expr):
+    """An operand the source left out (`x >= 1 && < 2`); evaluating it halts the script.
+
+    See: docs/commentary/script_convert.md#missing-operand-halts
+    """
+
+
+def has_missing(expr: Expr) -> bool:
+    """Does `expr` contain an operand the source left out?"""
+    return any(isinstance(e, Missing) for e in walk_expr(expr))
 
 
 # --------------------------------------------------------------------------
@@ -198,6 +207,12 @@ class If(Stmt):
 class While(Stmt):
     """OBSE `while <cond> ... loop`."""
     cond: Expr = None
+    body: list = field(default_factory=list)
+
+
+@dataclass
+class ForEach(ExprStmt):
+    """OBSE `forEach <it> <- <container> ... loop`; `expr` is the header command."""
     body: list = field(default_factory=list)
 
 

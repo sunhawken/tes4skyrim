@@ -226,6 +226,49 @@ navmesh link at all.
 Note `build_edge_links` only appends edge links to *exterior* meshes and never
 reorders triangles, so indices captured before it stay valid.
 
+<a id="fallout-edge-links"></a>**FO3/FNV edge links are authored, so they are
+carried, not stitched** (`navm_falloutnv`). A Fallout navmesh names its
+neighbours in NVEX (xEdit `wbRecord(NAVM)`: u32 type, NAVM FormID, u16
+triangle; 10 bytes, the same as Skyrim's), and a triangle whose flag bit 0, 1
+or 2 is set holds an NVEX index in that edge, not a neighbour triangle (xEdit
+`wbNVTREdgeToStr`). The exporter dropped NVEX and the parser ignored the flag,
+so a linked edge either vanished or, when its index was below the triangle
+count, joined an unrelated triangle; the geometric seam pass then linked only
+241 of the 2,727 exterior cells it counted (9%), though FalloutNV.esm authors
+94,467 links on 4,105 navmeshes (4,095 exterior). NPCs could not cross an
+exterior cell border: Sunny
+Smiles's `VCG02SunnyTravelToWell1` started and she never moved. Each authored
+link is now written after the mesh is packed, through `NavMeshView.add_link`
+with the source link type, to the target's output FormID
+(`derive_formid('NAVM', (cell, source FormID))`, mapped for every navmesh
+before any is converted). `build_edge_links` only fills border edges that
+carry no link, so it adds to them and never duplicates one.
+
+<a id="every-mesh-in-a-cell"></a>**The seam pass keys every exterior mesh, not
+every cell** (`edge_links._exterior_views`, `_stitch_seams`). It used to index
+meshes by `(worldspace, grid)`, so a cell holding several kept only the last
+one, and `_prune_dead_links` then stripped every link into the dropped ones.
+That was invisible while every source had one exterior mesh per cell
+(Oblivion's splitter cuts interiors only, after this pass), but FalloutNV.esm
+has 990 exterior cells with 2 to 8 navmeshes (2,523 meshes, 59% of the
+exterior). With the authored links carried in, the pass deleted 14,485 of the
+94,467 across 1,466 meshes. Keyed per mesh, with each seam matched across
+every mesh on both sides at once, it loses none, and 4,097 of 4,260 exterior
+meshes end up linked (96%). With one mesh per cell the output is
+byte-identical to the old pass (3,238 FNV meshes, one per cell, compared).
+
+<a id="fallout-door-links-renumbered"></a>**FO3/FNV door links are renumbered
+like every other reference** (`navm_falloutnv.parse_door_links`). An authored
+Fallout navmesh names its doors in NVDP by the source FormID, `0010618E` for
+the Prospector Saloon's front door. The converted plugin has Skyrim.esm as its
+first master, so that door is written as `0110618E`, and `convert_REFR` looks
+its link up by that id. The door links were stored unrenumbered, so the import
+logged "1100 doors bound" while none of FalloutNV.esm's 1,108 teleport doors
+got XNDP, and the navmeshes' own Door Triangles named records in Skyrim.esm's
+space. No NPC could path through a door: Sunny Smiles's Back in the Saddle
+package (travel to `VCG02SunnyOutsideMarkerREF` outside the saloon) started
+and she never moved.
+
 <a id="navmesh-worker-rebuilt-globals"></a>
 **What `init_worker` must rebuild in every pool child** (`navmesh/worker.py`).
 A spawned child does NOT inherit the parent's module globals, so each of these
@@ -531,8 +574,8 @@ function of the door, computed in `corridor_doors` and passed through
   the real doorway.  Correct forms everywhere now: center offset
   `(lx·c + ly·s, −lx·s + ly·c)`; threshold `(sin rz, cos rz)`; facing
   `(cos rz, −sin rz)`.
-* **The door cache measures the ORIGINAL NIF at the CLOSED pose**
-  (`asset_convert.collision.collision_extract.door_closed_geometry`, built by
+* <a id="door-closed-pose-cache"></a>**The door cache measures the ORIGINAL NIF at the CLOSED pose**
+  (`asset_convert.collision.door_geometry.door_closed_geometry`, built by
   `collision_extract.scan_door_axes` from `export/<plugin>/meshes`; the
   converted-mesh scan no longer writes it).  The 'Close' controller
   sequence's FINAL key values override the animated nodes, and the union
@@ -545,6 +588,16 @@ function of the door, computed in `corridor_doors` and passed through
   wrong — which is what rotated the CharacterGen pen gate's Door Triangle
   90° and put a corner at the door center.  z_min (the closed slab's base)
   also replaces the whole-NIF bounds z-min as the pivot→floor drop.
+  **A node's stored rotation rows are the row-vector form and are
+  transposed** (`_node_local`), as `book_inam`, `furniture_markers` and
+  `tree_billboard` read them. A pure Z turn hid the error, since its
+  transpose only flips the swing. A cyclic one such as Bloodmoon's
+  `Ex_colony_door06` panel (rows `[0,1,0]`, `[0,0,1]`) swapped X and Y: it
+  measured 193 wide across the passage instead of 130 across the doorway, and
+  the door got no Door Triangle. The fix changed 11 models' axis across
+  Morrowind, Bloodmoon, Oblivion, Nehrim and Morrowind_ob.
+  `door_thirsk_double01` now measures 85.12 against its partner's 85.06
+  (was 108), and `in_thirsk_door` 104 (was 386). Schema 4.
 * **Attach completion ladder** (in order, each a measured failure): stitch →
   T-junction split → apex bridges → **carve** (`_carve_door`: locally remove
   the same-storey triangles overlapping the wedge, retriangulate the region
@@ -614,6 +667,20 @@ Banding is on the STOREY gap, not one step: two corridors meeting at a node are 
 Coincident vertices are FUSED first: passes before and inside the loop mint midpoints independently on both sides of a seam, so two components can touch at IDENTICAL positions under different indices, invisible to the index-keyed junction scan -- **Chorrol and BarrenCave each ended with a component pair 0.00u apart**. The scan is driven from the GEOMETRY, not only the pathgrid node list: a junction is a vertex used by two components, and **Pinarus has two such points (the stair top at (-316.9, 134.9) and a second stair node at (-318.5, -88.0))**; stitching only sheet-shared nodes fixed one and left the other, so the house stayed in two pieces.
 
 A component may USE a junction while presenting no BORDER edge there -- the other surface arrives into the MIDDLE of its fan, so every edge already has two owners. A bridge cannot help: `_compute_adjacency` links an edge shared by 3+ triangles to NOTHING, so laying a bridge SEVERS the fan it lands on. Candidates are tried LARGEST FIRST until one passes; trying only the largest gave up whenever it failed a guard while a splittable fan triangle sat beside it (**the Sanctum pit-gate seam: the 15,676u^2 candidate's opposite edge spans dz 36, 2u over MAX_CLIMB, while the 2,936u^2 one is dead flat**).
+
+**A fan split cuts EVERY triangle on the split edge, or waits a round.** An
+edge split for one owner leaves each other owner on the uncut edge, so it drops
+out of the component. Where layers of floor stack, the far edge often has 4 or
+more owners, and the old code split only the first neighbor. On Morrowind_ob's
+ArkngthandVSHallSofSCentrifuge (the Dwemer bridge deck), fan splits alone added
+a component every round (3→4→6…→36). Each new component made new junctions to
+split, so the stitch never converged. The mesh then reached 88,048 triangles on
+5,670 vertices (87,107 of them stacked at z=1536). That is past NVNM's 16-bit
+indices, so the cell got no navmesh, took 6+ minutes to build, and its failure
+kept the plugin's CACHE_TAG from being stamped. `_open_fan` now splits every
+owner. It skips an edge that an earlier split this round already replaced, and
+the next round retries it. The cell now stitches to one component and builds
+803 vertices and 1,051 triangles in 5.1 s.
 
 Three guards apply. A split must not manufacture a near-VERTICAL or degenerate triangle -- the halves inherit the parent's corners plus a midpoint, so a parent spanning a big drop hands both halves that drop and the result reads as wall; splitting those **added OPPOSITE_NORMALS/DOWNFACING triangles to ImperialSewers03 and Bruma**. The test is SLOPE-based: a bridge on ramped ground may climb with its plan run (~35 degrees); only height without run is a wall. The MANIFOLD guard requires every introduced edge to end with at most TWO owners. The OVERLAP guard requires the bridge to land on empty ground -- a wide, guard-passing bridge can lie across mesh it shares no vertex with, and at **Pinarus's stair top a 126u flat bridge at the landing height overlapped the flight's emerging top triangles (same surface, dz 19)**.
 
@@ -717,21 +784,188 @@ Verified on all 16 worst-offending cells from the shipped ESM (10 interior +
 6 exterior): every one now reports CLEAN under `tools/navmesh/check.py`'s rules,
 with coverage/steep/island metrics unchanged.
 
-### Exterior coverage (the "discontinuities with no obstacles" fixes)
+### Exterior coverage: the cap counts BUILT floor, ONE code path
+<a id="exterior-coverage-one-code-path"></a>
 
-- **Reach**: `PGRD_XY_REACH_EXTERIOR` (8192) replaces the interior 384u gate
-  outdoors — vanilla exterior navmeshes cover essentially the whole cell, and
-  the tight gate carved open terrain into blobs around the road pathgrid.
-  Geodesic flooding still can't climb >MAX_CLIMB per step or reach roofs.
-- **Ledge spread test scales with cs**: `filter_ledge_spans`' steep-slope test
-  `(max_drop - min_drop) > lim` must use `lim = max(MAX_CLIMB,
-  2*cs*tan(MAX_SLOPE_DEG))`. With raw MAX_CLIMB at CS_EXTERIOR=32 it un-walked
-  every hillside steeper than ~28° (2·32·tan28°≈34) — the mystery holes in open
-  terrain. At CS=16 the scaled value equals MAX_CLIMB, so interiors unchanged.
-- **Cell borders**: a neighbour column outside the exterior cell's LAND is
-  unknown terrain (it continues in the next cell), NOT a cliff — treating it as
-  a drop un-walked the border row and left a 2-column gap on every cell seam
-  (`ext_rect` threading through `apply_filters`).
+**Code:** `native/src/navgrow/grow.cpp` (`grow_half_width`), `corridor._stands_on_land`, `world.LandField`. **NOT in-game verified.**
+
+A 160u half-width cap clipped exteriors: `WrldMorrowind -17 -51` (Tamriel
+Rebuilt) meshed **13.7%** of the cell; it now meshes **62.7%**. Interiors and
+exteriors run the SAME march — no cell-type branch. What differs is the ground
+under each step.
+
+**Why interiors must not change at all.** Every stop rule that altered interior
+widths scrambled the union downstream, moving cracks from cell to cell with no
+pattern (`tools/navmesh/sweep.py`, crack counts, HEAD first):
+
+| rule | ImperialDungeon01 | Leyawiin hall | AnvilFightersGuild |
+|---|---|---|---|
+| HEAD, cap 160 | 2 | 2 | 0 |
+| halfway line to the nearest centerline | 7, +4 miss | 1 | 0 |
+| wall + floor only | 7, +4 miss | 13, +29 miss, 2 comps | 3, 4 comps |
+| stop AT the first crossed centerline | 12 | 6, 2 comps | 0 |
+| cap 160 only after a crossing | 2 | 6, 2 comps | 0 |
+
+The mechanism behind the uncapped failures: a hall edge 1000u away threads a
+doorway and lays its ribbon over another room (AnvilFightersGuild, edges (1,2)
+and (4,16) covering the NW room). The rule shipped leaves all nine reference
+interiors IDENTICAL to HEAD (same triangle counts, components, miss, crack).
+
+**The cap is a budget of BUILT floor.** A step whose walkable sample is a LAND
+triangle (`land_from` marks where LAND starts in the walkable soup) is free; any
+other step spends `RIBBON_GROW_MAX_HALF`. A doorway leak is the cap's whole
+reason and terrain has no doorways. An interior has no LAND, so it is HEAD.
+
+**Past another centerline the cap binds on LAND too**
+(`NeighbourField::first_crossing`): the rail ends at max(crossing, cap). Ground
+beyond another corridor's line is that corridor's to cover. Measured on two
+exterior cells, removing this stop raised cracks 88 -> 195 and 437 -> 502.
+
+<a id="terrain-standing-ribbons-follow-the-land"></a>**A ribbon whose nodes
+stand on LAND follows the LAND** (`_stands_on_land`: each node snapped within
+`NODE_SNAP_RADII[0]` of the terrain; a node in a neighbouring cell is judged
+where its edge crosses the rim, the chord within `MAX_CLIMB` of the LAND there;
+its disc, against the rim nearest it). Exempting outside nodes outright
+flattened a dock bridge crossing the seam onto the seabed 215u below, so the
+two cells' border edges never paired (Arktwend (-20,0)/(-19,0)), and draped an
+exit node's disc on the seabed under a boardwalk, whose clashing levels erased
+the walkway's last 226u (Arktwend (-4,-1)). `_node_on_land`, mirrored in native
+`cstrips.cpp`. The cap
+was not what clipped hilly exteriors — the flat-ribbon floor test was: a rail
+stopped once terrain left its chord by `MAX_CLIMB` (median rail 96u; 303u with
+that test off). For such a ribbon:
+
+- the march measures wall and floor above the LAND under each step, and its
+  stations start AT the land (`_plan_stations`);
+- its height at any point IS the land (`union_geom._height_on`, native
+  `levels_at` column 12). "Chord plus terrain rise" was tried first and shredded
+  slopes: chords float above or sink below a hillside by different amounts, so
+  overlapping ribbons disagreed;
+- it is never a staircase: a hill path over `RIBBON_GROW_MAX_SLOPE` otherwise
+  took a tread profile and sat 30u under the terrain;
+- the sheet splitter skips its node-height shortcut (`union_sheets._z_ranges`):
+  two terrain ribbons from different hill heights read as different storeys and
+  one cell fell into **59 sheets instead of 2**;
+- emission compares corners in heights ABOVE the land (`_emit_surfaces`), so a
+  hillside is one surface. At HEAD the same cell had **212 corners with
+  conflicting levels and 588 triangles emitted twice**; now 0 and 0.
+
+A ribbon with a node on built floor (bridge, porch) stays flat, as before.
+
+<a id="far-widths-are-eroded"></a>**Past the cap every rail and disc ray is held
+to its SHORTEST neighbour** (`_erode_far_widths`, +-`FAR_WIDTH_WINDOW` stations,
++-1 disc ray); interiors never reach it. Adjacent rays stopped by a rock or a
+steep LAND patch end at wildly different distances, and the sawtooth outline
+triangulates into fans of needles — in-game report, `AnvilAnvilExteriorCastle03`.
+Less coverage, clean outline.
+
+<a id="land-slits-are-closed"></a>**Hairline gaps between terrain ribbons are
+closed** (`corridor_union._close_land_slits`, `corridor._land_slit_ok`). Long
+ribbons from different edges run nearly parallel and leave slits under
+`2 * LAND_SLIT_HALF` wide that triangulate into needle fans. The sheet's union
+is buffered out and back; each filled piece is kept only if a wall probe along
+its outline, at actor height above the LAND, finds nothing — so a fence or a
+trunk standing in a gap keeps its gap. Terrain sheets only.
+
+<a id="land-sheets-bisect-long-edges"></a>**A terrain sheet bisects every edge
+over `LAND_MAX_EDGE_RATIO` target edges** (`union_cdt._refine_steep` with
+`steep_pts=None`, then `_flip2d`). The CDT fans a far vertex onto each 128u
+segment of a long straight ribbon side; those needles are too thin to contain a
+hex-lattice point, so `_hex_refine` never breaks them —
+`AnvilAnvilExteriorCastle03` emitted **427 needles in 1,602 triangles**.
+`_fan_split` fans from corner 0, which is only right when the marked edge is the
+one OPPOSITE it: with edge (a, b) marked it yields the collinear (a, m, b) plus
+the ORIGINAL triangle, i.e. no split at all (that cell's everywhere-refine made
+**44,974 zero-area triangles out of 46,791**). The terrain pass therefore fans
+from the first midpoint (`from_midpoint`). The stair pass keeps corner 0: its
+output is in-game verified and was left untouched — a KNOWN DEFECT, unfixed.
+For the same reason a terrain ribbon never seeds the stair refine
+(`_ribbon_seeds`): fed hill paths, that pass left T-junction cracks.
+
+<a id="seam-probe-replays-real-jobs"></a>**`tools/navmesh/seam_probe.py` replays
+the import's REAL jobs** (`job_trace.load_export`). It used to parse the
+plugin's own export only, so for a plugin with masters it resolved no master
+bases and saw none of the neighbours' overhanging refs: TR_Mainland (-17,-51)
+probed as **728 verts / 1,297 tris over open ground with 104 refs**, where the
+import builds **258 / 360 from 122 refs and 10,620 blocking triangles** — every
+conclusion drawn from the old probe was about a mesh that does not exist.
+
+<a id="land-rails-overshoot-the-cell"></a>**A terrain rail overshoots its
+cell's LAND by one cap, so the cell clip cuts the sheet ON the plane**
+(`grow.cpp`, `Land::covers`). LAND covers exactly one cell, so a rail used to
+end on its last 8u step INSIDE the cell, and the far-width erosion, the 12u rail
+simplify and decimation then pulled the outline further in: the sheet came
+within a few dozen units of the seam without lying on it. `edge_links` pairs
+border edges whose ends are both within `SEAM_BAND` and whose midpoints agree
+within `SEAM_TOLERANCE`, and both cells put seam vertices on the same world grid
+ONLY where the clip made the boundary. Measured on the real jobs for TR_Mainland
+(-17,-51)/(-17,-50), plane y=-204800: border edges **5 vs 0, 0 matched -> 7 vs
+7, 4 matched**. At 128u target edges a near-miss outline still scattered enough
+short edges into the band to pair by luck; at 256u it did not, which is why the
+coarse terrain sheets exposed it. Rejected: raising the cap to the cell edge for
+every terrain rail (it also lifted the crossing limit and the BUILT-floor
+budget), densifying near the seam, dilating the polygon, loosening
+`_match_seam`.
+
+<a id="land-sheets-mesh-coarse"></a>**A terrain sheet meshes at
+`LAND_TRI_TARGET_EDGE` (256u) and refines only where the LAND curves**
+(`corridor_union._target_edge`, `union_cdt._refine_land`, `_cuts_relief`). Most
+of a cell's build is spent AFTER triangulation and scales with triangle count,
+and the NVNM payload is ~16 bytes a triangle. Measured on 12 Oblivion exterior
+cells, target edge alone (time / triangles / payload / sample points over 16u
+off the ground): **128: 42.9s / 27,305 / 610 KB / 0.4%; 192: 25.4s / 14,156 /
+325 KB / 1.3%; 256: 21.4s / 8,983 / 213 KB / 3.2%; 384: 19.8s / 5,919 / 146 KB
+/ 8.1%** — the time curve is flat past 256 and the hover tail is not. So 256,
+plus a bisection of any triangle whose edge midpoint sits more than
+`LAND_RELIEF_TOL` (16u) off the chord between its ends (never below
+`LAND_MIN_EDGE`): **23.3s / 10,802 / 252 KB / 1.0%**, with p99 off-ground 25.9
+-> 16.2. `AnvilAnvilExteriorCastle03`: 2,269 -> 905 triangles. Walked-line
+cracks rise (60 -> 76 on the sample) — accepted by the author for open terrain.
+Interiors keep `TRI_TARGET_EDGE`: at 256 twelve interiors saved 8% build time
+and DOUBLED their uncovered pathgrid samples (26 -> 58).
+
+<a id="cross-sheet-weld-spans-one-step"></a>**Two sheets' vertices on the SAME
+plan spot weld across one step of height** (`union_mesh._weld_match`). The weld
+is a 16u sphere, so two sheets that disagree by more than that at a shared
+outline corner each keep a vertex and the seam between them is a crack. Hand-
+corrected in `tests/navmesh_fixed/Oblivion.esm/imperialdungeon01.2.json`: the
+gate quad west of node 137 put (-112.5, -13.2) at **-61.8** (ground -64.3) while
+the room sheet, whose flat -84 ribbons lie under the stair flank, put it at
+**-84.8** — a 100u crack across the walked line. Vertices from DIFFERENT
+emissions within `SAME_PART_WELD_XY` in plan and `MAX_CLIMB` in height now fuse.
+Measured on seven interiors: ImperialDungeon01 cracks **2 -> 0** with 11 of 867
+triangles changed and the fused vertex at -61.8, the hand fix's own value; the
+other six cells changed **0 triangles**. Two things were tried first and
+rejected: dropping the far-side quad where the probe mesh already joins the two
+faces left a wedge-shaped gap at the same seam, and the quad's own height was
+the CORRECT one.
+
+<a id="land-triangles-are-never-walls"></a>**A triangle lying on the LAND is
+never a wall** (`union_mesh._steep_triangles`). A sliver's 3D tilt is
+ill-conditioned: three nearly collinear corners with a little terrain relief
+read as steeper than `WALL_SLOPE_COS`. Indoors slivers are flat and the test
+holds; on one Oblivion exterior cell `_drop_walls` deleted **1,135 of 12,205
+triangles, all with every corner exactly on the land, and cracks went 11 ->
+1,514**. Terrain steepness is already decided upstream — a steep LAND face is
+blocking (`world._split_by_slope`) and never gets mesh.
+
+**Measured result** (`tools/navmesh/sweep.py` invariants, eight Oblivion
+exterior cells): walked-line cracks **246 at HEAD -> 39**, coverage up 12-28
+points per cell. `AnvilAnvilExteriorCastle03` (in-game report: hovering
+triangles and long slivers): `tri_check.py` flags **315 at HEAD (JUT 216, SINK
+97), 113 on the first terrain-following build (NEEDLE 87), 8 now**; cracks 50
+-> 2. `WrldMorrowind -17 -51`: 13.7% -> 62.7%. Cost: the densest cell measured
+(143 nodes, 95% covered) builds in 15s against 5.5s; the rest are unchanged.
+Thin-obstacle "shadows" were tested as a crack source and ruled out (closing /
+opening the rail widths moved 88 to 72 / 85).
+
+<a id="poly-strips-admit-by-containment"></a>**A poly strip admits by
+CONTAINMENT, never by radius** (`union_geom._levels_at`). A door quad or a
+grown corridor owns exactly its outline. `half` is an admission radius only for
+a fixed-width rectangle; for a grown ribbon it is the widest that rail ever got
+anywhere along its length, so `distance <= half` claims points far outside the
+real ribbon and injects phantom surface levels that split the triangulation —
+**Pinarus fragmented into 11 components**.
 
 ### Geometry cache (the import-time fix)
 
@@ -751,6 +985,290 @@ changes can't bake in.
 
 **Code:** `navmesh/pool.py`. The parent-side scheduling around `navm_worker` —
 gathering jobs, the indexes their carving needs, the cache tag, and the pool.
+
+#### <a id="no-pathgrids-no-gather"></a>A plugin with no pathgrids builds no carving indexes
+
+Jobs are driven only by the plugin's own PGRDs, so with none `gather_navm_jobs`
+returns `[]` before merging the masters' REFR/LAND/CELL. It still stamps XCLC on
+grid-less exterior cells (the builders rely on it). `_phase4a_navmesh` likewise
+skips the door-teleport table when no navmesh was made, since only the interior
+split reads it. Measured on Morrowind-Morroblivion-Compatibility.esp: navmesh
+phase 31.2 s → 15.9 s, output byte-identical. The rest builds indexes later
+phases need; master edge relinking is untouched.
+
+#### <a id="seeded-cells"></a>Cells with no pathgrid are seeded from their neighbours' seams
+
+**Code:** `navmesh/seeding.py`, `navmesh/pool.py::_seed_empty_cells`. **Status:
+not yet confirmed in game.**
+
+Jobs come from pathgrids, so an exterior land cell without one got no navmesh.
+Measured on the built ESMs: Morrowind.esm had navmesh in 357 of its 5,168 LAND
+cells and its exterior graph split into 462 pieces, the largest holding 5.1% of
+the triangles; Arktwend 775 of 5,180, largest piece 38.2%. No follower, escort or
+travel package could cross that ground (Ahemmusa Camp to Ald Daedroth,
+`REACHABLE: False` in `reach.py`).
+
+After the pathgrid jobs build, each wave takes every still-empty land cell that a
+built mesh reaches on a seam -- its border edges on the shared edge, exactly
+where an edge link can form -- and seeds the cell there (one seed per run of
+border edges, one more per 512u of a long run). In the worker the seeds flood a
+512u lattice over the cell's walkable ground: a node needs a floor and no wall in
+the actor's body, a link needs a straight walk with no step over `MAX_CLIMB` per
+32u and no wall. The reached nodes become a synthetic pathgrid, keyed by the
+cell's own FormID, that builds through `convert_PGRD` like an authored one; its
+mesh's far seams seed the next wave. A cell its master already navmeshed is left
+to the master; the masters' meshes also seed.
+
+Seeding stays inside the authored playable area, decided once before the first
+wave from WRLD and REGN records with the masters' merged in:
+
+- **A Small world (TES4 WRLD `DATA.Flags` 0x01) is not seeded, except a cell a
+  door lands travellers in.** Oblivion flags every city, Imperial City district,
+  Oblivion realm, Camoran's Paradise, Pale Pass and test world this way, and their
+  pathgrids cover nearly all that is played. Unflagged: Tamriel, SEWorld, the
+  Fringe, and Morrowind's WrldMorrowind. That also keeps navmesh off realm lava,
+  since every lava realm is a small world. The exception: Castle Bruma's
+  forecourt (BrumaWorld 4,36) has no pathgrid, yet the castle's front door lands
+  everyone there; unseeded it had no navmesh, the door got no Door Triangle and no
+  actor could leave the castle (run 41b, the Countess). A small-world cell whose
+  template carries a door landing ([door-reach](#door-reach)) is seeded: 10 cells in
+  Oblivion.esm -- BrumaWorld 1, ArkvedsTowerWorld 1, OblivionRD002 1, test worlds 7.
+  Landings are filed by worldspace AND square: by square alone, a Tamriel landing
+  was attached to every worldspace's cell at that grid (2,393 small-world
+  squares looked landed instead of 10). A seeded cell's own door landings are
+  offered as seeds too (`grow_into_empty`), once, beside its neighbours' seams; a
+  pathgrid cell being regrown is not offered them. That alone still built nothing
+  (imports 36, 37): `castlekeepbruma.nif` is one closed box (x 18906..20642, z
+  27148..28381) holding every 512-unit flood lattice point near the door, and the
+  porch (floor 27253) is recessed into its east face across the 4,36 / 5,36
+  border. The cell's two seeds -- the landing (20441 148640) and 5,36's seam seed
+  (20476 148633), 35 apart on the porch -- each joined no lattice point, and the
+  flood joins seeds only through those. So when the lattice floods nothing,
+  `seeded_graph` walks the job's landings to its other seeds with
+  `door_reach.join_missing_doors`: BrumaWorld 4,36 gets an 8-triangle porch mesh
+  holding door 000303F0, and off-mesh doors in Oblivion.esm went 83 -> 82 (import 38;
+  no FormID moved; the protected cells unchanged).
+- **Where a worldspace authors Border regions (REGN record flag 0x40), a cell
+  is seeded only if a corner, edge midpoint or its centre lies in one of their
+  areas.** The areas enclose the playable land: 4,395 of Tamriel's 4,832
+  pathgrid navmeshes and all of SEWorld's and Camoran's Paradise's lie inside.
+- **Land is always meshed; open sea only near it.** A reached cell with any LAND
+  vertex above its water height is seeded with no limit, so a follower can walk
+  every stretch of land the flood reaches. A cell that is all water is seeded
+  only within `MAX_SEA_CELLS` = 2 cells of one with land. Measured from LAND
+  heights, every cell of the strait between the Ahemmusa coast (23,33) and Ald
+  Daedroth (23,40) has land above the water, so even a cap of 1 joins them; 2
+  leaves a margin for unmapped crossings. Unbounded, Oblivion's flood ran 90
+  waves and seeded 20,323 cells (ESM 559 MB -> 1,055 MB, about 3,100 s more
+  navmesh time), 8,778 of Tamriel's 9,185 past the border. A flat cap of three
+  waves was tried and dropped: it left Morrowind's pathgrid-less wilderness
+  (most of the Grazelands between Tel Aruhn and Zainab Camp) with no mesh, so
+  an escort could not follow there.
+
+Water needs nothing extra: terrain under water is walkable LAND, and
+`_compute_water_flags` marks every triangle below the cell's water height.
+Vanilla puts its water triangles on the bed, not the surface -- of 300,472
+water-flagged triangles in Skyrim.esm, 0.9% are flat, and most meshes' water
+triangles span hundreds of units of depth.
+
+`seeding.py` is outside the cache tag: its output is the synthetic pathgrid,
+which every seeded cell's geometry hash already covers.
+
+#### <a id="regrow-reuse"></a>A regrown pathgrid cell keeps its result when its new seeds change no flood
+
+**Code:** `seeding.regrow_unchanged`, `worker.convert_job`, native `gap_graph` / `seeds_link`
+(`bridge.cpp`).
+
+A pathgrid cell that a new neighbour offers seeds is rebuilt in full: the gather, the first corridor
+build, the gap flood, and the second build over the flood. On Nehrim (2026-11-11) 1,262 of the 2,419
+such rebuilds came out byte-identical to the cell's previous mesh, and pass 2's 1,020 of 1,855 cost
+about 45 s of its 99 s. A replay of 200 pass-2 rebuilds put collision gathering at 14% of a rebuild
+and the flood search at ~1%; the rest is the two corridor builds.
+
+The check is exact, not a threshold. A build's flood is `flood_lattice` over the lattice nodes its
+first mesh does not cover; a seed changes it only if `seed_links` places it, i.e. it links to one of
+those nodes. A seed that links nowhere is skipped and changes neither `placed` nor the links. So each
+corridor build reports its uncovered lattice keys as a 64-bit mask (the lattice is 8 x 8 at 512u;
+`None` when it would not fit), stored with the build in the geometry cache so a cache hit carries it
+too ([one-file-every-build](#one-file-every-build)); the job's result keeps every build's mask
+(`meta['flood_opens']`, discarded door-choice builds included) and the seeds it was built with. The
+next round's job gathers the cell's collision and tests only the seeds it was not built with against
+each mask; when none links, the previous result is returned. A cell with no LAND never floods, so its
+seeds never matter.
+
+When a seed does link, the cell is rebuilt, but not twice. Its first corridor mesh depends on every
+input except the seeds, and the gap flood reads that mesh only through the lattice keys it leaves
+uncovered -- the mask. So each mask is stored under a key hashing the build's graph (points, edges) --
+the only first-mesh input that differs between one cell's builds; its references, LAND, doors, spawns
+and obstacles are the job's own, and pins act only after the build and as flood seeds. Hashing every
+input instead (`geom_hash`) costs Python time on every build under the GIL. With the mask goes
+whether the flood ran (the first mesh was not empty), and a
+rebuild with a known, flooded mask floods from it (`open_graph`) and builds once over the flood
+(`build_cell`'s `known_open`). Only if that flood finds nothing does it fall back to the first build,
+whose result is then the cell's mesh. The first build carries nothing into the second but the grow
+memo, an exact cache.
+
+#### <a id="door-reach"></a>An interior's navmesh reaches its doors
+
+**Code:** `navmesh/door_reach.py`, native `doorreach.cpp`, `pool.py::_emit_interior`.
+**Status: not yet confirmed in game.**
+
+A pathgrid often stops short of a door (at the foot of its stairs, or never in
+the room it opens into), and an interior with no pathgrid got no navmesh at
+all, so no actor could walk to the door and a follower could not follow
+through it. Measured on Arktwend: 321 of 403 interiors had no pathgrid; in
+Naremar the mesh ended 2,800 units short of the airship's door; the Crystal
+Hall's and Arpk's doors stood up stairs 170-270 above the mesh's end.
+
+Each interior job carries seeds: its teleport doors' positions and the XTEL
+landing points of the doors that lead into it (masters' included), one per 64
+units. A seed is first set on open floor: a door's frame stands in a wall or
+past a ledge and a landing marker floats, so it takes the nearest unblocked
+floor within 192 units in plan and 256 below. A seed with no pathgrid edge
+within 256 units in plan at its height floods a 64-unit, 8-direction lattice
+over the walkable floor, at most 3,000 nodes, and the shortest walkable path
+to a pathgrid node joins the graph, string-pulled so it keeps only its turns.
+An interior of this plugin with no pathgrid but with doors gets a synthetic
+pathgrid of everything its doors flood, keyed by the cell's own FormID, and
+builds like any other.
+
+Each lattice step is its own walk test, not seeding's `Ground::walk`, which
+exteriors keep unchanged: a sample every 16 units, each one's floor taken
+nearest half a climb above the last, and a sample in a hairline gap between
+treads nudged 4 units. Arktwend's dock stairs failed each of the coarser
+tests in turn. The fine spacing is what fits a node between a stair's rails;
+the plain `Ground` walk at 32 units stepped over treads, and its floor search
+found the dock plate running on under the stairs.
+
+A pathgrid-less flood is thinned before it is built: one node per 256-unit
+block and storey, linked to neighboring blocks where an actor walks straight
+between them, plus the string-pulled tree path wherever those links leave two
+parts of the flood apart. Unthinned, a 3,000-node graph took 149 s to build
+one cell. Thinned, it takes 8 s, and the import's navmesh stage took 20.9 s
+cold (Arktwend, 1,164 cells, 29 workers). On the same pool, the 857 cells
+that already had navmesh went from 5.3 s to 6.0 s, and the 307 new interior
+navmeshes added about 14 s. The new NAVMs moved one existing FormID: a BPTD
+was rehashed off the slot a new NAVM took first. The user accepted both the
+slowdown and that FormID move.
+
+**Seeded exterior cells get their landings too** (`pool.gather_navm_jobs`). A door
+with no Door Triangle is linked at its landing (`worker._at_landings`), but the
+landings were attached to the pathgrid jobs only, so a seeded exterior cell's
+template (a land cell with no pathgrid, grown from its neighbours) had none.
+Castle Bruma's front door (REFR 000303F0, BrumaWorld cell 4,36, a seeded cell)
+stands 150 above its landing, got no Door Triangle and no XNDP, and no actor
+could route through it: in run 41a/41b the Countess, on her way to the Chapel,
+stood still in the great hall and even on the landing outside. Census: 26,278
+seeded templates, 999 door landings in seeded squares (temp/seed_landings.py).
+
+#### <a id="exterior-water-height"></a>A watered exterior cell with no XCLW still has water
+
+**Code:** `navmesh/pool.py::_with_water`, `record_types/world.py::cell_water_height`.
+
+`_cell_frame` flags water triangles below the cell's `XCLW.WaterHeight`, and
+exterior cells rarely author one: they render their water at the worldspace
+default. Morrowind's exterior cells carry the has-water flag and no `XCLW` at
+all, and Oblivion writes the -2147483648 "use the default" sentinel, so no
+exterior triangle in those cells was ever water-flagged. The parent now gives
+each such job's copy of its cell the height the engine renders its water at
+(`cell_water_height`: the cell's own valid `XCLW`, else the worldspace's
+`DNAM.DefaultWaterHeight`, else 0.0 -- the rule the CELL and WRLD writers and
+the lava planes already follow). A cell with a valid height of its own is
+untouched. Flags are applied after the geometry cache, so no cached cell changes.
+
+#### <a id="refs-overhang-their-cell"></a>A quarter of exterior refs overhang their own cell
+
+**Code:** `navmesh/pool.py::_overhang_index`. A cell's geometry was gathered
+from `refr_by_cell[cell_fid]` alone — the refs whose `ParentCELL` is this cell.
+But an exterior placement is parented to the cell containing its ORIGIN, and
+large statics routinely extend well past that square.
+
+Measured over Oblivion.esm (`export/Oblivion.esm`, non-persistent exterior
+cells only, refs whose centre lies inside their own parent square):
+
+| | count |
+|---|---|
+| exterior cells | 33,540 |
+| placements with a bounding radius | 628,086 |
+| **reaching into a neighbouring cell** | **168,197 (26.8%)** |
+| centred outside their parent cell (excluded) | 31 |
+
+Reach past the border, in game units: 72,787 under 512; 24,675 at 512+;
+25,761 at 1024+; 23,274 at 1536+; 11,623 at 2048+; 4,727 at 2560+; 5,350 at
+3072+. The largest single reach is 9,864 units — more than two cells.
+
+Such a ref carved nothing in the cell it visually occupies. AnvilBayEast01
+(grid −47,−9) is the case that exposed it: `AnvilBoardwalkComplete01`
+(`MODB=1721.96`) is placed by refr `00014CFB` at X=−193042.2, whose origin
+sits in grid −48,−9 and whose `ParentCELL` is therefore `0000AC27`, the
+neighbour. The pier reaches to X=−191320 — 1,192 units into AnvilBayEast01 —
+yet none of its 189 walkable triangles were ever gathered there. The result
+was a pier-shaped hole in both the navmesh and the transplant render, with a
+completely healthy collision cache.
+
+Persistent (dummy) cells are excluded: their refs are scattered worldwide and
+their `XCLC` says nothing about placement, so they are not overhangs.
+
+#### <a id="child-worldspaces-walk-the-parents-land"></a>A child worldspace walks on its PARENT's land
+
+**Code:** `navmesh/pool.py::navmesh_land_at`. A job's land used to be
+`land_by_cell[cell_fid]` — the LAND under that exact CELL. But a child
+worldspace (WNAM set) whose PNAM does not clear bit 0 (Use Land Data) draws the
+**parent's** land; every TES4 child qualifies, because TES4 authors no PNAM and
+the engine's WNAM default is "use everything"
+([child worldspace PNAM default](tes4_export_falloutnv.md#child-worldspaces)).
+The child's own LAND is never drawn, so the navmesh was built on the wrong
+terrain, or on none at all.
+
+The job's land now resolves through the WNAM chain to the worldspace whose land
+is drawn, at the same grid square, masters included. The child's own LAND is
+only a fallback where the parent has none. Authored FO3/FNV PNAMs without bit 0
+keep the child's own land.
+
+Cellview and every `NavIndex` tool resolve a cell's land through the same
+function (`tools/navmesh/index.py::NavIndex.land_for`). Before that, they read the
+LAND stored under the cell's own FormID, so the Fringe's `XPGardensExterior`
+(−13, 0) opened on the child's `00018EC9` (base 73), not the parent's
+`0000D4EC` (base 253) the pipeline builds on.
+
+Found through Jayred Ice-Veins, who stopped leading the player in SE02 ("Through
+the Fringe of Madness"). SETheFringe is a child of SEWorld (`00009F18`):
+
+| Fringe square | Own LAND | What the navmesh did |
+|---|---|---|
+| (−12, 0), the Garden courtyard gate | none in Oblivion.esm | built as landless: no cell clip (`corridor.py` clips only when `land_rec` is set), vertices spilled to x −49,452…−44,867, **0** edges on the x −49,152 seam, **0** links to (−13, 0) |
+| (−13, 0) | `00018EC9`, VHGT base 73 (×8 units) | built on terrain the game never draws; the parent's `0000D4EC` has base 253 |
+
+The escort destination (`XSE02JayredFindBones`) was unreachable from Jayred and
+from his house (`tools/navmesh/reach.py`). The escort procedure then ran with
+no route (`GetCurrentAIProcedure` = −1), and neither `evp` nor `ResetAI`
+revived it. After the fix, (−12, 0) is clipped to its square, has 3 seam edges
+and 3 links to (−13, 0) and 19 links in total, and both routes are reachable.
+NAVM FormIDs did not move (8,239 before and after).
+
+Oblivion.esm has 1,765 exterior cells with no LAND of their own (93 in
+SETheFringe). Any of them with a pathgrid got the same unclipped mesh.
+`pool.py` is outside the cache tag, and each cell's land VHGT is in its
+`geom_hash`, so only cells whose resolved land changed rebuild.
+`tools/navmesh/audit.py` and `cell_check.py` still read the cell's own LAND.
+
+#### <a id="speedtree-model-keys"></a>A TREE base names a `.spt`, not a NIF
+
+**Code:** `navmesh/pool.py::_model_key`. TREE bases carry a SpeedTree path —
+`\ShrubSeabuckthornSU.spt`, `\Dbush16.spt` — with a leading separator, no
+directory, and a `.spt` extension. The speedtree stage rebuilds each one as
+`<ns>/speedtrees/<name>.nif` (`asset_convert/asset_pipeline.py::convert_speedtrees`),
+so BOTH the directory and the extension differ from the authored path.
+
+The old key appended `.nif` rather than replacing `.spt` and never added the
+`speedtrees/` directory, producing `tes4/shrubseabuckthornsu.spt.nif`. No such
+entry exists, so `get_collision` returned None for **every TREE in the game**:
+Oblivion.esm ships 142 speedtree collision entries, all with non-empty soups,
+and all were unreachable. Trees carved nothing and drew nothing in the
+transplant editor. TREE is in `_BLOCKING_BASE_TYPES`, so this was silent — the
+index built happily, it just pointed at keys that could not resolve.
+
+Found via AnvilBayEast01, where every seabuckthorn was missing from the render.
 
 **Why the tag excludes collision.** It hashes the navmesh generator SOURCES
 only, so editing any navmesh code (params included) invalidates every entry
@@ -908,8 +1426,8 @@ uncovered** (was 2.5% uncovered / 2452 broken pathgrid edges with contours).
   and reports UNCOV%/BROKEN/STEEP/FLOOR/ISL/TINY/SLIV%/MICRO per cell (UNCOV
   measures the EDGE's z-range, not the chord — the generator follows the
   surface, and a long cave edge's chord cuts open air two storeys up).
-  `tools/navmesh/perf.py --cell X` cProfiles one cell's build (how the
-  shadowed()/plane_err hotspots were found).
+  (`tools/navmesh/perf.py`, which cProfiled the Python build, was deleted with
+  the Python reference: see [cell-baseline](#cell-baseline).)
 - **NVNM binary layout** (validated byte-exact against Skyrim.esm via
   `tools/navmesh/dump.py`): all arrays use U32 count prefixes; CRC of
   "PathingCell" = `0xA5E9A03C`; parent union decided by (Parent Worldspace==0)
@@ -1012,12 +1530,20 @@ neighbouring cell. `convert_PGRD` built edges only from `Point.Edge` and ignored
 PGRI, so no ribbon ever crossed a boundary.
 
 **Fix (two parts):**
-1. **Export bug — PGRI is 16 bytes, not 14, and LocalNode is U32, not U16**
-   (UESP TES4 PGRD ref: `Local node number (long)`, then float X/Y/Z of the
-   FOREIGN node). The old 14-byte/U16 reading misaligned every entry after the
-   first into uninitialised CS memory (denormal floats ~1e-41, node indices like
-   17306). Fixed in `tes4_export/record_types/world.py::export_PGRD`. This is a
-   pure-dump correctness fix — it belongs in the export, per CLAUDE.md.
+1. **Export bug — PGRI is 16 bytes, not 14:** U16 local node, **2 unused
+   bytes**, then float X/Y/Z of the FOREIGN node (xEdit
+   `wbDefinitionsTES4.pas`: `wbInteger('Point', itU16), wbUnused(2)`). The old
+   14-byte reading misaligned every entry after the first into uninitialised CS
+   memory (denormal floats ~1e-41, node indices like 17306). Fixed in
+   `tes4_export/record_types/world.py::_pgri_lines`. This is a pure-dump
+   correctness fix — it belongs in the export, per CLAUDE.md.
+   - **The unused bytes are NOT zero.** UESP's `long` reading made the node a
+     U32, which pulled CS garbage into the high half (`794951681` =
+     `0x2F620001` = node 1). `_collect_intercell` then dropped it as out of
+     range, so the ribbon never reached the seam — Nehrim grid (-16,-9)/(-15,-9)
+     had no link at y≈-35000. Measured on the U32 export: 26,323 of 82,121
+     Nehrim entries and 31,751 of 290,661 Oblivion entries had the high half
+     set; every one is in range once read as U16 (0 remain out of range).
 2. **Import — build a cross-seam ribbon per valid PGRI link.**
    `pgrd_to_navm._collect_intercell` parses PGRI, drops residual garbage
    (LocalNode out of range, `(0,0,~0)` padding, non-finite / far-away exits),
@@ -1134,7 +1660,11 @@ exterior cells regenerate automatically.
 
 <a id="blocked-stations-are-bridged"></a>**A station blocked on BOTH sides at the centerline takes its neighbours' widths** (`_bridge_blocked_stations`). The wall slab straddles the line, so an object hanging over the pathgrid line at head height zeroes both rails: ImperialDungeon03's east corridor (n181-n182) lost **six consecutive stations, 48u of a 74u-wide corridor, to a 4x11x25u block at z 64-90 above the floor** -- the corridor came out as a point in the union. The pathgrid line is the author's assertion that actors pass there, so a station whose line is inside collision cannot be a wall; its widths are interpolated from the nearest stations along the edge that grew on at least one side.
 
-<a id="neighbour-cap-removed"></a>**There is no parallel-neighbour width cap** (`grow_half_width`, `grow.cpp`). Capping a rail at half the distance to a roughly-parallel other edge never changed the union in an open room (both ribbons reach each other either way), but it PINCHED corridor mouths: ImperialDungeon03's N-S corridor (n98-n99) had its right rail cut from 64u to 40u over its last 100u by edge n100-n101 in the room beyond, **27u short of the wall**, and the hand correction ran that rail straight to the wall. Walls, the floor test and the hard cap bound a rail; overlap between ribbons is the union's job.
+<a id="neighbour-cap-removed"></a>**No rail is capped by its DISTANCE to another centerline** (`grow_half_width`, `grow.cpp`). Two versions were built and both reverted. Precomputing `0.5 * distance-to-nearest-parallel-edge` PINCHED corridor mouths: ImperialDungeon03's N-S corridor (n98-n99) had its right rail cut from 64u to 40u over its last 100u by edge n100-n101 **in the room beyond**, 27u short of the wall, and the hand correction ran that rail straight to the wall. Restricting the query to roughly-PARALLEL edges did not fix it. Testing the halfway line DURING the march (so an edge behind a wall could not cap) was reported in-game as seams across walked paths and measured on ImperialDungeon01 as **cracks 2 -> 7 with 4 uncovered pathgrid samples**. The flaw is shared: a halfway line hands ground to the other corridor, and nothing makes that corridor's perpendicular rails cover it. What replaced both: [exterior-coverage-one-code-path](#exterior-coverage-one-code-path).
+
+<a id="the-grow-cap-is-load-bearing"></a>**`RIBBON_GROW_MAX_HALF` (160u) is load-bearing indoors.** Removing it while the march had only wall + floor tests took **40-48% of stations past 160u (max 2621u)** and through-wall triangles from **9 -> 41, 9 -> 59, 12 -> 19** (floating 4 -> 26 on ImperialDungeon01) -- collision alone does NOT bound a rail, because the floor test binds only beyond `lo` and a single ray threading a doorway or a gap in the blocking soup finds neither a wall nor a departure.
+
+**Coverage metrics cannot see this class of bug, in either direction.** A mesh sprawling through walls still covers the floor, so mean-uncovered IMPROVED while the mesh got worse; and a mesh with its node discs collapsed to nothing has FEWER through-wall triangles, because geometry that does not exist cannot cross a wall. Measure `tools/navmesh/grow_check.py` through-wall counts AND the width distribution per station class (edge rails vs disc rays) when changing a stop condition.
 
 <a id="disc-radius-capped-by-its-ribbons"></a>**A node disc reaches no further than the ribbons meeting at that node** (`_disc_strip`, `_node_reach`). Removing the neighbour cap let every disc ray run to `RIBBON_GROW_MAX_HALF` (160u) whenever walls and the floor test allowed, and the floor test allows ground a full step below: in-game verified discontinuities, both hand-corrected. ImperialDungeon01 node n74 (-1.7, 3019, z -805) at the top of a 27u flight grew a flat 160u disc over the -832/-840 floor 150u away, emitting a second vertex column at (-1.7, 3171) 30.7u above the corridor's own -- a crack an actor cannot cross (`ImperialDungeon01.json` welds them). ImperialDungeon02 nodes n74-n76 (1530, 5480-5709) each grew a 160u disc and the union of three overlapping fans plus the 57u ribbon between them was a fan of seven slivers (`ImperialDungeon02.2.json` collapses it to two triangles). The pre-change generator had neither, because the neighbour cap bounded discs at half the distance to the next edge. A disc exists to fill the notch between the ribbons that meet at its node, so past their reach it has no business unless the ground really is its own floor: its rays are clamped to the largest half-width any incident ribbon reached at that node's station (never below `RIBBON_HALF_WIDTH`), and may run on beyond that only while the walkable layers there hold a height within `DISC_LEVEL_TOL` (2u, the sampler's own layer dedupe) of the node's level (`_level_reach`). A plain clamp was tried first and split ImperialDungeon02's -992 mezzanine into two components (28 -> 12 + 9 triangles): it carries two pathgrid islands with no edge between them, and the discs running over the level floor between them were the only join. The n74 disc in ImperialDungeon01 stops at its ribbons because the floor beyond is 27u below its level; the mezzanine discs run on because the floor is exactly -992.
 
@@ -1172,6 +1702,8 @@ exterior cells regenerate automatically.
 **Code:** `tes5_import/navmesh/corridor_clean.py`
 
 <a id="a-flap-is-topological-not-steep"></a>**An open flap is found by TOPOLOGY, never by slope** (`cull_open_flaps`). A triangle with TWO UNSHARED edges that each fall a storey-ish drop is not ground: both long edges are the mesh's own silhouette, so nothing walks across them and nothing connects through them, and the only thing holding it on is the short edge along the floor rim it grew from. It reaches from that rim down to a single vertex on the stairs below, across a void -- the shape the author saw jutting "from the upper left to the right" through a wall in Pinarus's upstairs. `_drop_walls` cannot find it, because a flap is not vertical: **the Pinarus one measures 30 degrees (corners at z 68.6, 68.6 and 18.8 over ~95u of plan)**, comfortably inside the walkable band. Nor is it unsupported -- every sample under it lands on real collision, because the stairwell it spans genuinely has floor at the bottom. What distinguishes it is that real sloped ground is STITCHED: a stair tread shares its edges with the treads above and below, a ramp shares its edges with the floors it joins, and even a ledge an actor drops off has ONE free edge at its lip, never two that both plunge.
+
+<a id="flaps-are-culled-after-decimation"></a>**Flaps are culled after decimation and before `find_ledge_links`.** Emission fans a whole floor rim back to one stair vertex below; while every spoke of that fan is present each shares its long edges with the next, so nothing upstream sees a free edge. Decimation merges the spokes into one triangle, and the fan's two outer edges become the silhouette that identifies the flap. Culling before the ledge pass keeps a flap from being mistaken for a mezzanine an actor is meant to drop off. **A free edge on the cell seam never counts**: it is a portal to the neighbour, not a rim. Counting it emptied whole exterior cells: Arktwend (18,-38), whose only pathgrid node sits on the cell corner, kept a two-triangle quarter disc on a hillside whose two seam edges fall 56u and 66u, and the cull deleted both triangles.
 
 <a id="the-pathgrid-is-the-prime-directive"></a>**A triangle carrying a walked sample is never dropped, however shaped** (`cull_open_flaps`). Topology alone is not enough: a ramp landing in an open room legitimately presents two free sloping edges, and the census caught one -- **LeyawiinCastleCountyHall's 105u/91u ramp spanning 44u, a ~25 degree slope the authored pathgrid walks straight down; culling it cost three walked samples**. The same guard is why `_drop_walls` spares steep ground the pathgrid uses. What remains is only ground the author never routed an actor across. Census over the reference cells: **zero matches in ChorrolFightersGuild, ImperialDungeon01, ImperialDungeon05, AnvilFightersGuild and Moranda02, and in Pinarus exactly the triangle the author reported.**
 
@@ -1330,9 +1862,25 @@ exterior cells regenerate automatically.
 
 <a id="soft-floor-never-beats-a-wall"></a>**A WALL always overrides the caller's soft floor** (`grow_half_width`, `lo`). `lo` keeps junctions overlapping, but forcing the ribbon out to a connectivity floor drove mesh straight through walls near every junction -- the same defect the Phase-1 unconditional width has. So the soft floor is marched too, from zero, and the wall test may cut it short. The walkable-floor test binds only BEYOND `lo`: inside it the pathgrid's own assertion wins (a node at a threshold or a ledge lip would otherwise collapse its corridor to nothing), and no wall was found there, so nothing can be on the far side of anything.
 
-<a id="only-parallel-edges-cap-a-width"></a>**The parallel-neighbour width cap is gone** -- see [neighbour-cap-removed](#neighbour-cap-removed). Its last form counted only edges within a parallel-dot of this one, because a crossing or diverging edge treated as an opposing wall pinched dense junctions; removing the cap outright fixed the corridor-mouth pinch the parallel test could not.
+<a id="only-parallel-edges-cap-a-width"></a>**There is no parallel-edge cap** -- see [neighbour-cap-removed](#neighbour-cap-removed).
 
 <a id="node-discs-fill-junction-notches"></a>**Pathgrid NODES grow radial discs to fill the corner notches** (`corridor._disc_march_rows`, `_disc_strip`). Ribbons grow only PERPENDICULAR to their own edge, so where two edges meet at an angle the outer corner is a notch no ribbon reaches -- a right-angle junction leaves a square bite out of the mesh. Marching outward on `RIBBON_GROW_DISC_RAYS` evenly-spaced bearings under the same stop rules as a rail, then closing the ray ends into a polygon, fills exactly that corner; it joins the union like any other strip.
+
+<a id="slab-floor-is-max-climb"></a>**The wall slab starts at `MAX_CLIMB`, not below it.** The width-grow wall
+test counts ANY collision in the slab `[floor + RIBBON_GROW_SLAB_Z_BOTTOM,
+floor + AGENT_HEIGHT]` as a wall, and a wall overrides the soft floor and
+restarts the march from 0. With the slab floor at 12 (below `MAX_CLIMB` = 34), a
+17-20u curb whose top is within one climb registered as a wall on both sides and
+pinched the grown half-width to 0.0 at the middle stations (edge (5,6): 113, 169,
+0, 0, 116), splitting the ribbon union into two lobes: Anvil's main-gate door
+(AnvilExterior07, one cell north of AnvilMainGate) sat on a 21-triangle island.
+`RIBBON_GROW_SLAB_Z_BOTTOM = MAX_CLIMB` (`params.py`, passed to the native march
+through `_native_params()`, also used by the door-bridge wall test). A real wall
+extends far above `MAX_CLIMB` and is still caught. Measured: AnvilExterior07 3 -> 2
+components, coverage 97.83% -> 99.46%; AnvilMainGate 97.99% -> 99.23%; interiors
+unchanged. Diagnose a split with `tools/navmesh/coverage.py --cell <EDID>`
+(MISSING = ribbon-union ground lost); a rebuild harness must pass the exterior
+grid origin or the cell clip discards everything.
 
 <a id="slab-test-is-a-2d-sat"></a>**The slab test is a separating-axis check in the slab's own frame** (`_tri_hits_slab`). The slab is an oriented box centered at (cx, cy): extent `half_w` along the edge-tangent (~actor width), `depth` along the march direction (thin), full Z span. The triangle's vertices are projected into that frame (tangent = X', march = Y') and tested against the axis-aligned rectangle, gated first by a cheap Z overlap.
 
@@ -1385,15 +1933,19 @@ exterior cells regenerate automatically.
 
 <a id="vhgt-offset-scales-too"></a>**BOTH the VHGT offset and its accumulated deltas scale by `_VHGT_UNIT`** (`decode_vhgt`). The layout is a float offset then a 33x33 grid of SIGNED int8 gradients -- the first column of each row is a delta from the previous row's first column, and within a row each column is a delta from the previous. The old converter did `offset / 8` going in and `* 8` coming out, which cancels for the deltas but silently ANNIHILATES the offset's contribution, so every exterior cell's terrain came out at the wrong absolute height. For **Tamriel (47,6) that put terrain at z=829..3213 while the cell's own pathgrid and REFRs sat at z=18288..19776, a ~16,700u error**; with the offset scaled correctly the terrain lands at 17608..19992, under the objects standing on it.
 
-<a id="placements-are-slope-resplit"></a>**The walkable/blocking split is re-derived from PLACED normals** (`gather_cell_geometry`). Rotating a static can turn a floor triangle into a wall and vice versa, so the cache's local-space classification cannot be trusted once a rotation is applied.
+<a id="placements-are-slope-resplit"></a>**The walkable/blocking split is re-derived from PLACED normals** (`gather_cell_geometry`). Rotating a static can turn a floor triangle into a wall and vice versa, so the cache's local-space classification cannot be trusted once a rotation is applied. Both classes are re-split: the extractor classifies by slope alone, so a cached wall face that the placement lays flat is floor. Re-splitting only the walkable class left **4,743 of 60,125 placed wall faces in Nehrim's SchattenrufMinePart04 flatter than the walk limit** — rotated cave rocks (`crock02`/`crock03`) whose tops the pathgrid walks on. As walls they covered the floor beneath them (2,378 of 2,978 floor columns on the climb past the bridge) and left only the pathgrid's protected strip standing.
 
 <a id="door-panels-are-never-blocking"></a>**A door panel contributes no BLOCKING collision, but keeps its FLAT faces** (`gather_cell_geometry`, `skip_bases`). A door is a thing an actor OPENS, never a wall: vanilla navmesh runs under every door, and treating the panel as blocking walls off the corridor wherever the panel happens to be parked -- measured on **Pinarus's upstairs ANIMATED door, whose at-rest panel sits 47u from its threshold ACROSS the passage**, pinching the ribbon to nothing and making the doorway unwalkable. The walkable faces stay because a trapdoor or platform door IS the floor the pathgrid walks on -- measured on **ImperialDungeon01 nodes 243-248, whose whole junction stands on a flat door piece**; excluding it wholesale deleted the floor. Gates are authored upright and laid flat by rotation, so the classification comes from the placed slope, and steep door faces are DISCARDED rather than demoted to blocking (a vertical panel's edge sliver would wall the doorway right back up).
 
 <a id="land-split-for-the-grid-rasterizer"></a>**`split_land=True` keeps LAND terrain separate** (`gather_cell_geometry`). Terrain is a regular grid of large triangles, and the generic scalar rasterizer spends most of an exterior cell's build time on it, so the caller sends it down the vectorized grid-rasterizer path instead.
 
-<a id="wild-placements-are-dropped"></a>**A REFR placed beyond `MAX_PLACEMENT` (1e7) contributes no collision** (`_finite_placement`). Such a ref is nowhere near the pathgrid so it could contribute nothing usable, and a non-finite or absurd placement crashed a worker and failed the whole Nehrim import with a bare `BrokenProcessPool`. The ref itself is still converted and written normally by the record path.
+<a id="wild-placements-are-dropped"></a>**A REFR placed beyond `MAX_PLACEMENT` (1e7) contributes no collision** (`finite_placement`). Such a ref is nowhere near the pathgrid so it could contribute nothing usable, and a non-finite or absurd placement crashed a worker and failed the whole Nehrim import with a bare `BrokenProcessPool`. The ref itself is still converted and written normally by the record path.
 
 Oblivion's worldspaces span roughly ±2e5 units (a 4096-unit cell grid at ±32 blocks), so the 1e7 threshold is ~50x the whole map and cannot be a real placement. **This is not defensive padding.** Nehrim genuinely ships refs whose position the CS never initialised: **17 REFRs across 10 base objects carry PosY = 8.936455989415117e+17** (with PosX = 1.68e-36), e.g. REFR `001E57C4` in cell `001E4FEC`. Placing one stretches the cell's triangle soup to 8.9e17 units wide, which blew the native TriGrid's dense bucket grid to **5.4e14 buckets — a 4-billion-GB allocation** whose `std::bad_alloc` aborted the pool worker.
+
+<a id="wild-pathgrid-points-are-dropped"></a>**A pathgrid point beyond `MAX_PLACEMENT`, or non-finite, is dropped with its edges** (`_pathgrid_nodes`, the same `finite_placement` rule as refs), and the import logs the PGRD and the count. The kept points are renumbered in record order, so a cell with no bad point builds exactly as before, and an InterCell `LocalPoint` (a record index) is looked up through the same renumbering. Reported in [issue #112](https://github.com/bryantmh/tes4skyrim/issues/112): `Cyr_Main.ESM` cell `TEM Eye of the Abecean: Hold` ships 25 of its 32 TES3 pathgrid points at coordinates like (1523151872, -1074418304, 1388934016). An edge to one is ~1.9e9 units long, and the stair profile samples every 16 units along it (`surface_profile` in `cstrips.cpp`), so a single edge asked for ~1e8 stations and the cell grew past 100 GB. With points inside 1e7 the longest edge is ~1.8e6 stations, so no separate cap on the station count is needed.
+
+The PGRI exits use a tighter rule of their own (`_collect_intercell`): an exit must be finite, not the (0, 0) padding, and within `_INTERCELL_MAX_REACH` (two cells) of the cell, because Oblivion's PGRI is padded with uninitialized CS memory (AnvilExterior `InterCell[1]`: LocalPoint=17292, X=0, Y≈2.5e-41).
 
 ## LAND Record Structure
 <a id="land-record-structure"></a>
@@ -1542,7 +2094,7 @@ outright: **4.2 s** for the whole export.
 - No DNAM: vanilla Skyrim LTEX TXSTs omit DNAM. The 0x0001Fa "No Specular Map" flag only applies to the object (BSLightingShader) path, NOT the landscape shader. Writing it has no positive effect.
 - TX00 = diffuse (`tes4\landscape\<icon>.dds`)
 - TX01 = normal map (`tes4\landscape\<icon>_n.dds`)
-- LTEX SNAM specular exponent: **pass through the TES4 value**. SNAM is a Phong exponent used directly by the landscape shader. Setting SNAM=0 gives `pow(NdotH, 0) = 1.0` everywhere → whole landscape appears blindingly bright white. TES4 landscape textures use ~30 (moderate gloss). Do NOT write SNAM=0.
+- LTEX SNAM specular exponent: **pass through the TES4 value**. SNAM is a Phong exponent used directly by the landscape shader. Setting SNAM=0 gives `pow(NdotH, 0) = 1.0` everywhere → whole landscape appears blindingly bright white. TES4 landscape textures use ~30 (moderate gloss). Do NOT write SNAM=0. An ABSENT SNAM is safe: the `TESLandTexture` constructor (1.6.1170, RVA 0x2b0950) writes 30 at +0x38, the value all 68 vanilla LTEX author, so a TES3 source with no specular exponent renders at vanilla gloss.
 
 ## OBND (Object Bounds) defaults
 <a id="obnd-defaults"></a>
@@ -1750,6 +2302,33 @@ a local after the function shadows it — the call then resolves to `None`,
 raising `'NoneType' object is not callable` per cell and **silently producing 61
 empty navmeshes with every XNDP door link dropped**, which no test caught.
 
+### <a id="one-file-every-build"></a>One cache file holds every build of its cell
+
+**Code:** `from_pgrd.geom_cache_store` / `geom_cache_load`, `cache_audit.rekey_entry`,
+`worker._verify_against_cache`.
+
+A cell is often built more than once per run, each build with its own input hash: a pinned cell
+decides its doors unpinned and then builds pinned; a door with no Door Triangle rebuilds with paths
+joined from it, then at its landing; a pathgrid cell regrows in the seeding rounds
+([regrow-reuse](#regrow-reuse)). The file was one entry per cell, so each build overwrote the last,
+and on the next run the cell's first build missed, rebuilt and overwrote, and so did every build
+after it: those cells built cold on every run, published cache or not (found 2026-11-12 from the
+code; the miss count was not measured).
+
+The file now keeps the newest build at its top level -- the shape every reader (`verify`, adoption,
+`cached_geometry`) already expects -- and the cell's other builds under `more`, `{hash: build}`,
+oldest first, at most `GEOM_CACHE_BUILDS` in all. A load hits either. The file records the cache tag
+it was written under; a store under another tag drops `more`, since an old tag's hashes never hit
+again, and so does a re-key (which also drops the build's open-lattice mask, `open`: adoption proves
+the final geometry, not the first mesh the mask describes). The run-time verify compares against the
+geometry the job was served (`meta['geometry']`), which may come from `more`, not against the file's
+top entry.
+
+Each build also stores its open lattice ([regrow-reuse](#regrow-reuse)). Without it a warm run could
+not skip a regrown cell -- its pass-1 result came from the cache with no mask -- and the cold run
+never stored the pass-2 builds it skipped: Nehrim's warm run still missed 1,148 builds (pass 2:
+62.7 s) before the mask was cached.
+
 ## The shared navmesh cache — design rationale
 <a id="shared-navmesh-cache-design-rationale"></a>
 
@@ -1780,6 +2359,27 @@ entry silently restores geometry the current build would never produce:
   published cache survive a user's own mesh edits — see
   `collision_extract.collision_digest` and `tools/navmesh/navmesh_cache.py`.
 
+### <a id="the-tag-covers-the-native-march"></a>The tag hashes the native march too, by SOURCE
+
+**Code:** `_native_tag_sources` / `navmesh_geom_cache` in `tes5_import/navmesh/pool.py`
+
+The tag globbed `tes5_import/navmesh/*.py` only, but the width-grow march that
+decides a cell's geometry lives in `native/src/navgrow/grow.cpp`. Editing it
+changed every exterior mesh while leaving the tag — and therefore every cached
+entry — untouched: the cache stayed *valid* and became *wrong*, which is worse
+than a miss because nothing reports it. `_TAG_NATIVE` names the native source
+DIRECTORY (`navgrow/`): every `.cpp` and `.h` in it is hashed by name, so a new
+kernel or a shared header cannot slip past the tag. `NAVMESH_PATHS` in
+`navmesh_cache_hook.py` carries the same directory so a push republishes.
+
+It hashes the **`.cpp`, never the built `.pyd`**: a different compiler or flag
+gives identical source a different binary, so hashing the artifact would miss
+every downloader's cache for no semantic reason. The lookup is anchored on the
+repo rather than on `pool.__file__` — `test_tag_ignores_line_endings` copies the
+navmesh package to a temp dir, and a path derived from that copy finds no native
+tree. A native source that is missing entirely drops out of the hash instead of
+voiding the tag, so a source-only checkout still tags.
+
 ### <a id="cache-tag-steps-in-its-own-scheme"></a>`previous_tag` steps in the tag's OWN width
 
 **Code:** `_raw_minor_field` / `previous_tag` in `tools/navmesh/navmesh_cache.py`
@@ -1806,6 +2406,32 @@ and the sliver is too narrow for an actor to stand on (vanilla door triangles:
 which is both standable and deterministic. Heights within a step (32 units) are
 treated as the same floor and ranked by area, so a sliver never wins over the
 real door triangle beside it.
+
+### <a id="door-triangle-on-the-landing-side"></a>A load door's triangle is on its landing's side
+
+**Code:** `from_pgrd.toward_landings`, `door_reach.landing_of_door`, `pool._attach_door_landings`.
+
+The tie-break above picks between the triangles on BOTH sides of the threshold, and nothing in it knows
+which side a traveller uses. Vanilla does: of Skyrim.esm's NVNM door entries whose door teleports, 1,690
+lie on the side of the door's landing (the XTEL position stored on its partner door), 6 on the far side
+(each with its landing within 10-26 units of the door) and 7 level. Our Oblivion.esm had 597 on the far side
+against 3,625 (temp/run58/door_side_census.py).
+
+On the far side the door is unusable to a loaded actor. Run 58a: Baurus (MQ05BaurusLeaveLutherBroads, a
+Travel to the cellar of Luther Broad's) walked to the cellar door's landing (-175.66 375.48, inn side) and
+stood there with procedure -1 while the player was in the room. `evp` and `resetai` did nothing. The door
+00047CC5 was linked to triangle 79, the large triangle EAST of the door; the landing lies west. With the player
+out of the cell he went through at once, and a console activation of the door by him worked. Reproduced 1 of
+2 from the checkpoint at the same spot to two decimals.
+
+Each load door's point now moves toward its own landing, half the way and at most 32 units
+(DOOR_LANDING_NUDGE), before the triangle is picked. Counted as wrong only when the landing lies outside the
+picked triangle AND its centre is behind the door (vanilla: 0 such), replaying the pick on the shipped
+geometry (temp/run58/door_rule_sim.py) gave: door point as is 703 wrong, 8 toward 227, 16 toward 118, 32
+toward 345 (overshoots short landings), half-way capped at 32: 52. Two earlier versions were imported and
+measured: 8 toward the landing (558 -> 179) and 8 across the threshold along the door's facing (172; a door
+whose model has no threshold data keeps its raw RotZ, so the facing is not reliable). The geometry is
+untouched: door triangles are picked when the NVNM is packed, after the geometry cache.
 
 ### <a id="nvnm-xxxx-size-protocol"></a>An NVNM over 64 KB needs the XXXX size protocol
 
@@ -1845,10 +2471,12 @@ suppress checks.
 **`navmesh/edge_links.py` is excluded from the tag** (`pool._TAG_EXCLUDE`).
 `build_edge_links` stitches cross-cell portals into the NVNM *after* geometry
 comes out of the cache, so editing it changes the written mesh but never the
-cached geometry. Note that the restructure moved this file **under the
-`tes5_import/navmesh/` prefix**, so every edit to it now gates a push via
-`NAVMESH_PATHS` unless `NAVMESH_EXCLUDE` keeps listing it. That is a permanent,
-low-grade cost — an unnecessary tag bump per edit — and never a wrong mesh.
+cached geometry. The same holds for every other file in `_TAG_EXCLUDE`. They
+all sit **under the `tes5_import/navmesh/` prefix** that `NAVMESH_PATHS` gates,
+so the hook's `NAVMESH_EXCLUDE` must carry the same set. It reads
+`_TAG_EXCLUDE` from `pool.py`'s source (no import, so the pre-push hook stays
+light). A hand-kept copy once listed only `edge_links.py`, so edits to `pool.py`,
+`worker.py`, `cache_audit.py` and the rest blocked pushes for no reason.
 
 ### <a id="publishable-plugins"></a>`PUBLISHABLE_PLUGINS` — why a whitelist
 
@@ -1981,11 +2609,72 @@ GitHub's UI runs no local hook) — CI cannot validate a cache built from
 gitignored `export/` data. Use `--run` for the PR case.
 
 
+## The download path never runs `git`
+<a id="the-download-path-never-runs-git"></a>
+
+**Code:** `navmesh_cache.api_repo`, `CACHE_REPO`.
+
+git is **not a prerequisite** for running the converter and must not be reachable
+from any end-user path. The README tells people to paste a source drop over their
+folder, so the usual install has no `.git` directory, and many such machines have
+no `git` executable on PATH at all.
+
+`api_repo()` used to derive `owner/name` by spawning
+`git remote get-url origin` (via `gh_repo()`), falling back to a constant when
+that returned non-zero. The fallback never fired on a machine without git:
+`subprocess.run` raises `FileNotFoundError` — `[WinError 2] The system cannot
+find the file specified` — at *launch*, before a return code exists. That
+exception propagated out of `_api_releases()` (whose own `try` starts after the
+`api_repo()` call) and was swallowed by `auto_install()`'s catch-all, which
+printed `Navmesh cache: skipped ([WinError 2] ...)` and regenerated navmesh from
+scratch — hours of work, silently, for precisely the population the shared cache
+exists to serve.
+
+The repo name is now the constant `CACHE_REPO`. Nothing about the download needs
+git or `gh`: the release listing and the ~115 MB asset transfer are both plain
+anonymous HTTPS through `urllib.request`. Deriving the name only ever helped a
+*fork's developers*, and cost every gitless end user the entire feature.
+
+`gh_repo()` still shells out to git and is still correct — it is used solely by
+the publish path and by `install`'s explicit-`--tag` branch, both of which gate
+on `have_gh()` first, so git is guaranteed there. It stays because every `gh`
+call must name the repo explicitly instead of relying on the process CWD:
+`install` is the one command a user may run from outside a checkout (or against
+a redirected repo root), and a bare `gh release list` there reports "no releases
+found" rather than failing loudly — which is exactly how a working publish once
+looked broken.
+
+**Do not reintroduce a git call on the download path**, guarded or otherwise.
+`version.py:_version_from_git_dir` makes the same choice for the same reason and
+reads `.git` ref files directly rather than spawning.
+
+
 ## Verifying a cache against fresh geometry
 <a id="verifying-a-cache-against-fresh-geometry"></a>
 
 **Code:** `pgrd_to_navm.geom_equal` / `geom_quantize`, `navm_worker.run_job`,
 `import_main._precompute_navmeshes`, `tools/navmesh/navmesh_cache.py adopt`.
+
+**A prover must build exactly as the import does, and must never store.** Two
+defects made a child plugin's cache look non-reproducible (Morrowind_ob, push
+gate refusing with a geometry MISMATCH of 1-3 verts on scattered cells):
+
+- `navmesh_adopt.load_plugin` and `job_trace` loaded only the plugin's OWN
+  `collision_cache.bin`, while the import loads `collision_cache_chain`
+  (masters first). Master-owned meshes had no collision in the tool, so cell
+  024802DC built 107 verts there against the import's 109, and 024802C1 354
+  against 355. Both now go through `job_trace.init_worker_for`.
+- `job_trace.load_export` never called `set_namespace(namespace_for(...))`,
+  so model keys took the default `tes4/` prefix. Nehrim's are `nehrim/`: all
+  10,337 base-model keys differed from the import's and EVERY Nehrim cell
+  mismatched (011A575C 36 verts cached, 37 in the tool), while Oblivion, whose
+  namespace IS `tes4`, passed 40/40. It looked random because the old proof
+  was vacuous while the tag matched (a cache hit compared with itself) and
+  only really compared after a navmesh source edit.
+- A proving rebuild ran `run_job` with the live cache. Once the tag has moved
+  every lookup misses, so the rebuild STORED over the entry being proven — a
+  refused adoption left its wrong geometry behind under the new tag. Proving
+  jobs now carry `job['prove']`, which builds with `geom_cache=None`.
 
 The source tag is a *proxy* for "the generator's behaviour changed": it hashes
 the bytes of `tes5_import/navmesh/*.py` and `pgrd_to_navm.py`. It cannot tell a
@@ -2047,6 +2736,30 @@ correct. Measured on a real moved tag: **Morrowind_ob 40/40 identical → 5,239
 entries adopted → 40/40 cache hits, 0 rebuilt**; Nehrim 39/39 → 2,885 adopted.
 With a deliberately corrupted entry the same path refused (1/7 differ) and left
 the stamp uncertified.
+
+**A failed cell keeps no cache entry, and is built once more.**
+<a id="a-failed-cell-keeps-no-cache-entry"></a>
+Geometry is stored before it is packed (`_cell_geometry`), so a cell whose
+NVNM fails to pack still leaves an entry. Adoption proves only a sample, then
+re-keys EVERY entry, so that entry was carried from tag to tag: Morrowind_ob's
+ArkngthandVSHallSofSCentrifuge failed with `'h' format requires -32768 <=
+number <= 32767` in every build from 9/19 to 9/28. Once the stitch was fixed,
+the next import adopted 40/40 identical and served the old 88,048-triangle entry
+straight back. `worker.run_job` now deletes a failed cell's entry and builds it
+once more. A stale adopted entry then heals in the same run, and a cell that
+fails again leaves nothing to adopt. A run that still has failures also removes
+the CACHE_TAG that adoption wrote before generation (`pool.precompute_navmeshes`),
+so the pre-push gate calls the cache stale instead of publishing a partial one.
+
+**Adoption samples only STALE entries.**
+<a id="adoption-samples-only-stale-entries"></a>
+An entry already keyed to the current code was built by it, so it reproduces
+by construction and proves nothing about the others. A stopped Morrowind_ob
+import had rebuilt 2,508 of 5,285 cells with new code. The next import drew
+its 40-cell sample from those, found 40/40 identical, and adopted the other
+2,777 entries, which nothing had rebuilt; the navmesh step ran at 200+/s.
+`cache_audit._stale_jobs` now restricts the sample to entries whose stored
+hash differs from the one the current code would write.
 
 **Proving runs on the pool, not in the parent.**
 <a id="proving-runs-on-the-pool"></a>
@@ -2305,6 +3018,22 @@ plane. An exterior pathgrid edge that crosses (or ends at) the cell boundary
 produces exactly such border edges — so this is satisfied by construction as
 long as the ribbon is emitted out to the node, and no clamp pulls it inside the
 seam band. Phase 1 verifies this; it writes no new code for cell links.
+
+<a id="seam-edges-run-along-the-seam"></a>**A seam edge must run ALONG the
+seam, not across the band** (`edge_links.border_edges`). The band test alone
+(both ends within `SEAM_BAND`) also accepted short stubs pointing away from
+the boundary, and `match_seam` paired two such stubs from opposite cells
+because their midpoints agreed. The portal then joined two triangles that
+touch at one corner. The engine's straight-line triangle walk (SkyrimSE
+1.6.1170 ID 90416) crosses a portal and re-projects into the neighbour; across
+that false portal it cycled between the two meshes forever, appending one
+8-byte step per hop. At 268,435,456 entries the array grow's 32-bit
+`count x 8` wrapped to 0, and the 2 GB copy faulted in VCRUNTIME140
+(`vmovntdq`). Nehrim (-10,-11)/(-11,-11), triangles 367 and 791, named in the
+crash log's stack. Census of portal edges whose across-seam extent is at least
+their along-seam length: **Skyrim.esm 2 / 190,573 (both under 2u); Nehrim
+157 / 39,038 in 145 meshes, 10-24u**. After requiring along > across: Nehrim
+0 / 38,852, Oblivion 0 / 208,548. Confirmed in game.
 
 ---
 
@@ -2937,6 +3666,187 @@ and replayed in each child's init; without it their `get_formid()` calls
 mis-map every PathingCell parent FormID, which the engine meets as a
 navmesh-load null deref.
 
+## <a id="cellview-progress"></a>Cellview: a progress bar with measured weights
+
+**Code:** `tools/cellview/progress.py`, polled by `GET /progress`.
+
+Opening a cell is not a short wait, so an indeterminate spinner cannot tell
+"working" from "hung". Measured on `Oblivion.esm` / `ImperialDungeon01`, a cold
+open costs **43.9s**, split:
+
+| stage | seconds | share |
+|---|---|---|
+| load the export index | 21.6 | 49% |
+| arm collision + resolve cell | 15.5 | 35% |
+| generate the navmesh | 6.7 | 15% |
+| gather collision, name sources | 0.11 | <1% |
+
+The weights in `STAGES` are those shares, so the bar tracks elapsed time
+instead of jumping 0 -> 90 -> done. Gathering collision is effectively free
+once the cache is armed (0.01s for 13,862 triangles) and is folded into its
+neighbour rather than given a visible stage of its own.
+
+Progress is per JOB, keyed by an id the page generates, because two tabs on one
+server would otherwise overwrite each other's state. `read` reports completed
+stage weights plus the fraction of the current stage, so it never rewinds.
+
+Two details the measurement forced:
+
+- **The server is `ThreadingHTTPServer`.** A bake holds its handler for a
+  minute or more, and the single-threaded default could not answer the
+  `/progress` poll that is meant to be tracking it. Verified: 34 polls
+  answered during one 75s bake, advancing 0 -> 49 -> 85%.
+- **`creep` advances within a stage on a time estimate.** Unpickling a 2 GB
+  index is one opaque call with no checkpoints, so the bar sat at a dead 0%
+  for 42s -- which reads as a hang. It now approaches the stage boundary
+  asymptotically and snaps to the true value when the stage ends.
+
+## <a id="cellview-cell-index"></a>The per-cell index (`cell_index.sqlite`)
+
+**Code:** `tools/navmesh/cell_index.py`, built by `audit.cell_index`.
+
+`audit_index3.pkl` was one pickle of the whole plugin. Measured on
+`TR_Mainland.esm` (1098 MB): `land_by_cell` 628 MB, `refr_by_cell` 378 MB
+(**1,598,079 REFRs**), `pgrd_by_cell` 80 MB, everything else 7 MB. Reading the
+bytes cost 0.6s; the remaining ~5s warm (**~60s COLD**, page-faulting a 1.1 GB
+allocation) was Python rebuilding 1.6M dicts. Opening one cell paid for all
+21,078.
+
+Every heavy table is keyed by cell FormID and only ever read as `.get(fid)`, so
+it stores as one row per cell in SQLite.
+
+**A child plugin does not copy its masters -- it reads them.** The first
+attempt merged the masters' records into the child's own index, and
+Morrowind_ob went from 379 MB to **2400 MB, 1767 MB of it duplicated LAND**.
+Each plugin now indexes only what it OWNS, and a lookup walks the chain
+(`TR_Mainland -> Morrowind_ob -> Oblivion -> ...`, resolved recursively) until
+one answers. The child's own record wins. Measured after: Morrowind_ob **383 MB**,
+TR_Mainland **725 MB**.
+
+Everything is deferred, because each of these was separately fatal to open time
+on a four-master chain:
+
+| what | eager | lazy |
+|---|---|---|
+| open the chain | 40.1s | **0.03s** |
+| `resolve_cell` (coordinates) | 28.9s | **0.85s** |
+| merge 61,181 CELL records | (at open) | 0.09s, on first `.cells` |
+
+- **Masters open on first need**, not at construction.
+- **`base_model` / `door_fids` / `cells` are properties**, merged across the
+  chain on first access. A caller that only wants one cell's geometry never
+  triggers it; `NavIndex` defers its EditorID/FormID lookup tables the same way.
+- **`ensure_index` opens the index instead of calling `build_index`**, which
+  would reassemble every REFR in the chain to answer one cell. This was the
+  entire remaining 28s.
+
+`build_index` still returns all six tables for the batch tools (`audit.py
+--interiors`, `sweep.py`, `render.py`, `cell_check.py`); reassembly measured
+4.70s against the 5.81s pickle, so they lose nothing.
+
+**One connection PER THREAD.** sqlite3 refuses a connection used from a thread
+that did not create it, and the server is threaded (for the progress poll), so
+a cached index outlives the request that opened it -- the second request on a
+different thread raised `ProgrammingError`. `_Store` keeps its connection in a
+`threading.local`, which is safe because the index is read-only once built.
+
+**`pathgrid_fids` reads an indexed column**, not every cell's pickle. The cell
+search box asks which cells have a pathgrid, and unpickling the chain to answer
+measured 10.8s; the stored `has_pgrd` flag answers in 0.1s.
+
+A single file, not ~21k loose shards: 21k files per plugin is hostile to
+Windows directory listing and to any future zip of the export. The build writes
+to a temp name and renames, so an interrupted build cannot leave a partial index
+that reads as complete. `SCHEMA` bumps force a rebuild rather than serving a
+stale shape.
+
+## <a id="cellview-open-is-cached"></a>Cellview: why opening a cell was slow
+
+**Code:** `tools/navmesh/audit.py` (`_TABLES`), `tools/cellview/bake.py`.
+
+The generator was never the problem. Profiled on `TR_Mainland.esm`
+`wrldmorrowind -17 -51`, before -> after:
+
+| step | before | after |
+|---|---|---|
+| `build_index` (warm) | 6.17s | **0.00s** |
+| `resolve_cell` (warm) | 7.73s | **0.00s** |
+| `grid_of` | 8.62s | **0.01s** |
+| `worlds()` | 5.51s | **~0s** |
+| `src.build()` (real work) | 1.08s | 0.56s |
+
+Three separate re-reads, all ours:
+
+- **`build_index` had no in-process memo.** It re-unpickled the whole index
+  from disk on EVERY call -- and `index_of` called it per request, after
+  `index_for` had already cached a `NavIndex` holding those same tables.
+  `_TABLES` keyed on the normalized export path fixes it.
+- **`index_of` re-ran the existence check every call.** `_READY` records the
+  plugins this process already ensured.
+- **`worlds()` loaded the full master export** (476k records, 5.5s) to read
+  six WRLD records. The masters' own `WRLD.txt` is 2.3 KB, so it reads those
+  directly.
+
+What remains on a cold open is the one unavoidable unpickle (~5s) plus the
+navmesh generation itself. Everything after the first cell of a plugin is
+effectively instant.
+
+## <a id="cellview-edge-links"></a>Cellview: showing cross-cell edge links
+
+**Code:** `tools/cellview/seams.py`.
+
+An exterior navmesh with no links to its neighbours is an island: actors path
+inside the cell and can never leave it (the failure documented under
+[edge links](#edge-links)). In a single-cell view a missing link looks exactly
+like a correct one, so the editor draws the seam itself -- matched border edges
+in green, dangling ones in red, per side.
+
+It reuses production's own `border_edges` and `match_seam` (promoted from
+`_`-private for this; `edge_links.py` is excluded from the geometry cache tag,
+so touching it invalidates nobody's cache). A second seam predicate here would
+be free to disagree with the writer, which is the one thing this view must not
+do.
+
+The generator emits corner indices only, while `border_edges` needs the
+neighbour columns to tell a border edge from an interior one, so `seams.py`
+derives them from shared edges and presents the same row shape `NavMeshView`
+exposes.
+
+**Seams load on their own request, after the cell is on screen.** Each of the
+four neighbours costs a full navmesh generation: measured on `Tamriel 4 12`,
+44s for the cell alone against 178s with its seams folded in. `GET /seams` is
+therefore separate from `GET /mesh`, and neighbour geometry is cached per
+session -- walking a worldspace re-uses what the last cell already built.
+
+Since those neighbour meshes are generated anyway, they ship with the report
+and draw dimmed behind the cell: a dangling edge is only legible against the
+mesh it was meant to meet. Measured on that cell, all four neighbours resolve
+(355/893/809/1022 triangles) and the seam pairing is 19 matched against 31
+dangling.
+
+## <a id="navmeshview-decode-is-vectorised"></a>NavMeshView decode: why numpy, why float64
+
+**Code:** `tes5_import/navmesh/edge_links.py` (`NavMeshView.__init__`, `pack`).
+
+The per-element `struct.unpack_from` loops this replaces were **39% of the whole
+edge-link pass** (15.3M calls over 6.5k meshes).
+
+`verts`/`tris` stay NUMPY ARRAYS rather than being converted back to Python
+lists: `add_link` mutates a triangle row in place, so a list form would have to
+be re-converted with `np.asarray` on every seam scan -- measured, 103k asarray
+calls and 11.9s, more than the decode it was meant to save. Arrays are mutated
+directly and `border_edges` reads them with no conversion at all.
+
+`verts` are float64 for the same reason the seam midpoints are: the original
+scalar code did that arithmetic on Python floats (doubles), and computing it in
+float32 shifts midpoints enough to reorder near-ties in the greedy pairing
+(measured: 4 extra links).
+
+The triangle record is 6 signed + 2 unsigned shorts. Reading it as int16 would
+make the two trailing unsigned fields negative, so it widens to int32 and
+restores the sign of the last two columns only. `pack` is byte-for-byte
+identical to the per-element `struct.pack` loop it replaces.
+
 ## <a id="renderer-colour-contract"></a>The renderer as an instrument (`tools/navmesh/render.py`, `draw.py`)
 
 **Code:** `tools/navmesh/draw.py` (layers), `tools/navmesh/render.py` (CLI).
@@ -3102,13 +4012,107 @@ install, which CLAUDE.md permits for Papyrus logs and Skyrim.esm specifically.
 A vanilla base carries a `00` master index here only because Bruma lists
 Skyrim.esm first; never assume that index across other plugins.
 
-## <a id="transplant-editor"></a>The transplant editor
+## <a id="transplant-editor"></a>Cellview: the whole-cell editor
 
-**Code:** `tools/navmesh/transplant_server.py`, `tools/navmesh/transplant_editor.html`.
+**Code:** `tools/cellview/` (`server.py`, `bake.py`, `corpus.py`, `plugins.py`,
+`static/`).
 
 ```bash
-python tools/navmesh/transplant_server.py
+python tools/cellview/server.py
 ```
+
+Named `transplant_editor` while its only job was hand-fitting Bruma pathgrids.
+It is now a whole-cell preview and editor; the transplant corpus is one feature
+inside it, reached from a secondary panel rather than the main toolbar, and the
+mesh editor is the default view.
+
+### <a id="cellview-index-on-demand"></a>Any cell of any export
+
+A plugin used to appear only if `export/<p>/audit_index3.pkl` already existed,
+which was true of three exports out of the fourteen that have a `CELL.txt`.
+The limit was never a whitelist — it was a missing artifact.
+
+`tools/cellview/plugins.py` lists every export with a `CELL.txt` and builds the
+index on first open (`audit.build_index`, the same builder `audit.py` uses; a
+second one would drift from the pickle's six-tuple shape).
+
+**Collision is a precondition, not a nicety.** `ce.load_collision` returns 0 for
+a missing cache instead of raising, so a cell of a plugin with no
+`collision_cache.bin` used to open with a pathgrid, no walls and no floor, and
+looked merely broken. `preconditions()` refuses those cells by name and says
+which stage to run. Measured at the time of writing: 5 of 14 exports have both
+`collision_cache.bin` and `meshes/`.
+
+The test is `collision_extract.collision_cache_is_current`, not
+`os.path.isfile`: existence is not usability. Measured while building this --
+Morrowind.esm's cache is a 0-byte placeholder, and Nehrim.esm (`TESCOL06`) and
+FalloutNV.esm (`TESCOL05`) predate the current `TESCOL07` magic. All three load
+as ZERO entries, so those cells drew no walls at all under the old editor and
+looked like a generation bug. They now say so and name the stage to re-run.
+
+Cache paths resolve through `output_layout.assets_for`, so an imported mod
+nested as `export/<Mod>/<plugin>/` finds its assets one level up.
+
+### <a id="cellview-exterior-coordinates"></a>Opening an exterior cell
+
+Measured on Oblivion.esm: 33,639 of 35,494 cells are exterior, and **not one
+of them has an EditorID**. The cell search box matches EditorIDs, so until now
+an exterior cell simply could not be opened -- the overwhelming majority of the
+plugin was unreachable.
+
+An exterior cell is named the way the engine names it, by worldspace and grid:
+
+```
+wrldmorrowind -17 -51
+Tamriel 4 12
+```
+
+The worldspace is matched by EditorID, case-insensitively, and the numbers are
+the cell's own `XCLC.X`/`XCLC.Y` exactly as authored -- no scaling, which
+matters because a Morrowind-derived worldspace does not share Oblivion's cell
+size. A comma between them is accepted, since the CK prints them that way.
+
+The name-to-FormID map is read from `WRLD.txt` (84 records, 0.01s) rather than
+from the cached index: an exterior CELL record carries only a `ParentWRLD`
+FormID, and adding a seventh table to `audit_index3.pkl` would invalidate every
+index already on disk, including Oblivion's 2.1 GB one.
+
+A miss reports the worldspace's actual grid extent, because the common cause of
+one is a coordinate outside it. The grid is indexed once per worldspace: the
+original linear scan measured 8.5s per lookup on a 35k-cell export, and a miss
+is exactly what a mistyped coordinate produces.
+
+### <a id="cellview-master-owned-cells"></a>Master-owned worldspaces and cells
+
+**A child plugin need not own the worldspace it builds in.** Measured:
+`TR_Mainland.esm` has ZERO WRLD records of its own, and every one of its
+exteriors sits in `wrldmorrowind`, owned by `Morrowind_ob.esm`. Reading only
+the plugin's own `WRLD.txt` resolves nothing, and its cells and their collision
+read as absent -- the master-export blindness CLAUDE.md warns about.
+
+Cellview therefore reads worldspaces and cells from `load_master_export` first
+and lets the plugin's own records override by FormID, the same order
+`navmesh/pool.py:_records_of` uses. `load_master_export` re-keys
+each master id into THIS plugin's index space, which is what makes a
+master-owned FormID comparable to one of the plugin's own.
+
+Three places had to learn this, and each was separately fatal:
+
+- `audit.build_index` now merges the masters' records into `by_type`
+  (`_merge_masters`) before indexing base models, doors and LAND.
+- `NavIndex.arm` passes `collision_caches()` -- masters first -- to
+  `ce.load_collision`, which already took a LIST for exactly this reason.
+- `plugins.export_dir` resolves through `output_layout.record_dir`, because an
+  imported mod's plugin lives at `export/<Mod>/<plugin>/`, not `export/<plugin>/`.
+
+Measured on `TR_Mainland.esm` cell `wrldmorrowind -17 -52`, before -> after:
+base models 3,723 -> 34,007; collision cache entries 95 -> 29,163; REFRs whose
+base model resolves 0/27 -> 27/27; collision triangles 0 -> 316 walkable +
+2,999 blocking. Before the fix the cell drew nothing at all.
+
+A cell with no pathgrid generates no navmesh, which is not an error -- the
+camera frames the COLLISION in that case, and the mode badge says
+`NO PATHGRID`, rather than leaving an empty viewport unexplained.
 
 Hand-placing nodes by reading coordinates off a rendered grid and issuing
 `transplant.py move` commands is slow and error-prone; dragging them is the
@@ -3174,10 +4178,26 @@ for the life of the process, which takes that to milliseconds.
 The cache key is the NORMALIZED path. The same export reaches `index_for`
 spelled two ways -- `export/Oblivion.esm` from the corpus JSON, and
 `export\\Oblivion.esm` from `os.path.join('export', plugin)` in
-`transplant_server.mesh_bake` -- which are different dict keys. That built two
+`cellview.bake.mesh_bake` -- which are different dict keys. That built two
 NavIndex objects for one export and paid the 10 s load twice on startup. It
 also broke `NavIndex.arm`, whose `_armed` check compared the two spellings and
 reloaded the collision tables on every alternation.
+
+**The cache is LOCKED, because the server is threaded.** `ThreadingHTTPServer`
+handles each request on its own thread, and `index_for` was an unguarded
+check-then-build: two requests that missed the same key each constructed a
+`NavIndex`, so both ran `arm()` and interleaved their writes to the shared
+collision, door and namespace globals. Observed as a `/plugin_cells` and a
+`/mesh` request racing on one export, surfacing as `ValueError: I/O operation
+on closed file`.
+
+That exception came from `load_origin_shifts`, which silenced its callee by
+wrapping it in `contextlib.redirect_stdout(open(os.devnull))` -- a swap of the
+PROCESS-GLOBAL `sys.stdout`. Thread B exiting the `with` closed the devnull
+handle and restored stdout while thread A was still inside, so A's `print`
+wrote to a closed file. **A threaded caller cannot mute a callee by redirecting
+`sys.stdout`**; `load_furniture_models` takes a `quiet` flag instead and the
+redirect is gone.
 
 The page-side half of the same problem: the canvas prototype redrew all ~22,000
 collision triangles per mouse-move. The WebGL version uploads each static layer
@@ -3214,7 +4234,7 @@ references → SSE BSAs**, and the LE copies sidestep the whole class.
 
 ## <a id="hand-corrected-navmesh-corpus"></a>The hand-corrected navmesh corpus
 
-**Code:** `tools/navmesh/meshedit.py`, served by `tools/navmesh/transplant_server.py`; read back by `tools/navmesh/fix_analyze.py`.
+**Code:** `tools/navmesh/meshedit.py`, served by `tools/cellview/bake.py`; read back by `tools/navmesh/fix_analyze.py`.
 
 <a id="a-correction-is-read-off-its-result-only"></a>**A correction is read off `result` against `base`; `ops` are keystrokes and mean nothing** (`make_entry`, `fix_analyze.py`). The first two corrections (ImperialDungeon02/03) carried 152 ops for 58 net vertex moves -- one vertex was dragged seven times -- and reading the ops as decisions measured the human's fight with the editor, not the mesh they wanted. `base` (the generator mesh the human edited) is stored in the file so the diff survives the generator moving; without it an index-based diff against a fresh build reads every vertex as changed. The analysis is scoped to the touched region: the two corrections changed 25-45 triangles of 600-940, so cell-wide percentages read as noise ("+0.2% area") while inside the region the human moved **13 of 85 and 45 of 101 vertices** and covered **3.4-3.6% more floor**. What they encoded, measured with the tool: the boundary sat 10-60u inside the real floor edge (steep-edge approaches never grew, a hanging object zeroed a corridor, the neighbour cap pinched a mouth), corridors were zigzag-triangulated where rows of quads belong, and a mid-stair pathgrid node snapped 44u down through a tread seam sank the ramp 32u into the floor. After the fixes the generator covers **326 of the 361 floor samples the human added in ImperialDungeon02 and 249 of 374 in ImperialDungeon03**; what it still does worse than the human is the flight itself, which the profile places where the pathgrid line climbs (compressed to 45u where the line cuts the foot of the stairs) rather than along the flight's own 90u axis, so the stair-mouth triangles run 50-56 degrees against the human's 33.
 
@@ -3363,8 +4383,24 @@ them at all. A link joins two triangles that do NOT share an edge, so the only
 way to see one is to draw it centroid-to-centroid (orange).
 
 Links are **directional** — Ledge Up is not Ledge Down — so `l` takes the upper
-triangle first. `replay` drops a link whose triangle was deleted and remaps the
-survivors, the same tombstone-then-compact rule the door flags follow.
+triangle first, and chevrons along the line point down the drop. `replay` drops
+a link whose triangle was deleted and remaps the survivors, the same
+tombstone-then-compact rule the door flags follow. `l` refuses a triangle with
+no open edge, and a link that cannot be written draws red; see
+[pinned drop links](#pinned-drop-links).
+
+### <a id="cellview-layer-cut"></a>Cellview: the layer cut and page preferences
+
+The cut slider clips collision outside a height band with two three.js clipping
+planes, so one storey can be edited without the floors above and below in the
+way. The raycaster ignores clipping, so surface picking filters hits outside
+the band itself. **solid** draws collision opaque with a polygon offset, so the
+navmesh lying ON the floor still draws over it.
+
+The plugin and the Layers checkboxes are remembered in
+`export/cellview_prefs.json` (`server.save_prefs`), not browser storage: the
+GUI serves the page on a free port each launch, and browser storage is per
+origin, so it came back empty every time.
 
 Measured: `ImperialDungeon01` has one (triangle 567 → 276, a 192-unit drop);
 the Bruma corpus interiors have none, being single-storey.
@@ -3432,7 +4468,7 @@ from a second plugin re-armed the globals and every later Oblivion cell then
 found no collision for its meshes -- `get_collision` returned `None` for every
 path key, and the page drew a navmesh floating in empty space with "walls" and
 "floor" both ticked. Cells baked BEFORE the switch kept working, because
-`transplant_server._CACHE` had already stored their geometry, which made the
+`cellview.bake.CACHE` had already stored their geometry, which made the
 failure look specific to one cell.
 
 Measured on the running editor: of five cells requested, only
@@ -3446,6 +4482,174 @@ cells baked correctly in a fresh process.
 class-level `_armed` records which export currently owns them, so the common
 single-export case still pays the load exactly once.
 
+### The asset namespace is one of those globals
+
+**A model key carries the game namespace, so arming must set it too.** Every
+key is `<namespace>/<model path>` (`pool.model_key`, off `current_namespace()`),
+and only the conversion pipeline used to call `set_namespace`. A diagnostic left
+the process default `tes4` in force, so `Morrowind.esm` -- namespace `morrowind`
+-- looked its meshes up as `tes4/o/contain_crate_01.nif` against a cache keyed
+`morrowind/o/contain_crate_01.nif`, and `get_collision` returned `None` for all
+4,509 of its base models. Cellview drew the pathgrid in an empty room.
+
+`audit.py` made it permanent: it carried its OWN copy of `model_key` with
+`'tes4/'` HARDCODED, so the miss was baked into the persisted `cell_index`
+rather than recomputed per process. That duplicate is deleted -- the one
+namespace-aware implementation is shared -- and `_parse_tables` and
+`NavIndex.arm()` both call `set_namespace(namespace_for(export))`. `SCHEMA` is
+bumped to 4 so indexes written with `tes4/` keys rebuild instead of being
+served.
+
+Measured on `Imperial Prison Ship` (Morrowind.esm): `walk 0 block 0` before,
+14,949 walkable and 49,023 blocking triangles after. Oblivion is unaffected --
+its namespace IS `tes4`.
+
+### An EMPTY collision cache read as current
+
+**`_entry_table_is_intact` accepted `count == 0`** (`collision_extract`), so a
+20-byte `export/Morrowind.esm/collision_cache.bin` -- valid `TESCOL07` magic,
+zero entries, table consuming the blob exactly -- pinned itself as fresh. The
+rescan in `rescan_mesh_caches` is gated on that check, so it never fired again
+and the empty cache survived every run. An empty table is now never current;
+the rescan found 4,732 of 6,978 NIFs with collision.
+
+
+## <a id="land-slit-buffer-must-be-repaired"></a>Land slits: repair the buffer, never kill the cell
+
+**The slit-closing buffer produces INVALID geometry, and a failed fill must never kill the cell** (`corridor_union._close_land_slits`). The mitre round-trip `buffer(+16, join_style=2).buffer(-16, join_style=2)` self-intersects on terrain sheets whose outline has sharp spurs, and the `difference` against it then throws out of the whole cell -- **13 Oblivion exteriors and 1 TR_Mainland cell produced NO navmesh at all**, as `TopologyException: found non-noded intersection` (9), `unable to assign free hole to a shell` (3), `side location conflict` (1) and one `AssertionFailedException: Should never reach here`.
+
+The input is valid every time; only the buffered ring is (measured on 0100604B: `in valid=True buffered valid=False`, self-intersection at 42882.0 13177.3). So the ring is repaired with `make_valid` before the difference, which rescues the topology cases and yields a sensible fill. One cell (01006879) has both polygons valid and fails inside GEOS's overlay anyway, where `make_valid` does NOT help -- so `GEOSException` is caught around both the difference and the union and `gmerged` is returned unchanged. **The slits are cosmetic; a cell with hairline gaps beats a cell with no navmesh.** All 14 cells build after the fix, and a 40-cell sample of already-working Oblivion cells is byte-identical, so the repair touches only what was crashing.
+
+## <a id="leveled-placements-never-carve"></a>Leveled placements never carve
+
+**A REFR placing a leveled creature is gone before the navmesh gathers** (`pool.drop_leveled_placements`). `leveled_actors.build_leveled_actor_shells` rewrites every such REFR into an ACHR aimed at a shell NPC_, and it runs in the pre-scan phase -- BEFORE phase 4a. A navmesh built from the raw REFR list therefore carves placements the import never carves.
+
+This is what made the pre-push gate refuse a cache the import had just written: `job_trace.load_export` parsed the export and gathered jobs directly, so Morroblivion cell 024C16D6 came to 48 refs in the checker against the import's 42 (**501 verts stored, 514 rebuilt**). The checker must run the same preparation as the import, so the filter lives here and BOTH paths call it; only the import also mints the shells. Every other step the import performs between parse and gather -- `exclude=RUNTIME_ONLY_TYPES`, `drop_author_deleted_records`, `set_namespace`, `set_formid_index_offset` -- is on the checker's path for the same reason.
+
+## <a id="scripted-blockers-are-obstacles"></a>A base its script removes is an obstacle, not a wall
+
+**Code:** `tes5_import/base/obstacles.py`, `navmesh/pool.build_base_model_index`, `record_types/common._simple_object`
+
+Skyrim never rebuilds a navmesh at runtime. A blocker baked in as a wall stays
+cut after a script disables it. Measured in Bloodmoon's `Raven Rock, Mine`
+(`02785F7B`): seven `in_co_mine_boulder*` activators carry `ColonyMineBoulder2`,
+which disables them once CO_10 reaches 10. Baked as walls, they split the
+corridor to the abandoned shaft into its own 46-triangle component, so
+`reach.py` reported the shaft door unreachable. In the headless run, Unel
+Lloran followed the player through three load doors and stopped at the
+boulder line, 1,608 units short.
+
+Skyrim's own mechanism is the base record's **Obstacle** flag (bit 25 on
+ACTI/CONT/FURN/MSTT/DOOR). The CK wiki says it "will cut the navmesh".
+Skyrim.esm sets it on 38 ACTI and 6 MSTT, all objects that can move or go away
+(port gates, movable shelves, destructible webs, falling rocks). An obstacle
+base carves nothing into the generated navmesh, and its record carries the flag.
+
+**The indicator is the script's own verbs: it calls `Disable` with no target
+and never `Enable`.** The first draft also counted bases that enable themselves.
+It marked 190 Bloodmoon and 123 Morrowind bases, most of them buildings a script
+raises during play: Raven Rock's inn, houses, pier and walls, and the player
+strongholds' towers, stairs and docks. Their end state is standing, with
+walkable floors that a runtime cut would remove. Under the disable-only rule:
+
+| Export | Scripts | Bases | Placed refs |
+|---|---|---|---|
+| Morrowind.esm | 36 | 9 | 227 |
+| Bloodmoon.esm | 46 | 103 | 253 |
+| Oblivion.esm | 94 | 13 | 116 |
+| Nehrim.esm | 104 | 72 | 828 |
+
+Each listed case was read. They are the boulders and the colony terrain rocks
+that get cleared, the snow-drift and tomb doors, the first-stage colony
+buildings that later stages replace, Morrowind's chargen blockers and the Vivec
+puzzle-canal stairs, which `puzzlecanal` removes when the puzzle is solved.
+Nehrim adds 58 `SchattenrufMineCollisionBox` blockers.
+
+A named call (`"x"->Disable`, `ref.Disable`) does not qualify: it names one
+placement, and the flag lives on the base. The tools that rebuild the carving
+table (`probe.py`, `audit.py`, `job_trace.py`) index the scripts first;
+`cell_index.BASES` is 3, and `navmesh_index.pkl` stores its type list so a
+cache without SCPT is re-parsed.
+
+### <a id="a-removed-obstacle-is-bridged"></a>The pathgrid is bridged across a removed obstacle
+
+**Code:** `navmesh/obstacle_bridge.py`, `pool._obstacles_by_cell`, `from_pgrd._cell_geometry`
+
+Leaving the obstacle out of the collision is not enough on its own. The corridor
+generator meshes only along pathgrid edges, and the pathgrid was authored with
+the obstacle standing. In `Raven Rock, Mine`, node 94 at the shaft corridor's
+mouth has no edge to tunnel node 37. With the boulders gone, a strip about 90
+units wide between them stayed unmeshed.
+
+Each job carries its cell's obstacle placements with their model keys. After a
+cache miss, each placement's footprint is measured from its own collision, and
+footprints that touch in plan are merged into clusters. For each cluster, every
+pathgrid component with a node within the cluster's half-diagonal (in plan, and
+from an agent height below it to its top) offers its nearest node. Two of those
+nodes are joined when `seeding.Ground.walk` passes the straight line between
+them over the cell's collision, which no longer holds the obstacle. The cache
+key is unchanged: the obstacle placements are among the hashed references, and
+the bridge is a function of them and the collision.
+
+## <a id="base-ids-carry-their-plugin-index"></a>Base ids carry their plugin index
+
+**A carving base is keyed by its FULL FormID, never the low 24 bits** (`pool._records_of`). Morroblivion's LVLC `02000BC6` (`fbmw0bmUexUfelcoastU40`, a region spawn list) and Oblivion's TREE `00000BC6` (`TreeWillowOakFreeSU`) share the low bytes, so a low-24 index handed the leveled list an unrelated tree's collision and carved a phantom trunk. **16 low-24 ids in Morroblivion are claimed from two plugins at once, 7 of them by an LVLC.**
+
+The two id spaces must be aligned before they can be compared. `load_master_export` keys by the RAW TES4 slot (Oblivion = 0) while `get_formid` shifts every REFERENCE by the load-order offset, so a NAME of `01000BC6` names master key `00000BC6`; the master's key is shifted by the offset here to match. Masking to low bytes hid the mismatch by accident and resurrected the collision at the same time -- **offset-correcting raises exact REFR->base matches from 247,678 to 253,462 and drops low-only matches from 6,006 to 222**, the 222 being exactly the collisions that SHOULD miss.
+
+### The debug tools kept their own low-24 copies
+
+**Three tools rebuilt the carving index with `int(f, 16) & 0xFFFFFF` while the
+pipeline keys the FULL FormID**, so every lookup done through them missed on a
+plugin with masters. `audit.py:_parse_tables` and `_door_model_map` persist
+theirs into `cell_index.sqlite`, so the miss was BAKED IN rather than recomputed
+per process; `probe.py` built a third copy; and `index.py:collision_sources`
+masked the key a fourth time, one line away from the `base_fid` that
+`_placed_soup` actually resolves with.
+
+Morroblivion is the case that shows it, because its REFRs name bases in two id
+spaces at once: of 275 refs in `ImperialSPrisonSShip` (`Morrowind_ob.esm`), 259
+are `01xxxxxx` and 16 are Oblivion's `00xxxxxx`. Measured on that cell,
+`base_model.get(base_fid(refr))` hit **7** of 275 while the masked key hit 178 --
+the index was keyed one way and queried the other, so cellview drew the pathgrid
+in an empty room exactly as the `tes4/` namespace bug did.
+
+All four copies now key by `get_formid`, and `cell_index.SCHEMA` is bumped to 5
+so indexes written with masked keys rebuild instead of being served. Measured on
+`ImperialSPrisonSShip`: `walk 0 block 0`, 0 named collision sources before;
+**16,080 walkable, 51,475 blocking, 167/167 sources named** after. `Morrowind.esm`
+(no masters) and `Oblivion.esm` are unchanged -- with one plugin in the chain the
+two keyings agree.
+
+### <a id="cellview-master-numbering"></a>Each master's ids are rebased into the child's numbering
+
+**Keying by the full FormID only works if every table in the chain uses the
+SAME numbering, and each plugin numbers by its own master list.**
+`TR_Mainland.esm` lists `Morrowind_ob.esm` as master 00, but `Morrowind_ob.esm`
+lists Oblivion as 00 and itself as 01. So TR's REFRs name the ashland grass
+static `000C084C`, while Morrowind_ob's export stores it as `010C084C`. The
+low-24 mask had hidden this; the full-FormID switch made cellview draw TR
+exteriors as bare terrain.
+
+`cell_index.index_map(child, master)` maps each index byte in a master's export
+to the child's byte, matching masters by export directory
+(`master_export_dir`). A byte the child does not declare (Oblivion, seen from TR)
+is dropped. `CellIndex` rebases the masters' `base_model` and `door_fids` keys,
+and the REFR `NAME`s of master-owned cells, so everything is in the child's
+numbering. `NavIndex.activator_fids`, read from each export's `ACTI.txt`
+for the lattice generator, is rebased the same way. Measured over TR_Mainland's
+13,756 own cells, activator REFRs recognized went from 8,146 to 20,986.
+`NavIndex.collision_caches` now loads the whole master chain, deepest
+first, because a Morrowind_ob base can use an Oblivion (`tes4/`) mesh whose
+collision lives only in Oblivion's cache.
+
+Measured on `TR_Mainland.esm` cell `wrldmorrowind -17 -51`, before -> after:
+REFRs whose base resolves to collision went from 1/104 to 68/104, and collision
+triangles from 1,924 walkable + 124 blocking to 3,448 walkable + 8,458 blocking.
+Of the other 36 objects, 25 are grass with no collision, and 11 are ARMO, FLOR,
+INGR, LIGH or WEAP bases, which never carve. `Morrowind_ob.esm`'s
+`ImperialSPrisonSShip` is unaffected: with Oblivion as its only master, the map
+is the identity.
 
 ## <a id="master-owned-cells"></a>Navmesh in a cell the plugin does not own
 
@@ -3608,7 +4812,7 @@ and door panels read the module cache too.
 
 ### The geometry must merge the masters too
 
-**Code:** `navmesh/pool.py:_merge_master_cell_records`.
+**Code:** `navmesh/pool.py:_records_of`.
 
 Owning the master's NAVM id is only half the contract. A child plugin restates
 **only the references it edits**, so building the navmesh from `by_type` alone
@@ -3635,13 +4839,837 @@ This was latent before navmesh overriding landed. The thin navmesh used to ship
 under a **derived** id, so the master's correct navmesh stayed loaded beside it;
 once the child adopted the master's id, the thin mesh *replaced* the good one.
 
-`_merge_master_cell_records` therefore makes the masters the baseline for REFR
+`_records_of` therefore makes the masters the baseline for REFR
 and LAND: master records first, the plugin's own overriding by FormID, and an
 override flagged `DELETED_FLAG` dropping out so a deleted ref cannot resurrect.
 After merging, the cell above carries 154 refs (121 master + 33 new; the 12
 edited ones replace rather than add).
 
+**The override match must shift the master key.** `master_export` keys are raw
+TES4 ids; `get_formid` moves every id past the prepended Skyrim masters (UL:
+offset 1). A second merge helper once compared the raw key against the shifted
+id, so no override ever matched. Both copies were kept, with the master's first. UL's
+navmesh walked Oblivion's heights instead of UL's reshaped LAND in 1,733 of its
+1,856 jobs (Tamriel 20,20: 26-layer master LAND, not UL's 29-layer one). Every
+edited ref also carved twice, and a deleted one still carved. Tests at the default offset 0
+never saw it. There is now one merge (`_records_of`); Oblivion.esm's 8,228 jobs,
+masterless, come out identical.
+
 **PGRD is deliberately NOT merged.** Which jobs exist, and their
 `(cell_fid, pgrd_fid)` keys, stay driven by the plugin's own pathgrids — merging
 there would invent jobs and move every derived NAVM id. Verified on UL: job
 count is 1,865 before and after, and the probe cell keeps pathgrid `000392E8`.
+
+
+## <a id="patching-a-navmesh-into-a-built-esm"></a>Patching one corrected navmesh into a built ESM
+
+**Code:** `tools/navmesh/navm_patch.py`, reached from cellview's "To ESM" button
+(`/esm_patch` in `tools/cellview/server.py`).
+
+A correction in `tests/navmesh_fixed/` was a scoring target and nothing else:
+testing one in-game meant a whole `--import-only`. This writes the corrected
+geometry into `output/<plugin>/<plugin>.esm` in place instead, so the edit loads
+on the next launch.
+
+**Only the NVNM geometry moves.** The record keeps its FormID, its EDID and its
+ONAM, so NAVI's NVMI entry, every REFR's XNDP and every neighbour's edge link
+still name something real. `pack_nvnm` reproduces a shipped NVNM **byte for
+byte** from its own decode — verified on 3 interior and 2 exterior records of
+`output/Oblivion.esm` — which is what makes repacking with new triangles safe:
+the only difference in the blob is the geometry the human changed.
+
+**Doors and water flags are carried over, not recomputed.** A retriangulation
+renumbers every triangle, so each Door Triangle is re-aimed at whichever new
+triangle is nearest the old one's centroid. The door REFR's **XNDP names that
+triangle too** (`<Ihxx`: NAVM, triangle), so `xndp_edits` rewrites it in place
+(same size, no GRUP change). Before this, every patch left each door's XNDP
+naming its old triangle number. Fed a cell's own geometry back, the rewrite
+reproduces the shipped XNDP exactly: 8/8 doors in ImperialDungeon02 and 11/11 in
+ImperialDungeon01. The water flag is a height test against the cell's
+water plane; reading that plane back as the highest Z any water triangle reached
+reproduces the test without re-reading the CELL record.
+
+**An exterior cell's seams are re-stitched, both sides.** Cross-cell Portal
+links name triangle indices, so the neighbours' links into a rewritten mesh are
+all stale. Each of the four orthogonal neighbours has its links to this mesh
+dropped and renumbered, the seam is matched again with the import's own
+`border_edges`/`match_seam`, and the neighbour record is rewritten too. Measured
+on `output/Oblivion.esm`, 1,000 of 1,002 exterior navmeshes sampled carry edge
+links, so skipping this would strand the edited cell.
+
+**A split cell is re-cut onto its own records** (`split_edits`). `split.py`
+cuts an interior with a same-cell teleport pair into one NAVM per component
+(8,183 of 8,203 navmeshed cells in `output/Oblivion.esm` hold one NAVM, 20 hold
+more, ImperialDungeon01 among them). Cellview edits the whole cell, so the
+patch packs the corrected mesh once, finds its components with the import's
+own `components`, and packs each one with `pack_component_nvnm`. Each
+component then goes to the record whose old triangles most of its own lie
+nearest, so FormIDs, EDIDs, ONAMs and NAVI's NVMI entries stay valid. The patch
+is refused, pointing at `--import-only`, when that is impossible:
+* the pieces no longer match the records one-to-one (an edit joined two pieces
+  or cut one in two), or
+* a piece's doors or sibling ledge links changed, because NVMI lists both.
+Re-splitting then would mean new FormIDs, which only a real import mints.
+Fed ImperialDungeon01's own geometry back (847 + 28 + 27 triangles, 11 doors,
+one cross-piece ledge pair), all three NVNMs come back byte-identical.
+
+**Resizing a record means fixing every GRUP above it.** A GRUP's size covers its
+children, so a record that grows or shrinks changes the size of each GRUP
+enclosing it; `splice` collects those headers by walking down to the record's
+offset, applies the delta to each, and then does the byte replacements back to
+front so the earlier offsets stay valid.
+
+The load-order shift is read back off the two files rather than reconstructed:
+the output's master list is the TES4 one with new masters prepended, so the
+difference in their lengths IS the shift every FormID's index byte took.
+
+
+## <a id="pinned-navmesh-floor"></a>Pinned navmesh corrections: edits that survive the generator
+
+**Code:** `tes5_import/base/navmesh_pins.py`, written by cellview's **Pin edits**
+button, applied in `from_pgrd._cell_geometry` after the build.
+
+A correction in `tests/navmesh_fixed/` records triangle and vertex INDICES, so
+it is meaningless the moment the generator renumbers anything — `is_stale`
+exists only to refuse replaying one. The corpus census shows the decay
+directly: of five corrections on disk, three (`ImperialDungeon01/02/03`) have
+**zero ops and identical base/result**, having already collapsed into snapshots.
+The files are also gitignored, so nothing a human decided ever reaches another
+machine.
+
+The pin file is the durable half of the same intent. It stores **world
+positions**, not indices, so it survives any retriangulation, and it is small
+enough to commit and read in a diff. It holds two kinds of entry, both applied
+after the generator: [cuts](#cut-pins) and [frozen patches](#frozen-navmesh-patches).
+
+**Floor pins and welds were removed.** The first design fed hand points into
+`finalize`'s `pin_xy` (so the cleanup passes would not cut that floor) and
+re-found hand welds inside `finalize` ([weld pins](#weld-pins)). Neither kept a
+real hand fix; the measurements are under frozen patches. Once every pinned
+cell had been re-pinned as a frozen patch, the pinned points, the welds, and
+the `pins`/`welds` parameters of both generators were deleted.
+
+**The key is plugin plus cell name.** One committable file per source plugin,
+`navmesh_pins/<plugin>.json` (`TR_Mainland.esm`, never the mod folder — see
+[pins key on the plugin](#pins-key-on-the-plugin)). Keyed by cell EditorID — or, for an exterior cell,
+by the `"<worldspace> X Y"` grid reference cellview opens it with, since an
+exterior CELL has no EditorID. Lookup is case-insensitive: the name is one a
+human typed.
+
+**The loader lives outside `tes5_import/navmesh/`.** That folder's bytes ARE the
+geometry cache tag (`pool.navmesh_geom_cache` hashes every `.py` in it), so a
+loader placed there would invalidate all ~8,200 cached cells on every edit. In
+`tes5_import/base/` it is free to change. The pin DATA still enters
+`geom_hash` per cell, so a pinned cell's stored hash stops matching while every
+unpinned cell's hash is byte-identical to what it was before pins existed.
+
+> Note: a changed hash makes a cell's cached geometry stale, which is not the
+> same as making the converter skip the others. Regenerating only the cells
+> whose pins moved is separate, unbuilt behavior.
+
+
+### <a id="cut-pins"></a>Cut pins: floor a human declared NOT walkable
+
+**Code:** `navmesh_pins.cuts_for` / `apply_cuts`, applied in
+`from_pgrd._cell_geometry` right after the build and before the geometry cache
+stores it. A cut removes floor the generator should not have made, in a region
+no hand edit draws triangle by triangle:
+`"cuts": {"<cell key>": [[zmin, zmax, x1, y1, x2, y2, x3, y3, ...]]}` — a
+world-XY polygon plus a height band. Every generated triangle whose centroid
+lies inside the polygon and band is removed, unused vertices are compacted,
+and ledge links naming a removed triangle go with it. A cut is a position, so
+it survives any retriangulation, and it enters the cell's
+`digest()` so only a cut cell's cache entry goes stale.
+
+First use, `XPGardensExterior` (SETheFringe −13, 0): Oblivion's own pathgrid
+runs through the solid wall-walk structure around `ExRuinWalkWallStairs01`
+(REFR `00042B78`) at ground level — node 46 sits on the ground inside it, joined
+to the walkway top (node 45, Z 1586) and edges 1→0→3 cross it at Z 1422 — and
+the pathgrid band is unconditional, so once the correct parent-worldspace land
+put the ground at Z 1408 the band pulled a floor into the structure's interior.
+The cut `[1300, 1500, −51225..−50185 × 1745..2583]` removes the ground inside
+the walls; the walkway (Z ≈ 1590) and the stair ramp (centroid Z 1529) are
+above the band and stay. A second row, `[1300, 1415, −51000..−50400 ×
+1590..1745]`, removes 7 ground triangles under the bottom of the stairs, where
+the stair collision sits only 4–62u overhead (less than `AGENT_HEIGHT`); its
+1415 ceiling keeps the two triangles beside pathgrid node 42 (Z 1430) that
+join the ramp to the courtyard. Courtyard → walkway (node 41 → node 45) stays
+reachable.
+
+Second use, `DMushroomTree01` (REFR `000524C6`, SETheFringe −11, −1): the
+ground navmesh ran over its stem and root arms where they lie flush with the
+terrain. The cut is the object's own footprint at walking height — the union
+of its collision triangles crossing land … land+128, padded 24u and
+simplified to three polygons — over its whole height band (Z −603..3196), so
+the open ground between the root arms stays. The footprint reaches three
+cells, so the same rows are keyed under `SEPassWallExterior02`,
+`wrld:011F7B -11 0` and `wrld:011F7B -12 -1`; they removed 48, 17 and 1
+triangles. Adding both cuts changed 10 of 8,239 navmeshes (the 4 cut cells and
+6 seam neighbours whose edge links name renumbered triangles).
+
+### <a id="weld-pins"></a>Weld pins (removed): why a crack needed more than a position
+
+A crack is not missing floor. Two triangles can meet at identical coordinates
+and still leave a crack, because the engine joins them only when they **share a
+vertex index** — the reason `meshedit._snap_vert` rewrites indices rather than
+just moving a vertex. A floor pin was therefore silently a no-op on a crack:
+rebuilding the Imperial Prison Ship with and without its floor pins gave
+byte-identical results, 145 verts and 171 tris either way, with the crack
+still open (v95 and v124 sitting 33u apart).
+
+Weld pins stored the two PLACES whose vertices had to become one and re-found
+them inside `finalize`, before adjacency was read. They matched within 8u
+(the Prison Ship's closest generated vertices sit 17u apart). But the
+endpoints were recorded from the FINISHED mesh and applied BEFORE decimation,
+where those vertices need not exist yet. On SchattenrufMinePart05 at least 2 of
+9 targets were more than 8u from where the weld looked for them. A frozen patch
+keeps the welded triangles themselves, sharing one index, so the crack stays
+closed without re-finding anything.
+
+
+### <a id="frozen-navmesh-patches"></a>Frozen patches: hand-edited triangles kept verbatim
+
+**Code:** `tes5_import/base/navmesh_frozen.py` (`apply_frozen`), stored in the
+`frozen`/`voids` sections of `navmesh_pins/<plugin>.json`, written by cellview's
+**Pin edits** (`bake.frozen_patch`), removed with `u` / `shift+u`
+(`navmesh_pins.remove_patch`). Applied after the generator in
+`from_pgrd._cell_geometry` and in cellview's `bake.generate`, after cuts.
+
+The floor pins and welds this replaced did not preserve a hand fix. On
+`SchattenrufMinePart05` (Nehrim.esm; 14 `del_tri`, 9 `snap_vert`, 6
+`move_vert`, 3 `add_tri`), rebuilding with the pins and welds Pin edits used to
+write left floor at 12 of the 14 deleted places and 0 of 3 added triangles,
+and moved no vertex. Its
+corner pins actually PROTECTED 9 of the 14 deleted triangles, because a corner
+lies on every triangle around it.
+
+A frozen patch is the door-reservation idea applied to a hand edit (see
+[door reservation](#door-reservation-hardening-2026-08-02)): keep the triangle
+out of the generator and attach it last, instead of protecting it in each pass.
+
+* **frozen**: every result triangle using a vertex the edits moved, welded or
+  created, as world positions.
+* **voids**: every on-screen triangle the edits deleted or that used such a
+  vertex. This is the ground the human took over. Voids with nothing frozen
+  over them stay holes.
+
+After the build, every generated triangle overlapping the patch on the same
+storey (plane heights within `STOREY_BAND` 60u at the overlap) is removed. A
+generated triangle whose corners ARE a void's is removed whatever its size,
+since a weld-collapsed sliver is too thin for the overlap test. Then the frozen
+triangles go in. Each edge-connected group of removed triangles is refilled as
+ONE polygon (its union minus the patch, constrained-Delaunay), so the refill
+uses only the generator's own vertices and the patch corners. Refilling each
+removed triangle separately put a vertex wherever a generated edge crossed a
+frozen edge; the T-junction split then broke the frozen triangles apart
+(lattice: 19 of 50 survived, and 3 edges had 3+ owners).
+
+Patch corners snap onto the generated vertex they already are (0.5u in plan,
+1u in height), so an unchanged generator reproduces the edit exactly. Measured
+on SchattenrufMinePart05: 1,092 triangles, none extra or missing against the
+saved result, and the same edge counts (1,324 shared, 628 open).
+
+<a id="frozen-corner-takes-the-vertex"></a>**A frozen corner takes over the
+generated vertex under it** (`_VertexPool.frozen_corner`). Past the 1u snap, a
+corner still claims the nearest generated vertex within 0.5u in plan and
+`STOREY_BAND` in height, and moves that vertex onto the pinned position. The pin
+wins, and the kept floor that shares the vertex stays joined to the patch.
+Before this, the corner got a vertex of its own. On ImperialDungeon01
+(Oblivion.esm), cellview built door 00085288's threshold corners at z 511.45,
+and the pin recorded them there. The import's generator built them at 518.66
+and 519.09. So the door triangle shared no vertex with the frozen triangles
+around it, `split_disconnected_interiors` moved it into a one-triangle NAVM of
+its own, and no actor could reach the door.
+
+The drift itself came from cellview: its index (`tools/navmesh/audit._parse_tables`)
+built its own base-model table from STAT/CONT/FURN/ACTI/TREE/DOOR. The import's
+`pool.build_base_model_index` uses STAT/CONT/FURN/ACTI/TREE/FLOR, so cellview
+carved door meshes the import never carves and skipped flora the import does
+carve. ImperialDungeon01 had 11 door refs that differed; cellview built 877
+triangles where the import built 902. Cellview and `probe.py` now call
+`build_base_model_index`. A stored index whose `bases` meta is older than
+`cell_index.BASES` gets that one table rewritten from the six base record types
+alone (`audit._ensure_store`), in about 2s. A `SCHEMA` bump would have worked
+too, but it throws away the whole 2 GB index and re-parses every cell, reference
+and LAND record inside the cellview process. That filled the user's RAM on the
+first open.
+
+**Where the new floor's edge crosses a frozen edge, the frozen edge is split**
+(`_stitch`). The refill cuts the patch out of the removed floor, so it leaves a
+vertex part-way along the frozen edge: a T-junction the engine will not link
+across. Only vertices the refill alone uses are moved, onto the edge at its own
+height, and the frozen triangle is fanned at them. The frozen SURFACE is
+unchanged; its tessellation gains a vertex. This is the door attach's own
+answer to the same problem (`_stitch_isolated_tri` splits a door triangle's
+side edge). On the lattice run all 11 such vertices came from the refill,
+0.9-46u off the frozen edge's height, none from a kept lattice triangle.
+
+Measured against the lattice generator's unrelated 3,342-triangle mesh: of the
+136 frozen edges that join floor in the saved result, 132 did before the stitch
+(4 T-junctions); after it, 133 join along their whole length. The other 3 join
+for 51-93% of their length, and the rest has no floor beside it in the RAW
+lattice mesh either, so there is nothing to join to. The frozen area is kept
+exactly (234,128.6 u²), in 62 pieces, all in one component with the lattice
+floor, and no edge has more than two owners.
+
+`FROZEN_VERSION` enters `digest()`, so a change to `apply_frozen` re-caches
+only patched cells.
+
+**A ledge whose triangle the patch replaced moves to its heir**
+(`_carry_ledges`): the patch or refill triangle that overlaps the removed one
+on its storey and still has an open edge. If several do, the winner is the one
+whose open edge lies nearest the other side, which is the same rule
+`_open_edge_towards` uses to pick the edge. So extending or re-cutting a lip
+triangle keeps its drop-down. A lip on a triangle deleted with nothing frozen
+over it has no heir, and its link is dropped. Not yet carried: door flags, and
+a generator ledge REMOVED in the editor (`del_link` is not pinned).
+
+### <a id="pinned-drop-links"></a>Pinned drop links
+
+**Code:** `navmesh_pins.links_for` / `save(links=)`, `navmesh_frozen._carry_ledges`,
+`bake.frozen_patch`.
+
+A link added in the editor is pinned as its two triangles by WORLD position
+(the `links` section, 18 floats: upper triangle, then lower), since the
+generator renumbers triangles on every build. Pinning a link also freezes and
+voids BOTH its triangles, so they come back verbatim. After the frozen patches
+go in, each stored triangle resolves to its heir by the same `_heir` rule as a
+carried generator ledge. Unpinning a patch drops every link with an end on it,
+and each link enters `digest()`, so pinning one restages only that cell.
+
+**A pin REPLACES the cell's links with the ones on screen** (`bake.pinned_links`):
+every link after the session's ops whose two triangles lie in the merged frozen
+patch. The first version appended, so a link the page no longer showed stayed
+pinned. On SchattenrufMinePart02, five earlier links whose triangles a later
+edit replaced all moved to their heir, one new triangle, which shipped as three
+ledges from it where the page had shown one.
+
+**A pin with no ops is refused**, and the Pin button is disabled without one.
+Pinning reloads the cell and clears the ops, and an empty list used to freeze
+EVERY triangle, so Pin, To ESM, Pin took over the whole cell.
+
+**An abandoned build ring drops its new corners** (`dropRing`). A bare-floor
+corner joins the page's vertex list on click but reaches the ops only when its
+triangle completes, so an `Esc` or `b` mid-ring left an orphan, and every later
+`add_vert` was numbered one higher on the page than in the server's replay:
+the pinned triangle got a different corner than the one placed.
+
+**Both ends need an open edge, or the link cannot be written.** A carrier
+edge's neighbour slot holds the Edge Link index instead of a neighbour
+(xEdit `wbEdgeToStr`), so an edge cannot be both. Vanilla census, Skyrim.esm
+(15,966 navmeshes): 2,027 Ledge Down and 2,027 Ledge Up, every one on an edge no
+other triangle shares. On the 1,705 reciprocal same-mesh pairs, the two lips'
+midpoints are 51u apart in plan at the median (90th percentile 96u, max 322u),
+with a drop of 89u (90th percentile 240u). So the landing is the LOWER FLOOR'S
+OWN EDGE near the ledge, usually against the wall below it. The first pinned
+links (SchattenrufMinePart02) all failed this way: each lower triangle lay
+mid-floor under a walkway, so `_heir` found it but it had no lip, and
+`_resolve_ledge_links` would have refused it anyway. Cellview now refuses such a
+link at `l` and draws any existing one red.
+
+### <a id="pin-ab-toggle"></a>The pinned-edits toggle is a RE-BAKE
+
+Cellview's **pinned edits** checkbox re-fetches `/mesh?pinned=0|1` rather than
+hiding a layer. Pinned edits change the mesh the build PRODUCES, so there is no
+pinned-vs-unpinned geometry sitting in the page to show or hide — the only
+honest A/B is to build the cell both ways. The bake cache is keyed on the
+flag so flipping back is instant, and both variants are dropped whenever the
+pin file is written, or the first bake after pinning would serve the mesh from
+before the pin.
+
+Until this landed `CellCtx.build` passed no pins at all, so the editor rendered
+the RAW generator while the pipeline rendered the corrected one — the viewer
+silently disagreed with the build it claims to mirror.
+
+**An unpinned cell says so.** Both halves of the A/B are identical when nothing
+is committed, which reads exactly like a broken switch, so the status line
+distinguishes "no pins committed" from "50 frozen tris over 65 replaced
+APPLIED" and "… DISABLED".
+
+Edits in progress are dropped on a flip, because their triangle and vertex
+indices address the mesh being replaced.
+
+The camera is NOT reframed. A re-bake of the cell already on screen keeps
+the view (`loadMesh`'s `keepCamera`), for the pin toggle and for Reload:
+the A/B is a comparison of one spot, and reframing throws away the spot.
+Opening a DIFFERENT cell still frames it.
+
+
+### <a id="current-mesh-is-the-generator"></a>"Current mesh" is the GENERATOR'S output, never a replay
+
+Cellview's mesh dropdown names two different things, and they must stay
+different:
+
+* **Current mesh** — what the generator produces for this cell, right now,
+  plus any edits made in THIS session. Nothing else.
+* **Saved result** — the frozen `result` from `tests/navmesh_fixed/`, read-only,
+  because ops cannot extend a stored mesh.
+
+The page used to seed `mOps` from the saved correction on every load and replay
+it onto the live mesh. Both dropdown entries then drew the same picture, and
+every comparison against the generator was worthless: the pinned/unpinned A/B
+changed the geometry underneath and the replay painted the correction straight
+back over both halves, so the toggle read as doing nothing at all. The bug
+survived three wrong diagnoses (the dropdown, a `hasPins` guard, the weld
+endpoints) because each was reasoned from the code rather than from what the
+page draws.
+
+So `mOps` now holds only this session's edits, and the view opens on **Current
+mesh** regardless of whether a correction exists. A correction is reached by
+choosing it, never by having it applied invisibly.
+
+Measured on `Morrowind.esm` / `Imperial Prison Ship`, vertex 95 is the tell:
+Current mesh has it at `(-61.63, 1175.06)` with the crack open, Saved result at
+`(-80.96, 1147.73)` welded. With the cell's pins committed, Current mesh drops
+to 170 triangles as the weld collapses one.
+
+
+### <a id="user-pin-folder"></a>A user's pins live in their own folder
+
+**Code:** `navmesh_pins.user_dir` / `_read` / `save`,
+`core.navmesh_options.navmesh_pins_dir`, `convert.py --navmesh-pins`.
+
+`navmesh_pins/` ships with the converter, and an update pastes a new copy over
+it. A user's pins therefore go to a folder of their own: the GUI's
+**Navmesh > Pin Save Location** setting (`navmeshPinsDir`), defaulting to
+`my_navmesh_pins/` beside the app, which no release contains. The GUI passes it
+to every `convert.py` run as `--navmesh-pins`, and to the editor server as
+`--pins`. It travels to the pool workers in `TESCONV_NAVMESH_PINS`, the way
+the generator choice does.
+
+Reading layers the two folders. For each section, a cell present in the user's
+file replaces the shipped cell, including an empty list. An empty list is how
+a user unpins a shipped patch without editing a file an update would replace:
+`save` keeps an empty entry wherever the shipped file has that cell, and
+removes the entry otherwise. Saving always writes to the user's folder. A user
+folder that IS `navmesh_pins/` (the developer's setup) is a single layer, and
+behaves exactly as before.
+
+The shipped folder is found from the module's own location, not the working
+directory, so a process started elsewhere still finds it.
+
+### <a id="navmesh-editor-in-the-gui"></a>The navmesh editor in the GUI
+
+**Code:** `core/gui/navmesh_editor.py`, `tools/cellview/server.py`.
+
+The **Navmesh** bar entry starts cellview's server as a child of the window,
+from the repository folder with `--port 0 --no-browser --pins <save folder>`.
+It then reads the first line, `cellview: <url>`, to learn the port. A status
+card shows Starting / Running / Stopped, the address and the server's latest
+line, and opens the browser once when the server comes up. Closing the card
+leaves the server running. Closing the window stops it through
+`kill_process_tree`, and the GUI's kill-on-close job catches a crash. Changing
+the save folder restarts a running server so it saves to the new one.
+
+The Transplant panel is shown only when the server runs with `--transplant`,
+which the GUI never passes: its Bruma corpus needs `references/` data that only
+a developer checkout has.
+
+Picking a plugin with no current collision cache builds it instead of refusing.
+`plugins.build_collision` runs `rescan_mesh_caches.py` over the plugin's
+masters and then the plugin, from their converted `output/` meshes, and then
+disarms `NavIndex` so the next open reloads the tables. The rescan takes the
+heavy-job lock, so it waits behind a running build. A plugin whose meshes were
+never converted still fails, with the tool's last lines, because collision
+comes from the converted meshes.
+
+### <a id="editing-a-saved-result"></a>Editing, pinning and shipping a saved result
+
+**Code:** `meshedit.rebase_ops` / `result_marks`, `cellview.bake.edit_basis`.
+
+On **Saved result**, Overwrite, Save new, To ESM and Pin edits act on the
+correction itself, not on the generator. The server replays the correction's
+stored `base` with its own ops, followed by the session's edits. Pinning a
+saved result therefore freezes exactly what was saved, however far the
+generator has moved since.
+
+Edits made over the result can be appended to the saved ops because replay
+never compacts VERTICES: result vertex *i* is replay vertex *i*. Only triangle
+indices move. Result triangle *j* is the *j*-th surviving replay triangle, and a
+triangle the session adds follows the replay's own list, so `rebase_ops`
+rewrites only the `tri`/`up`/`down` fields.
+
+A correction stores no base doors or links. `result_marks` maps the result's
+doors and links back through the survivors. Door and link ops only set or
+clear, so the last one on a triangle decides, and replay reproduces the saved
+result's doors and links exactly.
+
+Switching the mesh dropdown drops pending edits, since they index the mesh they
+were made on. Overwriting the correction on screen re-reads it, so the folded-in
+edits never apply twice.
+
+### <a id="the-tag-hashes-geometry-only"></a>The cache tag hashes the GEOMETRY code, not the whole folder
+
+**Code:** `pool._TAG_EXCLUDE`, consumed by `navmesh_geom_cache`.
+
+The geometry cache key is per-cell inputs plus a **tag**: a SHA-1 over the bytes
+of every `.py` in `tes5_import/navmesh/`. The tag is identical for every cell,
+so one edit anywhere in that folder invalidates all ~8,200 entries at once.
+That is correct for code that decides geometry and pure waste for code that
+does not.
+
+The cached payload is `(verts, tris, ledges)` and nothing else. Seven modules
+in that folder cannot reach it: `edge_links`, `navi`, `split`, `cache_audit`,
+`pool`, `worker` and `__init__`. They orchestrate the run, or rewrite records
+AFTER geometry has left the cache. Editing `navi.py` used to cost a full
+rebuild of every cell to produce byte-identical output.
+
+Verified three independent ways, all agreeing:
+
+* **Import-graph reachability** from `from_pgrd`/`build` — none of the seven is
+  reachable.
+* **A runtime trace** (`sys.setprofile`) over real builds of ImperialDungeon01,
+  ImperialDungeon02 and AnvilCastleGreatHall — 14 files execute, none of the
+  seven among them.
+* **Direct reference search** — the only edges are `pool → cache_audit, worker`
+  and `cache_audit → worker`, all orchestration. No geometry module names any
+  of them.
+
+**Two files that look inert and are NOT.** `params.py` never *calls* anything —
+it is constants — but its values drive every stage, so it stays in the tag. And
+`from_pgrd.py` did not appear in the trace only because `CellCtx.build` calls
+`build_navmesh` directly; the real pipeline runs it, and it computes the hash
+itself. Neither may be excluded, and "it did not execute in the trace" is not
+sufficient grounds on its own.
+
+Measured cost of the tag being all-or-nothing: a cache **hit** costs 12-18ms
+against a **miss** at 1.4-5.5s, so a full warm pass is ~129s of CPU over 8,218
+cells plus ~1.2 GB of job records pickled out to workers. An edit to one of the
+seven used to pay a full rebuild for zero change in output.
+
+
+### <a id="pins-key-on-the-plugin"></a>Pins key on the plugin, never its export folder
+
+**Code:** `navmesh_pins.use_plugin`, `core.navmesh_options.navmesh_plugin`.
+
+Pins used to be keyed by the folder holding the geometry cache. For an imported
+mod that holds one plugin, that folder is the mod's own (`export/Tamriel
+Rebuilt 25.08.12/`), so TR's pins were saved as `Tamriel Rebuilt 25.08.12.json`
+— a name no other machine has, and one the next TR release changes. Cellview
+offered the folder beside `TR_Mainland.esm` in its plugin list, and pins saved
+under whichever was picked.
+
+The import now names the plugin outright: `use_plugin` sets
+`TESCONV_NAVMESH_PLUGIN` (the pool workers inherit it, so no worker signature
+changes) before navmesh generation. A pin file still named for the folder, in the
+shipped or the user's pin folder, is renamed to the plugin's name on that run and
+logged `DEPRECATED`; if both exist, the plugin's file wins. Cellview no longer
+lists a registered mod's folder as a plugin.
+
+### <a id="mixed-separators-lost-the-pins"></a>Mixed separators made every pin a no-op
+
+**Code:** the removed `navmesh_pins.plugin_of`, replaced by
+[pins key on the plugin](#pins-key-on-the-plugin).
+
+Pins are looked up by plugin, and the plugin is derived from the geometry cache
+directory rather than threaded through every navmesh worker's signature. That
+directory is built by `os.path.join(os.path.dirname(collision_cache),
+'navmesh_geom_cache')`, and the collision cache path arrives with FORWARD
+slashes, so the result is mixed:
+
+    export/Morrowind.esm\navmesh_geom_cache
+
+`os.path.dirname` on Windows splits at the last separator it recognises, which
+here is the backslash, leaving `export/Morrowind.esm`; `os.path.basename` of
+that is the whole string, and the original code's `basename(dirname(...))`
+answered **`export`**. `pins_for('export', ...)` finds nothing, so every pin and
+every weld silently did not apply — including in a full `--import-only` run,
+where the cell rebuilt for an unrelated reason (a tag change) and the operator
+saw a fresh mesh with no correction in it.
+
+The failure is silent by construction: a missing pin file is not an error,
+because a conversion must never abort over one. That makes the wrong plugin
+name indistinguishable from "nobody pinned anything".
+
+`plugin_of` now normalizes to forward slashes before splitting, so both path
+forms answer the same. Verified against all three spellings — pure forward,
+pure backslash, and the mixed form the pipeline actually produces.
+
+**How it was found:** the shipped NAVM had 145 verts / 171 tris with the
+crack-open vertex still present, while calling `build_navmesh` directly with
+the same pins gave 143 / 170. Same code, same inputs, different answer — which
+located the difference in how the pins were fetched, not in how they were
+applied.
+
+### <a id="adopt-and-pins"></a>An adopt must not re-key a cell whose pins changed
+
+**Code:** `cache_audit.rekey_cache`, `_pins_since`.
+
+Pins are baked into the stored geometry at build time; a cache hit returns it
+without applying them again. The pin digest is part of the cell's hash, so a
+changed pin misses normally. But adoption (a navmesh source edit moved the tag,
+a sample reproduced) re-keys EVERY entry to the hash `cell_geom_key` computes
+now, pin digest included, so a cell pinned since the cache was built got
+today's pinned hash stamped onto its unpinned geometry and was never rebuilt.
+Seen on Nehrim: three freshly pinned SchattenrufMine cells adopted, not rebuilt.
+
+The re-key now proves a pinned cell's pins are unchanged: the OLD tag (read from
+`CACHE_TAG` before it is overwritten) with today's pins must reproduce the
+stored hash. If it doesn't, or there was no `CACHE_TAG`, the entry is left
+stale and the cell rebuilds. Only pinned cells pay the second hash, so the cost
+grows with the pin count, not the cache size, and unchanged pins stay adopted.
+
+Gap: a cell UNPINNED since the cache was built has an empty digest now, so it is
+treated as unpinned and keeps its pinned geometry through an adopt.
+
+## <a id="native-port-ab"></a>Porting the generator to C++: exact parity, switchable
+
+**Code:** `native/src/navgrow/` (`sampler.cpp`, `sheets.cpp`, `decimate.cpp`,
+`cull.cpp`, `refine.cpp`, `meshflip.cpp`, `welds.cpp`, `stack.cpp`,
+`geos_bind.cpp`, `trigrid.h`, `clip_area.h`, `pymath.h`),
+`tools/navmesh/cell_baseline.py`, `tests/test_navmesh_native.py`.
+
+<a id="cell-baseline"></a>**The Python reference is gone (2026-11-01).** Once
+the whole per-cell build ran natively, every Python twin of a kernel was dead
+code that only the A/B tools ran, and keeping it in step with each C++ change
+was pure cost. The `TES_NAVMESH_IMPL` / `native_loader.NATIVE` switch, the
+process pool it selected, `native_ab.py`, `perf.py`, `job_trace.py --ab` and
+nine modules (`corridor_union`, `union_sheets`, `union_cdt`, `union_geom`,
+`union_mesh`, `corridor_clean`, `clean_decimate`, `corridor_doors`,
+`door_routes`) were deleted, about 300 functions in all; the tunables the C++
+reads moved into `params.py` unchanged (99 names, every value equal). Before
+the deletion, `cell_baseline.py` saved 6 real Oblivion cells in normal, stress
+and flood modes with the old code and the same `.pyd`, and all 18 builds
+matched after it. A native change is now checked against EARLIER NATIVE
+BUILDS, never against a second implementation:
+
+- `tools/navmesh/cell_baseline.py <file> <cells>` saves the cells' builds on
+  first use and requires identical verts, tris and ledges afterwards;
+- `test_navmesh_native.py` holds golden digests of a synthetic seeded flood and
+  a synthetic corridor cell (update them only for an intended output change),
+  and still checks the native NVNM packer against the Python `pack_nvnm` the
+  Fallout NV path and `navm_patch.py` use;
+- `test_navmesh_quality.py` calls the native `decimate` and `cull_slivers`
+  kernels directly.
+
+The C++ module still exports kernels only the deleted parity code called
+(`flip2d`, `hex_refine`, `bad_welds`, `stacked_pairs`, `notch_overlaps`,
+`candidate_pairs`, `pair_gaps`, `same_surface_pieces`, `refine_land`,
+`refine_steep`, `simplify`, `union_mesh`, `levels_at`); removing those entry
+points is a C++-side cleanup.
+
+**Status: the whole per-cell corridor build is now native** -- one
+`corridor_cell` call from the collision gather to the cleaned mesh,
+`pack_nvnm` (`navm.cpp`) from the built mesh to the NVNM bytes, plus
+`seed_graph` for seeded cells -- and under `NATIVE` the pool runs cells on
+threads in the importing process
+([plan](../plans/navmesh_native_rewrite.md#one-process-many-threads)). The
+kernel table below is the history of how it got there. Verified exact:
+
+- `native_ab.py`: the 8 Oblivion cells **23.7s -> 2.2s (10.9x)**, all MATCH;
+  `--mode stress` (40 obstacles, water 200u above the lowest node, every third
+  pathgrid edge dropped so bridging rejoins 2-11 edges per cell) and
+  `--mode flood` (50- and 58-node flooded graphs) MATCH too.
+- `job_trace.py --ab` on 15 real Nehrim jobs drawn across the whole job list:
+  packed NAVM bytes identical on all 15, **109.5s -> 8.0s (13.7x)** serial.
+- Throughput on 80 real Nehrim jobs, cold cache (`job_trace.py --sample 80
+  --no-cache --workers 12`): the Python reference on 12 worker processes
+  **1.33 jobs/s**; native on one thread 2.70 jobs/s, on **12 threads in one
+  process 13.07 jobs/s (9.8x the old pool)**.
+- At the pipeline's real worker count (31 on a 16-core, 32-thread Ryzen
+  7950X3D), 160 real Nehrim jobs, no cache: the Python reference on 31
+  processes **46.6s (3.43 jobs/s)**, native on 31 threads **4.0s (39.85
+  jobs/s, 11.6x)**. With `pack_nvnm` native, the Python left per job (record
+  reads into arrays, the geometry cache, the zlib wrap) holds the GIL for
+  1.4s of 44.3s single-threaded (3%).
+- Memory: the 12 Python workers held 218-277 MB each, about 2.75 GB on top of
+  the parent; the threaded run starts no processes, and its parent peaked
+  0.8 GB over its resting size (3.1 -> 3.9 GB, parsed export included).
+
+<a id="throughput-after-gap-flood"></a>**Throughput after seams, door reach and
+the gap flood (measured 2026-11-11, same 160-job Nehrim sample, cold cache).**
+Serial 44.3s -> **69.7s**; 31 threads 4.0s -> **12.2s (13.1 jobs/s)**. Two
+separate causes:
+
+- *More work per cell.* A native stack sampler over 30 serial jobs put
+  **47%** of build time in `with_gaps` (ccell.cpp), which reruns the whole
+  corridor build once the flood finds open LAND. `grow_march` is 37% of the
+  total, split 18.7% first build / 18.4% rebuild; the rebuild re-grew every
+  authored station the first build already grew. GEOS overlays/unions are ~25%;
+  `wall_hit` 12%, `tri_height` (walk sampling inside the march) 8%,
+  `Land::z` 5%.
+  <a id="grow-memo"></a>*Fixed by `GrowMemo`* (kernels.h, held on `CellCtx`):
+  a width is a pure function of the station's exact bits, the neighbour field's
+  exact segments, and the cell's collision/LAND/tunables (fixed for one
+  `build_cell`), so a station marched before against an identical field reuses
+  its width. Flood nodes are appended after the authored ones, so authored
+  stations keep their indices and hit; on 40 real Nehrim jobs every authored
+  station in a gap rebuild hit (85-99% of a rebuild's stations). Keys are
+  fixed-size arrays in one sorted vector per field: a map node per station
+  added heap traffic, which is what the threads contend on. Output unchanged
+  (`cell_baseline.py` against the previous build: 20 Nehrim cells, 14 in
+  `--mode stress`, 12 Oblivion, all MATCH). Serial 80 jobs **41.4s -> 37.0s**
+  and 45.8s -> 39.7s on a second pass; 31 threads unchanged within noise
+  (11.5-14.4s either build), as the contention below bounds it.
+- *Threads stop scaling at 8.* 80 jobs: 1 thread 41.5s, 4 12.7s, 8 9.5s, 16
+  9.5s. The Python side is 6% of a job and the GIL is released for the whole
+  build, so this is inside the native call: at 16 threads `corridor_cell`
+  spends 88.6s wall against 58.5s thread CPU (a third blocked) and its CPU time
+  grows 40% over the single-thread run. The heap is ~16% of single-thread time
+  (`RtlAllocateHeap` 10%, `RtlFreeHeap` 6%), spread over GEOS and many navgrow
+  callers (none above 1.5%), and a job touches ~48,000 fresh pages (~190 MB).
+  Confirmed below: it is the process heap's lock.
+
+<a id="allocator"></a>**The process heap's lock bounded the thread pool; navgrow
+allocates through mimalloc** (`native/src/navgrow/alloc.cpp`, vendored
+`external/mimalloc/` v2.1.7, MIT). Measured on 600 Nehrim jobs, cold cache, one process:
+
+| threads | 8 | 12 | 16 | 20 | 24 | 30 |
+|---|---|---|---|---|---|---|
+| jobs/s (process heap) | 12.7 | **16.1** | 15.4 | 13.7 | 11.4 | 10.4 |
+
+Throughput peaked at 12 threads and FELL as threads were added, which a
+hardware limit does not do. The same 24 threads as two processes of 12 ran
+27.7 jobs/s against 11.4 in one process, so the bound was per process. A stack
+sampler over every thread at 30 threads (no WPR: it needs admin; an
+out-of-process `SuspendThread` + `StackWalk64` sampler over a `/Zi` build)
+found 65% of all time inside navgrow asleep in `ZwWaitForAlertByThreadId`
+under `RtlEnterCriticalSection` from `RtlAllocateHeap`/`RtlFreeHeap`: one
+lock, entered through `malloc`/`free`. About 80% of those waits came from
+navgrow's own `new`/`delete` (growing vectors, hash tables, `EdgeOwners`,
+`gather_cell`'s soups, `TriGrid` teardown), the rest from GEOS.
+
+`alloc.cpp` compiles mimalloc into the module and replaces only this module's
+`operator new`/`delete` (navgrow calls no `malloc` directly); GEOS and Python
+keep their own allocators. mimalloc gives each thread its own heap, frees
+from another thread safely, and returns freed pages to the OS.
+A process pool would also remove the lock but holds a copy of the collision
+per process, so it was not taken.
+
+mimalloc's default 10 ms delay before returning freed pages raised the pool's
+peak; `alloc.cpp` sets `mi_option_purge_delay` to 0. At 30 threads on the
+same 600 jobs (peak above the level at pool start):
+
+| build | time | peak commit | peak working set |
+|---|---|---|---|
+| process heap | 58.4s | +4.75 GB | +4.60 GB |
+| mimalloc, default purge delay | 25.6s | +6.71 GB | +5.90 GB |
+| mimalloc, purge delay 0 | 25.5s | +5.83 GB | +4.83 GB |
+
+Committing on demand as well (`eager_commit`/`arena_eager_commit` 0) changed
+nothing. After the pool, commit and working set sit slightly BELOW the
+process heap's (4.83 vs 5.06 GB, 3.31 vs 3.37 GB).
+
+<a id="lazy-solid-index"></a>**Each placed object's face index is built on first use** (`world.h` `Solid`,
+`SolidSet::enclosed`). A whole-phase sample of Nehrim (2026-11-12, every thread) put
+`gather_cell` at 16.3% of navgrow time, 6.4% of it building a `TriGrid` per placed object and
+3.5% more tearing them down (mostly mimalloc returning the pages), yet only the enclosure test
+reads them, at a few lattice points per cell. Built lazily, and with `split_by_slope` and the
+gathered soups sized once instead of grown a triangle at a time, `gather_cell` fell to 5.4%;
+with the [regrow reuse](#regrow-reuse) Nehrim's navmesh phase went 290.5 s -> 234.5 s, peak
+commit about +7.5 -> +5.3 GB, output identical on all 3,769 cells.
+
+<a id="biggest-first"></a>**Starting the costliest jobs first was tried and
+reverted.** With the process heap, sorting the pool's jobs by pathgrid points x
+placed refs (doubled with LAND) cut the 600 jobs at 30 threads from 57.7s to
+42.6s: contention stretched each job, so a large cell started last ran alone.
+With mimalloc it changed nothing (24.7s sorted, 24.6s natural), and it would
+have edited `pool.py`, which re-keys every navmesh cache.
+
+**A dense cell is bound by GEOS overlays, not by the port.** Nehrim
+`00230BF2` took 16.7s natively against 52.7s in Python: stage timers on a
+scratch build put 13.8s in `_sheet_coverage`, all of it in
+`_same_surface_pieces`' 4,048 `(pa & pb) & shared` overlays (about 4 ms each,
+because `shared` is a large polygon every overlay re-nodes). 1,925 of those
+pair overlaps are disjoint from `shared`, so their overlay is empty and
+dropped; a prepared `intersects` test now skips them (fail-open: a GEOS error
+still runs the overlay). The cell is 8.6s, MATCH. The remaining 2,123
+overlays produce the pieces the result is built from and cannot be changed
+without changing the bits.
+
+<a id="exterior-grow-cap-reverted"></a>**A wide exterior grow cap was tried and
+reverted.** Raising the exterior cap from `RIBBON_GROW_MAX_HALF` (160) to 8192
+so only walls and floor edges stopped the grow made exterior cells 1.5-5x
+slower to build (`01000BC1` 0.89s -> 4.85s) and the worst ones far worse:
+Nehrim `010024D9` went from 2.1s to 57s natively (161s in Python), and
+`010024DD` grew past NVNM's 16-bit triangle indices, so packing failed and the
+cell got no navmesh at all (1,014 triangles at the 160 cap). The 160 job
+sample went from 44s to 764s single-threaded.
+
+The generator moved into C++ one kernel at a time. While it did, every kernel
+kept its Python original as the REFERENCE: `TES_NAVMESH_IMPL=python` ran the
+Python path, and `native_ab.py` built a cell both ways in one process and
+demanded identical verts, tris and ledges. "Close" was a failure: the output is
+byte-reproducible and cached, so a kernel either matched bit for bit or it was
+wrong. (The references are now deleted; see [above](#cell-baseline).)
+
+Ported, each matching on 8 Oblivion + 2 Nehrim reference cells:
+
+| kernel | Python original | how it stays exact |
+|---|---|---|
+| `TriIndex.surface/layers/walk/wall` | `corridor._surface_sampler`, `corridor_grow.walkable_sampler` / `wall_slab_sampler` | same buckets (`py_floordiv`), same candidate ORDER (`visit_py_order`), returns `numpy.float64` like the original |
+| `pair_gaps` | `union_sheets._overlap_height_gap` loop in `_partition_by_agreement` | calls shapely's OWN loaded GEOS on shapely's own geometries |
+| `decimate` | `clean_decimate.decimate` | operation-for-operation port; Z keeps its Python type |
+| `cull_slivers` | `corridor_clean.cull_boundary_slivers` | same bucket order and first-wins ties; centroid sums use `PyMixedSum` over per-coordinate exactness flags |
+| `flip2d`, `hex_refine`, `refine_land`, `refine_steep`, `land_z`, `simplify` | `union_cdt._flip2d` / `_hex_refine` / `_refine_land` / `_refine_steep`, `LandField.z`, `corridor._simplify` | operation-for-operation |
+| `bad_welds`, `stacked_pairs`, `notch_overlaps` | `union_mesh._revert_bad_welds` / `_stacked_pairs`, `corridor_union._overlaps_existing` | threshold fast paths, GEOS near the threshold |
+| `candidate_pairs`, `same_surface_pieces` | `union_sheets._candidate_pairs` / `_same_surface_pieces` | as above; pieces come back as shapely geometries |
+
+Measured with `native_ab.py` (Python s -> native s, `TESCONV_WORKERS=2`): the 8
+Oblivion cells **20.5s -> 4.2s (4.9x)**; Nehrim `DaromithtempelGruftPart01` +
+`GiliadHaus06` **4.45s -> 0.72s (6.2x)**. After that, no single Python
+function in a cell build is above ~6% of it.
+
+**A threshold test may skip GEOS, but only with a margin.** `clip_area.h`
+computes an overlap AREA by clipping (Sutherland-Hodgman keeps a simple ring's
+winding number inside a convex window, and a second ring is a signed fan of
+triangles); it is trusted only when it clears the caller's threshold by
+`kClipMargin = 1e-4`, and GEOS answers the rest. `rings_intersect` does the same
+for GEOS `intersects`: a clear edge crossing says yes, boundaries more than
+`kSepMargin = 1e-5` apart say no (or yes when one ring holds the other), and
+anything nearer goes to GEOS. A convex-only fast path was tried and dropped:
+89% of the ribbons are not convex.
+
+**An index may change, the visit order may not.** `walk_sample` in the grow
+march now reads a 32-unit fine index instead of scanning the 3x3 window of
+128-unit buckets, and breaks a distance tie by the (first window bucket,
+triangle index) the window scan would have met first. A change like this is
+checked with `cell_baseline.py` against builds saved before the change.
+
+**Memory: the navmesh code is not where a worker's memory goes.** One cell
+build adds 5-18 MB. A pool worker's commit charge is the BLAS thread buffers
+(numpy +750 MB, scipy +820 MB at 32 cores), which
+`configure_multiprocessing()` already removes with `OPENBLAS_NUM_THREADS=1`
+(1,605 MB -> 126 MB, see [performance.md](performance.md)), then the
+collision cache (~80 MB resident) and the imports (~100 MB). A native rewrite
+saves memory only if it runs every cell in ONE process on threads, sharing the
+collision cache instead of loading it once per worker -- which the native
+pool now does (numbers above).
+
+**Python float arithmetic is not C arithmetic.** These were each found by the
+fuzz tests in `test_navmesh_native.py`, which hold `pymath.h` against the
+interpreter:
+
+- `a // b` is not `floor(a / b)` (`1 // 0.1 == 9.0`); `py_floordiv` copies
+  CPython's `_float_div_mod`.
+- `x ** 2` is the C library `pow`, which differs from `x * x` for **~0.05%** of
+  doubles (52 of 100,000 random values). And on Windows it must be the DLL
+  runtime's pow (`ucrtbase.dll`, what python3xx.dll links): this module links
+  the STATIC runtime, whose pow rounded differently on 1 of the first 4,006
+  test values. `crt_pow` resolves the interpreter's.
+- `math.hypot` / `math.dist` are CPython's `vector_norm` (lossless scaling,
+  FMA products, one Newton correction), not the C library hypot.
+- `sum()` of floats is Neumaier-compensated (3.12+), but ONLY over exact
+  floats: a `numpy.float64` item drops the rest of the sum to plain addition.
+  That is why the native samplers return `numpy.float64` -- the Python ones do,
+  and node heights flow from them into sums downstream -- and why decimation
+  tracks which vertex Z values are numpy.
+
+**Set iteration order was made deterministic first.** `clean_decimate` summed
+plan areas (`cut_area`) and centroids (`is_convex`) while walking a Python
+`set` of triangle indices, so the last bit followed CPython's hash-table layout,
+which C++ cannot reproduce. Both now walk the indices in ascending order
+(`_Collapse.incident`); `native_ab.py --baseline` showed the 10 reference cells
+unchanged by that.
+
+**Known non-parity, kept as shipped:** the older `levels_at` kernel squares
+profile distances with `x * x` where `union_geom._height_on` uses `** 2`, so the
+two can pick different stair segments on an exact tie. `strip.h`'s
+`strip_height<PyExact>` keeps both behaviors explicitly rather than silently
+changing what production ships.
+
+**The GEOS binding** (`geos_bind.cpp`) finds `geos_c` among the process's
+LOADED modules after importing shapely's C API capsule (`shapely.lib._C_API`),
+so it can only ever bind the library shapely itself uses; a second GEOS copy
+would round its overlays differently. What remains of `pair_gaps`' time is
+GEOS's own overlay, not wrapper cost.

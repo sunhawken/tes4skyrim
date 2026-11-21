@@ -1,0 +1,113 @@
+# B2 "Ahemmusa Nerevarine": the wise woman Sinnammu Mirpal wants the ruins of
+# Ald Daedroth made a safe refuge for her tribe, and to be brought there before
+# the great statue of the inner shrine.
+# PositionCell stands in for the walks she takes no part in; where she follows,
+# the player walks in short legs, waiting for her to catch up after each one,
+# with the creatures on the way killed first and any that attacks fought off.
+# The water has navmesh only on its floor, so the player swims across and up
+# the island steered at the controls, around the ruins in the way. Ref FormIDs carry Morrowind.esm's slot 05.
+# Run: python -m tools.live.test_instance mwtest --cases <this folder> --fast --checkpoints --stop-on-fail --from b2_meet
+# See docs/commentary/headless_testing.md#quest-runs
+
+# She speaks only to one who has first given courtesy to a gulakhan, Kausi.
+# Then she tells of the shrine, what must be done, and that she will cross the
+# water with the player once it is safe.
+case b2_meet
+run
+player->PositionCell 22 477 -253 0 "Ahemmusa Camp, Kausi's Yurt"
+until 600 GetPCCell "Ahemmusa Camp, Kausi's Yurt" == 1
+talk kausi
+ask Nerevarine
+expect GetJournalIndex B2a_Kausi == 1
+bye
+run
+player->PositionCell -130 630 -349 0 "Ahemmusa Camp, Wise Woman's Yurt"
+until 600 GetPCCell "Ahemmusa Camp, Wise Woman's Yurt" == 1
+talk sinnammu mirpal
+ask Nerevarine
+choose 2
+ask safe place
+expect GetJournalIndex B2_AhemmusaSafe == 1
+ask make it safe
+expect GetJournalIndex B2_AhemmusaSafe == 5
+ask accompany you
+expect GetJournalIndex B2_AhemmusaSafe == 10
+ask cross the water
+expect GetJournalIndex B2_AhemmusaSafe == 15
+bye
+end
+
+# Bribed until she is well disposed (90), the priestess Hlireni Indavel lets
+# the Ahemmusa share her shrine and calls off her cultists. A level-3 player's
+# Speechcraft is held under the skill cap, so the bribe is the honest route.
+case b2_witches
+run
+player->AddItem gold_001 2000
+player->PositionCell -204 -1990 994 180 "Ald Daedroth, Antechamber"
+until 600 GetPCCell "Ald Daedroth, Antechamber" == 1
+talk hlireni indavel
+persuade bribe1000
+persuade bribe100
+persuade bribe100
+persuade bribe100
+expect "hlireni indavel"->GetDisposition >= 90
+ask Player of the Game
+choose 1
+expect GetJournalIndex B2_AhemmusaSafe == 20
+bye
+end
+
+# Asked to come, she follows the player out of her yurt, over the water and
+# through the shrine's doors to the statue, and names the player Nerevarine.
+# She follows, so the player walks to each door and to the statue; a greeting ends a walk, so the walk
+# is taken up again. The creatures on the way are killed as the player would.
+case b2_escort
+run
+player->PositionCell -130 630 -349 0 "Ahemmusa Camp, Wise Woman's Yurt"
+until 600 GetPCCell "Ahemmusa Camp, Wise Woman's Yurt" == 1
+talk sinnammu mirpal
+ask accompany you
+choose 1
+expect GetJournalIndex B2_AhemmusaWalk == 10
+bye
+expect "sinnammu mirpal"->GetCurrentAiPackage == 3
+activate 05CD72DF
+until 600 GetPCCell "Ahemmusa Camp, Wise Woman's Yurt" == 0
+until 900 "sinnammu mirpal"->GetDistance player < 500
+console 0545A87A.kill
+console 054F600A.kill
+console 05D85846.kill
+console 05AE3C7B.kill
+console 059F1607.kill
+console 05DD082E.kill
+console 05E2D8D9.kill
+console 059DFAEC.kill
+console 05BE814E.kill
+console 05A2F58C.kill
+console 054803CD.kill
+console 05559817.kill
+console 05BB7739.kill
+defend
+walk 94552 167450 1220
+bye if open
+walk 94552 167450 1220
+until 900 "sinnammu mirpal"->GetDistance player < 500
+activate 059CC9D1
+until 600 GetPCCell "Ald Daedroth, Outer Shrine" == 1
+until 900 "sinnammu mirpal"->GetDistance player < 1000
+walk 320 -4950 -256
+bye if open
+walk 320 -4950 -256
+bye if open
+until 3000 "sinnammu mirpal"->GetDistance player < 600
+activate 05428857
+until 600 GetPCCell "Ald Daedroth, Inner Shrine" == 1
+until 900 "sinnammu mirpal"->GetDistance player < 600
+walk 4412 3440 50
+until 1800 GetJournalIndex B2_AhemmusaSafe == 40
+until 600 MenuMode == 1
+ask name you Nerevarine
+expect GetJournalIndex B2_AhemmusaSafe == 50
+expect player->GetItemCount Madstone == 1
+bye
+end

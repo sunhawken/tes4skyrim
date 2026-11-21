@@ -50,18 +50,21 @@ Unit/convention notes (all verified against the vanilla deer dump):
 
 import math
 import os
-import re
 import sys
 
 import numpy as np
 
 from asset_convert.nif.pyffi_monkey_patch import apply_patches
 apply_patches()
-from asset_convert.havok.ragdoll_math import (bone_worlds, capsule_inertia,
+from asset_convert.havok.ragdoll_math import (OB_TO_GAME, bone_worlds,
+                                              capsule_inertia,
                                               mat_row_to_quat,
                                               quat_to_mat_row, unit, v4)
 from asset_convert.havok.hkx_xml import fmt_vec
 from asset_convert.havok import hkx_xml
+from asset_convert.havok.ragdoll_bone_words import (AXIAL_WORDS, bone_words,
+                                                    is_loose_bone)
+from asset_convert.havok.hkx_ragdoll_morrowind import attach_synthetic_bodies
 from pyffi.formats.nif import NifFormat
 
 hkx_xml.SIGNATURES.update({
@@ -79,8 +82,6 @@ hkx_xml.SIGNATURES.update({
     'hkMemoryResourceHandle': '0xbffac086',
     'hkpShapeInfo': '0xea7f1d08',
 })
-
-OB_TO_GAME = 7.0          # Oblivion Havok units → game units
 
 # Oblivion's authored ragdoll MASSES have to be divided by the same 7 (2026-08-08
 # "dead creatures weigh a million pounds — I can only move limbs a little" report).
@@ -300,6 +301,111 @@ def is_marker_body(node, body):
     return float(getattr(body, 'mass', 0.0)) <= _MARKER_MAX_MASS
 
 
+def node_local(node):
+    """(R row-convention 3x3 with scale, t) of a NiNode's local transform."""
+    m = node.rotation
+    R = np.array([[m.m_11, m.m_12, m.m_13], [m.m_21, m.m_22, m.m_23],
+                  [m.m_31, m.m_32, m.m_33]], dtype=float) * float(node.scale)
+    t = np.array([node.translation.x, node.translation.y, node.translation.z], dtype=float)
+    return R, t
+
+
+def walk_rig(data, exclude_markers):
+    """DFS the rig: (body nodes, {id: parent node}, {id: (R, t) world}, {id: DFS index}), or None without a rig root."""
+    from asset_convert.havok.hkx_skeleton import find_skeleton_root
+    try:
+        skel_root = find_skeleton_root(data)
+    except ValueError:
+        return None
+    body_nodes, node_parent, worlds, bone_order = [], {}, {}, {}
+
+    def visit(node, parent, R_p, t_p):
+        """Record one node and recurse into its NiNode children."""
+        R_l, t_l = node_local(node)
+        R_w, t_w = R_l @ R_p, t_l @ R_p + t_p
+        worlds[id(node)] = (R_w, t_w)
+        node_parent[id(node)] = parent
+        bone_order[id(node)] = len(bone_order)
+        co = getattr(node, 'collision_object', None)
+        if (co is not None and getattr(co, 'body', None) is not None
+                and not (exclude_markers and is_marker_body(node, co.body))):
+            body_nodes.append(node)
+        for child in node.children:
+            if isinstance(child, NifFormat.NiNode):
+                visit(child, node, R_w, t_w)
+
+    visit(skel_root, None, np.eye(3), np.zeros(3))
+    return body_nodes, node_parent, worlds, bone_order
+
+
+def ancestors(node, node_parent):
+    """[node, parent, ..., rig root]."""
+    out = []
+    while node is not None:
+        out.append(node)
+        node = node_parent.get(id(node))
+    return out
+
+
+def dominant_root(body_nodes, node_parent):
+    """Move the root body onto the lowest common ancestor bone of all bodies when its own bone is not one.
+
+    The engine re-bases the actor root on the root body at the ragdoll
+    handover; bones outside that body's bone subtree keep their pose offset
+    from the re-based root and are drawn away from their physics (land
+    dreugh, measured live: 66 units).  The body keeps its world transform.
+    Returns the body nodes, root first.
+    """
+    common = ancestors(body_nodes[0], node_parent)
+    for n in body_nodes[1:]:
+        ids = {id(a) for a in ancestors(n, node_parent)}
+        common = [a for a in common if id(a) in ids]
+    lca = common[0]
+    if lca is body_nodes[0] or node_parent.get(id(lca)) is None:
+        return body_nodes
+    co = body_nodes[0].collision_object
+    body_nodes[0].collision_object = None
+    lca.collision_object = co
+    co.target = lca
+    return [lca] + body_nodes[1:]
+
+
+def authored_joints(body_nodes, body_of, node_of_body):
+    """[(holder node id, other node id, block)]: convertible joints between two ragdoll bodies, holders in DFS order."""
+    out = []
+    for n in body_nodes:
+        body = body_of[id(n)]
+        for con in getattr(body, 'constraints', []):
+            kind, _d = _descriptor(con)
+            ents = list(con.entities) if kind is not None else []
+            if (len(ents) == 2 and ents[0] is body
+                    and id(ents[1]) in node_of_body):
+                out.append((id(n), node_of_body[id(ents[1])], con))
+    return out
+
+
+def plan_edges(body_nodes, authored, dfs_index, node_of_id, node_parent):
+    """(edges, edge_con, synthetic) by plan_ragdoll_tree's three-way parent rule."""
+    root, edges, edge_con, synthetic = body_nodes[0], {}, {}, []
+    for n in body_nodes[1:]:
+        nid = id(n)
+        own = next(((pid, con) for hid, pid, con in authored
+                    if hid == nid and dfs_index[pid] < dfs_index[nid]), None)
+        if own is not None:
+            edges[nid], edge_con[nid] = node_of_id[own[0]], (own[1], False)
+            continue
+        named = next(((hid, con) for hid, pid, con in authored
+                      if pid == nid and dfs_index[hid] < dfs_index[nid]), None)
+        if named is not None:
+            edges[nid], edge_con[nid] = node_of_id[named[0]], (named[1], True)
+            continue
+        anc = node_parent.get(nid)
+        while anc is not None and id(anc) not in dfs_index:
+            anc = node_parent.get(id(anc))
+        synthetic.append((n, anc if anc is not None else root))
+    return edges, edge_con, synthetic
+
+
 def plan_ragdoll_tree(data, exclude_markers=True):
     """Plan the single constrained tree over EVERY collision body in a
     creature skeleton.nif (works on Oblivion source or mid-conversion data;
@@ -351,105 +457,20 @@ def plan_ragdoll_tree(data, exclude_markers=True):
       node_of_id  {id(node): NiNode}
       bone_order  {id(node): DFS index over ALL NiNodes} == the anim bone index
     """
-    from asset_convert.havok.hkx_skeleton import find_skeleton_root
-    try:
-        skel_root = find_skeleton_root(data)
-    except ValueError:
+    rig = walk_rig(data, exclude_markers)
+    if rig is None or len(rig[0]) < 2:
         return None
-
-    body_nodes = []
-    node_parent = {}
-    worlds = {}
-    # DFS visit order == hkx_skeleton.collect_bones' anim bone index: both
-    # walk this same tree, from the same find_skeleton_root(), taking
-    # NiNode children in order.  This is the ONLY stable identity for a node
-    # across the two parses (extract_ragdoll re-reads the NIF, so id() does
-    # not carry), and unlike the node NAME it is unique — see anim_idx.
-    bone_order = {}
-
-    def _local(node):
-        m = node.rotation
-        R = np.array([[m.m_11, m.m_12, m.m_13],
-                      [m.m_21, m.m_22, m.m_23],
-                      [m.m_31, m.m_32, m.m_33]], dtype=float) \
-            * float(node.scale)
-        t = np.array([node.translation.x, node.translation.y,
-                      node.translation.z], dtype=float)
-        return R, t
-
-    def visit(node, parent, R_p, t_p):
-        R_l, t_l = _local(node)
-        R_w = R_l @ R_p
-        t_w = t_l @ R_p + t_p
-        worlds[id(node)] = (R_w, t_w)
-        node_parent[id(node)] = parent
-        bone_order[id(node)] = len(bone_order)
-        co = getattr(node, 'collision_object', None)
-        if (co is not None and getattr(co, 'body', None) is not None
-                and not (exclude_markers and is_marker_body(node, co.body))):
-            body_nodes.append(node)
-        for child in node.children:
-            if isinstance(child, NifFormat.NiNode):
-                visit(child, node, R_w, t_w)
-
-    visit(skel_root, None, np.eye(3), np.zeros(3))
-
-    if len(body_nodes) < 2:
-        return None
-
+    body_nodes, node_parent, worlds, bone_order = rig
+    body_nodes = dominant_root(body_nodes, node_parent)
     dfs_index = {id(n): i for i, n in enumerate(body_nodes)}
     body_of = {id(n): n.collision_object.body for n in body_nodes}
     node_of_body = {id(b): nid for nid, b in body_of.items()}
     node_of_id = {id(n): n for n in body_nodes}
-
-    # every convertible authored joint whose two entities are both ragdoll
-    # bodies, as (holder, other, block), holders in DFS order
-    authored = []
-    for n in body_nodes:
-        body = body_of[id(n)]
-        for con in getattr(body, 'constraints', []):
-            kind, _d = _descriptor(con)
-            if kind is None:
-                continue
-            ents = list(con.entities)
-            if (len(ents) == 2 and ents[0] is body
-                    and id(ents[1]) in node_of_body):
-                authored.append((id(n), node_of_body[id(ents[1])], con))
-
-    root = body_nodes[0]
-    edges = {}
-    edge_con = {}
-    synthetic = []
-    for n in body_nodes[1:]:
-        nid = id(n)
-        # (1) the body's own joint to an EARLIER body
-        pick = next(((pid, con) for hid, pid, con in authored
-                     if hid == nid and dfs_index[pid] < dfs_index[nid]), None)
-        if pick is not None:
-            edges[nid] = node_of_id[pick[0]]
-            edge_con[nid] = (pick[1], False)
-            continue
-        # (2) an EARLIER body's joint that names this body: same joint,
-        #     ends swapped
-        pick = next(((hid, con) for hid, pid, con in authored
-                     if pid == nid and dfs_index[hid] < dfs_index[nid]), None)
-        if pick is not None:
-            edges[nid] = node_of_id[pick[0]]
-            edge_con[nid] = (pick[1], True)
-            continue
-        # (3) synthesize: nearest body-carrying NIF ancestor (always earlier
-        #     in pre-order), else the root
-        target = None
-        anc = node_parent.get(nid)
-        while anc is not None:
-            if id(anc) in body_of:
-                target = anc
-                break
-            anc = node_parent.get(id(anc))
-        synthetic.append((n, target if target is not None else root))
-
+    authored = authored_joints(body_nodes, body_of, node_of_body)
+    edges, edge_con, synthetic = plan_edges(body_nodes, authored, dfs_index,
+                                            node_of_id, node_parent)
     return {'body_nodes': body_nodes, 'edges': edges, 'edge_con': edge_con,
-            'synthetic': synthetic, 'worlds': worlds, 'root': root,
+            'synthetic': synthetic, 'worlds': worlds, 'root': body_nodes[0],
             'node_of_id': node_of_id, 'bone_order': bone_order}
 
 
@@ -511,6 +532,19 @@ def swap_joint_ends(kind, info):
     return out
 
 
+def _read_rig(skeleton_nif_path: str):
+    """The parsed skeleton.nif, with ragdoll bodies synthesized when the rig
+    authors none -- a Morrowind (NIF 4.0.0.2) skeleton carries no Havok at all.
+
+    See: docs/commentary/asset_convert_creature.md#morrowind-synthetic-ragdolls
+    """
+    data = NifFormat.Data()
+    with open(skeleton_nif_path, 'rb') as f:
+        data.read(f)
+    attach_synthetic_bodies(data, skeleton_nif_path)
+    return data
+
+
 def extract_ragdoll(skeleton_nif_path: str, bones: list):
     """Parse the Oblivion skeleton.nif into RagdollPart list (parent-before-
     child, constraints attached), or None when the skeleton has no ragdoll.
@@ -519,11 +553,7 @@ def extract_ragdoll(skeleton_nif_path: str, bones: list):
     constrained tree; unconstrained bodies (atronach rocks, detached
     skeleton-creature clusters) get synthetic vanilla-template joints to
     their nearest body-carrying ancestor (see plan_ragdoll_tree)."""
-    data = NifFormat.Data()
-    with open(skeleton_nif_path, 'rb') as f:
-        data.read(f)
-
-    plan = plan_ragdoll_tree(data)
+    plan = plan_ragdoll_tree(_read_rig(skeleton_nif_path))
     if plan is None:
         return None
 
@@ -698,35 +728,6 @@ def extract_ragdoll(skeleton_nif_path: str, bones: list):
 
 
 
-# Bone-name WORDS identifying the chains vanilla leaves UNPINNED on a LIVE
-# actor: the tail wags and the head/neck bob under physics while the
-# locomotion body is keyframed to the animation.  Vanilla dog census
-# (`KeyframeLowerBody`, 17 of 22 bones) omits exactly Tail1/2/3, Neck2 and
-# Head — nothing else.
-#
-# Matched as whole WORDS, never as substrings: a plain `'ear' in name` test
-# also matches "For<ear>m", which set every forearm (and its hand subtree)
-# loose on a living creature.
-_LOOSE_WHILE_ALIVE = ('tail', 'neck', 'head', 'skull', 'scull',
-                      'ponytail', 'ear', 'jaw', 'tongue', 'wing')
-
-# Trailing digits/side letters are part of the chain, not the word:
-# 'Bip01 Tail3', 'Canine_Neck2', 'Bip01 L Ear01' all belong to their chain.
-_WORD_RE = re.compile(r'[^a-z]+')
-
-# The axial (trunk) chain: everything that is NOT a limb.  Used to find the
-# limb ROOTS for the contact-listener set — vanilla lists limb roots plus the
-# trunk's own links, never the toe/palm tips.
-_AXIAL_WORDS = {'pelvis', 'spine', 'chest', 'ribcage', 'neck', 'head',
-                'skull', 'scull', 'com', 'tail', 'nonaccum', 'torso',
-                'body', 'abdomen', 'thorax'}
-
-
-def _bone_words(name: str):
-    """Lower-case word set of a bone name, digits stripped."""
-    return {w for w in _WORD_RE.split(name.lower()) if w}
-
-
 def _keyframe_bone_sets(parts):
     """The three vanilla `hkbBoneIndexArray` sets, in ragdoll indices.
 
@@ -780,7 +781,7 @@ def _keyframe_bone_sets(parts):
     def _loose(i):
         j = i
         while j >= 0:
-            if _bone_words(parts[j].name) & set(_LOOSE_WHILE_ALIVE):
+            if is_loose_bone(parts[j].name):
                 return True
             j = parts[j].parent
         return False
@@ -799,7 +800,7 @@ def _keyframe_bone_sets(parts):
     # children" instead stops at the first spine node that also carries a
     # leg, which left the front limbs out of the contact set entirely.
     trunk = {0} | {i for i in range(n)
-                   if _bone_words(parts[i].name) & _AXIAL_WORDS}
+                   if bone_words(parts[i].name) & AXIAL_WORDS}
     # Limb roots: the first body of each chain hanging off the trunk that is
     # itself not a leaf (a lone leaf hanging off the spine is a fin/ear, not
     # a leg).
@@ -812,7 +813,7 @@ def _keyframe_bone_sets(parts):
     # `Ragdoll` release before the body has actually landed.
     spine_contacts = {i for i in trunk
                       if parts[i].parent >= 0
-                      and not (_bone_words(parts[i].name) & {'tail'})}
+                      and not (bone_words(parts[i].name) & {'tail'})}
     contact = sorted(limb_roots | spine_contacts)
     if not contact:
         contact = [i for i in range(n)

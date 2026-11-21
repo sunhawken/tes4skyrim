@@ -37,8 +37,11 @@ mesh's links are appended in sorted order, so the output stays byte-reproducible
 
 import struct
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+
+from core.worker_budget import worker_count
 
 # NVNM layout constants (see module docstring).
 EDGE_LINK_SIZE = 10
@@ -70,6 +73,10 @@ class NavMeshView:
                  'exterior', 'grid', 'dirty')
 
     def __init__(self, fid, blob):
+        """Decode one NVNM blob into mutable numpy arrays.
+
+        See: docs/commentary/tes5_import_navmesh.md#navmeshview-decode-is-vectorised
+        """
         self.fid = fid
         self.dirty = False
         p = 8                                    # version + crc
@@ -84,21 +91,6 @@ class NavMeshView:
             self.grid = None
             p += 4                               # interior: cell FormID
         head_end = p
-        # Vectorised decode.  The per-element struct.unpack_from loops this
-        # replaces were 39% of the whole edge-link pass (15.3M calls over 6.5k
-        # meshes).
-        #
-        # verts/tris stay NUMPY ARRAYS rather than being converted back to
-        # Python lists: add_link mutates a triangle row in place, so a list
-        # form would have to be re-converted with np.asarray on every seam scan
-        # (measured: 103k asarray calls, 11.9s — more than the decode it was
-        # meant to save).  Arrays are mutated directly and _border_edges reads
-        # them with no conversion at all.
-        #
-        # verts are float64 for the same reason the seam midpoints are: the
-        # original scalar code did that arithmetic on Python floats (doubles),
-        # and computing it in float32 shifts midpoints enough to reorder
-        # near-ties in the greedy pairing (measured: 4 extra links).
         nv = struct.unpack_from('<I', blob, p)[0]
         p += 4
         self.verts = np.frombuffer(blob, dtype='<f4', count=nv * 3,
@@ -106,9 +98,6 @@ class NavMeshView:
         p += nv * 12
         nt = struct.unpack_from('<I', blob, p)[0]
         p += 4
-        # Triangle record is 6 signed + 2 unsigned shorts.  Reading it as int16
-        # would make the two trailing unsigned fields negative, so widen to
-        # int32 and restore the sign of the last two columns only.
         self.tris = np.frombuffer(blob, dtype='<i2', count=nt * 8,
                                   offset=p).reshape(nt, 8).astype(np.int32)
         if nt:
@@ -153,6 +142,23 @@ class NavMeshView:
         tri[6] |= (1 << edge_slot)               # 'Edge N Link' flag
         self.dirty = True
 
+    def door_triangles(self) -> list:
+        """[(triangle index, door reference FormID)] of the mesh's Door Triangles."""
+        count = struct.unpack_from('<I', self.tail, 0)[0]
+        rows = (struct.unpack_from('<hII', self.tail, 4 + i * DOOR_TRI_SIZE) for i in range(count))
+        return [(int(ti), ref) for ti, _crc, ref in rows]
+
+    def own_links(self) -> list:
+        """[(triangle, linked triangle)] of every non-portal (ledge) link into this same mesh."""
+        out = []
+        for ti, t in enumerate(self.tris):
+            for slot in range(3):
+                if t[6] & (1 << slot):
+                    typ, fid, other = self.links[t[3 + slot]]
+                    if typ != LINK_TYPE_PORTAL and fid == self.fid:
+                        out.append((ti, int(other)))
+        return out
+
 
 def _prune_links(view: NavMeshView, live_fids: set) -> None:
     """Remove links whose target isn't live and renumber the survivors.
@@ -181,11 +187,13 @@ def _prune_links(view: NavMeshView, live_fids: set) -> None:
     view.dirty = True
 
 
-def _border_edges(view: NavMeshView, axis: int, coord: float):
-    """[(tri_index, edge_slot, midpoint, z)] for border edges lying on a seam.
+def border_edges(view: NavMeshView, axis: int, coord: float):
+    """[(tri_index, edge_slot, midpoint, z, half length)] for border edges lying on a seam.
 
     A border edge is one whose neighbour field is -1 (nothing local adjoins it).
+    It must run ALONG the seam: a stub crossing the band is not one.
     `axis` 0 = the seam is a constant-X plane, 1 = constant-Y.
+    See: docs/commentary/tes5_import_navmesh.md#seam-edges-run-along-the-seam
     """
     if len(view.tris) == 0:
         return []
@@ -213,23 +221,23 @@ def _border_edges(view: NavMeshView, axis: int, coord: float):
         # KEPT.  `<=` would silently drop it.  Same predicate, same result.
         with np.errstate(invalid='ignore'):
             on_seam = ~((np.abs(a[:, axis] - coord) > SEAM_BAND) |
-                        (np.abs(b[:, axis] - coord) > SEAM_BAND))
+                        (np.abs(b[:, axis] - coord) > SEAM_BAND) |
+                        (np.abs(a[:, axis] - b[:, axis]) >=
+                         np.abs(a[:, 1 - axis] - b[:, 1 - axis])))
         if not on_seam.any():
             continue
         keep = np.nonzero(on_seam)[0]
         ti = idx[keep]
         mid_other = (a[keep, 1 - axis] + b[keep, 1 - axis]) * 0.5
         mid_z = (a[keep, 2] + b[keep, 2]) * 0.5
-        rows.append((ti, np.full(ti.shape, slot), mid_other, mid_z))
+        half = np.abs(a[keep, 1 - axis] - b[keep, 1 - axis]) * 0.5
+        rows.append((ti, np.full(ti.shape, slot), mid_other, mid_z, half))
 
     if not rows:
         return []
-    ti = np.concatenate([r[0] for r in rows])
-    sl = np.concatenate([r[1] for r in rows])
-    mo = np.concatenate([r[2] for r in rows])
-    mz = np.concatenate([r[3] for r in rows])
-    order = np.lexsort((sl, ti))            # triangle index, then slot
-    return [(int(ti[i]), int(sl[i]), float(mo[i]), float(mz[i]))
+    ti, sl, mo, mz, hl = (np.concatenate([r[k] for r in rows]) for k in range(5))
+    order = np.lexsort((sl, ti))
+    return [(int(ti[i]), int(sl[i]), float(mo[i]), float(mz[i]), float(hl[i]))
             for i in order]
 
 
@@ -237,9 +245,16 @@ def _seam_sort_key(e):
     return (e[2], e[3], e[0], e[1])
 
 
-def _match_seam(edges_a, edges_b):
+def _shared(ea, eb):
+    """Length of seam two border edges both cover (negative when apart)."""
+    return min(ea[2] + ea[4], eb[2] + eb[4]) - max(ea[2] - ea[4], eb[2] - eb[4])
+
+
+def match_seam(edges_a, edges_b):
     """Greedy nearest-neighbour pairing of border edges across one seam.
 
+    Two edges pair when their midpoints lie within SEAM_TOLERANCE or they share at
+    least that much of the seam, as edges split differently by the two meshes do.
     Deterministic: both sides are sorted once up front and each edge on side B
     is consumed at most once, so the pairing depends only on geometry — never on
     dict or iteration order (the ESM must stay byte-reproducible).
@@ -255,7 +270,7 @@ def _match_seam(edges_a, edges_b):
             if j in used_b:
                 continue
             d_along = abs(ea[2] - eb[2])
-            if d_along > SEAM_TOLERANCE:
+            if d_along > SEAM_TOLERANCE and _shared(ea, eb) < SEAM_TOLERANCE:
                 continue
             if abs(ea[3] - eb[3]) > SEAM_Z_TOLERANCE:
                 continue
@@ -287,6 +302,17 @@ def _drop_stale_links(view, ours) -> None:
         view.dirty = True
 
 
+def master_view(master_index, fid):
+    """(view, subs before NVNM, subs after) of a master's NAVM, or None when unreadable."""
+    blob, prefix, suffix = extract_nvnm(master_index.record(fid))
+    if blob is None:
+        return None
+    try:
+        return NavMeshView(fid, blob), prefix, suffix
+    except (struct.error, IndexError):
+        return None
+
+
 def _master_neighbour_views(views, master_index, master_navms):
     """Decode the MASTER meshes bordering ours; return {cell: view}.
 
@@ -302,30 +328,24 @@ def _master_neighbour_views(views, master_index, master_navms):
         return {}
     ours = {v.fid for v in views.values()}
     wanted = set()
-    for (wrld, gx, gy) in views:
+    for (wrld, gx, gy, _fid) in views:
         for dx, dy, _axis, _ in _NEIGHBOURS:
             wanted.add((wrld, gx + dx, gy + dy))
         for dx, dy in ((-1, 0), (0, -1)):
             wanted.add((wrld, gx + dx, gy + dy))
     out = {}
     missing = no_record = 0
-    for cell in sorted(wanted - set(views)):
+    for cell in sorted(wanted - {vkey[:3] for vkey in views}):
         fid = master_navms.get(cell)
         if not fid:
             missing += 1
             continue
-        blob, prefix, suffix = extract_nvnm(master_index.record(fid))
-        if blob is None:
+        entry = master_view(master_index, fid)
+        if entry is None:
             no_record += 1
-            continue
-        try:
-            view = NavMeshView(fid, blob)
-        except (struct.error, IndexError):
-            no_record += 1
-            continue
-        if view.exterior:
-            _drop_stale_links(view, ours)
-            out[cell] = (view, prefix, suffix)
+        elif entry[0].exterior:
+            _drop_stale_links(entry[0], ours)
+            out[cell] = entry
     if missing or no_record:
         print(f"    Master neighbours: {len(out)} loaded, {missing} cell(s) "
               f"with no master navmesh, {no_record} unreadable")
@@ -358,60 +378,15 @@ def build_edge_links(navm_cache: dict, verbose: bool = True,
     Returns the number of links created.
     See: docs/commentary/tes5_import_navmesh.md#cross-plugin-edge-links
     """
-    from .from_pgrd import pack_navm_record
-    from ..base.writer import pack_subrecord
-
-    # Decode every exterior mesh once, indexed by (worldspace, grid).
-    views = {}
-    holders = {}
-    for key, value in navm_cache.items():
-        if not value:
-            continue
-        navm_bytes, meta = value
-        if not navm_bytes or not meta or not meta.get('is_exterior'):
-            continue
-        blob, prefix, suffix = extract_nvnm(navm_bytes)
-        if blob is None:
-            continue
-        try:
-            view = NavMeshView(meta['fid'], blob)
-        except (struct.error, IndexError):
-            continue
-        if not view.exterior:
-            continue
-        cell = (meta.get('wrld_fid'), meta['grid_x'], meta['grid_y'])
-        views[cell] = view
-        holders[cell] = (key, prefix, suffix, meta)
-
+    views, holders = exterior_views(navm_cache)
     if relinked_masters is None:
         relinked_masters = []
-    masters = _master_neighbour_views(views, master_index, master_navms)
-    for cell, (view, _pre, _suf) in masters.items():
-        views[cell] = view
+    masters = {}
+    for cell, entry in _master_neighbour_views(views, master_index, master_navms).items():
+        masters[cell + (entry[0].fid,)] = entry
+        views[cell + (entry[0].fid,)] = entry[0]
     live_fids = {v.fid for v in views.values()}
-
-    made = 0
-    # Sorted iteration + only the +X/+Y neighbours means each seam is visited
-    # exactly once, in a stable order.
-    for cell in sorted(views):
-        wrld, gx, gy = cell
-        view_a = views[cell]
-        for dx, dy, axis, _ in _NEIGHBOURS:
-            other = (wrld, gx + dx, gy + dy)
-            view_b = views.get(other)
-            if view_b is None:
-                continue
-            # The shared plane: cell A's upper edge on that axis.
-            coord = ((gx + 1) * CELL_SIZE) if axis == 0 else ((gy + 1) * CELL_SIZE)
-            edges_a = _border_edges(view_a, axis, coord)
-            edges_b = _border_edges(view_b, axis, coord)
-            if not edges_a or not edges_b:
-                continue
-            for ea, eb in _match_seam(edges_a, edges_b):
-                view_a.add_link(ea[0], ea[1], view_b.fid, eb[0])
-                view_b.add_link(eb[0], eb[1], view_a.fid, ea[0])
-                made += 2
-
+    made = _stitch_seams(views)
     _prune_dead_links(views, live_fids, master_navms, masters)
 
     rewritten = _repack(views, holders, masters, navm_cache,
@@ -428,6 +403,62 @@ def build_edge_links(navm_cache: dict, verbose: bool = True,
     return made
 
 
+def exterior_views(navm_cache: dict) -> tuple:
+    """({(wrld, gx, gy, fid): view}, {same key: (cache key, prefix, suffix, meta)}) per exterior mesh.
+
+    Keyed by mesh, not cell: FO3/FNV author up to 8 navmeshes in one cell.
+    See: docs/commentary/tes5_import_navmesh.md#every-mesh-in-a-cell
+    """
+    views, holders = {}, {}
+    for key, value in navm_cache.items():
+        navm_bytes, meta = value or (None, None)
+        if not navm_bytes or not meta or not meta.get('is_exterior'):
+            continue
+        blob, prefix, suffix = extract_nvnm(navm_bytes)
+        if blob is None:
+            continue
+        try:
+            view = NavMeshView(meta['fid'], blob)
+        except (struct.error, IndexError):
+            continue
+        if view.exterior:
+            vkey = (meta.get('wrld_fid'), meta['grid_x'], meta['grid_y'], meta['fid'])
+            views[vkey] = view
+            holders[vkey] = (key, prefix, suffix, meta)
+    return views, holders
+
+
+def _seam_edges(cell_views: list, axis: int, coord: float) -> list:
+    """Border edges on one seam from every mesh in a cell, each tagged with its mesh."""
+    return [e + (view,) for view in cell_views for e in border_edges(view, axis, coord)]
+
+
+def _stitch_seams(views: dict) -> int:
+    """Link matching border edges across each cell seam; return the links made.
+
+    Sorted cells and only the +X/+Y neighbours visit each seam once, in a stable
+    order. The seam plane is cell A's upper edge on that axis, and every mesh on
+    either side competes for it.
+    """
+    cells = {}
+    for vkey in sorted(views):
+        cells.setdefault(vkey[:3], []).append(views[vkey])
+    made = 0
+    for (wrld, gx, gy) in sorted(cells):
+        for dx, dy, axis, _ in _NEIGHBOURS:
+            other = cells.get((wrld, gx + dx, gy + dy))
+            if other is None:
+                continue
+            coord = ((gx + 1) * CELL_SIZE) if axis == 0 else ((gy + 1) * CELL_SIZE)
+            edges_a = _seam_edges(cells[(wrld, gx, gy)], axis, coord)
+            edges_b = _seam_edges(other, axis, coord)
+            for ea, eb in match_seam(edges_a, edges_b):
+                ea[5].add_link(ea[0], ea[1], eb[5].fid, eb[0])
+                eb[5].add_link(eb[0], eb[1], ea[5].fid, ea[0])
+                made += 2
+    return made
+
+
 def _repack(views, holders, masters, navm_cache, relinked) -> int:
     """Re-emit every mesh whose links changed; return how many.
 
@@ -440,6 +471,7 @@ def _repack(views, holders, masters, navm_cache, relinked) -> int:
     from .from_pgrd import pack_navm_record
     from ..base.writer import pack_subrecord
     rewritten = 0
+    pending = []
     for cell, view in views.items():
         if cell in masters:
             if not view.dirty:
@@ -461,13 +493,13 @@ def _repack(views, holders, masters, navm_cache, relinked) -> int:
         # NVMI omits).  Stored on the meta so navi_builder can mirror it.
         meta['edge_link_fids'] = sorted(
             {lk[1] for lk in view.links if lk[1] != view.fid})
-        if not view.dirty:
-            continue
-        new_nvnm = pack_subrecord('NVNM', view.pack())
-        subs = prefix + new_nvnm + suffix
-        navm_cache[key] = (pack_navm_record(meta['fid'], subs), meta)
-        rewritten += 1
-    return rewritten
+        if view.dirty:
+            pending.append((key, meta, prefix + pack_subrecord('NVNM', view.pack()) + suffix))
+    with ThreadPoolExecutor(max_workers=worker_count()) as ex:
+        records = list(ex.map(lambda p: pack_navm_record(p[1]['fid'], p[2]), pending))
+    for (key, meta, _subs), record in zip(pending, records):
+        navm_cache[key] = (record, meta)
+    return rewritten + len(pending)
 
 
 def extract_nvnm(navm_bytes: bytes):

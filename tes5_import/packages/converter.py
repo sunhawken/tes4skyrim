@@ -27,12 +27,15 @@ map exactly, which degrade, and why).
 
 import struct
 
+from .ambush_near import ambush_template, place_reference
+from .sit_at import sit_at_template
+from .escort_when_near import NPC_NEAR_RADIUS, NPC_WAIT, escort_template
 from .templates import (
     ACQUIRE,
-    ESCORT,
     EAT,
     FLEE_TO,
     FOLLOW,
+    FOLLOW_TO,
     FORCE_GREET,
     HOLD_POSITION,
     PKDT_TYPE_PACKAGE,
@@ -41,6 +44,7 @@ from .templates import (
     SIT_TARGET,
     ACTIVATE,
     SLEEP,
+    DO_NOTHING,
     TRAVEL,
     T_BOOL,
     T_FLOAT,
@@ -52,6 +56,11 @@ from .templates import (
     Template,
 )
 from ..base.conditions import convert_ctda_list_with_strings
+from ..base.owned_records import DIALOGUE_OPEN_GLOBAL, WELL_KNOWN_PROPERTIES
+from .interrupt_morrowind import morrowind_interrupt
+from ..record_types.world_falloutnv import is_fallout_source
+from .use_magic import spell_item_inputs
+from .location_morrowind import standing_wander_location
 from ..base.text_reader import (get_formid, get_int, get_str, remap_formid,
                           PLAYER_REF_FID, PLAYER_BASE_FID)
 
@@ -67,13 +76,8 @@ PLAYER_FID = PLAYER_REF_FID
 
 
 def _targets_player(rec: dict) -> bool:
-    """True when this package's PTDT names the player, either spelling.
-
-    Oblivion writes "the player" as the REFERENCE 0x14 or, just as often, as
-    Object-ID + the player's base NPC_ 0x07.  Every player-specific branch
-    below has to accept both or it silently takes the generic path.
-    """
-    return get_formid(rec, 'PTDT.Target') in (PLAYER_REF_FID, PLAYER_BASE_FID)
+    """Does PTDT name the player (reference 0x14 or base 0x07, not a type code)?"""
+    return get_int(rec, 'PTDT.Type', -1) != 2 and get_formid(rec, 'PTDT.Target') in (PLAYER_REF_FID, PLAYER_BASE_FID)
 
 # Fallback SEARCH area for an Object-ID target when no interior cell can be
 # named (see PackContext.search_ground): a wide radius around the actor's own
@@ -82,6 +86,14 @@ def _targets_player(rec: dict) -> bool:
 # 3000 radius is the vanilla predator package's own Hunt Location
 # (DefaultPredatorPackage slot 4); WEJS21HunterWander uses type 2 radius 5000.
 _SEARCH_NEAR_SELF = (12, 0, 3000)
+
+#: The export key a pre-pass sets on a wander package that runs on its actor's linked marker.
+MARKER_KEY = 'MorrowindMarker'
+MARKER_SIT = 'sit'
+MARKER_IDLE = 'idle'
+
+#: PTDA "Linked Reference" with no keyword: the actor's own XLKR.
+_LINKED_REF = struct.pack('<iIi', 3, 0, 0)
 
 # --- TES4 PKDT.Type ------------------------------------------------------
 T4_FIND = 0
@@ -109,6 +121,8 @@ T4_LOCK_DOORS_START = 0x00000008
 T4_LOCK_DOORS_END = 0x00000010
 T4_UNLOCK_DOORS_START = 0x00000040
 T4_UNLOCK_DOORS_END = 0x00000080
+#: Opens a shop for the day; becomes TES5 unlock-at-start, as vanilla vendor packages write it.
+T4_UNLOCK_DOORS_LOCATION = 0x00000100
 T4_CONTINUE_IF_PC_NEAR = 0x00000200
 T4_ONCE_PER_DAY = 0x00000400
 T4_ALWAYS_RUN = 0x00002000
@@ -144,6 +158,7 @@ _FLAG_MAP = (
     (T4_MUST_COMPLETE, T5_MUST_COMPLETE),
     (T4_UNLOCK_DOORS_START, T5_UNLOCK_DOORS_START),
     (T4_UNLOCK_DOORS_END, T5_UNLOCK_DOORS_END),
+    (T4_UNLOCK_DOORS_LOCATION, T5_UNLOCK_DOORS_START),
     (T4_CONTINUE_IF_PC_NEAR, T5_CONTINUE_IF_PC_NEAR),
     (T4_ONCE_PER_DAY, T5_ONCE_PER_DAY),
     (T4_ALWAYS_SNEAK, T5_ALWAYS_SNEAK),
@@ -203,10 +218,25 @@ SPEED_WALK, SPEED_JOG, SPEED_RUN, SPEED_FASTWALK = 0, 1, 2, 3
 # authorisation.
 DEFAULT_INTERRUPT = 0x0044  # observe combat 0x04 | aggro radius 0x40
 
+#: A force greet's interrupt flags, measured from vanilla MS05InductionForcegreet.
+FORCEGREET_INTERRUPT = 0xFEFF
+
+#: PKDT interrupt flag "Observe combat behavior": watch a fight the actor is not part of.
+OBSERVE_COMBAT = 0x0004
+
+#: PKDT interrupt flag "Greet corpse behavior": walk to a dead body (ReactToDead) when one is near.
+GREET_CORPSE = 0x0008
+
+#: PSDT for any month, day and hour with no duration.
+ANY_TIME_PSDT = struct.pack('<bbBbb3xi', -1, -1, 0, -1, -1, 0)
+
 # TES4 record signatures a package target's BASE can carry, by what the actor
 # does with one.  ('CHAI'/'BED ' used to be listed here, but those are TES5
 # wbObjectTypeEnum names, never TES4 signatures — only FURN can match.)
 FURNITURE_SIGS = frozenset({'FURN'})
+
+#: Search radius round a seat an actor is sent to; 500 in vanilla's Sit instances on one named reference.
+SEAT_SEARCH_RADIUS = 500
 # Carriable items: what a TES4 Find(Object ID) picks UP -> TES5 Acquire.
 ITEM_SIGS = frozenset({'WEAP', 'ARMO', 'CLOT', 'BOOK', 'INGR', 'ALCH', 'MISC',
                        'KEYM', 'LIGH', 'SGST', 'SLGM', 'AMMO', 'APPA'})
@@ -240,9 +270,9 @@ def _operate_target(rec: dict, ctx: 'PackContext') -> bool:
     if not target or target == PLAYER_FID:
         return False
     sig = ctx.base_sig_of(target)
-    if not sig:
-        return False
     ptype = get_int(rec, 'PKDT.Type', -1)
+    if not sig or (ptype == T4_USEITEMAT and ctx.starts_disabled(target)):
+        return False
     if ptype == T4_USEITEMAT:
         # A static is "operated" too: Relmyna studying her atronach STAT
         # (SE09RelmynaStudyAtronach) walks up to it and stays; Activate on a
@@ -301,10 +331,9 @@ class Inputs:
                 out += pack_subrecord('PTDA', v if isinstance(v, bytes)
                                       else _null_target())
             elif atype == T_TOPIC:
-                # PDTO: (u32 type, u32 formid); type 0 names a DIAL record.
-                # This input is what opens dialogue for a ForceGreet package.
-                out += pack_subrecord('PDTO', struct.pack('<II', 0,
-                                                          int(v or 0)))
+                ptype, pval = v if isinstance(v, tuple) else (0, v)
+                out += pack_subrecord('PDTO', struct.pack('<II', ptype,
+                                                          int(pval or 0)))
             elif atype == T_BOOL:
                 # Bool CNAM is a single byte (verified against vanilla).
                 out += pack_subrecord('CNAM', bytes([1 if v else 0]))
@@ -578,9 +607,25 @@ def convert_flags(t4_flags: int, pack_type: int,
 def build_pkdt(flags: int, speed: int,
                interrupt: int = DEFAULT_INTERRUPT) -> bytes:
     """PKDT: Flags u32, Type u8, InterruptOverride u8, PreferredSpeed u8,
-    pad u8, InterruptFlags u16, pad u16  (12 bytes)."""
+    pad u8, InterruptFlags u16, pad u16  (12 bytes). A TES3/TES4 package never
+    allows observe-combat or greet-corpse (that game has neither procedure).
+
+    See: docs/commentary/tes5_import_package.md#no-spectators
+    """
+    if not is_fallout_source():
+        interrupt &= ~(OBSERVE_COMBAT | GREET_CORPSE)
     return struct.pack('<IBBBBHH', flags, PKDT_TYPE_PACKAGE, 0, speed, 0,
                        interrupt, 0)
+
+
+def package_markers() -> bytes:
+    """The empty POBA/POEA/POCA begin/end/change blocks 943/944 vanilla packages carry."""
+    out = b''
+    for marker in ('POBA', 'POEA', 'POCA'):
+        out += pack_subrecord(marker, b'')
+        out += pack_formid_subrecord('INAM', 0)
+        out += pack_subrecord('PDTO', struct.pack('<II', 0, 0))
+    return out
 
 
 def build_psdt(rec: dict) -> bytes:
@@ -642,6 +687,7 @@ class PackContext:
         # hunts expanded into a Follow chain (import_main fills this from
         # hunt_chain_targets + writer.derive_formid).
         self.hunt_chains = {}
+        self.done_latches = {}
         self.script_vars = script_vars or {}
         # Converted FormID of the GREETING topic (TES4 DIAL 0x000000C8).  A
         # ForceGreet package opens THIS -- Oblivion's force-greet raised the
@@ -762,6 +808,14 @@ class PackContext:
             return None
         return self.plan.owner_quest.get(pack_fid)
 
+    def greet_quest(self, pack_fid: int, edid: str, gated: int):
+        """The quest whose GREETING the force-greet opens, else None."""
+        return self.plan.greet_quest(pack_fid, edid, gated) if self.plan else gated or None
+
+    def starts_disabled(self, ref_fid: int) -> bool:
+        """Does the placed reference start the game disabled?"""
+        return bool(self.plan) and ref_fid & 0x00FFFFFF in self.plan.starts_disabled
+
     def alias_for(self, pack_fid: int, ref_fid: int):
         q = self.quest_of(pack_fid)
         if q is None or self.plan is None:
@@ -806,6 +860,10 @@ def resolve_target(rec: dict, ctx: PackContext, pack_fid: int) -> bytes:
 
 
 def resolve_location(rec: dict, ctx: PackContext, pack_fid: int) -> bytes:
+    """The TES5 PLDT for a package's TES4 location."""
+    standing = standing_wander_location(rec)
+    if standing:
+        return standing
     loc_type = get_int(rec, 'PLDT.Type', -1)
     if loc_type < 0:
         return _null_location()
@@ -964,8 +1022,35 @@ def _sandbox(loc, **flags) -> Inputs:
     return i
 
 
+def _seat_travelled_to(p: _Pick) -> int:
+    """The furniture reference a Travel names as its exact destination, or 0."""
+    ref = get_formid(p.rec, 'PLDT.Location')
+    exact = get_int(p.rec, 'PLDT.Type', -1) == 0 and not p.radius
+    return ref if exact and ref and p.ctx.base_sig_of(ref) in FURNITURE_SIGS else 0
+
+
+def _sit_in(p: _Pick, seat: int) -> Inputs:
+    """Sit, searching round furniture reference `seat` for that reference alone (its alias in a quest package).
+
+    SitTarget does not walk an actor to a seat across a room; Sit travels first. Radius as vanilla's
+    WindhelmJarlSitInThrone. The converter's TES4SitAt root (vanilla Sit whose Find waits until the seat is
+    near) reaches a seat in another cell; vanilla Sit when it is not installed.
+    See: docs/commentary/tes5_import_package.md#sit-in-a-seat-in-another-cell
+    """
+    alias = p.ctx.alias_for(p.pack_fid, seat)
+    i = Inputs(sit_at_template() or SIT)
+    i.set('location', build_alias_location(alias, SEAT_SEARCH_RADIUS) if alias is not None
+          else build_location(0, seat, SEAT_SEARCH_RADIUS))
+    for slot in ('chair_target', 'seat') if 'seat' in i.t.slots else ('chair_target',):
+        i.set(slot, build_alias_target(alias) if alias is not None else build_target(0, seat))
+    return i
+
+
 def _pick_travel(p: _Pick) -> Inputs:
-    """Travel: exact."""
+    """Travel: exact; to a furniture reference itself it is SitTarget, as Oblivion sits the actor in it."""
+    seat = _seat_travelled_to(p)
+    if seat:
+        return _sit_in(p, seat)
     i = Inputs(TRAVEL)
     i.set('location', p.loc)
     if p.use_horse:
@@ -974,7 +1059,23 @@ def _pick_travel(p: _Pick) -> Inputs:
 
 
 def _pick_wander(p: _Pick) -> Inputs:
-    """Wander -> Sandbox: exact, wander/sit/idle within a radius."""
+    """Wander -> Sandbox within a radius, or the actor's own animation file's stand-in.
+
+    A pre-pass flags (MARKER_KEY) a Morrowind wander package whose NPCs' own
+    animation files became vanilla furniture (SitTarget on the linked marker)
+    or vanilla idles (DoNothing, so the actor stays where MorrowindRuntime
+    holds it and plays them). A Morrowind wander of distance 0 never moves its
+    actor in OpenMW, so it is DoNothing too.
+    See: docs/commentary/asset_convert_animation.md#vanilla-markers-for-npc-animation-files
+    """
+    kind = get_str(p.rec, MARKER_KEY)
+    if kind == MARKER_SIT:
+        i = Inputs(SIT_TARGET)
+        i.set('target', _LINKED_REF)
+        i.set('wait_time', 0.0)
+        return i
+    if kind == MARKER_IDLE or standing_wander_location(p.rec):
+        return Inputs(DO_NOTHING)
     return _sandbox(p.loc, allow_wandering=1, allow_sitting=1,
                     allow_idle_markers=1, allow_conversation=1,
                     allow_eating=0, allow_sleeping=0)
@@ -1008,34 +1109,37 @@ def _follow_destination_reachable(p: _Pick) -> bool:
 
 
 def _pick_follow(p: _Pick) -> Inputs:
-    """Follow / Accompany, rerouted to Escort when it must ARRIVE.
+    """Follow / Accompany; with a reachable PLDT destination, FollowTo it.
 
-    Skyrim's Follow has no location slot, so a TES4 Follow carrying a PLDT
-    destination becomes an Escort -- but only when that destination is
-    reachable, since Escort makes it the goal and a cross-cell goal has no
-    navmesh route.
+    FollowTo trails the target and stops at the destination, so the package
+    ends there as in TES4. Skyrim's Follow never ends; a cross-cell
+    destination has no route. FollowTo has no ride-horse input, so a Use
+    Horse one stays Escort.
+    See: docs/commentary/tes5_import_package.md#follow-with-a-destination-is-followto
     """
-    if _follow_destination_reachable(p):
-        i = Inputs(ESCORT)
-        i.set('target', p.tgt)
-        i.set('location', p.loc)
-        if p.use_horse:
-            i.set('ride_horse', 1)
-        return i
-    i = Inputs(FOLLOW)
+    arrives = _follow_destination_reachable(p)
+    if arrives and p.use_horse:
+        return _pick_escort(p)
+    i = Inputs(FOLLOW_TO if arrives else FOLLOW)
     i.set('target', p.tgt)
+    keep_within(i, float(get_int(p.rec, 'PTDT.Count', 0) or 0))
     i.set('accompany', 1 if get_int(p.rec, 'PKDT.Type', -1) == T4_ACCOMPANY
           else 0)
-    if p.use_horse:
+    if arrives:
+        i.set('location', p.loc)
+    elif p.use_horse:
         i.set('ride_horse', 1)
     return i
 
 
 def _pick_escort(p: _Pick) -> Inputs:
-    """Escort: exact."""
-    i = Inputs(ESCORT)
+    """Escort: exact, restarting whenever the escorted player returns in range; an NPC is escorted from anywhere."""
+    i = Inputs(escort_template())
     i.set('target', p.tgt)
     i.set('location', p.loc)
+    if 'radius' in i.t.slots and not _targets_player(p.rec):
+        i.set('radius', NPC_NEAR_RADIUS)
+        i.set('wait', NPC_WAIT)
     if p.use_horse:
         i.set('ride_horse', 1)
     return i
@@ -1048,16 +1152,17 @@ def _pick_flee(p: _Pick) -> Inputs:
     return i
 
 
-def _force_greet(p: _Pick, radius: float) -> Inputs:
-    """A ForceGreet on the player, anchored on the player at `radius`.
+def force_greet_inputs(topic, radius: float = 0) -> Inputs:
+    """A ForceGreet on the player opening `topic`, anchored on the player at `radius`.
 
-    The forcegreet distance MUST be a type-0 location on ref 0x14: a
-    type-2/type-3 location is not relative to the player, so the actor walks
-    to a world spot instead of talking.
+    `topic` is a DIAL FormID or a (PDTO type, value) pair.  The forcegreet
+    distance MUST be a type-0 location on ref 0x14: a type-2/type-3 location
+    is not relative to the player, so the actor walks to a world spot instead
+    of talking.
     """
     i = Inputs(FORCE_GREET)
     i.set('target', _target(0, PLAYER_FID, 0))
-    i.set('topic', p.greet_topic or 0)
+    i.set('topic', topic)
     if radius > 0:
         i.set('forcegreet_distance', _location(0, PLAYER_FID, int(radius)))
     return i
@@ -1074,7 +1179,9 @@ def _pick_ambush(p: _Pick) -> Inputs:
     TES4 Ambush means "wait for the target to come near, then act on it" --
     Oblivion uses it for scripted approaches as well as literal ambushes.
     An actor is approached to PTDT.Count, the authored talking distance;
-    PLDT.Radius is only the watch area around the location.
+    with a location the actor waits there until the target is within
+    PLDT.Radius (TES4AmbushNear).
+    See: docs/commentary/tes5_import_package.md#ambush-at-a-place
     """
     if not _has_target(p.rec):
         i = Inputs(HOLD_POSITION)
@@ -1082,14 +1189,26 @@ def _pick_ambush(p: _Pick) -> Inputs:
         return i
     radius = _pldt_radius_f(p.rec)
     if _targets_player(p.rec):
-        return _force_greet(p, radius)
+        return force_greet_inputs(p.greet_topic or 0, radius)
     reach = float(get_int(p.rec, 'PTDT.Count', 0) or 0) or radius
-    i = Inputs(FOLLOW)
+    at_place = ambush_template() if _has_location(p.rec) and (radius or reach) else None
+    i = Inputs(at_place or FOLLOW)
     i.set('target', p.tgt)
+    if at_place:
+        i.set('location', p.loc)
+        i.set('radius', radius or reach)
+        i.set('place_ref', place_reference(p.loc))
+    keep_within(i, reach)
+    return i
+
+
+def keep_within(i: Inputs, reach: float) -> None:
+    """A follow kept within the authored `reach`; 0 keeps the template's radii.
+    See: docs/commentary/tes5_import_package.md#follow-keeps-its-authored-distance
+    """
     if reach > 0:
         i.set('min_radius', max(64.0, reach * 0.5))
         i.set('max_radius', reach)
-    return i
 
 
 def _pick_cast(p: _Pick) -> Inputs:
@@ -1127,7 +1246,13 @@ def _use_item_at_is_furniture(p: _Pick) -> bool:
 
 
 def _pick_use_item(p: _Pick) -> Inputs:
-    """UseItemAt: sit at furniture, operate an activator, else sandbox."""
+    """UseItemAt: sit at furniture, operate an activator, cast a spell item, else sandbox.
+
+    A target that starts disabled cannot be operated: the actor goes to it.
+    See: docs/commentary/tes5_import_package.md#use-item-at-a-disabled-reference
+    """
+    if get_int(p.rec, 'PTDT.Type', -1) == 0 and p.ctx.starts_disabled(get_formid(p.rec, 'PTDT.Target')):
+        return _pick_travel(p)
     if (get_int(p.rec, 'PTDT.Type', -1) == 0
             and get_formid(p.rec, 'PTDT.Target')):
         chosen = _use_item_at_ref(p)
@@ -1138,8 +1263,11 @@ def _pick_use_item(p: _Pick) -> Inputs:
         i.set('location', p.loc)
         i.set('chair_target', p.tgt)
         return i
-    return _sandbox(p.loc, allow_sitting=1, allow_special_furniture=1,
-                    allow_idle_markers=1, allow_wandering=0)
+    seat = _seat_travelled_to(p)
+    if seat:
+        return _sit_in(p, seat)
+    return spell_item_inputs(p, Inputs) or _sandbox(
+        p.loc, allow_sitting=1, allow_special_furniture=1, allow_idle_markers=1, allow_wandering=0)
 
 
 def _find_resolved_target(p: _Pick) -> tuple:
@@ -1196,10 +1324,15 @@ def _find_by_ref_sig(p: _Pick, target: int, ref_sig: str) -> Inputs:
 def _pick_find(p: _Pick) -> Inputs:
     """Find: force-greet, operate, sit, acquire, seek, or sandbox.
 
-    One TES4 type covering five idioms; the target decides which.
+    One TES4 type covering five idioms; the target decides which. With no
+    location the player is sought anywhere.
+    See: docs/commentary/tes5_import_package.md#find-the-player-anywhere
     """
     if _targets_player(p.rec):
-        return _force_greet(p, _pldt_radius_f(p.rec))
+        i = force_greet_inputs(p.greet_topic or 0, _pldt_radius_f(p.rec))
+        if not _has_location(p.rec):
+            i.set('trigger_location', _location(2, 0, int(NPC_NEAR_RADIUS)))
+        return i
     if _operate_target(p.rec, p.ctx):
         i = Inputs(ACTIVATE)
         i.set('target', p.tgt)
@@ -1264,6 +1397,16 @@ def _choose(rec: dict, ctx: PackContext, pack_fid: int) -> Inputs:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def latches_when_done(rec: dict, ctx: PackContext) -> bool:
+    """True for a quest-gated Once Per Day package that is not a force greet.
+
+    See: docs/commentary/tes5_import_package.md#once-per-day-completion-latch
+    """
+    if not get_int(rec, 'PKDT.Flags') & T4_ONCE_PER_DAY or ctx.quest_of(get_formid(rec, 'FormID')) is None:
+        return False
+    return not (get_int(rec, 'PKDT.Type', -1) in (T4_AMBUSH, T4_FIND) and _targets_player(rec))
+
+
 def convert_PACK(rec: dict, ctx: PackContext = None) -> bytes:
     """TES4 PACK -> TES5 PACK (a Type-18 template instance).
 
@@ -1279,6 +1422,8 @@ def convert_PACK(rec: dict, ctx: PackContext = None) -> bytes:
     edid = get_str(rec, 'EditorID')
     if edid:
         subs += pack_string_subrecord('EDID', edid)
+    done_vmad, done_gate = ctx.done_latches.get(pack_fid, (b'', b''))
+    subs += done_vmad
 
     ptype = get_int(rec, 'PKDT.Type', -1)
     # An Ambush aimed at the PLAYER is Oblivion's scripted-approach idiom, not
@@ -1288,36 +1433,33 @@ def convert_PACK(rec: dict, ctx: PackContext = None) -> bytes:
                      and _targets_player(rec))
     hostile = not (is_forcegreet or _approaches_ref(rec, ptype))
     flags, speed = convert_flags(get_int(rec, 'PKDT.Flags'), ptype, hostile,
-                                 quest_gated=ctx.quest_of(pack_fid) is not None)
+                                 quest_gated=ctx.quest_of(pack_fid) is not None or bool(done_gate))
     # A scripted one-shot (force-greet, or "go operate that switch") must run
     # at vanilla's pace and with vanilla's interrupt authorisation, or the actor
     # dawdles / can never break off to do the thing.  Both were measured from
     # real instances: MS05InductionForcegreet and CWEscapeCitySceneActivateDoor.
     is_activate = _operate_target(rec, ctx)
     if is_forcegreet:
-        subs += pack_subrecord('PKDT', build_pkdt(_forcegreet_flags(rec, flags),
-                                                  SPEED_RUN, interrupt=0xFEFF))
+        subs += pack_subrecord('PKDT', build_pkdt(_forcegreet_flags(rec, flags, bool(done_gate)),
+                                                  SPEED_RUN,
+                                                  FORCEGREET_INTERRUPT))
     elif is_activate:
         # Keep the TES4 flags (Must Complete / Once Per Day are real), but take
         # vanilla's speed and interrupts.
         subs += pack_subrecord('PKDT', build_pkdt(flags, SPEED_RUN,
                                                   interrupt=0xFFFF))
     else:
-        subs += pack_subrecord('PKDT', build_pkdt(flags, speed))
+        subs += pack_subrecord('PKDT', build_pkdt(
+            flags, speed, morrowind_interrupt(rec, DEFAULT_INTERRUPT)))
     subs += pack_subrecord('PSDT', build_psdt(rec))
 
-    # Conditions carry the activation logic and ARE the package's gate.  A
-    # GetScriptVariable condition becomes GetVMScriptVariable + a CIS2 naming
-    # the Papyrus property — see dialog_conditions; the legacy function is dead
-    # in Skyrim, so without this the package could never fire.
-    subs += _source_conditions(rec, ctx)
+    inputs = _choose(rec, ctx, pack_fid)
+    t = inputs.t
+    subs += dialogue_gate(t) + done_gate + _source_conditions(rec, ctx)
 
     owner = ctx.quest_of(pack_fid)
     if owner:
         subs += pack_formid_subrecord('QNAM', owner)
-
-    inputs = _choose(rec, ctx, pack_fid)
-    t = inputs.t
 
     # PKCU: DataInputCount u32, PackageTemplate formid, VersionCounter u32.
     # The template lives in Skyrim.esm (master index 0) so it is written
@@ -1325,20 +1467,10 @@ def convert_PACK(rec: dict, ctx: PackContext = None) -> bytes:
     subs += pack_subrecord('PKCU', struct.pack('<III', len(t.inputs),
                                                t.formid, t.version))
     subs += inputs.emit()
-
-    # All three markers are mandatory (943/944 vanilla packages carry them).
-    for marker in (b'POBA', b'POEA', b'POCA'):
-        subs += pack_subrecord(marker.decode(), b'')
-        subs += pack_formid_subrecord('INAM', 0)
-        subs += pack_subrecord('PDTO', struct.pack('<II', 0, 0))
+    subs += package_markers()
 
     if inputs.t is FORCE_GREET:
-        # The greeting topic does not exist yet (Phase 5); remember which quest
-        # this package belongs to so patch_forcegreet_topics can bind it.
-        # Only 120 of 7,209 packages are quest-OWNED, so fall back to the quest
-        # the package's own conditions test (GetStage/GetQuestVariable) — that
-        # is the quest whose greeting the force-greet is part of.
-        _FORCEGREET_PENDING[pack_fid] = owner or _condition_quest(rec)
+        _FORCEGREET_PENDING[pack_fid] = ctx.greet_quest(pack_fid, get_str(rec, 'EditorID'), _condition_quest(rec))
 
     return pack_record('PACK', pack_fid, get_int(rec, 'RecordFlags'), subs)
 
@@ -1418,9 +1550,24 @@ CTDA_GET_DISABLED = 35       # GetDisabled
 CTDA_GET_DEAD = 46           # GetDead
 
 
+CTDA_GET_GLOBAL_VALUE = 74
+
+
+def dialogue_gate(template) -> bytes:
+    """A ForceGreet instance's wait for Skyrim's dialogue menu to close, or b''."""
+    gate = WELL_KNOWN_PROPERTIES.get(DIALOGUE_OPEN_GLOBAL) if template is FORCE_GREET else 0
+    return pack_subrecord('CTDA', _subject_ctda(CTDA_GET_GLOBAL_VALUE, gate, 0.0)) if gate else b''
+
+
 def _source_conditions(rec: dict, ctx: PackContext) -> bytes:
+    """The package's own gates: each TES4 condition, a script-variable test as GetVMScriptVariable + CIS2.
+
+    A run-on-target test of a package aimed at one reference runs on that reference.
+    See: docs/commentary/tes5_import_package.md#run-on-target-conditions
+    """
     out = b''
-    for ctda, cis2 in convert_ctda_list_with_strings(rec, ctx.script_vars):
+    target = get_formid(rec, 'PTDT.Target') if get_int(rec, 'PTDT.Type', -1) == 0 else 0
+    for ctda, cis2 in convert_ctda_list_with_strings(rec, ctx.script_vars, run_on_target_ref=target or None):
         out += pack_subrecord('CTDA', ctda)
         if cis2:
             out += pack_string_subrecord('CIS2', cis2)
@@ -1460,10 +1607,7 @@ def _seek_record(rec: dict, ctx: PackContext, src_fid: int, seek_fid: int,
     subs += pack_subrecord('PKCU', struct.pack('<III', len(t.inputs),
                                                t.formid, t.version))
     subs += inputs.emit()
-    for marker in (b'POBA', b'POEA', b'POCA'):
-        subs += pack_subrecord(marker.decode(), b'')
-        subs += pack_formid_subrecord('INAM', 0)
-        subs += pack_subrecord('PDTO', struct.pack('<II', 0, 0))
+    subs += package_markers()
     return pack_record('PACK', seek_fid, get_int(rec, 'RecordFlags'), subs)
 
 
@@ -1488,9 +1632,12 @@ _QUEST_PARAM_FUNCS = frozenset({
 })
 
 
-def _forcegreet_flags(rec: dict, flags: int) -> int:
-    """Force-greet PKDT flags: TES4's, Once Per Day restored (contracts doc, PKDT)."""
-    if get_int(rec, 'PKDT.Flags') & T4_ONCE_PER_DAY:
+def _forcegreet_flags(rec: dict, flags: int, gated: bool) -> int:
+    """TES4's flags, Once Per Day restored unless a completion gate replaces it.
+
+    See: docs/commentary/tes5_import_package.md#a-completion-gate-replaces-once-per-day
+    """
+    if get_int(rec, 'PKDT.Flags') & T4_ONCE_PER_DAY and not gated:
         flags |= T5_ONCE_PER_DAY
     return flags
 

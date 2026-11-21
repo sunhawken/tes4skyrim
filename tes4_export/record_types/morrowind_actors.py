@@ -14,9 +14,10 @@ import os
 import struct
 
 from ..record_types.common import escape_value
-from ..tes3_reader import Tes3Record, get_string, get_subrecord
-from .morrowind import (MW_SKILL_TO_TES4, emit_inventory, emit_ref, emit_str,
-                        unpack)
+from ..tes3_reader import (Tes3Record, get_all_subrecords, get_string,
+                           get_subrecord)
+from .morrowind import (MW_ENCHANT_SKILL, MW_SKILL_TO_TES4, emit_inventory,
+                        emit_ref, emit_str, unpack)
 from .morrowind_packages import emit_packages
 
 #: Morrowind race ID -> the Oblivion RACE FormID the importer maps to Skyrim's.
@@ -30,16 +31,80 @@ RACE_FORMIDS = {
 #: Imperial: what the importer itself falls back to.
 _DEFAULT_RACE = 0x00000907
 
+#: BODY BYDT part ids of a head and of hair, and the part type of skin (not clothing or armor).
+_FACE_PARTS = (0, 1)
+_SKIN = 0
+
+
+def _text(rec: Tes3Record, sig: str) -> str:
+    """A string subrecord, stripped and lower case; '' when absent."""
+    sub = get_subrecord(rec, sig)
+    return get_string(sub).strip().lower() if sub is not None else ''
+
+
+class RaceTable:
+    """Every RACE's display name and the head and hair meshes its BODY parts use, over a plugin and its masters.
+
+    See: docs/commentary/tes4_export_morrowind.md#custom-races
+    """
+
+    def __init__(self):
+        """Empty; fill with `add`, in load order."""
+        self.names = {}
+        self.parts = {}
+
+    def add(self, records) -> None:
+        """Add a plugin's RACE names and head/hair BODY meshes, later plugins overriding."""
+        for rec in records:
+            if rec.deleted:
+                continue
+            if rec.type == 'RACE':
+                self.names[rec.record_id.lower()] = _text(rec, 'FNAM')
+            elif rec.type == 'BODY':
+                bydt = get_subrecord(rec, 'BYDT')
+                if bydt and len(bydt.data) >= 4 and bydt.data[0] in _FACE_PARTS and not bydt.data[1] \
+                        and bydt.data[3] == _SKIN:
+                    self.parts[rec.record_id.lower()] = (_text(rec, 'FNAM'), _text(rec, 'MODL'))
+
+    def _meshes(self) -> dict:
+        """{race: set of head/hair meshes}."""
+        out = {}
+        for race, mesh in self.parts.values():
+            if race and mesh:
+                out.setdefault(race, set()).add(mesh)
+        return out
+
+    def formids(self) -> dict:
+        """RACE_FORMIDS plus each custom race, by its vanilla display name, else its most-shared vanilla meshes."""
+        vanilla = {race: race for race in RACE_FORMIDS}
+        vanilla.update((n, r) for r, n in self.names.items() if r in RACE_FORMIDS and n)
+        meshes = self._meshes()
+        out = dict(RACE_FORMIDS)
+        for race, name in self.names.items():
+            stand_in = vanilla.get(name) or _most_shared(meshes.get(race, set()), meshes)
+            if race not in out and stand_in:
+                out[race] = RACE_FORMIDS[stand_in]
+        return out
+
+
+def _most_shared(own: set, meshes: dict):
+    """The one vanilla race sharing the most of `own` meshes, or None on no share or a tie."""
+    shared = {race: len(own & meshes.get(race, set())) for race in RACE_FORMIDS}
+    best = max(shared.values())
+    winners = [race for race, n in shared.items() if n == best]
+    return winners[0] if best and len(winners) == 1 else None
+
 #: Attribute order, identical in both games.
 _ATTRIBUTES = ('Strength', 'Intelligence', 'Willpower', 'Agility', 'Speed',
                'Endurance', 'Personality', 'Luck')
 
-#: TES4 skill names by TES4 skill index (the NPC DATA.<skill> keys).
-_TES4_SKILLS = ('Armorer', 'Athletics', 'Blade', 'Block', 'Blunt',
-                'HandToHand', 'HeavyArmor', 'Alchemy', 'Alteration',
-                'Conjuration', 'Destruction', 'Illusion', 'Mysticism',
-                'Restoration', 'Acrobatics', 'LightArmor', 'Marksman',
-                'Mercantile', 'Security', 'Sneak', 'Speechcraft')
+#: NPC DATA.<skill> key by TES4 skill index, plus Morrowind Enchant.
+_SKILL_NAMES = dict(enumerate((
+    'Armorer', 'Athletics', 'Blade', 'Block', 'Blunt', 'HandToHand',
+    'HeavyArmor', 'Alchemy', 'Alteration', 'Conjuration', 'Destruction',
+    'Illusion', 'Mysticism', 'Restoration', 'Acrobatics', 'LightArmor',
+    'Marksman', 'Mercantile', 'Security', 'Sneak', 'Speechcraft')))
+_SKILL_NAMES[MW_ENCHANT_SKILL] = 'Enchant'
 
 #: (Morrowind FLAG bit, TES4 ACBS bit) for NPCs: female, essential, respawn, autocalc.
 _NPC_FLAGS = ((0x01, 0x01), (0x02, 0x02), (0x04, 0x08), (0x10, 0x10))
@@ -72,8 +137,12 @@ _FACTION_HIDDEN = 0x1
 #: CLDT: 2 attributes, specialization, 5 x 2 skills, playable, services.
 _CLDT_FORMAT = '<2ii10iii'
 
-#: SNDG type -> TES4 CSDT slot: left foot, right foot, Moan->Idle, Roar->Attack, Scream->Hit.
-_SOUND_GEN_SLOTS = {0: 0, 1: 1, 4: 4, 5: 6, 6: 7}
+#: The class id the TES3 engine treats as a guard, and TES4's CLAS Guard flag.
+_GUARD_CLASS_ID = 'guard'
+_CLASS_GUARD = 0x02
+
+#: SNDG type -> CSDT slot. See: docs/commentary/tes4_export_morrowind.md#creature-sound-generators
+_SOUND_GEN_SLOTS = {0: 0, 1: 1, 2: 2, 3: 3, 4: 5, 5: 6, 6: 7, 7: 8}
 
 #: The bones-only NIF the creature pipeline keys a folder on.
 _SKELETON_NIF = 'skeleton.nif'
@@ -113,7 +182,7 @@ def _emit_attributes(lines: list, values) -> None:
 
 
 def _emit_skills(lines: list, skills) -> None:
-    """DATA.<skill> for TES4's 21 skills, folding Morrowind's 27 onto them.
+    """DATA.<skill> for TES4's 21 skills plus Enchant, folding Morrowind's 27 onto them.
 
     Where two Morrowind skills land on one TES4 skill the larger wins.
     """
@@ -122,7 +191,7 @@ def _emit_skills(lines: list, skills) -> None:
         tes4 = MW_SKILL_TO_TES4.get(index)
         if tes4 is not None:
             best[tes4] = max(best.get(tes4, 0), value)
-    for index, name in enumerate(_TES4_SKILLS):
+    for index, name in _SKILL_NAMES.items():
         lines.append(f'DATA.{name}={_clamp(best.get(index, 0), 255)}')
 
 
@@ -130,20 +199,21 @@ def _emit_npc_full_stats(lines: list, data: bytes) -> int:
     """The 52-byte NPDT: authored stats. Returns the faction rank."""
     fields = unpack_bytes(data, '<h8B27BxHHHBBBxi')
     level, attributes, skills = fields[0], fields[1:9], fields[9:36]
-    health, mana, fatigue, _disposition, _reputation, rank, gold = fields[36:]
+    health, mana, fatigue, disposition, _reputation, rank, gold = fields[36:]
     lines.extend([f'ACBS.Level={level}', f'ACBS.SpellPoints={mana}',
                   f'ACBS.Fatigue={fatigue}', f'ACBS.BarterGold={gold}',
-                  f'DATA.Health={health}'])
+                  f'ACBS.Disposition={disposition}', f'DATA.Health={health}'])
     _emit_skills(lines, skills)
     _emit_attributes(lines, attributes)
     return rank
 
 
 def _emit_npc_autocalc_stats(lines: list, data: bytes) -> int:
-    """The 12-byte NPDT: level and gold only. Returns the faction rank."""
-    level, _disposition, _reputation, rank, gold = unpack_bytes(
+    """The 12-byte NPDT: level, disposition and gold. Returns the faction rank."""
+    level, disposition, _reputation, rank, gold = unpack_bytes(
         data, '<hBBB3xi')
-    lines.extend([f'ACBS.Level={level}', f'ACBS.BarterGold={gold}'])
+    lines.extend([f'ACBS.Level={level}', f'ACBS.BarterGold={gold}',
+                  f'ACBS.Disposition={disposition}'])
     return rank
 
 
@@ -162,6 +232,53 @@ def _emit_faction(lines: list, rec: Tes3Record, ctx, rank: int) -> None:
         lines.append(f'Faction[0].Rank={rank}')
 
 
+def _emit_spells(lines: list, rec: Tes3Record, ctx) -> None:
+    """Emit the NPCS spell list -- one fixed 32-byte ID per subrecord.
+
+    A spell this pass does not convert is left out rather than written as a
+    null FormID.
+    """
+    spells = []
+    for sub in get_all_subrecords(rec, 'NPCS'):
+        form_id = ctx.resolve(get_string(sub), 'SPEL')
+        if form_id:
+            spells.append(form_id)
+    lines.append(f'SpellCount={len(spells)}')
+    for index, form_id in enumerate(spells):
+        lines.append(f'Spell[{index}]={form_id}')
+
+
+def _emit_authored_identity(lines: list, rec: Tes3Record, rank: int) -> None:
+    """The TES3 race, class and faction strings a dialogue filter tests.
+
+    `RNAM.Race` is a converted FormID and collapses every custom race onto
+    Imperial, so a dependent plugin cannot tell an Ayleid speaker from an
+    Imperial one by reading it. The authored strings survive alongside it,
+    letting a bark resolve its real audience across masters.
+    See: docs/commentary/tes4_export_morrowind.md#voiced-barks
+    """
+    for sig, key in (('RNAM', 'MorrowindRace'), ('CNAM', 'MorrowindClass'),
+                     ('ANAM', 'MorrowindFaction')):
+        emit_str(lines, key, rec, sig)
+    lines.append(f'MorrowindRank={rank}')
+
+
+def _emit_head_parts(lines: list, rec: Tes3Record, ctx) -> None:
+    """The NPC's authored head and hair BODY ids, each with the mesh it names.
+
+    See: docs/commentary/tes5_import_actors.md#morrowind-faces
+    """
+    for sig, key in (('BNAM', 'MorrowindHead'), ('KNAM', 'MorrowindHair')):
+        sub = get_subrecord(rec, sig)
+        part = get_string(sub) if sub is not None else ''
+        if not part:
+            continue
+        lines.append(f'{key}={escape_value(part)}')
+        model = getattr(ctx, 'body_models', {}).get(part.lower())
+        if model:
+            lines.append(f'{key}Model={escape_value(model)}')
+
+
 def export_NPC_(rec: Tes3Record, ctx) -> list:
     """An NPC in TES4's actor vocabulary, raced by Oblivion FormID.
 
@@ -169,6 +286,7 @@ def export_NPC_(rec: Tes3Record, ctx) -> list:
     """
     lines = [f'EditorID={escape_value(rec.record_id)}']
     emit_str(lines, 'FULL', rec, 'FNAM')
+    emit_str(lines, 'MorrowindAnim', rec, 'MODL')
     flags = unpack(rec, 'FLAG', '<I')
     lines.append(f'ACBS.Flags={_map_flags(flags[0] if flags else 0, _NPC_FLAGS)}')
     npdt = get_subrecord(rec, 'NPDT')
@@ -179,9 +297,12 @@ def export_NPC_(rec: Tes3Record, ctx) -> list:
         rank = _emit_npc_autocalc_stats(lines, npdt.data)
     race = get_subrecord(rec, 'RNAM')
     race_id = get_string(race).lower() if race else ''
-    lines.append(f'RNAM.Race={RACE_FORMIDS.get(race_id, _DEFAULT_RACE):08X}')
+    lines.append(f'RNAM.Race={ctx.race_formids.get(race_id, _DEFAULT_RACE):08X}')
+    _emit_authored_identity(lines, rec, rank)
+    _emit_head_parts(lines, rec, ctx)
     _emit_faction(lines, rec, ctx, rank)
     emit_inventory(lines, rec, ctx)
+    _emit_spells(lines, rec, ctx)
     _emit_aidt(lines, rec)
     emit_packages(lines, rec, ctx)
     emit_ref(lines, 'CNAM.Class', rec, 'CNAM', ctx, 'CLAS')
@@ -230,6 +351,7 @@ def export_CREA(rec: Tes3Record, ctx) -> list:
         lines.append(f'BNAM.BaseScale={scale[0]}')
     lines.append('FactionCount=0')
     emit_inventory(lines, rec, ctx)
+    _emit_spells(lines, rec, ctx)
     _emit_aidt(lines, rec)
     emit_packages(lines, rec, ctx)
     _emit_sound_slots(lines, rec, ctx)
@@ -267,13 +389,33 @@ def _emit_creature_model(lines: list, rec: Tes3Record, ctx) -> None:
         lines.append(f'MorrowindModel={escape_value(path)}')
 
 
+def _sound_source(source: str, ctx) -> str:
+    """The FormID of the creature `source` names, or of Morroblivion's stand-in for it."""
+    found = ctx.resolve(source, 'CREA')
+    if found or ctx.morroblivion is None:
+        return found
+    return ctx.morroblivion.paired_creature(source, ctx.index)
+
+
 def _emit_sound_slots(lines: list, rec: Tes3Record, ctx) -> None:
-    """The creature's SNDG sound generators as TES4 CSDT slots."""
-    slots = ctx.sound_gens.get(rec.record_id.lower(), {})
+    """The creature's SNDG sound generators as TES4 CSDT slots.
+
+    TES3 looks generators up under the creature's `CNAM` sound-gen creature
+    before its own id. When that creature's generators are not this plugin's,
+    it is named as TES4's `CSCR` inherit-sound source, which the creature
+    pipeline follows into the master that holds them.
+    See: docs/commentary/tes4_export_morrowind.md#creature-sound-generators
+    """
+    original = get_subrecord(rec, 'CNAM')
+    source = (get_string(original) if original is not None else '')         or rec.record_id
+    slots = ctx.sound_gens.get(source.lower(), {})
     lines.append(f'SoundTypeCount={len(slots)}')
     for index, (slot, form_id) in enumerate(sorted(slots.items())):
         lines.append(f'SoundType[{index}].Type={slot}')
         lines.append(f'SoundType[{index}].Sound={form_id}')
+    inherited = '' if slots or source == rec.record_id         else _sound_source(source, ctx)
+    if inherited:
+        lines.append(f'CSCR.InheritSound={inherited}')
 
 
 def register_sound_gens(records, ctx) -> None:
@@ -364,10 +506,28 @@ def export_CLAS(rec: Tes3Record, ctx) -> list:
     data = unpack(rec, 'CLDT', _CLDT_FORMAT)
     if data:
         specialization, playable, services = data[2], data[13], data[14]
-        lines.extend([f'DATA.Specialization={specialization}',
-                      f'DATA.Flags={playable & 1}',
+        guard = _CLASS_GUARD if rec.record_id.lower() == _GUARD_CLASS_ID else 0
+        lines.extend([f'DATA.PrimaryAttribute1={data[0]}',
+                      f'DATA.PrimaryAttribute2={data[1]}',
+                      f'DATA.Specialization={specialization}',
+                      f'DATA.Flags={(playable & 1) | guard}',
                       f'DATA.Services={services & _SERVICES_MASK}',
                       'DATA.Teaches=-1', 'DATA.MaxTraining=0'])
+    return lines
+
+
+def export_BSGN(rec: Tes3Record, ctx) -> list:
+    """A birthsign: name, picture, description and its spells, each by the
+    FormID the spell converts to and by its TES3 id, which the runtime grants."""
+    lines = [f'EditorID={escape_value(rec.record_id)}']
+    emit_str(lines, 'FULL', rec, 'FNAM')
+    emit_str(lines, 'ICON', rec, 'TNAM')
+    emit_str(lines, 'DESC', rec, 'DESC')
+    spells = [get_string(sub) for sub in get_all_subrecords(rec, 'NPCS')]
+    lines.append(f'SpellCount={len(spells)}')
+    for index, spell in enumerate(spells):
+        lines.append(f'Spell[{index}]={ctx.resolve(spell, "SPEL")}')
+        lines.append(f'SpellId[{index}]={escape_value(spell)}')
     return lines
 
 
@@ -379,4 +539,5 @@ MORROWIND_ACTOR_EXPORTERS = {
     'LEVC': export_LEVC,
     'FACT': export_FACT,
     'CLAS': export_CLAS,
+    'BSGN': export_BSGN,
 }

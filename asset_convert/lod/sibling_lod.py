@@ -35,7 +35,8 @@ import shutil
 import struct
 from pathlib import Path
 
-from asset_convert.lod.terrain_lod import (shipped_lod_worldspaces, master_names)
+from asset_convert.lod.terrain_lod import shipped_lod_worldspaces
+from core.plugin_masters import masters_from_export_header as master_names
 from tes5_import.base.tes5_reader import FLAG_PERSISTENT, records, walk
 
 
@@ -257,7 +258,7 @@ def converted_plugins(out_root: Path) -> list[str]:
     and are found by their `<name>.manifest.json`.
 
     Either way the plugin file itself must be present — output/ also collects
-    the shared `Slot44 Patch.esp`, this step's own merged folder, and whatever
+    the `Finished Mods` folder, this step's own merged folder, and whatever
     else the pipeline drops at the root.
     """
     if not out_root.is_dir():
@@ -533,6 +534,22 @@ def _defined_edids(esm: Path) -> frozenset:
         return frozenset(e for _sz, _f, e in detect_terrain_worldspaces(esm))
     except Exception:
         return frozenset()
+
+
+def defined_worldspaces_by_plugin(names: list[str], export_root: Path,
+                                  out_root: Path) -> dict[str, list[str]]:
+    """{plugin: [EDID, ...]} for every worldspace its converted ESM defines.
+
+    Ignores shipped LOD, so it also lists worldspaces the source never gave
+    distant LOD. `owner_map`'s pass 2 resolves exactly these, so each is
+    bakeable when named explicitly.
+    """
+    out: dict[str, list[str]] = {}
+    for name in names:
+        esm = _out_root(out_root, name, export_root) / name
+        out[name] = (sorted(_defined_edids(esm), key=str.lower)
+                     if esm.is_file() else [])
+    return out
 
 
 def owner_map(edids, order: list[str], export_root: Path,

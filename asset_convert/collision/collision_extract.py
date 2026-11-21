@@ -61,7 +61,7 @@ Cache: two-phase, mirroring mesh_bounds.
     load_collision(cache_path)             — in each navmesh worker
 """
 
-from asset_convert.game_paths import current_namespace
+from asset_convert.game_paths import ascii_path, current_namespace
 from output_layout import assets_for
 import hashlib
 import json
@@ -74,7 +74,12 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from asset_convert.collision.door_geometry import door_closed_geometry, mat_mul, quat_mat
+from asset_convert.nif.pyffi_monkey_patch import apply_patches
 from core.worker_budget import worker_count
+from pyffi.formats.nif import NifFormat
+
+apply_patches()
 
 # --- Constants ----------------------------------------------------------------
 
@@ -91,16 +96,15 @@ PRIM_TO_GAME = 70.0
 # Only real world collision supports/obstructs an NPC.
 OL_STATIC = 1
 OL_ANIM_STATIC = 2
+OL_UNIDENTIFIED = 0
+OL_TRANSPARENT = 3
 OL_TERRAIN = 13
 OL_GROUND = 17
 OL_STAIRS = 19
 
-# Ignored: OL_BIPED(8) actor ragdolls, OL_CLUTTER(4) loose physics props (pushed
-# aside, not walked around), OL_TRANSPARENT(3), OL_TRIGGER(12),
-# OL_NONCOLLIDABLE(15), weapons/projectiles/trees/props.  Ignoring these is what
-# fixes the old converter's "too many objects are avoided".
-_PATHING_LAYERS = frozenset({OL_STATIC, OL_ANIM_STATIC, OL_TERRAIN,
-                             OL_GROUND, OL_STAIRS})
+#: Layers that block actors; 0 is architecture Bethesda left unset, 3 invisible collision. Clutter etc. is pushed aside.
+_PATHING_LAYERS = frozenset({OL_UNIDENTIFIED, OL_STATIC, OL_ANIM_STATIC, OL_TRANSPARENT,
+                             OL_TERRAIN, OL_GROUND, OL_STAIRS})
 
 WALKABLE = 0
 BLOCKING = 1
@@ -226,11 +230,6 @@ def read_nif_data(nif_path: str):
 
     Split out so one parse can feed several analyses (bounds + collision).
     """
-    import time as _t
-    if not hasattr(_t, 'clock'):
-        _t.clock = _t.perf_counter  # pyffi 2.2.3 still calls the removed time.clock
-    from pyffi.formats.nif import NifFormat
-
     data = NifFormat.Data()
     with open(nif_path, 'rb') as fh:
         data.read(fh)
@@ -240,10 +239,11 @@ def read_nif_data(nif_path: str):
 def collision_from_data(data) -> Optional[dict]:
     """Collision soup from an ALREADY-PARSED NIF (see extract_nif_collision).
 
-    A body is placed at its OWNING NODE's world transform: collision usually
-    sits on the root, but where it hangs off a moved child the engine still
-    honours that chain.  Non-pathing layers (clutter, biped ragdolls,
-    triggers) are dropped wholesale.
+    A body is placed by its own transform (a bhkRigidBodyT's), then at its
+    OWNING NODE's world transform: collision usually sits on the root, but
+    where it hangs off a moved child the engine still honours that chain.
+    Non-pathing layers (clutter, biped ragdolls, triggers) are dropped
+    wholesale.
     See: docs/commentary/asset_convert_collision.md#body-placement
     """
     walk: List[float] = []
@@ -254,9 +254,9 @@ def collision_from_data(data) -> Optional[dict]:
         if type(body).__name__ not in ('bhkRigidBody', 'bhkRigidBodyT'):
             continue
         tris = _body_tris(body)
-        place = placement.get(id(body))
-        if place is not None:
-            tris = [tuple(place(pt) for pt in tri) for tri in tris]
+        for place in (_body_transform(body), placement.get(id(body))):
+            if place is not None:
+                tris = [tuple(place(pt) for pt in tri) for tri in tris]
 
         for (a, b, c) in tris:
             cls = _classify(a, b, c)
@@ -299,43 +299,37 @@ def bounds_from_data(data):
     )
 
 
-# Schema version of mesh_bounds_cache.json, stored under _BOUNDS_SCHEMA_KEY.
-#
-# Bump this whenever an entry gains a field or a field changes meaning.  Any
-# cache written before versioning, or at a lower version, is REGENERATED rather
-# than trusted: entries are plain lists, so a missing trailing field is
-# indistinguishable from a computed zero and the reader cannot tell a stale
-# cache from a complete one.
-#
-# That exact hole cost a shipped bug.  `physics_flags_from_data` gained the
-# HELD bit (bit 1) on 2026-08-05, but the scan only ran when the cache file was
-# ABSENT, so Nehrim kept its 2026-08-02 cache forever: 0 of its 11,946 meshes
-# carried the bit, `needs_havok_release` answered False for every one, and no
-# converted `playgroup` ever emitted TES4Polyfill.ReleaseBreakaway.
-# mwallplankbreakaway01's planks hung in mid-air.  Oblivion's cache happened to
-# be rebuilt an hour after that commit, so the same meshes worked there — which
-# is why this looked like a Nehrim-only mesh bug rather than a stale cache.
-BOUNDS_SCHEMA_VERSION = 3
+#: Bounds-cache entry schema; bump on any field change (docs/commentary/tes5_import_pipeline.md).
+BOUNDS_SCHEMA_VERSION = 4
 _BOUNDS_SCHEMA_KEY = '__schema__'
 
-#: Bumped when a door axis entry gains a field or a field changes meaning.
-DOOR_AXIS_SCHEMA_VERSION = 1
+#: Bumped when a door axis entry gains a field or a field changes meaning, or the reader measures more doors.
+DOOR_AXIS_SCHEMA_VERSION = 4
 
 
-def door_axis_cache_is_current(axis_cache: str) -> bool:
-    """True if the door axis cache exists AND was written at this schema.
+#: Axis-cache key listing the door meshes the scan measured, so a later mesh extraction re-measures.
+_DOOR_MESHES_KEY = '__meshes__'
+
+
+def door_axis_cache_is_current(axis_cache: str, export_plugin_dir: str = None) -> bool:
+    """True if the door axis cache exists, was written at this schema, and measured the doors there now.
 
     Entries are plain lists, so one written before a field existed loads
-    cleanly and silently contributes no center and no floor drop.
+    cleanly and silently contributes no center and no floor drop. With
+    `export_plugin_dir`, a cache that measured a different set of door meshes
+    (one written before the meshes were extracted) is stale too.
     See: docs/commentary/tes5_import_pipeline.md#phase-0-stale-bounds-cache
     """
     try:
         with open(axis_cache, encoding='utf-8') as fh:
             raw = json.load(fh)
-        return int(raw[_BOUNDS_SCHEMA_KEY][0]) >= DOOR_AXIS_SCHEMA_VERSION
+        current = int(raw[_BOUNDS_SCHEMA_KEY][0]) >= DOOR_AXIS_SCHEMA_VERSION
     except (OSError, json.JSONDecodeError, ValueError, KeyError,
             TypeError, IndexError):
         return False
+    if not current or export_plugin_dir is None:
+        return current
+    return raw.get(_DOOR_MESHES_KEY) == sorted(key for _path, key in _door_axis_jobs(export_plugin_dir))
 
 
 def bounds_cache_is_current(bounds_cache: str) -> bool:
@@ -360,15 +354,14 @@ def bounds_cache_is_current(bounds_cache: str) -> bool:
 def physics_flags_from_data(data) -> int:
     """Physics facts the IMPORTER needs about a converted mesh, as bit flags.
 
-    bit 0 — constrained dynamic island: the mesh contains at least one
-    simulated (mass > 0) rigid body AND at least one bhk constraint block.
-    Skyrim only simulates such content on MSTT/ACTI references — a STAT
-    reference leaves the whole compound frozen (Oblivion's PrisonCellChains01
-    is a STAT; every vanilla swinging sign is MSTT, the bone-alarm is ACTI).
-    The constraint is checked file-wide, not per-body, because chain links
-    routinely carry mass with ncons=0 and hang off an anchor's constraint
-    (vanilla trapbonealarmhavok01 stores its bhkBallSocketConstraintChain on
-    the static peg, not on the swinging bones).
+    bit 0 — simulated content: a free dynamic body (mass > 0, a simulated
+    motion type), or a constrained island (a body with mass plus a bhk
+    constraint block).  Skyrim only simulates either on MSTT/ACTI references
+    — a STAT reference leaves it frozen, while Oblivion simulated it on a
+    STAT (PrisonCellChains01, the broken-chest pieces the log trap knocks
+    apart).  The constraint is checked file-wide, not per-body, because chain
+    links routinely carry mass with ncons=0 and hang off an anchor's
+    constraint.  See: docs/commentary/asset_convert_collision.md#stat-simulated-mstt
 
     bit 1 — HELD body: the mesh ships at least one KEYFRAMED body that kept a
     non-zero mass.  `_convert_collision` writes that combination for exactly
@@ -397,18 +390,31 @@ def physics_flags_from_data(data) -> int:
     for block in data.blocks:
         cls = type(block).__name__
         if cls in ('bhkRigidBody', 'bhkRigidBodyT'):
-            if getattr(block, 'mass', 0) > 0:
-                has_dynamic = True
-                # MO_SYS_KEYFRAMED (4) with mass retained == held-until-scripted.
-                if getattr(block, 'motion_system', 0) == 4:
-                    flags |= 2
-            if getattr(block, 'num_constraints', 0) > 0:
-                has_constraint = True
+            flags |= _body_physics_flags(block)
+            has_dynamic = has_dynamic or getattr(block, 'mass', 0) > 0
+            has_constraint = (has_constraint
+                              or getattr(block, 'num_constraints', 0) > 0)
         elif cls.startswith('bhk') and 'Constraint' in cls:
             has_constraint = True
     if has_dynamic and has_constraint:
         flags |= 1
     return flags
+
+
+#: Skyrim hkpMotion types Havok simulates: dynamic, sphere/box inertia, thin box.
+_MOTION_SIMULATED = frozenset({1, 2, 3, 6})
+#: Skyrim MO_SYS_KEYFRAMED; with mass kept it is a held-until-scripted body.
+_MOTION_KEYFRAMED = 4
+
+
+def _body_physics_flags(body) -> int:
+    """Bit 1 for a held body (keyframed, mass kept), bit 0 for a free simulated one."""
+    if getattr(body, 'mass', 0) <= 0:
+        return 0
+    motion = getattr(body, 'motion_system', 0)
+    if motion == _MOTION_KEYFRAMED:
+        return 2
+    return 1 if motion in _MOTION_SIMULATED else 0
 
 
 def _tri_shape_points(shape):
@@ -461,18 +467,9 @@ def _unwrap_shapes(shape, depth=0):
     yield shape
 
 
-def _pal_name(sp, off):
-    """Resolve a NiStringPalette offset to a node name, or None."""
-    if sp is None or off is None or off < 0:
-        return None
-    try:
-        pal = sp.palette.palette
-    except AttributeError:
-        return None
-    if isinstance(pal, str):
-        pal = pal.encode('latin1')
-    end = pal.find(b'\x00', off)
-    return pal[off:end if end >= 0 else None].decode('ascii', 'replace')
+def _can_move(body) -> bool:
+    """True for a rigid body with mass: clutter, which an actor pushes aside."""
+    return float(getattr(body, 'mass', 0.0) or 0.0) > 0.0
 
 
 def _body_tris(body):
@@ -487,7 +484,7 @@ def _body_tris(body):
         layer = int(body.havok_col_filter.layer)
     except AttributeError:
         layer = OL_STATIC
-    if layer not in _PATHING_LAYERS:
+    if layer not in _PATHING_LAYERS or (layer == OL_UNIDENTIFIED and _can_move(body)):
         return []
 
     shape = getattr(body, 'shape', None)
@@ -534,7 +531,7 @@ def _body_placements(data):
         ls = getattr(node, 'scale', 1.0) or 1.0
         Tw = [sum(R[i][k] * lt[k] * sc for k in range(3)) + T[i]
               for i in range(3)]
-        Rw = _mat_mul(R, lr)
+        Rw = mat_mul(R, lr)
         sw = sc * ls
         co = getattr(node, 'collision_object', None)
         body = getattr(co, 'body', None) if co is not None else None
@@ -549,6 +546,19 @@ def _body_placements(data):
         except Exception:
             continue
     return out
+
+
+def _body_transform(body):
+    """f(point) placing a bhkRigidBodyT's shape by its own rotation and translation; None when identity.
+
+    See: docs/commentary/asset_convert_collision.md#nested-owner-transform
+    """
+    if type(body).__name__ != 'bhkRigidBodyT':
+        return None
+    q, t = body.rotation, body.translation
+    R = quat_mat(q.w, q.x, q.y, q.z)
+    T = [t.x * CMS_TO_GAME, t.y * CMS_TO_GAME, t.z * CMS_TO_GAME]
+    return None if _is_identity(R, T, 1.0) else _placer(R, T, 1.0)
 
 
 def _is_identity(R, T, s):
@@ -567,194 +577,6 @@ def _placer(R, T, s):
         return tuple(sum(R[i][k] * q[k] for k in range(3)) + T[i]
                      for i in range(3))
     return place
-
-
-def _mat_mul(A, B):
-    return [[sum(A[i][k] * B[k][j] for k in range(3)) for j in range(3)]
-            for i in range(3)]
-
-
-def _quat_mat(w, x, y, z):
-    return [
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-    ]
-
-
-def _euler_xyz_mat(ax, ay, az):
-    import math as _m
-    cx, sx = _m.cos(ax), _m.sin(ax)
-    cy, sy = _m.cos(ay), _m.sin(ay)
-    cz, sz = _m.cos(az), _m.sin(az)
-    Rx = [[1, 0, 0], [0, cx, -sx], [0, sx, cx]]
-    Ry = [[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]]
-    Rz = [[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]]
-    return _mat_mul(_mat_mul(Rx, Ry), Rz)
-
-
-def _close_pose_overrides(data):
-    """{node name: (R|None, T|None, keyed)} from the 'Close' sequence.
-
-    Each controlled node's local transform in the fully-CLOSED pose: the FINAL
-    key values of its interpolator's data (XYZ rotation groups or quaternion
-    keys, plus translation keys), else the interpolator's direct transform
-    when finite.  `keyed` is True only when real key data exists — that is
-    what distinguishes the moving door leaf from a statically-retargeted
-    frame piece.
-    """
-    seq = None
-    for b in data.blocks:
-        if type(b).__name__ != 'NiControllerSequence':
-            continue
-        nm = b.name
-        if isinstance(nm, bytes):
-            nm = nm.decode('ascii', 'replace')
-        if nm.lower() == 'close':
-            seq = b
-            break
-    if seq is None:
-        return {}
-    out = {}
-    for cb in (getattr(seq, 'controlled_blocks', None) or []):
-        nn = _pal_name(getattr(cb, 'string_palette', None),
-                       getattr(cb, 'node_name_offset', None))
-        itp = getattr(cb, 'interpolator', None)
-        if not nn or itp is None:
-            continue
-        R = T = None
-        keyed = False
-        dt = getattr(itp, 'translation', None)
-        if dt is not None and abs(dt.x) < 1e30:
-            T = [dt.x, dt.y, dt.z]
-        dr = getattr(itp, 'rotation', None)
-        if dr is not None and abs(getattr(dr, 'w', 3e38)) < 1e30:
-            R = _quat_mat(dr.w, dr.x, dr.y, dr.z)
-        d = getattr(itp, 'data', None)
-        if d is not None:
-            if int(getattr(d, 'rotation_type', 0) or 0) == 4:
-                angs = []
-                got = False
-                for g in d.xyz_rotations:
-                    ks = getattr(g, 'keys', None) or []
-                    got = got or bool(len(ks))
-                    angs.append(float(ks[-1].value) if len(ks) else 0.0)
-                if got:
-                    # An all-zero final rotation is still a CLOSED pose (the
-                    # leaf swings back to identity) — key data existing is
-                    # what marks the node as the moving door.
-                    R = _euler_xyz_mat(*angs)
-                    keyed = True
-            else:
-                qk = getattr(d, 'quaternion_keys', None) or []
-                if len(qk):
-                    q = qk[-1].value
-                    R = _quat_mat(q.w, q.x, q.y, q.z)
-                    keyed = True
-            tks = getattr(d.translations, 'keys', None) or []
-            if len(tks):
-                v = tks[-1].value
-                T = [v.x, v.y, v.z]
-                keyed = True
-        if R is not None or T is not None:
-            out[nn] = (R, T, keyed)
-    return out
-
-
-def door_closed_geometry(data):
-    """Doorway as ('X'|'Y', width, center_x, center_y, z_min) — WORLD units.
-
-    Reads the ORIGINAL Oblivion NIF's render graph at the CLOSED pose: the
-    'Close' controller sequence's final key values override each animated
-    node's local transform, then the union bbox of the shapes under the KEYED
-    nodes — the door leaf/leaves themselves — gives the doorway span, its
-    center relative to the REFR pivot, and the slab's base height.
-
-    This is the AUTHORED closed door, which no static measurement recovers:
-    idgate01's two leaves are STORED mid-open (bbox nowhere near the doorway)
-    and swing 90 degrees on 'Close'; the converted collision (previous source
-    for this cache) additionally baked the leaf transforms wrong, which is
-    what rotated and offset the CharacterGen pen gate's Door Triangle.
-
-    Frames, arches and static fence sections carry no keys, so they never
-    widen the doorway (idgate01's fixed side grates span 269u; its keyed
-    leaves close to 133u).  A model with no Close sequence measures all its
-    shapes at rest pose — plain static doors are stored closed.
-
-    Returns None when the closed union is thin in Z (a trapdoor/hatch: swings
-    about a horizontal axis, no vertical threshold line exists).
-    """
-    ovr = _close_pose_overrides(data)
-    shapes = []                              # (keyed, lo3, hi3)
-
-    ident = [[1, 0, 0], [0, 1, 0], [0, 0, 1]]
-
-    def walk(node, R, T, s, keyed):
-        name = getattr(node, 'name', b'')
-        if isinstance(name, bytes):
-            name = name.decode('ascii', 'replace')
-        o = ovr.get(name)
-        my_keyed = keyed or bool(o and o[2])
-        if o and o[0] is not None:
-            lr = o[0]
-        else:
-            m = getattr(node, 'rotation', None)
-            lr = ([[m.m_11, m.m_12, m.m_13],
-                   [m.m_21, m.m_22, m.m_23],
-                   [m.m_31, m.m_32, m.m_33]] if m is not None else ident)
-        if o and o[1] is not None:
-            lt = o[1]
-        else:
-            tr = getattr(node, 'translation', None)
-            lt = [tr.x, tr.y, tr.z] if tr is not None else [0.0, 0.0, 0.0]
-        ls = getattr(node, 'scale', 1.0) or 1.0
-        Tw = [R[i][0] * lt[0] * s + R[i][1] * lt[1] * s
-              + R[i][2] * lt[2] * s + T[i] for i in range(3)]
-        Rw = _mat_mul(R, lr)
-        sw = s * ls
-        ln = type(node).__name__
-        if ln in ('NiTriShape', 'NiTriStrips') \
-                and getattr(node, 'data', None) is not None:
-            vs = node.data.vertices
-            if len(vs):
-                lo = [1e30] * 3
-                hi = [-1e30] * 3
-                for v in vs:
-                    q = (v.x * sw, v.y * sw, v.z * sw)
-                    for i in range(3):
-                        p = (Rw[i][0] * q[0] + Rw[i][1] * q[1]
-                             + Rw[i][2] * q[2] + Tw[i])
-                        if p < lo[i]:
-                            lo[i] = p
-                        if p > hi[i]:
-                            hi[i] = p
-                shapes.append((my_keyed, lo, hi))
-        for ch in (getattr(node, 'children', None) or []):
-            if ch is not None:
-                walk(ch, Rw, Tw, sw, my_keyed)
-
-    for r in data.roots:
-        try:
-            walk(r, ident, [0.0, 0.0, 0.0], 1.0, False)
-        except Exception:
-            continue
-    if not shapes:
-        return None
-    pick = [sh for sh in shapes if sh[0]] or shapes
-    lo = [min(sh[1][i] for sh in pick) for i in range(3)]
-    hi = [max(sh[2][i] for sh in pick) for i in range(3)]
-    ex, ey, ez = hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]
-    if max(ex, ey) <= 1e-9:
-        return None
-    # Thin in Z => swings about a HORIZONTAL axis (trapdoor, hatch, grate,
-    # display case, manhole cover).  No vertical-axis threshold line exists,
-    # so the caller must skip it rather than lay a door quad in a made-up
-    # direction.
-    if ez < max(ex, ey) * 0.5:
-        return None
-    axis = 'Y' if ey > ex else 'X'
-    return (axis, max(ex, ey),
-            0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1]), lo[2])
 
 
 def _worker(args: tuple):
@@ -806,10 +628,10 @@ def _worker_both(args: tuple):
 # ---------------------------------------------------------------------------
 
 #: Bumped when extraction or mesh conversion changes walkable/blocking output.
-COLLISION_SCHEMA_VERSION = 3
+COLLISION_SCHEMA_VERSION = 7
 
 #: Cache format id; its trailing digits carry COLLISION_SCHEMA_VERSION.
-_MAGIC = b'TESCOL06'
+_MAGIC = b'TESCOL11'
 _COLLISION: Dict[str, dict] = {}
 # path_key -> short collision digest, memoised by collision_digest().  Cleared
 # with _COLLISION so a reload cannot serve digests for the previous cache.
@@ -834,13 +656,17 @@ def collision_cache_is_current(collision_cache: str) -> bool:
 def _entry_table_is_intact(data: bytes) -> bool:
     """True if *data* has the current magic and entries consuming it exactly.
 
-    Reads only the lengths, so no float data is decoded.
+    Reads only the lengths, so no float data is decoded.  An EMPTY table is
+    never current: it parses perfectly, so a run that scanned the wrong mesh
+    dir pins itself as fresh and the rescan never fires again.
     See: docs/commentary/tes5_import_pipeline.md#phase-0-stale-bounds-cache
     """
     if data[:8] != _MAGIC:
         return False
     try:
         (count,) = struct.unpack_from('<I', data, 8)
+        if not count:
+            return False
         off = 12
         for _ in range(count):
             (klen,) = struct.unpack_from('<H', data, off)
@@ -863,11 +689,15 @@ def _serialize(results: Dict[str, dict]) -> bytes:
         buf += struct.pack('<H', len(kb))
         buf += kb
         buf += struct.pack('<II', len(w) // 9, len(b) // 9)
-        if w:
-            buf += struct.pack('<%df' % len(w), *w)
-        if b:
-            buf += struct.pack('<%df' % len(b), *b)
+        buf += _f32_bytes(w) + _f32_bytes(b)
     return zlib.compress(bytes(buf), 6)
+
+
+def _f32_bytes(values) -> bytes:
+    """Little-endian float32 bytes of a float list or a loaded numpy array."""
+    if hasattr(values, 'astype'):
+        return values.astype('<f4').tobytes()
+    return struct.pack('<%df' % len(values), *values)
 
 
 def _deserialize(raw: bytes) -> Dict[str, dict]:
@@ -977,6 +807,27 @@ def scan_mesh_data(mesh_dir: str, collision_cache: str, bounds_cache: str,
     return len(col_results), len(bnd_results)
 
 
+def fold_mesh_entries(mesh_dir: str, collision_cache: str, bounds_cache: str,
+                      seed_bounds, seed_collision) -> None:
+    """Layer producer entries over both CURRENT caches, parsing no NIF.
+
+    Keeps only meshes still on disk, so a removed file drops out as it would
+    from a full scan.
+    See: docs/commentary/tes5_import_pipeline.md#producer-emitted-mesh-entries
+    """
+    on_disk = {key for _path, key in _list_nifs(os.path.normpath(mesh_dir))}
+    with open(bounds_cache, encoding='utf-8') as fh:
+        bounds = {k: tuple(v) for k, v in json.load(fh).items()
+                  if k != _BOUNDS_SCHEMA_KEY}
+    with open(collision_cache, 'rb') as fh:
+        collision = _deserialize(fh.read())
+    bounds.update(seed_bounds)
+    collision.update(seed_collision)
+    _write_mesh_caches({k: v for k, v in collision.items() if k in on_disk},
+                       {k: v for k, v in bounds.items() if k in on_disk},
+                       collision_cache, bounds_cache, len(on_disk))
+
+
 def _write_mesh_caches(col_results, bnd_results, collision_cache,
                        bounds_cache, total) -> None:
     """Report the tallies and write both caches in their shipped formats.
@@ -1064,18 +915,18 @@ def scan_door_axes(export_plugin_dir: str, dest: str,
     See: docs/commentary/tes5_import_navmesh.md#door-base-line-is-local-y
     """
     jobs = _door_axis_jobs(export_plugin_dir)
-    if not jobs:
-        return 0
     out = {}
-    with ProcessPoolExecutor(max_workers=workers or worker_count()) as ex:
-        for key, res in ex.map(_closed_door_entry, jobs, chunksize=8):
-            if res is not None:
-                axis, width, cx, cy, zmin = res
-                out[key] = [axis, round(width, 2), round(cx, 2),
-                            round(cy, 2), round(zmin, 2)]
+    if jobs:
+        with ProcessPoolExecutor(max_workers=workers or worker_count()) as ex:
+            for key, res in ex.map(_closed_door_entry, jobs, chunksize=8):
+                if res is not None:
+                    axis, width, cx, cy, zmin = res
+                    out[key] = [axis, round(width, 2), round(cx, 2),
+                                round(cy, 2), round(zmin, 2)]
     os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
     n = len(out)
     out[_BOUNDS_SCHEMA_KEY] = [DOOR_AXIS_SCHEMA_VERSION]
+    out[_DOOR_MESHES_KEY] = sorted(key for _path, key in jobs)
     with open(dest, 'w', encoding='utf-8') as fh:
         json.dump(out, fh, indent=0, sort_keys=True)
     print(f"  Door axes: {n} / {len(jobs)} door meshes classified")
@@ -1155,9 +1006,14 @@ def load_collision(cache_path, quiet: bool = False) -> int:
     return len(_COLLISION)
 
 
+def _entry(path_key: str) -> Optional[dict]:
+    """The cache entry for an authored or `ascii_path` key, or None."""
+    return _COLLISION.get(path_key) or _COLLISION.get(ascii_path(path_key))
+
+
 def get_collision(path_key: str) -> Optional[dict]:
     """Return {'w': [...9N floats], 'b': [...]} in game units for a key, or None."""
-    return _COLLISION.get(path_key)
+    return _entry(path_key)
 
 
 def collision_digest(path_key: str) -> str:
@@ -1175,7 +1031,7 @@ def collision_digest(path_key: str) -> str:
     """
     if path_key in _DIGESTS:
         return _DIGESTS[path_key]
-    ent = _COLLISION.get(path_key)
+    ent = _entry(path_key)
     if ent is None:
         digest = ''
     else:

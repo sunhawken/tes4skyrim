@@ -14,7 +14,8 @@ import struct
 
 from ..morrowind_armor import emit_worn_models
 from ..record_types.common import escape_value
-from ..tes3_reader import Tes3Record, get_string, get_subrecord
+from ..record_types.morrowind_materials import material_of, matt_formid
+from ..tes3_reader import Tes3Record, get_string, get_subrecord, text
 
 #: Source extensions that always ship as DDS, whatever a record calls them.
 _IMAGE_EXTS = ('tga', 'bmp')
@@ -48,8 +49,11 @@ _HEAVY_ARMOR = 0x80
 _CLOTHING_SLOTS = {0: 0x8, 1: 0x20, 2: 0x4, 3: 0, 4: 0xC, 5: 0x10, 6: 0x10,
                    7: 0x8, 8: 0x40, 9: 0x100}
 
+#: Morrowind's Enchant, which Oblivion lacks: a skill index whose actor value (+12) no TES4 value uses.
+MW_ENCHANT_SKILL = 100
+
 #: Morrowind skill index -> TES4 skill index; shared with the actor exporters.
-MW_SKILL_TO_TES4 = {0: 3, 1: 0, 2: 6, 3: 6, 4: 4, 5: 2, 6: 4, 7: 4, 8: 1, 9: 12,
+MW_SKILL_TO_TES4 = {0: 3, 1: 0, 2: 6, 3: 6, 4: 4, 5: 2, 6: 4, 7: 4, 8: 1, 9: MW_ENCHANT_SKILL,
                     10: 10, 11: 8, 12: 11, 13: 9, 14: 12, 15: 13, 16: 7, 17: 15,
                     18: 18, 19: 19, 20: 14, 21: 15, 22: 2, 23: 16, 24: 17,
                     25: 20, 26: 5}
@@ -57,7 +61,14 @@ MW_SKILL_TO_TES4 = {0: 3, 1: 0, 2: 6, 3: 6, 4: 4, 5: 2, 6: 4, 7: 4, 8: 1, 9: 12,
 #: MCDT flag marking a key, which TES4 stores as its own KEYM type.
 _MISC_KEY = 0x1
 
-#: CONT FLAG respawn bit; TES4 DATA.Flags puts it at 0x01.
+#: ID prefix marking a soul gem, the same test OpenMW's `isSoulGem` makes.
+_SOULGEM_PREFIX = 'misc_soulgem'
+
+#: Soul gem ID suffix -> TES5 SLCP capacity (1 petty .. 5 grand).
+_SOULGEM_CAPACITY = {'petty': 1, 'lesser': 2, 'common': 3, 'greater': 4,
+                     'grand': 5, 'azura': 5}
+
+#: CONT FLAG respawn bit (TES3), and TES4 DATA.Flags Respawns -- both 0x02.
 _CONT_RESPAWN = 0x2
 
 #: ALDT autocalc bit; TES4 ENIT 0x01 means "no auto-calc", the inverse.
@@ -78,6 +89,9 @@ _FULL_VOLUME = 255
 _LIGHT_FALLOFF = 1.0
 _LIGHT_FOV = 90.0
 _LIGHT_FADE = 1.0
+
+#: WPDT stores enchant capacity multiplied by ten.
+_ENCHANT_POINT_SCALE = 10
 
 #: Armor rating is stored in hundredths in TES4 and Skyrim alike.
 _RATING_SCALE = 100
@@ -164,7 +178,7 @@ def emit_inventory(lines: list, rec: Tes3Record, ctx) -> None:
         if sub.type != 'NPCO' or len(sub.data) < 36:
             continue
         count = struct.unpack_from('<i', sub.data, 0)[0]
-        item = sub.data[4:36].split(b'\x00', 1)[0].decode('cp1252', 'replace')
+        item = text(sub, sub.data[4:36].split(b'\x00', 1)[0])
         form_id = ctx.resolve(item)
         if form_id:
             items.append((form_id, count))
@@ -186,11 +200,59 @@ def _misc_flags(rec: Tes3Record) -> int:
     return data[2] if data else 0
 
 
+def _soulgem_capacity(rec: Tes3Record) -> int:
+    """This MISC record's soul capacity, or 0 when it is not a soul gem.
+
+    TES3 has no soul-gem flag: the engine tests the ID prefix, and so does
+    OpenMW (`mwclass/misc.cpp` `isSoulGem`). An unrecognised tier holds a
+    grand soul, which is what Azura's Star does.
+    See: docs/commentary/tes4_export_morrowind.md#tes4-vocabulary
+    """
+    name = (rec.record_id or '').lower()
+    if not name.startswith(_SOULGEM_PREFIX):
+        return 0
+    tier = name[len(_SOULGEM_PREFIX):].strip('_')
+    return _SOULGEM_CAPACITY.get(tier, _SOULGEM_CAPACITY['grand'])
+
+
+def filled_soulgem_id(gem_id: str, soul: int) -> str:
+    """The EditorID of one gem's FILLED variant, keyed on the gem's own id.
+    See: docs/commentary/tes4_export_morrowind.md#filled-soul-gems
+    """
+    return f'{gem_id}_Filled{soul}'
+
+
+def filled_soulgems(records) -> list:
+    """`(gem id, soul, lines)` per filled variant the chain's gems can hold.
+
+    🛑 TES3 keeps a captured soul on the INVENTORY STACK and authors no filled
+    record; Skyrim makes one a separate base record whose `SOUL` is the
+    trapped size, so `AddSoulGem` has nothing to add until these exist.
+    See: docs/commentary/tes4_export_morrowind.md#filled-soul-gems
+    """
+    out = []
+    for rec in records:
+        capacity = _soulgem_capacity(rec) if rec.type == 'MISC' else 0
+        if not capacity or rec.deleted:
+            continue
+        for soul in range(1, capacity + 1):
+            edid = filled_soulgem_id(rec.record_id, soul)
+            lines = [f'EditorID={escape_value(edid)}' if
+                     line.startswith('EditorID=') else line
+                     for line in export_MISC(rec, None)
+                     if not line.startswith('SOUL=')]
+            lines.append(f'SOUL={soul}')
+            out.append((rec.record_id, soul, lines))
+    return out
+
+
 def tes4_signature(rec: Tes3Record) -> str:
     """The TES4 record type this Morrowind record is exported as.
 
     See: docs/commentary/tes4_export_morrowind.md#tes4-vocabulary
     """
+    if rec.type == 'MISC' and _soulgem_capacity(rec):
+        return 'SLGM'
     if rec.type == 'MISC' and _misc_flags(rec) & _MISC_KEY:
         return 'KEYM'
     if rec.type == 'WEAP' and _weapon_type(rec) in _AMMO_TYPES:
@@ -233,8 +295,7 @@ def export_CONT(rec: Tes3Record, ctx) -> list:
     emit_common(lines, rec)
     weight = unpack(rec, 'CNDT', '<f')
     flags = unpack(rec, 'FLAG', '<I')
-    respawns = bool(flags and flags[0] & _CONT_RESPAWN)
-    lines.append(f'DATA.Flags={int(respawns)}')
+    lines.append(f'DATA.Flags={flags[0] & _CONT_RESPAWN if flags else 0}')
     lines.append(f'DATA.Weight={weight[0] if weight else 0.0}')
     emit_inventory(lines, rec, ctx)
     return lines
@@ -264,20 +325,28 @@ def export_LIGH(rec: Tes3Record, ctx) -> list:
     return lines
 
 
-def _emit_value_weight(lines: list, value: int, weight: float) -> None:
+def emit_value_weight(lines: list, value: int, weight: float) -> None:
     """The DATA.Value / DATA.Weight pair every carriable item has."""
     lines.append(f'DATA.Value={value}')
     lines.append(f'DATA.Weight={weight}')
 
 
 def export_MISC(rec: Tes3Record, ctx) -> list:
-    """Miscellaneous clutter, or a key when MCDT says so."""
+    """Miscellaneous clutter, a key when MCDT says so, or a soul gem.
+
+    A soul gem ships EMPTY: TES3 stores a captured soul on the inventory
+    stack, not on the base record, so there is no filled variant to carry.
+    """
     lines = []
     emit_common(lines, rec)
     emit_icon(lines, rec)
     data = unpack(rec, 'MCDT', '<fii')
     if data:
-        _emit_value_weight(lines, data[1], data[0])
+        emit_value_weight(lines, data[1], data[0])
+    capacity = _soulgem_capacity(rec)
+    if capacity:
+        lines.append(f'SLCP.Capacity={capacity}')
+        lines.append('SOUL=0')
     return lines
 
 
@@ -306,6 +375,8 @@ def export_WEAP(rec: Tes3Record, ctx) -> list:
         lines.append(f'DATA.Health={health}')
     lines.append(f'DATA.Weight={weight}')
     lines.append(f'DATA.Damage={damage}')
+    lines.append(f'ANAM={data[6] // _ENCHANT_POINT_SCALE}')
+    emit_ref(lines, 'ENAM', rec, 'ENAM', ctx, 'ENCH')
     return lines
 
 
@@ -313,17 +384,15 @@ def _emit_wearable(lines: list, rec: Tes3Record, biped: int,
                    general: int, ctx) -> None:
     """The TES4 wearable header: models, icon and biped flags.
 
-    The worn model and its body parts are named only for a piece with a slot.
     See: docs/commentary/tes4_export_morrowind.md#worn-models
     """
     lines.append(f'EditorID={escape_value(rec.record_id)}')
     emit_str(lines, 'FULL', rec, 'FNAM')
-    lines.append(f'BMDT.BipedFlags={biped}')
     lines.append(f'BMDT.GeneralFlags={general}')
     emit_model(lines, rec, 'Male.WorldModel.MODL')
-    if biped:
-        emit_worn_models(lines, rec, ctx)
+    emit_worn_models(lines, rec, biped, ctx)
     emit_icon(lines, rec, key='Male.Icon')
+    emit_ref(lines, 'ENAM', rec, 'ENAM', ctx, 'ENCH')
 
 
 def export_ARMO(rec: Tes3Record, ctx) -> list:
@@ -333,11 +402,13 @@ def export_ARMO(rec: Tes3Record, ctx) -> list:
     if data is None:
         _emit_wearable(lines, rec, 0, 0, ctx)
         return lines
-    atype, weight, value, health, _enchant, armor = data
+    atype, weight, value, health, enchant_points, armor = data
     heavy = weight > _ARMOR_CLASS_WEIGHT.get(atype, 0.0) * _LIGHT_MAX_MOD
     _emit_wearable(lines, rec, _ARMOR_SLOTS.get(atype, 0),
                    _HEAVY_ARMOR if heavy else 0, ctx)
+    lines.append(f'MorrowindWearableType={atype}')
     lines.append(f'DATA.ArmorRating={armor * _RATING_SCALE}')
+    lines.append(f'ANAM={enchant_points}')
     lines.append(f'DATA.Value={value}')
     lines.append(f'DATA.Health={health}')
     lines.append(f'DATA.Weight={weight}')
@@ -351,9 +422,11 @@ def export_CLOT(rec: Tes3Record, ctx) -> list:
     if data is None:
         _emit_wearable(lines, rec, 0, 0, ctx)
         return lines
-    ctype, weight, value, _enchant = data
+    ctype, weight, value, enchant_points = data
     _emit_wearable(lines, rec, _CLOTHING_SLOTS.get(ctype, 0), 0, ctx)
-    _emit_value_weight(lines, value, weight)
+    lines.append(f'MorrowindWearableType={ctype}')
+    emit_value_weight(lines, value, weight)
+    lines.append(f'ANAM={enchant_points}')
     return lines
 
 
@@ -363,10 +436,21 @@ def export_LTEX(rec: Tes3Record, ctx) -> list:
     The ICON carries the full `textures\\` path: Morrowind stores a bare file
     name and ships it flat, where Oblivion's is relative to a Landscape
     subfolder the import stage prepends.
+
+    `HNAM.Material` is inferred, because TES3 LTEX has no material field; the
+    authored EditorID ("Road Dirt") beats the file name, which is the tiebreak
+    for the records whose EditorID is itself a filename.
     See: docs/commentary/tes4_export_morrowind.md#land-terrain
     """
     lines = [f'EditorID={escape_value(rec.record_id)}']
     emit_icon(lines, rec, 'DATA', prefix='textures' + chr(92))
+    texture = get_subrecord(rec, 'DATA')
+    material = material_of(
+        rec.record_id, get_string(texture) if texture is not None else '')
+    matt = matt_formid(material)
+    lines.append(f'HNAM.Material={max(material, 0)}')
+    if matt:
+        lines.append(f'HNAM.MaterialFormID={matt:08X}')
     intv = unpack(rec, 'INTV', '<I')
     if intv:
         lines.append(f'TextureIndex={intv[0]}')
@@ -381,38 +465,12 @@ def export_BOOK(rec: Tes3Record, ctx) -> list:
     emit_str(lines, 'DESC', rec, 'TEXT')
     data = unpack(rec, 'BKDT', '<fiiii')
     if data:
-        weight, value, scroll, skill, _enchant = data
+        weight, value, scroll, skill, enchant_points = data
         lines.append(f'DATA.Flags={int(bool(scroll))}')
         lines.append(f'DATA.Teaches={MW_SKILL_TO_TES4.get(skill, -1)}')
-        _emit_value_weight(lines, value, weight)
-    return lines
-
-
-def export_ALCH(rec: Tes3Record, ctx) -> list:
-    """A potion; its icon lives in TEXT and TES4's flag bit is inverted."""
-    lines = []
-    emit_common(lines, rec)
-    emit_icon(lines, rec, 'TEXT')
-    data = unpack(rec, 'ALDT', '<fii')
-    if data:
-        weight, value, flags = data
-        lines.append(f'ENIT.Value={value}')
-        lines.append(f'ENIT.Flags={int(not flags & _ALCH_AUTOCALC)}')
-        lines.append(f'DATA.Weight={weight}')
-    lines.append('EffectCount=0')
-    return lines
-
-
-def export_INGR(rec: Tes3Record, ctx) -> list:
-    """An alchemy ingredient."""
-    lines = []
-    emit_common(lines, rec)
-    emit_icon(lines, rec)
-    data = unpack(rec, 'IRDT', '<fi')
-    if data:
-        _emit_value_weight(lines, data[1], data[0])
-    lines.append('ENIT.Flags=0')
-    lines.append('EffectCount=0')
+        emit_value_weight(lines, value, weight)
+        lines.append(f'ANAM={enchant_points}')
+    emit_ref(lines, 'ENAM', rec, 'ENAM', ctx, 'ENCH')
     return lines
 
 
@@ -426,7 +484,7 @@ def export_APPA(rec: Tes3Record, ctx) -> list:
         atype, quality, weight, value = data
         lines.append(f'DATA.Type={atype}')
         lines.append(f'DATA.Quality={quality}')
-        _emit_value_weight(lines, value, weight)
+        emit_value_weight(lines, value, weight)
     return lines
 
 
@@ -442,7 +500,7 @@ def export_TOOL(rec: Tes3Record, ctx) -> list:
     sig = {'REPA': 'RIDT', 'PROB': 'PBDT', 'LOCK': 'LKDT'}[rec.type]
     data = unpack(rec, sig, '<fi')
     if data:
-        _emit_value_weight(lines, data[1], data[0])
+        emit_value_weight(lines, data[1], data[0])
     return lines
 
 
@@ -501,8 +559,6 @@ MORROWIND_ITEM_EXPORTERS = {
     'ARMO': export_ARMO,
     'LTEX': export_LTEX,
     'BOOK': export_BOOK,
-    'ALCH': export_ALCH,
-    'INGR': export_INGR,
     'CLOT': export_CLOT,
     'APPA': export_APPA,
     'REPA': export_TOOL,

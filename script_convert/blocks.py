@@ -7,8 +7,9 @@ add block types Oblivion never emits; those live in `constants_falloutnv`.
 `BLOCK_FILTER_PARAM` names the event parameter an Oblivion block filter
 (`begin OnEquip player`) has to become a guard on, since Papyrus has no filter;
 a block type absent from it has no parameter to filter on and its filter is
-dropped with a TODO. `COMBAT_STATE_GUARDS` carries the blocks that merge into
-the one OnCombatStateChanged event, each with the state it tests.
+dropped with a TODO. `BLOCK_TYPE_GUARDS` narrows an event that fires wider than
+its TES4 block: each block merged into OnCombatStateChanged tests its state, and
+OnTriggerActor admits only actors.
 
 See: docs/commentary/script_convert.md#block-type-mapping
 """
@@ -34,6 +35,7 @@ BLOCK_MAP = {
     'onequip':            ('Event OnEquipped(Actor akActor)', 'EndEvent'),
     'onunequip':          ('Event OnUnequipped(Actor akActor)', 'EndEvent'),
     'ondeath':            ('Event OnDeath(Actor akKiller)', 'EndEvent'),
+    'onknockout':         ('Event OnEnterBleedout()', 'EndEvent'),
     'onhit':              ('Event OnHit(ObjectReference akAggressor, Form akSource, Projectile akProjectile, bool abPowerAttack, bool abSneakAttack, bool abBashAttack, bool abHitBlocked)', 'EndEvent'),
     'onhitwith':          ('Event OnHit(ObjectReference akAggressor, Form akSource, Projectile akProjectile, bool abPowerAttack, bool abSneakAttack, bool abBashAttack, bool abHitBlocked)', 'EndEvent'),
     'onload':             ('Event OnLoad()', 'EndEvent'),
@@ -86,10 +88,11 @@ BLOCK_FILTER_PARAM = {
     **FALLOUT_BLOCK_FILTER_PARAM,
 }
 
-#: TES4 block type -> the Papyrus combat-state test its filter stood for.
-COMBAT_STATE_GUARDS = {'onalarm': 'aeCombatState != 0',
-                       'onstartcombat': 'aeCombatState == 1',
-                       **FALLOUT_COMBAT_STATE_GUARDS}
+#: TES4 block type -> the test narrowing its wider event. See: docs/commentary/script_convert.md#block-type-guards
+BLOCK_TYPE_GUARDS = {'onalarm': 'aeCombatState != 0',
+                     'onstartcombat': 'aeCombatState == 1',
+                     'ontriggeractor': 'akActionRef as Actor',
+                     **FALLOUT_COMBAT_STATE_GUARDS}
 
 
 def _filter_property_type(param_type: str, rtype: str) -> 'str | None':
@@ -133,6 +136,16 @@ def _filter_record_type(conv, name: str) -> str:
     return record_type_to_papyrus(conv.xref.record_type.get(fid, ''))
 
 
+def _ammo_hit_guard(conv, name: str) -> str:
+    """The OnHit guard for `begin OnHitWith <ammo>`, read off the shooter.
+
+    See: docs/commentary/script_convert.md#onhitwith-ammo
+    """
+    safe = safe_property_name(name)
+    conv.sc.property_refs[safe] = 'Ammo'
+    return f'TES4Polyfill.HitWithAmmo(akAggressor, {safe})'
+
+
 def block_filter_guard(conv, block_type: str,
                        block_filter: str) -> 'str | None':
     """Compile a TES4 block filter into a Papyrus condition, or '' if none.
@@ -155,6 +168,8 @@ def block_filter_guard(conv, block_type: str,
     rtype = _filter_record_type(conv, name)
     if not rtype:
         return ''
+    if block_type == 'onhitwith' and rtype == 'Ammo':
+        return _ammo_hit_guard(conv, name)
     ptype = _filter_property_type(param_type, rtype)
     if ptype is None:
         return ''

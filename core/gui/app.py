@@ -35,6 +35,7 @@ from core.gui.config import (
     STEPS,
     WINDING_AUTO,
     LOD_DETAIL_CONFIG_KEY,
+    NAVMESH_GENERATOR_CONFIG_KEY,
     WINDING_CONFIG_KEY,
     WINDING_MODES,
     default_on_steps,
@@ -45,8 +46,11 @@ from core.gui.config import (
     winding_enabled_for,
 )
 from core.gui.menus import build_menubar
+from core.navmesh_options import DEFAULT_GENERATOR, GENERATORS
 from core.worker_budget import cpu_total, worker_count
+from output_layout import configured_output, output_setting
 from preflight import RC_MISSING_DEP
+from tools.navmesh.navmesh_cache import DOWNLOAD_CONFIG_KEY
 
 # ---------------------------------------------------------------------------
 #  Palette and OS chrome
@@ -227,7 +231,7 @@ class GuiApp:
         self.file_combo = self.scope_combo = None
         self.run_btn = self.cancel_btn = self.upgrade_btn = None
         self.prog_bar = self.status_row = None
-        self.menubar = self.converted_menu = self.update_mb = None
+        self.menubar = None
         self.style = None
         self.global_btns = {}
         self.step_widgets = {}
@@ -246,7 +250,7 @@ class GuiApp:
         self.status_var = self.timer_var = None
         self.cache_dl_var = self.pack_default_var = None
         self.winding_mode_var = self.parallax_var = self.tex_only_var = None
-        self.lod_detail_var = None
+        self.lod_detail_var = self.navmesh_gen_var = None
         self.step_vars = {}
         self.mesh_subdir_vars = []
         self.all_plugins = []
@@ -280,7 +284,7 @@ class GuiApp:
     def out_root(self) -> Path:
         """The configured output directory, or the default beside the repo."""
         chosen = self.output_var.get().strip() if self.output_var else ""
-        return Path(chosen or str(REPO_ROOT / "output"))
+        return configured_output(chosen)
 
     def winding_on(self) -> bool:
         """Whether the INFERRED winding steps run for the current plugin."""
@@ -433,7 +437,7 @@ def _initial_paths(cfg: dict) -> tuple:
     """(tes4, tes5, output) from the config, auto-detecting what is missing."""
     return (cfg.get("tes4DataPath", "") or find_game_path("oblivion"),
             cfg.get("tes5DataPath", "") or find_game_path("skyrimse"),
-            cfg.get("outputDir", "") or str(REPO_ROOT / "output"))
+            str(configured_output(cfg.get("outputDir", ""))))
 
 
 def _initial_workers(cfg: dict, cpu_max: int) -> int:
@@ -479,11 +483,14 @@ def build_state(root, cfg: dict) -> GuiApp:
     app.file_var = tk.StringVar()
     app.workers_var = tk.IntVar(value=_initial_workers(cfg, app.cpu_max))
     app.cache_dl_var = tk.BooleanVar(
-        value=cfg.get("navmeshCacheDownload") is not False)
+        value=cfg.get(DOWNLOAD_CONFIG_KEY) is not False)
     app.pack_default_var = tk.BooleanVar(
         value=cfg.get(PACK_DEFAULT_CONFIG_KEY) is not False)
     app.winding_mode_var = tk.StringVar(value=_initial_winding(cfg))
     app.lod_detail_var = tk.IntVar(value=_initial_lod_detail(cfg))
+    saved_gen = cfg.get(NAVMESH_GENERATOR_CONFIG_KEY)
+    app.navmesh_gen_var = tk.StringVar(
+        value=saved_gen if saved_gen in GENERATORS else DEFAULT_GENERATOR)
     app.parallax_var = tk.BooleanVar(value=False)
     app.tex_only_var = tk.BooleanVar(value=False)
 
@@ -623,7 +630,7 @@ def _global_button_grid(app, parent, attach_tooltip) -> None:
 def _global_links(app, parent, on_patch_plugins) -> None:
     """The sub-links under the Global buttons, sharing their two columns.
 
-    Column 0 sits under "Patch Skyrim", the only action with a selection to
+    Column 0 sits under "Body Slot Patch", the only action with a selection to
     make from here. Create LOD needs no sub-link -- its button opens the
     selection dialog itself -- and neither packaging action has a choice.
     Stacked on separate rows they would read as two options of the left-hand
@@ -777,7 +784,7 @@ def _save_dirs(app):
     updated = load_config()
     updated["tes4DataPath"] = app.tes4_var.get()
     updated["tes5DataPath"] = app.tes5_var.get()
-    updated["outputDir"] = app.output_var.get()
+    updated["outputDir"] = output_setting(app.output_var.get().strip())
     updated["workers"] = app.get_workers()
     save_config(updated)
 
@@ -836,7 +843,7 @@ def _build_fields(app, sb_body, mods_ui, refresh, apply_scope, sep, path_row):
 def _bind_global_actions(app) -> None:
     """Bind the global-action callbacks, and the confirm panels they use.
 
-    Create LOD, Convert to Master and Convert UI each rewrite something shared,
+    Create LOD, Convert to Master and Convert Oblivion UI each rewrite something shared,
     so their selection is confirmed in a panel before anything runs.
     """
     def _stamp_of(key):

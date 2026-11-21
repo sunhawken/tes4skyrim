@@ -3,18 +3,23 @@
 import mmap
 import os
 import re
-from pathlib import Path
 
 from script_convert.constants import (
     PLACED_REF_SIGS, PLAYER_ALIAS_EXTENDS, SCHOOL_ENCHANT_SHADER, TYPE_MAP,
-    converted_worldspace_edid, papyrus_script_name
+    papyrus_script_name
 )
 from script_convert.command_rows import (
     ACTOR_ONLY_FUNCTIONS, OBJREF_SHARED_FUNCTIONS
 )
+from tes5_import.base.mesh_bounds import get_mesh_physics_flags
 from tes5_import.base.text_reader import parse_export_file
 from asset_convert.game_paths import current_namespace
+from core.plugin_masters import (
+    master_chain, master_dir, master_index_map, masters_from_export_header
+)
 from core.worker_budget import worker_count
+from core.worldspace_names import converted_worldspace_edid, renames_for
+from tes5_import.base.text_reader import unescape_value
 
 # ===========================================================================
 # Cross-reference graph builder
@@ -29,45 +34,28 @@ _SCAN_SKIP_SIGS = {'LAND', 'PGRD', 'ROAD'}
 _SCAN_CHUNK_BYTES = 16 * 1024 * 1024
 
 
-def master_names(export_dir) -> list:
-    """The TES4 master file names listed in an export's _HEADER.txt."""
-    header = Path(export_dir) / '_HEADER.txt'
-    if not header.is_file():
-        return []
-    names = []
-    for line in header.read_text(encoding='utf-8',
-                                 errors='replace').splitlines():
-        if line.startswith('Master['):
-            _, _, val = line.partition('=')
-            val = val.strip()
-            if val:
-                names.append(val)
-    return names
+def _scan_chain(export_dir: str) -> tuple:
+    """(`_export_dirs_with_masters`, the worldspace renames that chain applies)."""
+    dirs = _export_dirs_with_masters(export_dir)
+    return dirs, renames_for(dirs)
 
 
 def _export_dirs_with_masters(export_dir: str) -> list:
     """`export_dir` preceded by its masters' export dirs, deepest first.
 
     Masters come FIRST so the last-wins merge lets an overriding plugin's own
-    version of a record win.  The walk is transitive (a plugin's master may
-    itself have masters) and cycle-safe; masters with no export directory are
-    skipped silently, which degrades to the old single-directory behaviour.
+    version of a record win. A master with no export is reported, not skipped silently.
+    See: docs/reference/pipeline.md#master-resolution
     """
-    root = Path(export_dir)
-    ordered: list = []
-    seen: set = set()
-
-    def visit(d: Path):
-        key = str(d).lower()
-        if key in seen or not d.is_dir():
-            return
-        seen.add(key)
-        for name in master_names(d):
-            visit(d.parent / name)
-        ordered.append(str(d))
-
-    visit(root)
-    return ordered
+    dirs = []
+    for name in master_chain(export_dir):
+        d = master_dir(export_dir, name)
+        if os.path.isdir(d):
+            dirs.append(d)
+        else:
+            print(f"    WARNING: master export not found ({d}); "
+                  f"script references to {name}'s records will not resolve")
+    return dirs + [str(export_dir)]
 
 
 def _new_scan_out() -> dict:
@@ -75,10 +63,13 @@ def _new_scan_out() -> dict:
         'formid_to_edid': {}, 'edid_to_formid': {},
         'script_formid_to_edid': {}, 'script_formid_to_type': {},
         'record_scri': {}, 'record_base': {}, 'record_type': {},
-        'quest_edids': set(), 'npc_formids': set(),
+        'record_parent': {},
+        'quest_edids': set(), 'repeat_stage_quests': set(), 'npc_formids': set(), 'fragment_stages': {},
+        'gate_scripts': set(),
         'mgef_shaders': {}, 'spell_effects': {},
         'global_types': {}, 'global_values': {},
         'pack_type': {}, 'actor_packages': {},
+        'actor_speed': {}, 'move_gmsts': {},
         'record_model': {},
         # CELL geometry, for GetInCell: {formid: (is_interior, wrld_fid, x, y)}.
         # An EXTERIOR cell cannot back a Papyrus `Cell` property (see
@@ -90,152 +81,269 @@ def _new_scan_out() -> dict:
     }
 
 
-def _scan_record_lines(sig: str, lines: list, out: dict):
-    """Scan one record's KEY=VALUE lines into the partial result dicts."""
-    formid = edid = scri = name_fid = None
-    model = None
-    schr_type = None
-    glob_type = None
-    glob_value = None
-    mgef_shader = mgef_ench = None
-    mgef_school = -1
-    spel_effects: list[tuple[str, int]] = []
-    pkdt_type = None
-    ai_packages: list[str] = []
-    cell_flags = None
-    cell_wrld = None
-    cell_x = cell_y = None
-    book_enam = None
+_EFFECT_FIELD_RE = re.compile(r'Effect\[(\d+)\]\.(EFID|ActorValue)$')
 
-    for line in lines:
-        line = line.rstrip()
-        if line.startswith('FormID='):
-            formid = line[7:]
-        elif line.startswith('EditorID='):
-            edid = line[9:]
-        elif line.startswith('SCRI='):
-            scri = line[5:]
-        elif line.startswith('NAME='):
-            name_fid = line[5:]
-        elif line.startswith('Model.MODL='):
-            model = line[11:]
-        elif line.startswith('SCHR.Type='):
-            try:
-                schr_type = int(line[10:])
-            except ValueError:
-                pass
-        elif sig == 'GLOB' and line.startswith('FNAM.Type='):
-            glob_type = line[10:].strip()
-        elif sig == 'GLOB' and line.startswith('FLTV.Value='):
-            try:
-                glob_value = float(line[11:])
-            except ValueError:
-                pass
-        elif sig == 'MGEF' and line.startswith('DATA.EffectShader='):
-            mgef_shader = line[18:]
-        elif sig == 'MGEF' and line.startswith('DATA.EnchantEffect='):
-            mgef_ench = line[19:]
-        elif sig == 'MGEF' and line.startswith('DATA.School='):
-            try:
-                mgef_school = int(line[12:])
-            except ValueError:
-                pass
-        elif sig == 'BOOK' and line.startswith('ENAM='):
-            book_enam = line[5:].strip()
-        elif sig == 'CELL' and line.startswith('DATA.Flags='):
-            try:
-                cell_flags = int(line[11:].split()[0], 0)
-            except ValueError:
-                pass
-        elif sig == 'CELL' and line.startswith('ParentWRLD='):
-            cell_wrld = line[11:]
-        elif sig == 'CELL' and line.startswith('XCLC.X='):
-            try:
-                cell_x = int(line[7:])
-            except ValueError:
-                pass
-        elif sig == 'CELL' and line.startswith('XCLC.Y='):
-            try:
-                cell_y = int(line[7:])
-            except ValueError:
-                pass
-        elif sig == 'PACK' and line.startswith('PKDT.Type='):
-            try:
-                pkdt_type = int(line[10:])
-            except ValueError:
-                pass
-        elif sig in ('NPC_', 'CREA') and line.startswith('AIPackage['):
-            m = re.match(r'AIPackage\[\d+\]=(\w+)', line)
-            if m:
-                ai_packages.append(m.group(1))
-        elif sig == 'SPEL' and line.startswith('Effect['):
-            m = re.match(r'Effect\[(\d+)\]\.(EFID|ActorValue)=(.*)', line)
-            if m:
-                idx, key, val = int(m.group(1)), m.group(2), m.group(3)
-                while len(spel_effects) <= idx:
-                    spel_effects.append(('', -1))
-                code, av = spel_effects[idx]
-                if key == 'EFID':
-                    code = val
-                else:
-                    try:
-                        av = int(val)
-                    except ValueError:
-                        pass
-                spel_effects[idx] = (code, av)
 
+def _int_or(text, default: int) -> int:
+    """`text` as an int, or `default` when it is absent or not a number."""
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return default
+
+
+def _spell_effect_list(rec: dict) -> list:
+    """[(effect code, actor value int), ...] in Effect[n] order."""
+    effects: list[tuple[str, int]] = []
+    for key, val in rec.items():
+        m = _EFFECT_FIELD_RE.match(key)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        while len(effects) <= idx:
+            effects.append(('', -1))
+        code, av = effects[idx]
+        effects[idx] = ((val, av) if m.group(2) == 'EFID'
+                        else (code, _int_or(val, av)))
+    return effects
+
+
+def index_record_details(tables: dict, sig: str, formid: str, edid: str,
+                         rec: dict, rekey=lambda v: v) -> None:
+    """Fill the tables a record's own fields feed: model, MGEF shader, SPEL effects, GLOB, enchanted BOOK.
+
+    `tables` maps table name -> dict/set (a scan result, or a graph's `vars()`), so the
+    CLI scan and the importer's hand-built graph index these identically; `rekey`
+    corrects a master record's id fields.
+    See: docs/commentary/tes5_import_pipeline.md#phase-0-xref-mirrors-cli-scan
+    """
+    model = rec.get('Model.MODL')
+    if model:
+        tables['record_model'][formid] = model
+    if sig in PLACED_REF_SIGS and rec.get('XESP.Reference'):
+        tables['record_parent'][formid] = rekey(rec['XESP.Reference'])
+    low = edid.lower() if edid else ''
+    if sig == 'MGEF' and low:
+        tables['mgef_shaders'][low] = (
+            rekey(rec.get('DATA.EffectShader') or ''),
+            rekey(rec.get('DATA.EnchantEffect') or ''),
+            _int_or(rec.get('DATA.School'), -1))
+    elif sig == 'SPEL' and low:
+        effects = _spell_effect_list(rec)
+        if effects:
+            tables['spell_effects'][low] = effects
+    elif sig == 'GLOB' and low:
+        if rec.get('FNAM.Type'):
+            tables['global_types'][low] = rec['FNAM.Type'].strip()
+        try:
+            tables['global_values'][low] = float(rec.get('FLTV.Value'))
+        except (TypeError, ValueError):
+            pass
+    elif sig == 'BOOK' and (rec.get('ENAM') or '').strip().strip('0'):
+        tables['enchanted_books'].add(formid)
+    _index_move_speed(tables, sig, formid, low, rec)
+
+
+#: The GMSTs of TES4's walk-speed formula: walk = Min + (Max - Min) * Speed / 100.
+_MOVE_GMSTS = frozenset({'fmovecharwalkmin', 'fmovecharwalkmax',
+                         'fmovecreaturewalkmin', 'fmovecreaturewalkmax'})
+
+
+def _index_move_speed(tables: dict, sig: str, formid: str, low: str, rec: dict) -> None:
+    """An actor's authored Speed attribute, or a walk-speed GMST's value."""
+    if sig in ('NPC_', 'CREA'):
+        speed = _int_or(rec.get('DATA.Speed'), None)
+        if speed is not None:
+            tables['actor_speed'][formid] = speed
+    elif sig == 'GMST' and low in _MOVE_GMSTS:
+        try:
+            tables['move_gmsts'][low] = float(rec.get('DATA.Value'))
+        except (TypeError, ValueError):
+            pass
+
+
+
+
+#: An OBSE `begin Function` header at a line start, in raw or export-escaped (`\n`) SCTX text.
+_UDF_BLOCK_RE = re.compile(r'(?:^|\\n)(?:\s|\\t)*begin\s+function\b', re.I | re.M)
+
+#: SCHR.Type of a quest script.
+QUEST_SCRIPT_TYPE = 1
+
+
+def is_function_script(sctx: str) -> bool:
+    """True for an OBSE user-function script (raw or export-escaped SCTX)."""
+    return bool(_UDF_BLOCK_RE.search(sctx or ''))
+
+
+def hosted_script_type(schr_type: int, sctx: str) -> int:
+    """SCHR type a script is HOSTED as; an OBSE function script is a quest's.
+
+    See: docs/commentary/script_convert.md#udf-host-quest
+    """
+    return QUEST_SCRIPT_TYPE if is_function_script(sctx) else schr_type
+
+
+def _record_fields(lines: list) -> dict:
+    """A record's KEY=VALUE lines as a dict; a repeated key keeps its last value."""
+    return dict(line.rstrip().partition('=')[::2] for line in lines if '=' in line)
+
+
+def _int_field(rec: dict, key: str, base: int = 10):
+    """The field's leading number, or None when it is absent or not a number."""
+    try:
+        return int(rec[key].split()[0], base)
+    except (KeyError, ValueError, IndexError):
+        return None
+
+
+def _scan_scpt(rec: dict, formid: str, edid: str, out: dict) -> None:
+    """A script's EditorID and hosting type."""
+    if edid:
+        out['script_formid_to_edid'][formid] = edid
+    schr_type = _int_field(rec, 'SCHR.Type')
+    if schr_type is not None:
+        out['script_formid_to_type'][formid] = hosted_script_type(
+            schr_type, rec.get('SCTX', ''))
+
+
+def _scan_cell(rec: dict, formid: str, _edid: str, out: dict) -> None:
+    """A cell's interior flag, worldspace and grid position, for GetInCell."""
+    flags = _int_field(rec, 'DATA.Flags', 0)
+    if flags is not None:
+        out['cell_geom'][formid] = (bool(flags & 1), rec.get('ParentWRLD') or '',
+                                    _int_field(rec, 'XCLC.X'), _int_field(rec, 'XCLC.Y'))
+
+
+def _scan_actor(rec: dict, formid: str, _edid: str, out: dict) -> None:
+    """An NPC_/CREA and its AI package list."""
+    out['npc_formids'].add(formid)
+    packs = [m.group(0) for k, v in rec.items() if k.startswith('AIPackage[')
+             for m in [re.match(r'\w+', v)] if m]
+    if packs:
+        out['actor_packages'][formid] = packs
+
+
+def _scan_pack(rec: dict, formid: str, _edid: str, out: dict) -> None:
+    """A package's procedure type."""
+    pkdt_type = _int_field(rec, 'PKDT.Type')
+    if pkdt_type is not None:
+        out['pack_type'][formid] = pkdt_type
+
+
+def _scan_qust(rec: dict, _formid: str, edid: str, out: dict) -> None:
+    """A quest's EditorID, whether it allows repeated stages (DATA flag 0x08), and its stages with a fragment."""
+    if edid:
+        out['quest_edids'].add(edid.lower())
+        if (_int_field(rec, 'DATA.Flags', 0) or 0) & 0x08:
+            out['repeat_stage_quests'].add(edid.lower())
+        out['fragment_stages'][edid.lower()] = _fragment_stages(rec)
+
+
+def _fragment_stages(rec: dict) -> set:
+    """Stage indices whose log has journal text or a result script, as quest_fragments.stage_fragments counts."""
+    stages = set()
+    for i in range(_int_field(rec, 'StageCount', 0) or 0):
+        for j in range(_int_field(rec, f'Stage[{i}].LogCount', 0) or 0):
+            if rec.get(f'Stage[{i}].Log[{j}].Text') or rec.get(f'Stage[{i}].Log[{j}].ResultScript', '').strip():
+                stages.add(_int_field(rec, f'Stage[{i}].Index', 0) or 0)
+    return stages
+
+
+def _scan_door(rec: dict, _formid: str, _edid: str, out: dict) -> None:
+    """The script of a door flagged Oblivion Gate (FNAM bit 0)."""
+    if (_int_field(rec, 'FNAM.Flags', 0) or 0) & 0x01 and rec.get('SCRI'):
+        out['gate_scripts'].add(rec['SCRI'].upper())
+
+
+#: Signature -> the indexer for the fields only that record type carries.
+_SIG_SCANNERS = {'SCPT': _scan_scpt, 'CELL': _scan_cell, 'NPC_': _scan_actor,
+                 'CREA': _scan_actor, 'PACK': _scan_pack, 'QUST': _scan_qust, 'DOOR': _scan_door}
+
+
+#: The fields of a record that hold a FormID, beside its own and every `AIPackage[n]`.
+_ID_FIELDS = ('SCRI', 'NAME', 'ParentWRLD', 'DATA.EffectShader', 'DATA.EnchantEffect',
+              'XESP.Reference')
+
+_FORMID_RE = re.compile(r'[0-9A-Fa-f]{8}')
+
+
+def _index_remaps(export_dir: str, dirs: list) -> list:
+    """For each folder of `dirs`: {index byte of its ids -> `export_dir`'s}, or None.
+
+    None reads the ids as written: the plugin's own folder, and a master whose
+    every index already agrees. A master the plugin does not list keeps only
+    the indexes that name a file it does list.
+    See: docs/commentary/tes5_import_override.md#script-graph-rekeys-masters
+    """
+    names = masters_from_export_header(export_dir)
+    slot_of = {n.lower(): i for i, n in enumerate(names)}
+    name_of = {master_dir(export_dir, n): n.lower() for n in master_chain(export_dir)}
+    remaps = []
+    for folder in dirs[:-1]:
+        slot = slot_of.get(name_of.get(folder))
+        remap = {k: v for k, v in master_index_map(folder, slot, names).items() if v is not None}
+        identity = slot is not None and remap == {i: i for i in range(slot + 1)}
+        remaps.append(None if identity else remap)
+    return remaps + [None]
+
+
+def _rekey(value: str, remap: dict) -> str:
+    """`value` (a hex FormID, text may follow) in the plugin's index space; '' for a file it does not load."""
+    m = _FORMID_RE.match(value or '')
+    if not m:
+        return value
+    raw = int(m.group(0), 16)
+    slot = remap.get(raw >> 24)
+    if slot is None:
+        return ''
+    return '%08X%s' % (slot << 24 | raw & 0xFFFFFF, value[8:])
+
+
+def _rekey_record(rec: dict, remap: dict) -> None:
+    """Move a master record's own id and its id fields into the plugin's index space."""
+    for key in rec:
+        if key == 'FormID' or key in _ID_FIELDS or key.startswith('AIPackage['):
+            rec[key] = _rekey(rec[key], remap)
+
+
+def _scan_record_lines(sig: str, lines: list, out: dict, remap: dict = None):
+    """Scan one record's KEY=VALUE lines into the partial result dicts.
+
+    `remap` is given for a master's record (`_index_remaps`).
+    """
+    rec = _record_fields(lines)
+    if remap is not None:
+        _rekey_record(rec, remap)
+    formid = rec.get('FormID')
     if not formid:
         return
+    edid = rec.get('EditorID')
     if edid:
         out['formid_to_edid'][formid] = edid
         out['edid_to_formid'][edid.lower()] = formid
-    if sig == 'SCPT':
-        if edid:
-            out['script_formid_to_edid'][formid] = edid
-        if schr_type is not None:
-            out['script_formid_to_type'][formid] = schr_type
-    if sig == 'CELL' and cell_flags is not None:
-        out['cell_geom'][formid] = (bool(cell_flags & 1), cell_wrld or '',
-                                    cell_x, cell_y)
-    if sig == 'BOOK' and book_enam and book_enam.strip('0'):
-        out['enchanted_books'].add(formid)
-    if scri:
-        out['record_scri'][formid] = scri
-    if name_fid and sig in PLACED_REF_SIGS:
-        out['record_base'][formid] = name_fid
+    scanner = _SIG_SCANNERS.get(sig)
+    if scanner:
+        scanner(rec, formid, edid, out)
+    index_record_details(out, sig, formid, edid, rec)
+    if rec.get('SCRI'):
+        out['record_scri'][formid] = rec['SCRI']
+    if rec.get('NAME') and sig in PLACED_REF_SIGS:
+        out['record_base'][formid] = rec['NAME']
     out['record_type'][formid] = sig
-    if model:
-        out['record_model'][formid] = model
-    if sig == 'GLOB' and edid and glob_type:
-        out['global_types'][edid.lower()] = glob_type
-    if sig == 'GLOB' and edid and glob_value is not None:
-        out['global_values'][edid.lower()] = glob_value
-    if sig == 'QUST' and edid:
-        out['quest_edids'].add(edid.lower())
-    if sig in ('NPC_', 'CREA'):
-        out['npc_formids'].add(formid)
-        if ai_packages:
-            out['actor_packages'][formid] = ai_packages
-    if sig == 'PACK' and pkdt_type is not None:
-        out['pack_type'][formid] = pkdt_type
-    if sig == 'MGEF' and edid:
-        out['mgef_shaders'][edid.lower()] = (
-            mgef_shader or '', mgef_ench or '', mgef_school)
-    if sig == 'SPEL' and edid and spel_effects:
-        out['spell_effects'][edid.lower()] = spel_effects
 
 
 def _scan_range(args: tuple) -> dict:
     """Scan the records whose BEGIN delimiter starts in [start, end).
 
-    args = (fpath, sig, start, end). Module-level so it is picklable for
+    args = (fpath, sig, start, end, remap). Module-level so it is picklable for
     ProcessPoolExecutor; boundary rule matches text_reader.parse_file_range.
     """
 
     from tes5_import.base.text_reader import (DELIM_BEGIN, DELIM_END,
                                               find_delim_line)
 
-    fpath, sig, start, end = args
+    fpath, sig, start, end, remap = args
     out = _new_scan_out()
     try:
         f = open(fpath, 'rb')
@@ -256,12 +364,26 @@ def _scan_range(args: tuple) -> dict:
                 if rec_end < 0:
                     break
                 block = mm[nl + 1:rec_end].decode('utf-8', errors='replace')
-                _scan_record_lines(sig, block.split('\n'), out)
+                _scan_record_lines(sig, block.split('\n'), out, remap)
                 begin = find_delim_line(mm, DELIM_BEGIN,
                                          rec_end + len(DELIM_END))
         finally:
             mm.close()
     return out
+
+
+def _model_is_held(model: str) -> bool:
+    """Does the converted NIF of this AUTHORED model path hold a keyframed body (physics bit 1)?"""
+    if not model:
+        return False
+    key = model.replace('\\\\', '/').replace('\\', '/').lower().lstrip('/')
+    return bool(get_mesh_physics_flags(current_namespace() + '/' + key) & 2)
+
+
+def _agreed(sigs) -> str:
+    """The ONE signature every entry names, or '' when any is unknown or they differ."""
+    found = set(sigs)
+    return found.pop() if len(found) == 1 else ''
 
 
 class CrossRefGraph:
@@ -270,6 +392,8 @@ class CrossRefGraph:
     def __init__(self):
         self.formid_to_edid: dict[str, str] = {}
         self.edid_to_formid: dict[str, str] = {}
+        #: Source worldspace EDID -> converted EDID; see core/worldspace_names.py.
+        self.worldspace_renames: dict[str, str] = renames_for()
         self.script_formid_to_edid: dict[str, str] = {}
         self.script_formid_to_type: dict[str, int] = {}
         self.record_scri: dict[str, str] = {}  # record FormID -> SCRI FormID
@@ -288,7 +412,23 @@ class CrossRefGraph:
         # base FormID (upper) -> its ONE placed ref FormID; lazily inverted
         # from record_base by unique_placed_ref().
         self._base_to_unique_ref: 'dict[str, str] | None' = None
+        #: Placed ref FormID -> its ENABLE PARENT's FormID (XESP), what `getParentRef` returns.
+        self.record_parent: dict[str, str] = {}
+        #: (script EditorID, variable), lowercase, that ANOTHER script assigns (`set Owner.var to X`).
+        self.remote_writes: set[tuple[str, str]] = set()
+        #: (script, variable) pairs another script adds to: the owner carries an add helper for each.
+        self.remote_adds: set[tuple[str, str]] = set()
+        #: Variable names assigned through an owner no script could be found for; these veto by name.
+        self.remote_write_names: set[str] = set()
         self.quest_edids: set[str] = set()
+        #: Lowercased EditorIDs of quests whose stages may be set again (TES4 Allow Repeated Stages).
+        self.repeat_stage_quests: set[str] = set()
+        #: Lowercased quest EditorID -> the stage indices that have a stage fragment.
+        self.fragment_stages: dict[str, set] = {}
+        #: Lowercased Papyrus names of this plugin's own scripts (a master's compiled copy may predate a helper).
+        self.own_scripts: set[str] = set()
+        #: FormIDs of scripts attached to a DOOR flagged Oblivion Gate.
+        self.gate_scripts: set[str] = set()
         self.npc_formids: set[str] = set()
         # Cross-script ref-as-int analysis: set of (script_name_lower, var_name_lower)
         # where the TES4 `ref` variable is only ever assigned/compared with integers
@@ -303,9 +443,6 @@ class CrossRefGraph:
         self.ref_as_base_form: set[tuple[str, str]] = set()
         # Per-script ref-typed variable names (populated by build_ref_as_int_map)
         self.script_ref_vars: dict[str, set[str]] = {}
-        # Cross-script variable accesses: script_name_lower -> set of var_name_lower
-        # Variables that are accessed from OTHER scripts (need to be Properties)
-        self.cross_script_vars: dict[str, set[str]] = {}
         # Per-script ALL variable declarations: script_name_lower -> dict(var_low -> type_str)
         self.script_all_vars: dict[str, dict[str, str]] = {}
         # Per-script `ref` variables the script itself uses as an ACTOR, i.e. it
@@ -342,6 +479,10 @@ class CrossRefGraph:
         self.pack_type: dict[str, int] = {}
         # NPC_/CREA FormID -> [PACK FormID, ...] in AIPackage[n] order.
         self.actor_packages: dict[str, list] = {}
+        #: NPC_/CREA FormID -> authored DATA.Speed attribute.
+        self.actor_speed: dict[str, int] = {}
+        #: Walk-speed GMST (lower EditorID) -> value, for the TES4 speed formula.
+        self.move_gmsts: dict[str, float] = {}
 
     def load_from_export(self, export_dir: str, workers: int = None):
         """Load cross-reference data from all export .txt files.
@@ -363,7 +504,10 @@ class CrossRefGraph:
             return
 
         jobs = []
-        for d in _export_dirs_with_masters(export_dir):
+        dirs, self.worldspace_renames = _scan_chain(export_dir)
+        for d, remap in zip(dirs, _index_remaps(export_dir, dirs)):
+            if remap == {}:
+                continue
             for fname in sorted(os.listdir(d)):
                 if not fname.endswith('.txt'):
                     continue
@@ -376,8 +520,8 @@ class CrossRefGraph:
                 except OSError:
                     continue
                 for start in range(0, size, _SCAN_CHUNK_BYTES):
-                    jobs.append((fpath, sig,
-                                 start, min(start + _SCAN_CHUNK_BYTES, size)))
+                    jobs.append((fpath, sig, start,
+                                 min(start + _SCAN_CHUNK_BYTES, size), remap))
 
         if workers is None:
             workers = worker_count()
@@ -402,11 +546,15 @@ class CrossRefGraph:
         self.script_formid_to_type.update(out['script_formid_to_type'])
         self.record_scri.update(out['record_scri'])
         self.record_base.update(out['record_base'])
+        self.record_parent.update(out['record_parent'])
         self.record_type.update(out['record_type'])
         self.record_model.update(out['record_model'])
         self.cell_geom.update(out['cell_geom'])
         self.enchanted_books.update(out['enchanted_books'])
         self.quest_edids.update(out['quest_edids'])
+        self.repeat_stage_quests.update(out['repeat_stage_quests'])
+        self.fragment_stages.update(out['fragment_stages'])
+        self.gate_scripts.update(out['gate_scripts'])
         self.npc_formids.update(out['npc_formids'])
         self.mgef_shaders.update(out['mgef_shaders'])
         self.spell_effects.update(out['spell_effects'])
@@ -414,6 +562,8 @@ class CrossRefGraph:
         self.global_values.update(out['global_values'])
         self.pack_type.update(out['pack_type'])
         self.actor_packages.update(out['actor_packages'])
+        self.actor_speed.update(out['actor_speed'])
+        self.move_gmsts.update(out['move_gmsts'])
 
     def get_extends_class(self, script_formid: str) -> str:
         """The Papyrus extends class for a script.
@@ -433,9 +583,8 @@ class CrossRefGraph:
         if schr_type == 256:
             return 'ActiveMagicEffect'
 
-        attached = [rec_fid for rec_fid, scri_fid in self.record_scri.items()
-                    if scri_fid == script_formid]
-        sigs = {self.record_type.get(rec_fid, '') for rec_fid in attached}
+        attached = self.attached_records(script_formid)
+        sigs = self.attached_signatures(script_formid)
         if 'QUST' in sigs:
             return 'Quest'
 
@@ -446,6 +595,21 @@ class CrossRefGraph:
             return 'Actor'
 
         return 'ObjectReference'
+
+    def attached_records(self, script_formid: str) -> list:
+        """Every record whose SCRI names `script_formid`; the index is built on first use."""
+        index = getattr(self, '_attached_index', None)
+        if index is None:
+            index = {}
+            for rec_fid, scri_fid in self.record_scri.items():
+                index.setdefault(scri_fid, []).append(rec_fid)
+            self._attached_index = index
+        return index.get(script_formid, [])
+
+    def attached_signatures(self, script_formid: str) -> set:
+        """Record signatures of every record the script is attached to."""
+        return {self.record_type.get(rec_fid, '')
+                for rec_fid in self.attached_records(script_formid)}
 
     @staticmethod
     def _is_player_base(rec_fid: str) -> bool:
@@ -480,32 +644,6 @@ class CrossRefGraph:
             return self.formid_to_edid.get(self.edid_to_formid[fallback], '')
         return ''
 
-    def get_spell_first_skyrim_mgef(self, spell_name: str) -> int:
-        """Skyrim MGEF FormID the converted spell's first surviving effect uses.
-
-        IsSpellTarget has no Papyrus equivalent, but HasMagicEffect on the
-        effect the imported SPEL actually carries is the same runtime test.
-        Resolution MUST mirror tes5_import's _pack_effects: first effect whose
-        code maps to a Skyrim MGEF wins; if every effect drops (script-effect
-        spells), the importer substitutes its first filler effect, so detect
-        that instead.  Returns 0 for an unknown spell.
-        """
-        effects = self.spell_effects.get(spell_name.lower())
-        if not effects:
-            return 0
-        from tes5_import.base.equivalents import (MGEF_CODE_TO_SKYRIM,
-                                                  MGEF_AV_CODE_TO_SKYRIM)
-        for code, av in effects:
-            if not code:
-                continue
-            per_av = MGEF_AV_CODE_TO_SKYRIM.get(code)
-            fid = per_av.get(av, 0) if per_av is not None else 0
-            fid = fid or MGEF_CODE_TO_SKYRIM.get(code, 0)
-            if fid:
-                return fid
-        from tes5_import.record_types.equipment import _FILLER_EFFECTS
-        return _FILLER_EFFECTS[0]
-
     def is_quest_ref(self, name: str) -> bool:
         """Check if a name refers to a known quest."""
         return name.lower() in self.quest_edids
@@ -536,6 +674,11 @@ class CrossRefGraph:
                                         if k not in dup}
         return self._base_to_unique_ref.get((base_fid or '').upper(), '')
 
+    def is_gate_script(self, script_edid: str) -> bool:
+        """Whether the script named `script_edid` sits on a door flagged Oblivion Gate."""
+        low = (script_edid or '').lower()
+        return any(self.script_formid_to_edid.get(fid, '').lower() == low for fid in self.gate_scripts)
+
     def get_quest_script_type(self, quest_name: str) -> str:
         """Get the Papyrus script class name for a quest, e.g. 'TES4_MyQuestScript'.
         Returns 'Quest' if no attached script is found."""
@@ -550,6 +693,19 @@ class CrossRefGraph:
         if not script_edid:
             return 'Quest'
         return papyrus_script_name(script_edid)
+
+    def settling_script(self, quest_name: str) -> str:
+        """The quest's own script, which tracks its stage fragment; else ''.
+
+        See: docs/commentary/script_convert.md#a-stage-fragment-runs-before-its-poll
+        """
+        script = self.get_quest_script_type(quest_name)
+        return script if script.lower() in self.own_scripts else ''
+
+    def fragment_stages_of(self, script: str) -> list:
+        """Stages with a fragment, of every quest settled by `script`."""
+        return sorted({stage for quest, stages in self.fragment_stages.items()
+                       if self.settling_script(quest) == script for stage in stages})
 
     def get_cell_family(self, cell_name: str) -> list:
         """CELL EditorIDs that TES4 `GetInCell <cell_name>` matches.
@@ -616,7 +772,7 @@ class CrossRefGraph:
                 interior.append(edid)
                 continue
             wrld_edid = converted_worldspace_edid(
-                self.formid_to_edid.get(wrld_fid, ''))
+                self.formid_to_edid.get(wrld_fid, ''), self.worldspace_renames)
             if x is None or y is None:
                 # An exterior with no XCLC is the worldspace's own persistent
                 # "dummy cell". It holds no grid square, so the faithful test is
@@ -639,25 +795,43 @@ class CrossRefGraph:
         ANY of them is running a package of that type, and the disjunction the
         caller emits is exactly that.
         """
-        want = script_edid.lower()
-        script_fid = ''
-        for fid, edid in self.script_formid_to_edid.items():
-            if edid.lower() == want:
-                script_fid = fid
-                break
-        if not script_fid:
-            return []
         out = []
-        for actor_fid, scri in self.record_scri.items():
-            if scri != script_fid or actor_fid not in self.actor_packages:
-                continue
-            for pack_fid in self.actor_packages[actor_fid]:
+        for actor_fid in self.script_owner_actors(script_edid):
+            for pack_fid in self.actor_packages.get(actor_fid, ()):
                 if self.pack_type.get(pack_fid) != pkg_type:
                     continue
                 edid = self.formid_to_edid.get(pack_fid, '')
                 if edid and edid not in out:
                     out.append(edid)
         return out
+
+    def script_owner_actors(self, script_edid: str) -> list:
+        """FormIDs of the records whose SCRI names the script `script_edid`."""
+        want = script_edid.lower()
+        script_fid = next((fid for fid, edid in self.script_formid_to_edid.items()
+                           if edid.lower() == want), '')
+        return [fid for fid, scri in self.record_scri.items()
+                if script_fid and scri == script_fid]
+
+    def actor_formid(self, name: str) -> str:
+        """The FormID `name` names, following a placed reference to its base."""
+        fid = self.edid_to_formid.get(name.lower(), '')
+        return self.record_base.get(fid, fid)
+
+    def walk_speed_formula(self, actor_fids) -> tuple | None:
+        """(authored Speed, walk min, walk max) shared by every actor, else None.
+
+        See: docs/commentary/script_convert.md#speed-write-becomes-speedmult
+        """
+        forms = {(self.actor_speed.get(f), self.record_type.get(f)) for f in actor_fids}
+        if len(forms) != 1:
+            return None
+        speed, sig = forms.pop()
+        kind = 'creature' if sig == 'CREA' else 'char'
+        low, high = (self.move_gmsts.get(f'fmove{kind}walk{end}') for end in ('min', 'max'))
+        if speed is None or low is None or high is None:
+            return None
+        return speed, low, high
 
     def get_actor_packages_of_type(self, actor_name: str, pkg_type: int) -> list:
         """PACK EditorIDs of `actor_name`'s own packages whose PKDT.Type matches.
@@ -725,19 +899,11 @@ class CrossRefGraph:
         Resolves through a placed reference to its base record, like
         get_base_signature, so `CTrapLogs01Ref.playgroup` works.
         """
-        from tes5_import.base.mesh_bounds import get_mesh_physics_flags
-
         fid = self.edid_to_formid.get(name.lower(), '')
         if not fid:
             return False
-        model = self.record_model.get(self.record_base.get(fid, '') or fid, '')
-        if not model:
-            return False
-        key = model.replace('\\\\', '/').replace('\\', '/').lower().lstrip('/')
-        ns = current_namespace() + '/'
-        if not key.startswith(ns):
-            key = ns + key
-        return bool(get_mesh_physics_flags(key) & 2)
+        return _model_is_held(
+            self.record_model.get(self.record_base.get(fid, '') or fid, ''))
 
     def script_owner_needs_havok_release(self, script_edid: str) -> bool:
         """needs_havok_release for a BARE (self) `playgroup`.
@@ -747,8 +913,6 @@ class CrossRefGraph:
         shared between a held trap and something else still has to release the
         trap, and the release is inert on anything that is not held.
         """
-        from tes5_import.base.mesh_bounds import get_mesh_physics_flags
-
         want = (script_edid or '').lower()
         if not want:
             return False
@@ -759,19 +923,42 @@ class CrossRefGraph:
                 break
         if not script_fid:
             return False
-        for rec_fid, scri in self.record_scri.items():
-            if scri != script_fid:
-                continue
-            model = self.record_model.get(rec_fid, '')
-            if not model:
-                continue
-            key = model.replace('\\\\', '/').replace('\\', '/').lower().lstrip('/')
-            ns = current_namespace() + '/'
-            if not key.startswith(ns):
-                key = ns + key
-            if get_mesh_physics_flags(key) & 2:
-                return True
-        return False
+        return any(_model_is_held(self.record_model.get(rec_fid, ''))
+                   for rec_fid, scri in self.record_scri.items()
+                   if scri == script_fid)
+
+    def placed_refs(self, base_fid: str) -> list:
+        """Every placed reference of a base record; the index is built on first use."""
+        index = getattr(self, '_placed_index', None)
+        if index is None:
+            index = {}
+            for ref_fid, base in self.record_base.items():
+                index.setdefault(base, []).append(ref_fid)
+            self._placed_index = index
+        return index.get(base_fid, [])
+
+    def script_self_signature(self, script_edid: str) -> str:
+        """Signature every record carrying the script shares (its `getSelf`), or ''."""
+        return _agreed(self.record_type.get(fid, '')
+                       for fid in self.script_owner_actors(script_edid))
+
+    def script_parent_signature(self, script_edid: str) -> str:
+        """Base signature `getParentRef` resolves to in this script, or '' unless proven.
+
+        Proven means every record carrying the script is placed, every
+        placement names an enable parent (XESP), and every parent's base
+        record has the same signature.  A placement with no parent, or two
+        that disagree, proves nothing.
+        See: docs/commentary/script_convert.md#playgroup-variable-target
+        """
+        sigs = []
+        for owner in self.script_owner_actors(script_edid):
+            refs = self.placed_refs(owner)
+            if not refs:
+                return ''
+            sigs += [self.record_type.get(self.record_base.get(
+                self.record_parent.get(ref, ''), ''), '') for ref in refs]
+        return _agreed(sigs)
 
     def get_record_script_type(self, name: str) -> str:
         """Get the Papyrus script class name for any record with an attached script.
@@ -1019,48 +1206,77 @@ class CrossRefGraph:
                     self.ref_as_base_form.add(dest)
                     changed = True
 
-        # Phase D: detect cross-script variable access (Owner.VarName patterns)
-        # These variables must be Properties on the owning script so other scripts
-        # can access them. Scans SCPT sources, INFO result scripts, and QUST stage scripts.
-        _owner_var_re = re.compile(r'\b(\w+)\.(\w+)\b')
-        cross_script_vars: dict[str, set[str]] = {}
+    def build_script_indexes(self, scpt_path: str) -> None:
+        """Every index read off script SOURCE; the one entry both graph builders call."""
+        self.build_ref_as_int_map(scpt_path)
+        texts = _script_texts(os.path.dirname(scpt_path))
+        self.index_remote_writes(texts)
+        own = _own_script_edids(scpt_path)
+        self.own_scripts = {papyrus_script_name(edid).lower() for edid in own}
+        self.index_remote_adds(texts, own)
 
-        def _scan_text_for_cross_access(text):
-            for raw_line in text.split('\n'):
-                line = raw_line.strip()
-                if not line or line.startswith(';'):
-                    continue
-                semi = line.find(';')
-                if semi >= 0:
-                    line = line[:semi]
-                for match in _owner_var_re.finditer(line):
-                    owner = match.group(1).lower()
-                    var = match.group(2).lower()
-                    target_script = None
-                    if owner in script_all_vars and var in script_all_vars[owner]:
-                        target_script = owner
-                    else:
-                        fid = self.edid_to_formid.get(owner, '')
-                        if fid:
-                            scri_fid = self.record_scri.get(fid, '')
-                            if scri_fid:
-                                se = self.script_formid_to_edid.get(scri_fid, '')
-                                if se:
-                                    se_low = se.lower()
-                                    if se_low in script_all_vars and var in script_all_vars[se_low]:
-                                        target_script = se_low
-                    if target_script:
-                        if target_script not in cross_script_vars:
-                            cross_script_vars[target_script] = set()
-                        cross_script_vars[target_script].add(var)
+    def index_remote_writes(self, texts) -> None:
+        """Record every `set Owner.var to X` in `texts` against the script that OWNS var.
 
-        # Scan all SCPT sources
-        for scn_low, sctx in script_sources.items():
-            _scan_text_for_cross_access(sctx)
+        The owner is a script, a quest or object carrying one, or a placed
+        reference whose base carries one.  An owner that resolves to no script
+        vetoes the variable NAME instead: a write the scan cannot place must
+        never read as "nobody else assigns this".
+        See: docs/commentary/script_convert.md#playgroup-variable-target
+        """
+        known = {e.lower() for e in self.script_formid_to_edid.values()}
+        for text in texts:
+            for owner, var in _REMOTE_WRITE_RE.findall(text):
+                scripts = self._scripts_of(owner, known)
+                self.remote_writes.update((s, var.lower()) for s in scripts)
+                if not scripts:
+                    self.remote_write_names.add(var.lower())
 
-        _scan_plugin_result_scripts(export_dir, _scan_text_for_cross_access)
+    def index_remote_adds(self, texts, own: set) -> None:
+        """Record every `set Owner.var to Owner.var +/- X` whose owner is one of this plugin's `own` scripts.
 
-        self.cross_script_vars = cross_script_vars
+        Oblivion ran scripts one at a time; Papyrus does not, so that read and
+        write must happen inside the owning script. A master's script is left
+        out: its compiled copy may predate the helper.
+        """
+        known = {e.lower() for e in self.script_formid_to_edid.values()}
+        for text in texts:
+            for owner, var in _REMOTE_ADD_RE.findall(text):
+                scripts = self._scripts_of(owner, known)
+                if scripts and scripts <= own:
+                    self.remote_adds.update((s, var.lower()) for s in scripts)
+
+    def adds_remotely(self, owner: str, var_name: str) -> bool:
+        """Does every script `owner` reaches carry the add helper for this variable?"""
+        known = {e.lower() for e in self.script_formid_to_edid.values()}
+        scripts = self._scripts_of(owner, known)
+        return bool(scripts) and all((s, var_name.lower()) in self.remote_adds for s in scripts)
+
+    def holds(self, owner: str) -> bool:
+        """Does every script `owner` reaches carry the TES4Hold / TES4Release pair (it has an add helper)?"""
+        known = {e.lower() for e in self.script_formid_to_edid.values()}
+        scripts = self._scripts_of(owner, known)
+        helped = {script for script, _var in self.remote_adds}
+        return bool(scripts) and scripts <= helped
+
+    def _scripts_of(self, name: str, known: set) -> set:
+        """Lowercase EditorIDs of the scripts `name` reaches: itself, its SCRI, its base's SCRI."""
+        low = name.lower()
+        found = {low} & known
+        fid = self.edid_to_formid.get(low, '')
+        for rec_fid in (fid, self.record_base.get(fid, '')):
+            edid = self.script_formid_to_edid.get(
+                self.record_scri.get(rec_fid, ''), '')
+            if edid:
+                found.add(edid.lower())
+        return found
+
+    def remotely_assigned(self, script_edid: str, var_name: str) -> bool:
+        """Does another script assign this variable, or one indistinguishable from it?"""
+        var = var_name.lower()
+        return ((script_edid or '').lower(), var) in self.remote_writes \
+            or var in self.remote_write_names
+
     def is_remote_ref_var(self, owner_edid: str, var_name: str) -> bool:
         """Check if a variable on a remote record's script is ref-typed in TES4.
 
@@ -1110,19 +1326,41 @@ def _strip_comments(text: str) -> str:
     return nl.join(line.split(';', 1)[0] for line in text.split(nl))
 
 
-def _scan_plugin_result_scripts(export_dir: str, scan) -> None:
-    """Feed THIS plugin's INFO result scripts (both halves) and QUST stage
-    scripts to `scan`: a pure union that only ADDS names which must become
-    Properties.  The masters' copies are not read -- each master's own run
-    emits its fragments."""
-    for extra_file, field_name in [('INFO.txt', 'ResultScript'),
-                                   ('INFO.txt', 'ResultScriptEnd'),
-                                   ('QUST.txt', 'SCTX')]:
-        prefix = field_name + '='
-        for raw_line in _export_lines(os.path.join(export_dir, extra_file)):
-            if raw_line.startswith(prefix):
-                text = raw_line[len(prefix):].strip()
-                scan(text.replace('\\r\\n', '\n').replace('\\n', '\n'))
+#: `set Owner.var to` / `let Owner.var :=` (and its compound forms) at a statement start.
+_REMOTE_WRITE_RE = re.compile(
+    r'^[ \t]*(?:set|let)[ \t]+(\w+)[ \t]*\.[ \t]*(\w+)[ \t]*(?:to\b|[-+*/^]?:=)',
+    re.I | re.M)
+
+#: `set Owner.var to Owner.var + X` (or `-`), and `let Owner.var += X`: a cross-script read-then-write.
+_REMOTE_ADD_RE = re.compile(
+    r'^[ \t]*(?:set|let)[ \t]+(\w+)[ \t]*\.[ \t]*(\w+)[ \t]*'
+    r'(?:(?:to\b|:=)[ \t(]*\1[ \t]*\.[ \t]*\2[ \t]*[-+]|[-+]:=)',
+    re.I | re.M)
+
+
+def _own_script_edids(scpt_path: str) -> set:
+    """Lowercase EditorIDs of the scripts in one export's SCPT file."""
+    if not os.path.isfile(scpt_path):
+        return set()
+    with open(scpt_path, encoding='utf-8', errors='replace') as handle:
+        return {line[9:].strip().lower() for line in handle if line.startswith('EditorID=')}
+
+
+#: Export fields holding script source: a SCPT's text, INFO's two result halves, a QUST stage log entry's.
+_SCRIPT_TEXT_RE = re.compile(
+    r'(?:SCTX|ResultScript|ResultScriptEnd|Stage\[\d+\]\.Log\[\d+\]\.ResultScript)=(.*)')
+
+
+def _script_texts(export_dir: str) -> list:
+    """Every SCPT, INFO-result and QUST-stage script of the plugin AND its masters, as source text."""
+    texts = []
+    for d in _export_dirs_with_masters(export_dir):
+        for name in ('SCPT.txt', 'INFO.txt', 'QUST.txt'):
+            for line in _export_lines(os.path.join(d, name)):
+                m = _SCRIPT_TEXT_RE.match(line)
+                if m:
+                    texts.append(unescape_value(m.group(1)))
+    return texts
 
 
 def _export_lines(path: str):

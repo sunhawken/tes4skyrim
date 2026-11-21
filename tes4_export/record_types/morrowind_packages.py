@@ -9,11 +9,12 @@ as a marker in the cell the actor stands in.
 See: docs/commentary/tes4_export_morrowind.md#ai-packages
 """
 
+import math
 import struct
 
 from ..morrowind_ids import encode_editor_id
 from ..morrowind_world import cell_grid
-from ..tes3_reader import Tes3Record
+from ..tes3_reader import Tes3Record, get_subrecord, text
 
 #: TES4 PKDT.Type per Morrowind package: Find, Follow, Escort, Wander, Travel.
 _FIND, _FOLLOW, _ESCORT, _WANDER, _TRAVEL = 0, 1, 2, 5, 6
@@ -27,6 +28,9 @@ _TARGET_REFERENCE, _TARGET_OBJECT = 0, 1
 #: TES4's XMarker, the destination a travel package walks to.
 _XMARKER = '0000003B'
 
+#: AiTravel's reach: Morrowind ignores a point farther than this from the actor (OpenMW `isWithinMaxRange`).
+_TRAVEL_REACH = 7168.0
+
 #: Morrowind writes FLT_MAX for "no destination" on follow and escort.
 _NO_DESTINATION = 1.0e38
 
@@ -34,14 +38,10 @@ _NO_DESTINATION = 1.0e38
 _PERSISTENT = 1024
 
 
-def _tes3_id(raw: bytes) -> str:
-    """A fixed 32-byte Morrowind ID field as text."""
-    return raw.split(b'\x00', 1)[0].decode('cp1252', 'replace')
-
-
 def _wander(fields) -> tuple:
     """AI_W: distance, duration, time of day, eight idle chances."""
-    return 'wander', {'distance': fields[0], 'duration': fields[1]}
+    return 'wander', {'distance': fields[0], 'duration': fields[1],
+                      'idles': fields[3:11]}
 
 
 def _travel(fields) -> tuple:
@@ -52,7 +52,7 @@ def _travel(fields) -> tuple:
 def _follow(fields, kind: str = 'follow') -> tuple:
     """AI_F / AI_E: optional destination, duration and the target actor."""
     pos = None if abs(fields[0]) >= _NO_DESTINATION else fields[:3]
-    return kind, {'pos': pos, 'duration': fields[3], 'target': _tes3_id(fields[4])}
+    return kind, {'pos': pos, 'duration': fields[3], 'target': fields[4]}
 
 
 def _escort(fields) -> tuple:
@@ -62,7 +62,7 @@ def _escort(fields) -> tuple:
 
 def _activate(fields) -> tuple:
     """AI_A: the object to go and activate."""
-    return 'activate', {'target': _tes3_id(fields[0])}
+    return 'activate', {'target': fields[0]}
 
 
 #: Subrecord -> (struct layout, parser), for every Morrowind package kind.
@@ -76,13 +76,16 @@ _PARSERS = {
 
 
 def _packages(rec: Tes3Record) -> list:
-    """Every AI package on the actor, in file order, as (kind, fields)."""
+    """Every AI package on the actor, in file order, as (kind, fields); a
+    fixed 32-byte ID field arrives as text."""
     out = []
     for sub in rec.subrecords:
         parser = _PARSERS.get(sub.type)
         if parser is None or len(sub.data) < struct.calcsize(parser[0]):
             continue
-        out.append(parser[1](struct.unpack_from(parser[0], sub.data, 0)))
+        fields = tuple(text(sub, f.split(b'\x00', 1)[0]) if isinstance(f, bytes) else f
+                       for f in struct.unpack_from(parser[0], sub.data, 0))
+        out.append(parser[1](fields))
     return out
 
 
@@ -91,11 +94,24 @@ def package_id(actor_id: str, index: int) -> str:
     return 'pack:%s:%d' % (actor_id.lower(), index)
 
 
+def _hello(rec: Tes3Record) -> int:
+    """The actor's AIDT Hello setting; 0 means it never greets or chatters.
+
+    See: docs/commentary/tes4_export_morrowind.md#when-a-bark-fires
+    """
+    aidt = get_subrecord(rec, 'AIDT')
+    if aidt is None or len(aidt.data) < 2:
+        return 0
+    return struct.unpack_from('<H', aidt.data, 0)[0]
+
+
 def emit_packages(lines: list, rec: Tes3Record, ctx) -> None:
     """List the actor's packages by FormID and queue them for emission."""
     packages = _packages(rec)
+    hello = _hello(rec)
     lines.append(f'AIPackageCount={len(packages)}')
     for index, (kind, fields) in enumerate(packages):
+        fields['hello'] = hello
         form_id = ctx.derive(package_id(rec.record_id, index))
         lines.append(f'AIPackage[{index}]={form_id}')
         ctx.pending_packages.append((rec.record_id, form_id, kind, fields))
@@ -110,16 +126,17 @@ def _schedule(duration: int) -> list:
 def _marker(ctx, actor_id: str, pos: tuple, key: str, out: list) -> str:
     """Place an XMarker at `pos` in the actor's cell; its FormID, or '' when no cell.
 
-    An exterior destination names the grid it falls in; an interior one the
-    cell the actor is placed in, because Morrowind's coordinates are cell-local
-    and the package lives on the base actor.
+    Morrowind reads the position in the cell the actor stands in and never
+    leaves it, so an actor placed in an interior keeps the marker there; any
+    other names the exterior grid `pos` falls in.
+    See: docs/commentary/tes4_export_morrowind.md#ai-packages
     """
+    placed = ctx.placements.get(actor_id.lower(), ())
+    cell = placed[0][1] if placed else ''
     grid = cell_grid(pos[0], pos[1])
-    if grid in ctx.known_grids or ctx.index.lookup_exterior(grid):
+    outdoors = not cell or cell in ctx.exterior_cell_ids
+    if outdoors and (grid in ctx.known_grids or ctx.index.lookup_exterior(grid)):
         cell = ctx.exterior_cell_id(grid)
-    else:
-        placed = ctx.placements.get(actor_id.lower(), ())
-        cell = placed[0][1] if placed else ''
     if not cell:
         return ''
     form_id = ctx.derive(key)
@@ -128,6 +145,17 @@ def _marker(ctx, actor_id: str, pos: tuple, key: str, out: list) -> str:
                           'RotX=0.0', 'RotY=0.0', 'RotZ=0.0',
                           f'RecordFlags={_PERSISTENT}']))
     return form_id
+
+
+def _travel_point(ctx, actor_id: str, pos: tuple) -> tuple:
+    """Where a Travel walks: `pos`, or the actor's own spot when `pos` is beyond AiTravel's reach.
+
+    See: docs/commentary/tes4_export_morrowind.md#ai-packages
+    """
+    placed = ctx.placements.get(actor_id.lower(), ())
+    if placed and math.dist(pos, placed[0][2]) > _TRAVEL_REACH:
+        return placed[0][2]
+    return pos
 
 
 def _target_lines(ctx, target_id: str) -> list:
@@ -149,13 +177,15 @@ def _package_lines(ctx, actor_id: str, form_id: str, kind: str, fields: dict,
                    markers: list):
     """The TES4 PACK lines for one queued package, or None when it cannot resolve."""
     lines = [f'EditorID={encode_editor_id(actor_id)}Pack{form_id[-6:]}',
-             'PKDT.Flags=0']
+             'PKDT.Flags=0', f'MorrowindHello={fields.get("hello", 0)}']
     if kind == 'wander':
         lines += [f'PKDT.Type={_WANDER}', f'PLDT.Type={_NEAR_EDITOR_LOCATION}',
-                  'PLDT.Location=0', f'PLDT.Radius={max(0, fields["distance"])}']
+                  'PLDT.Location=0', f'PLDT.Radius={max(0, fields["distance"])}',
+                  'MorrowindIdle=' + ','.join(str(c) for c in fields['idles'])]
         return lines + _schedule(fields['duration'])
     if kind == 'travel':
-        marker = _marker(ctx, actor_id, fields['pos'], 'xmarker:' + form_id, markers)
+        marker = _marker(ctx, actor_id, _travel_point(ctx, actor_id, fields['pos']),
+                         'xmarker:' + form_id, markers)
         if not marker:
             return None
         return lines + [f'PKDT.Type={_TRAVEL}'] + _location_lines(marker) + _schedule(0)

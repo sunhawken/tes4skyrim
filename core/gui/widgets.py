@@ -27,11 +27,15 @@ case often enough that a raw compare would read as a switch and wipe it.
 See: docs/reference/pipeline.md#configuration
 """
 
+import os
+import subprocess
+import sys
 import threading
 import tkinter as tk
 from tkinter import filedialog, ttk
 
 from core.gui.config import CLR, REPO_ROOT
+from core.subprocess_flags import POPEN_FLAGS
 
 #: Vertical padding a sidebar separator owns on both sides.
 SEP_GAP = 12
@@ -60,12 +64,38 @@ def open_url(url: str) -> None:
     threading.Thread(target=_go, daemon=True).start()
 
 
-def _dialog_body(card, title: str, message: str, links) -> None:
-    """Fill `card` with the title, rule, message and any link rows."""
+def open_folder(app, path: str, what: str) -> None:
+    """Reveal `path` in the system file manager."""
+    if not path or not os.path.isdir(path):
+        app.info(f"Open {what}",
+                 f"{what} does not exist yet:\n\n{path or '(not set)'}\n\n"
+                 "Run a conversion first.")
+        return
+    try:
+        if sys.platform == "win32":
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path], **POPEN_FLAGS)
+        else:
+            subprocess.Popen(["xdg-open", path], **POPEN_FLAGS)
+    except OSError as exc:
+        app.info(f"Open {what}", f"Could not open:\n\n{path}\n\n{exc}")
+
+
+def _dialog_body(card, title: str, message: str, links, status=None) -> None:
+    """Fill `card` with the title, rule, any status line, message and links.
+
+    `status` is (text, color): an outcome in large bold type under the rule,
+    so the result reads at a glance before the details.
+    """
     tk.Label(card, text=title, bg=CLR["panel"], fg=CLR["text"],
              font=("Segoe UI", 10, "bold")).pack(anchor="w",
                                                  padx=16, pady=(14, 0))
     ttk.Separator(card, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=16, pady=8)
+    if status:
+        tk.Label(card, text=status[0], bg=CLR["panel"], fg=status[1],
+                 font=("Segoe UI", 13, "bold")).pack(anchor="w", padx=16,
+                                                     pady=(0, 8))
     tk.Label(card, text=message, bg=CLR["panel"], fg=CLR["subtext"],
              font=("Segoe UI", 9), justify=tk.LEFT, anchor="w",
              wraplength=380).pack(anchor="w", padx=16,
@@ -81,12 +111,13 @@ def _dialog_body(card, title: str, message: str, links) -> None:
 
 
 def dialog(app, title: str, message: str, buttons=("OK",),
-           default: int = 0, links=()) -> str:
+           default: int = 0, links=(), status=None) -> str:
     """Modal message card in the app's palette; returns the button clicked.
 
     Placed OVER the window rather than behind a full-size backdrop, which would
     cover the log and sidebar and read as the app disappearing. `links` is
-    [(label, url)] rendered as clickable rows under the message.
+    [(label, url)] rendered as clickable rows under the message; `status` is
+    an optional (text, color) outcome line.
     """
     result = [buttons[-1] if len(buttons) > 1 else buttons[0]]
     card = tk.Frame(app.outer, bg=CLR["panel"],
@@ -98,7 +129,7 @@ def dialog(app, title: str, message: str, buttons=("OK",),
         card.grab_release()
         card.destroy()
 
-    _dialog_body(card, title, message, links)
+    _dialog_body(card, title, message, links, status)
 
     btn_row = tk.Frame(card, bg=CLR["panel"])
     btn_row.pack(fill=tk.X, padx=16, pady=(0, 14))
@@ -119,9 +150,9 @@ def dialog(app, title: str, message: str, buttons=("OK",),
     return result[0]
 
 
-def info(app, title: str, message: str, links=()) -> None:
-    """Show a one-button message card."""
-    dialog(app, title, message, links=links)
+def info(app, title: str, message: str, links=(), status=None) -> None:
+    """Show a one-button message card, with an optional (text, color) status."""
+    dialog(app, title, message, links=links, status=status)
 
 
 def confirm(app, title: str, message: str,
@@ -245,24 +276,28 @@ def section(parent, text: str) -> None:
     ttk.Label(f, text=text, style="PanelSub.TLabel").pack(anchor="w")
 
 
-def _tooltip_window(widget, state, width) -> None:
-    """Create the popup below-right of the cursor, clamped to the screen."""
+def tooltip_window(widget, text: str, width: int, at=None):
+    """Create a tip popup and return it, clamped to the screen.
+
+    `at` is the screen (x, y) of its top-left corner; by default it sits
+    below-right of the cursor. Topmost, so it shows over a native popup menu.
+    """
     win = tk.Toplevel(widget)
     win.wm_overrideredirect(True)
+    win.attributes("-topmost", True)
     win.configure(bg=CLR["border"])
     tk.Label(
-        win, text=state["text"], justify="left", wraplength=width,
+        win, text=text, justify="left", wraplength=width,
         bg=CLR["log_bg"], fg=CLR["text"],
         font=("Segoe UI", 9), padx=8, pady=6,
     ).pack(padx=1, pady=1)
-    x = widget.winfo_pointerx() + 14
-    y = widget.winfo_pointery() + 18
+    x, y = at or (widget.winfo_pointerx() + 14, widget.winfo_pointery() + 18)
     win.update_idletasks()
     sw = win.winfo_screenwidth()
     if x + win.winfo_width() > sw:
         x = max(0, sw - win.winfo_width() - 4)
     win.wm_geometry(f"+{x}+{y}")
-    state["win"] = win
+    return win
 
 
 def attach_tooltip(widget, text: str, width: int = 340):
@@ -287,7 +322,7 @@ def attach_tooltip(widget, text: str, width: int = 340):
         """Put the popup up, unless one already is."""
         state["after"] = None
         if state["win"] is None:
-            _tooltip_window(widget, state, width)
+            state["win"] = tooltip_window(widget, state["text"], width)
 
     def _enter(_=None):
         """Arm the brief hover delay before showing."""

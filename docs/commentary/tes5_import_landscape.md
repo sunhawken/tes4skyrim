@@ -15,6 +15,7 @@ subsystems live:
 
 - [WATR — the DNAM offset trap](#watr-dnam-offset-trap)
 - [WATR — fields deliberately not carried](#watr-fields-not-carried)
+- [WRLD NAM2 — the water a worldspace naming none gets](#still-default-water)
 - [LSCR — NNAM is mandatory](#lscr-nnam-mandatory)
 
 ## WATR — the DNAM offset trap
@@ -63,6 +64,29 @@ record with a damage value but no flag is not meant to hurt.
 | `GNAM` / `NAM0` / `NAM1` | Required by the xEdit definition and present on all 34 vanilla records, always zeroed. TES4's Scroll X/Y Speed is NAM0's closest analogue, but the units differ by orders of magnitude — TES4 authors 0.0011 where vanilla NAM0 carries 0.22 — so it is not carried. |
 | `MNAM` / `TNAM` | TES5 marks MNAM "Material ID (Unused)" and every vanilla record that writes it writes a zero byte array, not the TES4 material string. TNAM took over as the material reference and is a MATT FormID; Skyrim ships no lava MATT and only 5 of 34 vanilla records set TNAM at all. Neither is emitted. |
 
+## <a id="still-default-water"></a>WRLD NAM2 — the water a worldspace naming none gets
+
+**Code:** `tes5_import/record_types/region.py::record_default_water`. **Status:
+not yet confirmed in game.**
+
+Skyrim's `DefaultWater` (0x18) carries a current: `NAM0` linear velocity
+(0.22, 0.22, 0) pushes every swimmer north-east. A worldspace with no `NAM2`
+used to fall back to it, so a swimmer drifted where the source never moved
+them: an idle player in Morrowind's sea crossed about 3,400 units in 300 fast
+ticks, faster than a following NPC swims. Neither source water has a current.
+TES4 has no velocity field, and Morrowind has no water record at all.
+
+- **A source whose masters or plugin author a WATR at raw 0x18** (Oblivion.esm's
+  `DefaultWater`) falls back to that record, converted like every WATR with
+  `NAM0` zeroed. 30 of Oblivion's 84 worldspaces name no water. That this
+  record is the TES4 engine's own fallback is assumed by analogy with
+  [DefaultClimate](#wrld-climate), not verified in Oblivion.exe.
+- **A source with none** (Morrowind) gets one generated `TES4DefaultWaterStill`:
+  Skyrim.esm's DefaultWater copied subrecord for subrecord with `NAM0`/`NAM1`
+  zeroed, so the sea looks the same and stands still.
+
+`NAM3` (LOD water) stays on vanilla 0x18; it is never swum in.
+
 ## LSCR — NNAM is mandatory
 <a id="lscr-nnam-mandatory"></a>
 
@@ -101,7 +125,7 @@ Remapping is what makes a separate key necessary: `get_formid` shifts every id
 by the new-master offset, so an exported `CNAM.Climate=00000812` arrives as
 `01000812` — this plugin's own space, where no climate exists.
 
-## CELL water and music
+## <a id="cell-water-and-music"></a>CELL water and music
 
 **Code:** `_cell_pointers` in `tes5_import/record_types/world.py`
 
@@ -109,6 +133,27 @@ Every CELL subrecord naming another record is built here, in vanilla's own
 order: `LTMP XCLW XNAM XCLR XCIM XLCN XEZN XCWT XCMO`. `XCIM` (imagespace) and
 `XEZN` (encounter zone) exist only in FO3/FNV sources; see
 [the reference-only types](tes4_export_falloutnv.md#reference-only-types).
+
+### <a id="interior-water-sentinel"></a>`XCLW` — an interior's only real height is 0
+
+The worldspace-default sentinel, `0xCF000000` = `-2147483648.0`, does NOT mean
+"this cell has water somewhere sensible". Censused over Skyrim.esm's interiors
+it is spread almost evenly across wet and dry cells — 104 of the Has Water
+interiors carry it, but so do 246 cells with no water flag at all — so it
+carries no height and no water.
+
+What every wet interior that states a height states is the same number:
+**all 71 interiors with a real `XCLW` height use exactly `0`**, and none uses
+any other value. Among Show Sky interiors with water the split is 53 writing
+`0` against 20 carrying the sentinel.
+
+So a Has Water interior with nothing authored gets `0.0`, not the sentinel.
+`build_cell_xclw` keeps its original rule — pass a real height through, omit
+the sentinel — because the sentinel never conveyed a usable interior height in
+the first place.
+
+`LTMP` is not part of this. It is the lighting template, and 5 vanilla Has
+Water interiors leave it null, so a null `LTMP` does not suppress water.
 
 ### <a id="cell-xclr-regions"></a>`XCLR` — how region weather reaches the sky
 
@@ -226,3 +271,39 @@ catches our own computed bounds.
 check each REFR/ACHR `NAME`. After these fixes only the FO3/FNV
 engine-hardcoded ids remain unresolved (`0x20`, 851 refs; `0x17`, 71 refs),
 which are not records in any plugin.
+
+## <a id="ltex-material-types"></a>LTEX material types — the MATT_MAP correction
+
+**Code:** `tes5_import/base/constants.py:MATT_MAP`, `tes5_import/record_types/world.py:convert_LTEX`
+
+TES4 LTEX carries `HNAM.Material`, a u8 enum; TES5 replaced it with `MNAM`, a
+FormID pointing at a MATT record. `MATT_MAP` bridges the two. The table was
+wrong on 10 of its 11 entries, in two independent ways.
+
+**The enum indices did not match TES4.** xEdit's definition
+(`references/xEdit/Core/wbDefinitionsTES4.pas:2727`) is 0 Stone, 1 Cloth,
+2 Dirt, 3 Glass, 4 Grass, 5 Metal, 6 Organic, 7 Skin, 8 Water, 9 Wood,
+10 Heavy Stone. The old table labelled index 1 "Dirt", 2 "Grass", 4 "Metal",
+5 "Wood", 9 "Cloth" and 10 "Snow".
+
+**The FormIDs did not match their own labels either.** Checked against
+`references/Skyrim.esm/MATT.txt`: `00012F3A` is MaterialChainMetal, not Grass;
+`00012F3F` is MaterialSkin, not Wood; `00012F3C` is MaterialSolidMetal, not
+Organic; `00012F3D` is MaterialOrganic, not Skin; `00012F3E` is MaterialSand,
+not Water; `00012F44` is MaterialBottle, not Snow.
+
+Net effect on shipped output: only index 0 resolved correctly. Oblivion grass
+terrain wrote MaterialHeavyMetal, dirt wrote MaterialChainMetal, and heavy
+stone wrote MaterialBottle. Every TES4 plugin was affected.
+
+The corrected table covers all 32 indices. Skyrim has only four stairs
+materials against TES4's fifteen, so the stairs range collapses onto
+StairsStone / StairsWood / StairsGlass / StairsSnow by underlying material —
+the same lossy grouping `OB_TO_SK_MATERIAL` uses for the NIF-side havok enum
+([havok material CRC](asset_convert_collision.md#havok-material-crc)).
+
+Wood maps to `MaterialWoodMedium` (`00043DCC`) rather than WoodLight or
+WoodHeavy: it is the MATT vanilla LTEX uses for plain wood, and the
+light/heavy split exists for objects.
+
+No FormID drift — every value is a vanilla Skyrim FormID, not a derived one.

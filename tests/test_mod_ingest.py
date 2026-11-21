@@ -9,6 +9,7 @@ import sys
 import zipfile
 from pathlib import Path
 
+import lz4.frame
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -714,7 +715,7 @@ def test_migrate_skips_missing_and_pluginless_dirs(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-#  BSA builder (mirrors the layout bsa_extract._iter_bsa reads)
+#  BSA builder (mirrors the layout bsa_extract.read_bsa_directory reads)
 # ---------------------------------------------------------------------------
 
 def _bsa_hash(name):
@@ -736,57 +737,47 @@ def _bsa_hash(name):
     return ((h2 & 0xFFFFFFFF) << 32) | (h1 & 0xFFFFFFFF)
 
 
-def _make_bsa(path, files):
-    """Write an uncompressed Oblivion-format BSA containing `files`."""
+def _make_bsa(path, files, version=103, compress=False):
+    """Write a v103 or v105 BSA of `files`; `compress` stores each file LZ4-framed."""
     by_folder = {}
     for full, data in files.items():
         folder, _, fname = full.replace('/', '\\').rpartition('\\')
+        if compress:
+            data = struct.pack('<I', len(data)) + lz4.frame.compress(data)
         by_folder.setdefault(folder, []).append((fname, data))
-
     folders = sorted(by_folder)
-    file_count = sum(len(v) for v in by_folder.values())
-    total_folder_name_len = sum(len(f) + 1 for f in folders)
+    record_size = 24 if version >= 105 else 16
     name_block = b''.join(
         bytes(fn, 'latin-1') + b'\x00'
         for f in folders for fn, _ in sorted(by_folder[f]))
+    folder_blocks = sum(2 + len(f) + len(by_folder[f]) * 16 for f in folders)
+    offset = 36 + len(folders) * record_size + folder_blocks + len(name_block)
 
-    header_size = 36
-    folder_records = len(folders) * 16
-    folder_blocks = sum(1 + len(f) + 1 + len(by_folder[f]) * 16
-                        for f in folders)
-    data_start = (header_size + folder_records + folder_blocks
-                  + len(name_block))
-
-    out = bytearray()
-    out += b'BSA\x00' + struct.pack('<I', 103)
-    out += struct.pack('<I', header_size)          # dir offset
-    out += struct.pack('<I', 0x0003)               # names present, no compress
-    out += struct.pack('<I', len(folders))
-    out += struct.pack('<I', file_count)
-    out += struct.pack('<I', total_folder_name_len)
-    out += struct.pack('<I', len(name_block))
-    out += struct.pack('<I', 0)                    # file flags
-
-    offset = data_start
-    folder_block = bytearray()
-    for f in folders:
-        raw = bytes(f, 'latin-1') + b'\x00'
-        folder_block += bytes([len(raw)]) + raw
-        for fn, data in sorted(by_folder[f]):
-            folder_block += struct.pack('<QII', _bsa_hash(fn), len(data),
-                                        offset)
-            offset += len(data)
-
+    out = bytearray(b'BSA\x00')
+    out += struct.pack('<8I', version, 36, 0x0003 | (0x0004 if compress else 0),
+                       len(folders), len(files), sum(len(f) + 1 for f in folders),
+                       len(name_block), 0)
     for f in folders:
         out += struct.pack('<QII', _bsa_hash(f), len(by_folder[f]), 0)
-    out += folder_block
-    out += name_block
+        out += b'\x00' * (record_size - 16)
+    payload = bytearray()
     for f in folders:
-        for _fn, data in sorted(by_folder[f]):
-            out += data
-
-    path.write_bytes(bytes(out))
+        raw = bytes(f, 'latin-1') + b'\x00'
+        out += bytes([len(raw)]) + raw
+        for fn, data in sorted(by_folder[f]):
+            out += struct.pack('<QII', _bsa_hash(fn), len(data), offset)
+            offset += len(data)
+            payload += data
+    path.write_bytes(bytes(out + name_block + payload))
     return path
+
+
+@pytest.mark.parametrize('version, compress', [(103, False), (105, False), (105, True)])
+def test_iter_bsa_reads_every_version(tmp_path, version, compress):
+    """v105's 24-byte folder records and LZ4 payloads read back like v103's."""
+    files = {r'meshes\a\one.nif': b'ONE' * 50, r'textures\b\two.dds': b'TWO' * 70}
+    bsa = _make_bsa(tmp_path / 'x.bsa', files, version, compress)
+    assert dict(bsa_extract.iter_bsa(bsa)) == files
 
 
 # ---------------------------------------------------------------------------
@@ -971,7 +962,7 @@ def test_a_master_inside_a_group_folder_still_resolves(tmp_path):
     silent-failure mode.
     """
     import os
-    from tes5_import.overrides.nested import export_root, master_export_dir
+    from core.plugin_masters import export_root, master_export_dir
 
     # A two-plugin mod, so its members nest inside the group folder.
     entries = _mod_entries('TWMP/Data/')
@@ -1013,3 +1004,29 @@ def test_missing_master_check_sees_group_folder_masters(tmp_path, monkeypatch):
     missing = convert._missing_master_exports(
         ['MapMarkers.esp'], str(export), '')
     assert missing == {}, f'falsely reported missing: {missing}'
+
+
+def test_mod_name_is_refused_as_a_plugin(tmp_path):
+    """-f with a mod's folder name builds a phantom plugin, so it is refused.
+
+    See: docs/reference/pipeline.md#-f-takes-the-plugin
+    """
+    import convert
+
+    export = tmp_path / 'export'
+    source_registry.put(export, 'TR_Mainland.esm', {
+        'plugin': 'TR_Mainland.esm', 'group_dir': 'Tamriel Rebuilt 25.08.12',
+        'group_label': 'Tamriel Rebuilt 25.08.12'})
+    source_registry.put(export, 'Tamriel Landscape Pack', {
+        'group_dir': 'Tamriel Landscape Pack',
+        'group_label': 'Tamriel Landscape Pack'})
+
+    assert source_registry.mod_plugins(
+        export, 'tamriel rebuilt 25.08.12') == ['TR_Mainland.esm']
+    assert source_registry.mod_plugins(export, 'TR_Mainland.esm') == []
+    assert source_registry.mod_plugins(export, 'Tamriel Landscape Pack') == []
+
+    args = type('Args', (), {'files': ['Tamriel Rebuilt 25.08.12'],
+                             'build_morrowind_patch': None})()
+    with pytest.raises(SystemExit, match='-f TR_Mainland.esm'):
+        convert._plugins_to_convert(args, {}, '', str(export))

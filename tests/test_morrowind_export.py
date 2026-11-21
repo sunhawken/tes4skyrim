@@ -12,9 +12,13 @@ import pytest
 
 from tes4_export import morrowind_land as land
 from tes4_export import tes3_reader as reader
-from tes4_export.export_morrowind import MorrowindContext, convert_plugin
+from tes4_export.export_morrowind import (MorrowindContext, convert_plugin,
+                                          magic_effect_records,
+                                          register_magic_effects)
+from tes4_export.record_types.morrowind_dialog import DIAL_SIG, INFO_SIG
 from tes4_export.morrowind_cell import parse_cell
-from tes4_export.morrowind_ids import IdIndex, encode_editor_id, marker_formid
+from tes4_export.morrowind_ids import (ENGINE_MARKERS, IdIndex, encode_editor_id,
+                                       load_index, marker_formid)
 from tes4_export.morrowind_markers import classify, place_name
 from tes4_export.morrowind_world import cell_grid, quadrant_suffix
 
@@ -48,6 +52,18 @@ def test_id_index_is_case_insensitive():
     assert index.lookup('Tel Mora') == '01234567'
     assert index.lookup('TEL MORA') == '01234567'
     assert index.lookup('tel mora') == '01234567'
+
+
+@pytest.mark.parametrize('grid', [[], ['XCLC.X=0', 'XCLC.Y=0']])
+def test_master_persistent_cell_is_indexed_with_or_without_a_grid(tmp_path, grid):
+    """Our own TES3 export writes no XCLC; Morroblivion's writes (0, 0). Both are found."""
+    lines = ['---RECORD_BEGIN---', 'Signature=CELL', 'FormID=00E681C5',
+             'EditorID=WrldMorrowindPersistent', 'RecordFlags=1024',
+             'DATA.Flags=2', 'ParentWRLD=008D2E7E', *grid, '---RECORD_END---']
+    (tmp_path / 'CELL.txt').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    index = load_index(str(tmp_path), types=('CELL',))
+    assert index.lookup_persistent('008D2E7E') == '00E681C5'
+    assert index.lookup_exterior((0, 0)) is None
 
 
 def test_engine_markers_are_named_not_converted():
@@ -110,6 +126,21 @@ def test_unconverted_base_object_is_never_referenced():
     assert ctx.resolve('some_npc_we_do_not_convert') == ''
     ctx.register_own('a_static_we_do_convert')
     assert ctx.resolve('a_static_we_do_convert') != ''
+
+
+def test_an_effect_a_master_supplies_is_not_stubbed_over():
+    """A stub override would hide the master's authored school, cost and flags.
+
+    See: docs/commentary/tes4_export_morrowind.md#effects-come-from-the-patch
+    """
+    ctx = MorrowindContext()
+    ctx.index.add('MW075RestoreHealth', '0140EBAA', 'MGEF')
+    register_magic_effects([], ctx)
+    names = {line for _fid, lines in magic_effect_records([], ctx)
+             for line in lines if line.startswith('EditorID=')}
+    assert 'EditorID=MW075RestoreHealth' not in names
+    assert 'EditorID=MW076RestoreSpellPoints' in names, (
+        'an effect no master supplies is still synthesized')
 
 
 def test_land_height_round_trip_is_exact():
@@ -231,15 +262,36 @@ def test_cell_refs_parse_positionally(morrowind_records):
 
 @needs_morrowind
 def test_conversion_emits_no_duplicate_formids(morrowind_records):
-    """Every emitted record must own a distinct FormID."""
+    """Every emitted record must own a distinct FormID.
+
+    DIAL/INFO are excluded: they are keyed by topic name and INAM, neither of
+    which is a FormID, and INAM is unique only within its topic.
+    See: docs/reference/morrowind_dialogue_format.md#info-identity
+    """
     ctx = MorrowindContext()
     out = convert_plugin(morrowind_records, ctx)
     seen = set()
-    for records in out.values():
+    for signature, records in out.items():
+        if signature in (DIAL_SIG, INFO_SIG):
+            continue
         for form_id, _ in records:
             assert form_id not in seen, f'duplicate FormID {form_id}'
             seen.add(form_id)
     assert len(seen) > 300000
+
+
+@needs_morrowind
+def test_an_info_is_identified_by_its_topic_and_inam(morrowind_records):
+    """INAM alone is not an identity: Morrowind.esm reuses 99 across topics.
+
+    See: docs/reference/morrowind_dialogue_format.md#info-identity
+    """
+    infos = convert_plugin(morrowind_records, MorrowindContext())[INFO_SIG]
+    topic = [next(l for l in lines if l.startswith('Topic=')) for _i, lines in infos]
+    pairs = {(t, inam) for t, (inam, _lines) in zip(topic, infos)}
+    assert len(pairs) == len(infos), 'topic + INAM identifies a response'
+    assert len({inam for inam, _ in infos}) == len(infos) - 211, \
+        'the 211 reused-INAM records are authored data, not an export defect'
 
 
 @needs_morrowind
@@ -374,6 +426,78 @@ def test_wrld_climate_names_a_record_that_exists():
         set_formid_index_offset(0)
 
 
+def test_container_respawn_is_tes4_bit_0x02():
+    """TES4 CONT DATA.Flags Respawns is 0x02 (xEdit; Oblivion.esm writes 2).
+
+    Exporting it as 1 lands on Skyrim's Allow Sounds When Animation, and the
+    restocking containers Morrowind merchants sell from never respawn.
+    """
+    from tes4_export.record_types.morrowind import export_CONT
+    rec = reader.Tes3Record('CONT', 0, [
+        reader.Subrecord(type='FLAG', data=struct.pack('<I', 0x0B)),
+        reader.Subrecord(type='CNDT', data=struct.pack('<f', 50.0))],
+        'shop_chest')
+    lines = export_CONT(rec, MorrowindContext())
+    assert 'DATA.Flags=2' in lines
+
+
+def _regn(record_id: str, weat: bytes):
+    """A minimal TES3 REGN record carrying one WEAT subrecord."""
+    return reader.Tes3Record(
+        'REGN', 0, [reader.Subrecord(type='WEAT', data=weat)], record_id)
+
+
+def test_region_weather_names_morroblivion_weathers():
+    """A region's WEAT chance bytes become an RDWT list naming real WTHR.
+
+    Slot 7 is blight, pinned by Morrowind's own RedMountainRegion.
+    See: docs/commentary/tes4_export_morrowind.md#region-weather
+    """
+    from tes4_export.morrowind_region import WEATHER_EDITOR_IDS, region_records
+    ctx = MorrowindContext()
+    for i, edid in enumerate(WEATHER_EDITOR_IDS):
+        ctx.index.add(edid, '010000%02X' % i, 'WTHR')
+    ctx.region_cells['bitter coast region'] = (
+        'Bitter Coast Region', {(3, 4), (5, 6)})
+
+    weat = bytes([60, 0, 0, 0, 0, 0, 0, 40, 0, 0])
+    out = region_records([_regn('Bitter Coast Region', weat)], ctx)
+
+    assert len(out) == 1
+    lines = out[0][1]
+    assert 'EditorID=0BitterSCoastSRegion' in lines
+    assert 'RegionData[0].Type=3' in lines
+    assert 'RegionData[0].WeatherCount=2' in lines
+    assert 'RegionData[0].Weather[0].FormID=01000000' in lines
+    assert 'RegionData[0].Weather[0].Chance=60' in lines
+    assert 'RegionData[0].Weather[1].FormID=01000007' in lines
+    assert 'RegionData[0].Weather[1].Chance=40' in lines
+    assert any(l.startswith('Area[0].PointsHex=') for l in lines)
+
+
+def test_region_weather_without_morroblivion_names_the_type():
+    """With no Morroblivion WTHR in any master, a weather is named by its TES3 type.
+
+    See: docs/commentary/tes5_import_weather.md#morrowind-weather-types
+    """
+    from tes4_export.morrowind_region import region_records
+    ctx = MorrowindContext()
+    ctx.region_cells['red mountain region'] = ('Red Mountain Region', {(2, 6)})
+    out = region_records([_regn('Red Mountain Region', bytes([0] * 7 + [100]))], ctx)
+    lines = out[0][1]
+    assert 'RegionData[0].Weather[0].MorrowindType=7' in lines
+    assert 'RegionData[0].Weather[0].Chance=100' in lines
+
+
+def test_region_with_no_cells_is_dropped():
+    """A region no cell claims has no polygon and nowhere to apply."""
+    from tes4_export.morrowind_region import region_records
+    ctx = MorrowindContext()
+    ctx.index.add('mwClear', '01000000', 'WTHR')
+    assert region_records(
+        [_regn('Nowhere Region', bytes([100] + [0] * 9))], ctx) == []
+
+
 @needs_morrowind
 def test_collision_node_becomes_skyrim_collision():
     """A RootCollisionNode must build real collision and stop rendering.
@@ -422,6 +546,50 @@ def test_collision_node_becomes_skyrim_collision():
     assert body.havok_col_filter.layer == 1
     assert type(body.shape).__name__ == 'bhkMoppBvTreeShape'
     assert body.shape.shape.target is root
+
+
+@needs_morrowind
+def test_item_models_convert_to_dynamic_clutter():
+    """An item record's model simulates; a fixture's stays static.
+
+    A dynamic body must carry a CONVEX shape -- havok will not simulate the
+    concave MOPP the static path builds -- on SKYL_CLUTTER with the authored
+    DATA.Weight and a non-zero inertia tensor.
+    See: docs/commentary/asset_convert_collision.md#morrowind-dynamic-clutter
+    """
+    import io
+
+    from asset_convert.nif import pyffi_monkey_patch
+    from asset_convert.nif.nif_converter_morrowind import (
+        build_collision, collision_triangles, find_collision_node)
+    assert pyffi_monkey_patch, 'the 4.0.0.2 read layouts must be installed'
+    from asset_convert.sources.bsa_extract_morrowind import iter_bsa
+    from pyffi.formats.nif import NifFormat
+
+    archive = os.path.join(MORROWIND_DATA, 'Morrowind.bsa')
+    if not os.path.exists(archive):
+        pytest.skip('Morrowind.bsa is not present')
+    target = 'meshes\\i\\in_r_l_int_bridge_02.nif'
+    payload = next((p for n, p in iter_bsa(archive)
+                    if n.lower().replace('/', '\\') == target), None)
+    assert payload is not None, 'sample mesh missing from the archive'
+
+    data = NifFormat.Data()
+    data.read(io.BytesIO(payload))
+    root = data.roots[0]
+    tris = collision_triangles(find_collision_node(root), root)
+
+    static = build_collision(root, tris).body
+    assert static.mass == 0.0
+    assert static.havok_col_filter.layer == 1
+
+    dynamic = build_collision(root, tris, 4.5).body
+    assert dynamic.mass == 4.5
+    assert dynamic.havok_col_filter.layer == 4, 'not on SKYL_CLUTTER'
+    assert dynamic.motion_system == 3 and dynamic.quality_type == 4
+    assert 'Convex' in type(dynamic.shape).__name__ or \
+        type(dynamic.shape).__name__ == 'bhkListShape'
+    assert dynamic.inertia.m_11 > 0, 'a zero tensor spins freely'
 
 
 @needs_morrowind
@@ -545,7 +713,7 @@ def test_no_reference_outlives_its_base_record(morrowind_records):
     bases = {form_id for sig, records in out.items()
              if sig not in ('CELL', 'REFR', 'LAND')
              for form_id, _ in records}
-    bases.update('%08X' % fid for fid in (1, 2, 3, 5, 6, 0x10, 0x3B))
+    bases.update('%08X' % fid for fid in (*ENGINE_MARKERS.values(), 0x10, 0x3B))
     cells = {form_id for form_id, _ in out['CELL']}
     for _, lines in out['REFR']:
         name = next(line[5:] for line in lines if line.startswith('NAME='))
@@ -563,6 +731,18 @@ def test_place_name_collapses_the_comma_convention():
     assert place_name('Balmora, Eight Plates') == 'Balmora'
     assert place_name('Vivec, St. Olms Canton') == 'Vivec'
     assert place_name('Nchuleft') == 'Nchuleft'
+
+
+def test_place_name_collapses_the_colon_convention():
+    """Tamriel Rebuilt separates a ship's rooms with a colon, not a comma.
+
+    See: docs/commentary/tes4_export_morrowind.md#map-markers
+    """
+    assert place_name('TEM Princess Morgiah: Hold') == 'TEM Princess Morgiah'
+    assert place_name('TEM Princess Morgiah: Cabin') == 'TEM Princess Morgiah'
+    assert place_name('Andresian Dreugh: Lower Deck') == 'Andresian Dreugh'
+    assert place_name('Dreugh: ') == 'Dreugh'
+    assert place_name(': Hold') == ': Hold'
 
 
 def test_size_outranks_kind_when_classifying():

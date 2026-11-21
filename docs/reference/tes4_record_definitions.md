@@ -1347,7 +1347,7 @@ New (8 bytes): u32 Flags, u8 Type, bytes[3] Unused
 
 **PGRP Point (16 bytes):** f32 X, f32 Y, f32 Z, u8 ConnectionCount, bytes[3] Unused
 
-**PGRI Inter-Cell Connection (14 bytes):** u16 Point, bytes[2] Unused, f32 X, f32 Y, f32 Z
+**PGRI Inter-Cell Connection (16 bytes):** u16 Point, bytes[2] Unused, f32 X, f32 Y, f32 Z
 
 ---
 
@@ -1923,7 +1923,7 @@ Each effect is a group of subrecords:
 | 16 | 4 | u32 | Type: 0=Self, 1=Touch, 2=Target |
 | 20 | 4 | s32 | Actor Value (ActorValueEnum) |
 
-**SCIT Script Effect struct (16 bytes, always paired with FULL):**
+**SCIT Script Effect struct (4, 12 or 16 bytes: the script alone, or with school and visual; follows the EFIT of the effect it belongs to):**
 
 | Offset | Size | Type | Field |
 |--------|------|------|-------|

@@ -27,6 +27,7 @@ from asset_convert.havok.behavior_clips import (
     build_attack_events,
     cast_phase_defs,
 )
+from asset_convert.havok.behavior_getup import GETUP_EVENTS
 
 #: Engine-set/read variables every creature declares: (name, type, init).
 ENGINE_VARIABLES = [
@@ -35,7 +36,8 @@ ENGINE_VARIABLES = [
     ('staggerMagnitude', 'REAL', 0), ('staggerDirection', 'REAL', 0),
     ('iState', 'INT32', 0), ('iGetUpType', 'INT32', 0),
     ('iCharacterSelector', 'INT32', 0), ('iCombatStance', 'INT32', 0),
-    ('iMovementSpeed', 'INT32', 0),
+    ('iMovementSpeed', 'INT32', 0), ('iSyncIdleLocomotion', 'INT32', 0),
+    ('iSyncTurnState', 'INT32', 1),
     ('IsAttacking', 'BOOL', 0), ('IsAttackReady', 'BOOL', 1),
     ('bEquipOK', 'BOOL', 1),
     ('iRightHandType', 'INT32', 0), ('iLeftHandType', 'INT32', 0),
@@ -107,12 +109,13 @@ def equip_events(clips):
     return out
 
 
-def graph_events(clips, vocal_states=None, sound_events=None):
+def graph_events(clips, vocal_states=None, sound_events=None, getup=False):
     """The graph's full event table, in declaration order.
 
     `sound_events` are FULLY-QUALIFIED `SoundPlay.<SNDR EditorID>` names;
     every one must appear here or the annotation resolves to no event and is
     dropped.  `vocal_states` contribute their IDLE records' ENAM strings.
+    `getup` appends the getup state's events last, leaving every other index as it was.
     """
     events = list(BASE_EVENTS)
     if cast_phase_defs(clips):
@@ -124,6 +127,8 @@ def graph_events(clips, vocal_states=None, sound_events=None):
                if e not in events]
     events += build_attack_events(clips)
     events += equip_events(clips)
+    if getup:
+        events += GETUP_EVENTS
     return events
 
 

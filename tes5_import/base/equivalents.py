@@ -11,6 +11,8 @@ NPC preset templates, voice types, head parts, hair colors, etc.
 
 import struct
 
+from tes4_export.record_types.morrowind import MW_ENCHANT_SKILL
+
 from .tes5_reader import records
 from .writer import pack_record, pack_string_subrecord, pack_subrecord
 
@@ -46,6 +48,14 @@ RACE_MAP = {
 }
 DEFAULT_RACE = 0x00013746  # Nord
 
+#: Each playable Skyrim race -> its vampire race (Skyrim.esm `<Race>RaceVampire`), which a vampire player wears.
+SKYRIM_VAMPIRE_RACES = {
+    0x00013740: 0x0008883A, 0x00013741: 0x0008883C, 0x00013742: 0x0008883D,
+    0x00013743: 0x00088840, 0x00013744: 0x00088844, 0x00013745: 0x00088845,
+    0x00013746: 0x00088794, 0x00013747: 0x000A82B9, 0x00013748: 0x00088846,
+    0x00013749: 0x00088884,
+}
+
 
 # ---------------------------------------------------------------------------
 # Creature race map: EditorID/name keyword → Skyrim race FormID
@@ -78,12 +88,17 @@ _SKY_MUDCRAB         = 0x000BA545   # MudcrabRace
 _SKY_SABRECAT        = 0x00013200  # SabreCatRace
 _SKY_SKEEVER         = 0x00013201  # SkeeverRace
 _SKY_SPIDER          = 0x000131F8  # FrostbiteSpiderRace
-_SKY_WOLF            = 0x000131EB  # WolfRace
+#: WolfRace
+_SKY_WOLF            = 0x0001320A
 _SKY_WEREWOLF        = 0x000CDD84  # WerewolfBeastRace (Dawnguard.esm 0x000CDD84)
-_SKY_CHAURUS         = 0x000131F3  # ChaurusRace
-_SKY_MAMMOTH         = 0x0001320A  # MammothRace (Skyrim.esm)
-_SKY_RABBIT          = 0x00059339  # RabbitRace (Skyrim.esm)
-_SKY_FOX             = 0x000A0EB2  # FoxRace (Skyrim.esm)
+#: ChaurusRace
+_SKY_CHAURUS         = 0x000131EB
+#: MammothRace
+_SKY_MAMMOTH         = 0x000131FF
+#: HareRace (Skyrim.esm has no RabbitRace)
+_SKY_RABBIT          = 0x0006DC99
+#: FoxRace
+_SKY_FOX             = 0x00109C7C
 _SKY_DEER            = 0x000131ED  # ElkRace (closest for deer)
 _SKY_DEFAULT         = 0x000B7998  # SkeletonRace (last-resort fallback)
 #   CC ESLs — file-local FormIDs (prefix 05 is placeholder load-order byte)
@@ -132,8 +147,8 @@ CREA_RACE_PATTERNS = [
     ('gnarl',         _SKY_SPRIGGAN,       'Skyrim.esm 0x00013204 SprigganRace (closest to Gnarl)', None),
     ('hunger',        _SKY_DREMORA,        'Skyrim.esm 0x000131F0 DremoraRace (Hunger)', None),
     ('shambles',      _SKY_DRAUGR,         'Skyrim.esm 0x00000D53 DraugrRace (closest to Shambles)', None),
-    ('scalon',        _SKY_CHAURUS,        'Skyrim.esm 0x000131F3 ChaurusRace (closest to Scalon)', None),
-    ('baliwog',       _SKY_CHAURUS,        'Skyrim.esm 0x000131F3 ChaurusRace (closest to Baliwog)', None),
+    ('scalon',        _SKY_CHAURUS,        'Skyrim.esm 0x000131EB ChaurusRace (closest to Scalon)', None),
+    ('baliwog',       _SKY_CHAURUS,        'Skyrim.esm 0x000131EB ChaurusRace (closest to Baliwog)', None),
     ('skinned hound', _SKY_SKELETON,       'Skyrim.esm 0x000B7998 SkeletonRace (Skinned Hound)', None),
     ('skinnedh',      _SKY_SKELETON,       'Skyrim.esm 0x000B7998 SkeletonRace (Skinned Hound)', None),
     # ---- Atronachs ----
@@ -159,22 +174,22 @@ CREA_RACE_PATTERNS = [
     ('undead',        _SKY_DRAUGR,         'Skyrim.esm 0x00000D53 DraugrRace',          None),
     # ---- Wildlife ----
     ('bear',          _SKY_BEAR_BROWN,     'Skyrim.esm 0x000131E7 BearBrownRace',       'Skyrim.esm 0x000131E8 BearBlackRace / 0x000131E9 BearSnowRace'),
-    ('wolf',          _SKY_WOLF,           'Skyrim.esm 0x000131EB WolfRace',            None),
-    ('timber wolf',   _SKY_WOLF,           'Skyrim.esm 0x000131EB WolfRace',            None),
+    ('wolf',          _SKY_WOLF,           'Skyrim.esm 0x0001320A WolfRace',            None),
+    ('timber wolf',   _SKY_WOLF,           'Skyrim.esm 0x0001320A WolfRace',            None),
     ('mountain lion', _SKY_SABRECAT,       'Skyrim.esm 0x00013200 SabreCatRace (Mountain Lion)', None),
     ('mountainlion',  _SKY_SABRECAT,       'Skyrim.esm 0x00013200 SabreCatRace (Mountain Lion)', None),
     ('muontain',      _SKY_SABRECAT,       'Skyrim.esm 0x00013200 SabreCatRace (Mountain Lion typo)', None),
     ('deer',          _SKY_DEER,           'Skyrim.esm 0x000131ED ElkRace (closest to Deer)', None),
     ('horse',         _SKY_HORSE,          'Skyrim.esm 0x000131FD HorseRace',           None),
     ('unicorn',       _SKY_HORSE,          'Skyrim.esm 0x000131FD HorseRace (Unicorn)', None),
-    ('dog',           _SKY_WOLF,           'Skyrim.esm 0x000131EB WolfRace (Dog)',      None),
+    ('dog',           _SKY_WOLF,           'Skyrim.esm 0x0001320A WolfRace (Dog)',      None),
     ('rat',           _SKY_SKEEVER,        'Skyrim.esm 0x00013201 SkeeverRace (Rat)',   None),
     ('sheep',         _SKY_GOAT,           'Skyrim.esm 0x000131FA GoatRace (Sheep)',    None),
     ('boar',          _SKY_GOAT,           'Skyrim.esm 0x000131FA GoatRace (Boar)',     None),
     ('mudcrab',       _SKY_MUDCRAB,        'Skyrim.esm 0x000BA545 MudcrabRace',          None),
     ('mud crab',      _SKY_MUDCRAB,        'Skyrim.esm 0x000BA545 MudcrabRace',          None),
     ('slaughterfish', _SKY_MUDCRAB,        'Skyrim.esm 0x000BA545 MudcrabRace (Slaughterfish—no fish race)', None),
-    ('dreugh',        _SKY_CHAURUS,        'Skyrim.esm 0x000131F3 ChaurusRace (Land Dreugh)', None),
+    ('dreugh',        _SKY_CHAURUS,        'Skyrim.esm 0x000131EB ChaurusRace (Land Dreugh)', None),
     ('spriggan',      _SKY_SPRIGGAN,       'Skyrim.esm 0x00013204 SprigganRace',        None),
     ('troll',         _SKY_TROLL,          'Skyrim.esm 0x00013205 TrollRace',           'BSHeartland.esm 0x0208BB68 CYRTrollRiverRace / Skyrim.esm 0x00013206 TrollFrostRace'),
     ('wisp',          _SKY_WISP,           'Skyrim.esm 0x00013208 WispRace',            'BSHeartland.esm 0x0207822E CYRWillotheWispRace'),
@@ -623,7 +638,7 @@ _FORTIFY_SKILL = {
     13: 0x0003EAF9,  # Athletics → AlchFortifyStamina
     14: 0x0003EB19,  # Blade → AlchFortifyOneHanded
     15: 0x0003EB1C,  # Block → AlchFortifyBlock
-    16: 0x0003EB19,  # Blunt → AlchFortifyOneHanded
+    16: 0x0003EB1A,  # Blunt → AlchFortifyTwoHanded (as magic.SKILL_TO_AV)
     17: 0x0003EB19,  # HandToHand → AlchFortifyOneHanded
     18: 0x0003EB1E,  # HeavyArmor → AlchFortifyHeavyArmor
     19: 0x0003EB18,  # Alchemy → AlchFortifyAlchemy
@@ -631,7 +646,7 @@ _FORTIFY_SKILL = {
     21: 0x0003EB25,  # Conjuration → AlchFortifyConjuration
     22: 0x0003EB26,  # Destruction → AlchFortifyDestruction
     23: 0x0003EB27,  # Illusion → AlchFortifyIllusion
-    24: 0x0003EB27,  # Mysticism → AlchFortifyIllusion
+    24: 0x0003EB24,  # Mysticism → AlchFortifyAlteration
     25: 0x0003EB28,  # Restoration → AlchFortifyRestoration
     26: 0x0003EAF9,  # Acrobatics → AlchFortifyStamina
     27: 0x0003EB1F,  # LightArmor → AlchFortifyLightArmor
@@ -655,32 +670,28 @@ MGEF_AV_CODE_TO_SKYRIM = {
 # (e.g. when no writer is available). ArrowIronProjectile [PROJ:0003BE11]
 DEFAULT_ARROW_PROJECTILE = 0x0003BE11
 
-# TES4 skill index → TES5 Actor Value index for BOOK teaching
-# TES4 uses absolute indices (12-32), TES5 uses AV indices (6-23)
-# AV 6=OneHanded, 7=TwoHanded, 8=Marksman, 9=Block, 10=Smithing,
-# 11=HeavyArmor, 12=LightArmor, 13=Pickpocket, 14=Lockpicking, 15=Sneak,
-# 16=Alchemy, 17=Speechcraft, 18=Alteration, 19=Conjuration, 20=Destruction,
-# 21=Illusion, 22=Restoration, 23=Enchanting
+#: TES4 BOOK DATA.Teaches, a 0-20 skill index (xEdit wbSkillEnum) -> the TES5 actor value it teaches.
 TES4_SKILL_TO_TES5_INDEX = {
-    12: 10,  # Armorer → Smithing (AV 10)
-    14: 6,   # Blade → OneHanded (AV 6)
-    15: 9,   # Block → Block (AV 9)
-    16: 6,   # Blunt → OneHanded (AV 6)
-    17: 6,   # HandToHand → OneHanded (AV 6)
-    18: 11,  # HeavyArmor → HeavyArmor (AV 11)
-    19: 16,  # Alchemy → Alchemy (AV 16)
-    20: 18,  # Alteration → Alteration (AV 18)
-    21: 19,  # Conjuration → Conjuration (AV 19)
-    22: 20,  # Destruction → Destruction (AV 20)
-    23: 21,  # Illusion → Illusion (AV 21)
-    24: 21,  # Mysticism → Illusion (AV 21)
-    25: 22,  # Restoration → Restoration (AV 22)
-    27: 12,  # LightArmor → LightArmor (AV 12)
-    28: 8,   # Marksman → Archery (AV 8)
-    29: 13,  # Mercantile → Pickpocket (AV 13)
-    30: 14,  # Security → Lockpicking (AV 14)
-    31: 15,  # Sneak → Sneak (AV 15)
-    32: 17,  # Speechcraft → Speech (AV 17)
+    0: 10,   # Armorer → Smithing
+    2: 6,    # Blade → OneHanded
+    3: 9,    # Block → Block
+    4: 6,    # Blunt → OneHanded
+    5: 6,    # HandToHand → OneHanded
+    6: 11,   # HeavyArmor → HeavyArmor
+    7: 16,   # Alchemy → Alchemy
+    8: 18,   # Alteration → Alteration
+    9: 19,   # Conjuration → Conjuration
+    10: 20,  # Destruction → Destruction
+    11: 21,  # Illusion → Illusion
+    12: 18,  # Mysticism → Alteration
+    13: 22,  # Restoration → Restoration
+    15: 12,  # LightArmor → LightArmor
+    16: 8,   # Marksman → Archery
+    17: 17,  # Mercantile → Speech
+    18: 14,  # Security → Lockpicking
+    19: 15,  # Sneak → Sneak
+    20: 17,  # Speechcraft → Speech
+    MW_ENCHANT_SKILL: 23,  # Morrowind Enchant → Enchanting
 }
 
 # ---------------------------------------------------------------------------
@@ -691,6 +702,7 @@ TES4_MARKER_FORMID_TO_SKYRIM = {
     0x00000001: 0x0000003B,  # DoorMarker       → XMarker (invisible generic)
     0x00000002: 0x00000002,  # TravelMarker     → same FormID in Skyrim.esm (fast-travel dest)
     0x00000003: 0x00000003,  # NorthMarker      → same FormID in Skyrim.esm
+    0x00000004: 0x00000004,  # PrisonMarker     → same FormID in Skyrim.esm (a jail)
     0x00000005: 0x0000003B,  # DivineMarker     → XMarker (no Skyrim equivalent)
     0x00000006: 0x0000003B,  # TempleMarker     → XMarker (no Skyrim equivalent)
     # MapMarker → MapMarker.  Skyrim's STAT 0x10 *is* the map marker base object
@@ -877,18 +889,39 @@ WEAPON_ANIM_MULT: dict[int, float] = {
     8: 1.0,   # Staff
 }
 
-# DNAM stagger (U8 at offset 76) by anim type
-WEAPON_ANIM_STAGGER: dict[int, int] = {
-    1: 6,   # Sword     — Ragdoll
-    2: 5,   # Dagger    — Normal
-    3: 6,   # WarAxe    — Ragdoll
-    4: 6,   # Mace      — Ragdoll
-    5: 7,   # GreatSword — Large Ragdoll
-    6: 7,   # Battleaxe  — Large Ragdoll
-    7: 0,   # Bow       — None
-    9: 0,   # Crossbow (as Bow)
-    8: 0,   # Staff     — None
+#: WEAP DNAM skill (int32 actor value at offset 76) by anim type: 6 OneHanded, 7 TwoHanded, 8 Marksman, -1 none.
+# See: docs/commentary/tes5_import_magic.md#weapon-skill-and-stagger
+WEAPON_ANIM_SKILL: dict[int, int] = {
+    1: 6,    # Sword
+    2: 6,    # Dagger
+    3: 6,    # WarAxe
+    4: 6,    # Mace
+    5: 7,    # GreatSword
+    6: 7,    # Battleaxe
+    7: 8,    # Bow
+    9: 8,    # Crossbow (as Bow)
+    8: -1,   # Staff
 }
+
+#: WEAP DNAM stagger (float at offset 96) by anim type: Skyrim.esm's commonest value; a crossbow takes the bow's.
+# See: docs/commentary/tes5_import_magic.md#weapon-skill-and-stagger
+WEAPON_ANIM_STAGGER: dict[int, float] = {
+    1: 0.75,   # Sword
+    2: 0.0,    # Dagger
+    3: 0.85,   # WarAxe
+    4: 1.0,    # Mace
+    5: 1.1,    # GreatSword
+    6: 1.15,   # Battleaxe
+    7: 0.0,    # Bow
+    9: 0.0,    # Crossbow (as Bow)
+    8: 0.0,    # Staff
+}
+
+
+def weapon_skill_stagger(anim_type: int) -> tuple:
+    """(DNAM skill, stagger) of a weapon animation type; (-1, 0.0) with no row."""
+    return WEAPON_ANIM_SKILL.get(anim_type, -1), WEAPON_ANIM_STAGGER.get(anim_type, 0.0)
+
 
 # DNAM flags (U32 at offset 12) by anim type
 # 0x40 = PlayerOnly (set for slower weapons: mace, greatsword, battleaxe)
@@ -943,57 +976,23 @@ HEAVY_ARMOR_FOOTSTEP_SET = 0x00021487   # FSTArmorHeavyFootstepSet
 LIGHT_ARMOR_FOOTSTEP_SET = 0x00021486   # FSTArmorLightFootstepSet
 CLOTHING_FOOTSTEP_SET = 0x00021468      # FSTBarefootFootstepSet
 
-# Additional races for ARMA records.  Every ARMA should list all playable
-# races so any race can equip the armor.  These are the base race FormIDs
-# from Skyrim.esm (sourced from IronBootsAA's MODL entries).
+#: ARMA MODL[]: each playable race, then its vampire race. See: docs/commentary/asset_convert_armor.md#arma-race-lists
 ARMA_ADDITIONAL_RACES = [
-    0x00013740,  # ArgonianRace
-    0x00013741,  # BretonRace
-    0x00013742,  # DarkElfRace
-    0x00013743,  # HighElfRace
-    0x00013744,  # ImperialRace
-    0x00013745,  # KhajiitRace
-    0x00013746,  # NordRace
-    0x00013747,  # OrcRace
-    0x00013748,  # RedguardRace
-    0x00013749,  # WoodElfRace
+    fid for race in sorted(SKYRIM_VAMPIRE_RACES) for fid in (race, SKYRIM_VAMPIRE_RACES[race])
 ]
 
-
-# BEAST-RACE HEAD GEAR (2026-08-27).  A converted hood/helmet mesh is fitted
-# to the SHARED HUMAN skull, which on a khajiit or argonian puts the geometry
-# inside the head: measured head-local, the khajiit Skyrim head reaches
-# z 14.85 and abs(x) 8.47 against the human head's 11.51 / 6.85, and over the
-# scalp region a hood sits on, beast verts stand a mean 1.91 (khajiit) / 1.40
-# (argonian) proud of the human surface (max 6.87 / 4.29).
-#
-# Vanilla Skyrim's answer is one ARMA PER RACE FAMILY, each naming its own
-# reshaped NIF -- ArmorIronHelmet lists IronHelmetAA (RNAM=DefaultRace,
-# Helmet.nif), IronHelmetKhajiitAA (RNAM=KhajiitRace, HelmetKhajiit.nif) and
-# IronHelmetArgonianAA (RNAM=ArgonianRace, HelmetArgonian.nif).  ARMA carries
-# no alternate-model slot; race targeting is RNAM plus the MODL[] additional
-# races, so a per-race MESH requires a per-race ARMA.  The same split runs
-# through BoneCrown, Blades, Orcish, Dragonscale, Draugr, Dragonplate, Falmer,
-# ThalmorHood and every Circlet.
-#
-# We mirror it: asset_convert.nif.nif_converter writes <name>_khajiit.nif /
-# <name>_argonian.nif beside the base mesh and equipment._build_arma emits the
-# ARMA naming each.  Khajiit and Argonian stay SEPARATE (never one shared
-# "beast" mesh) because the two skulls differ from each other as much as
-# either differs from the human one.
-#
-# race key -> (RNAM race FormID, [additional races], mesh suffix).  The
-# additional race is that race's vampire variant, exactly as vanilla lists it.
+#: Head-gear beast armatures: race key -> (RNAM race, [its vampire race], mesh suffix).
 ARMA_BEAST_RACES = {
-    'khajiit': (0x00013745, [0x00088845], '_khajiit'),
-    'argonian': (0x00013740, [0x0008883A], '_argonian'),
+    'khajiit': (0x00013745, [SKYRIM_VAMPIRE_RACES[0x00013745]], '_khajiit'),
+    'argonian': (0x00013740, [SKYRIM_VAMPIRE_RACES[0x00013740]], '_argonian'),
 }
 
-# The races the DEFAULT (human-fitted) ARMA should claim once beast variants
-# exist: everything in ARMA_ADDITIONAL_RACES except the beast races, which are
-# served by their own ARMA.  Leaving them in makes the engine pick whichever
-# armature it finds first and the beast mesh never renders.
-ARMA_BEAST_RACE_FIDS = {fid for fid, _extra, _sfx in ARMA_BEAST_RACES.values()}
+#: Every race a beast armature serves, its vampire race included.
+ARMA_BEAST_RACE_FIDS = {
+    fid for rnam, extra, _sfx in ARMA_BEAST_RACES.values() for fid in (rnam, *extra)
+}
+
+#: The default armature's races once beast armatures exist. See: docs/commentary/asset_convert_armor.md#arma-race-lists
 ARMA_ADDITIONAL_RACES_NONBEAST = [
     fid for fid in ARMA_ADDITIONAL_RACES if fid not in ARMA_BEAST_RACE_FIDS
 ]

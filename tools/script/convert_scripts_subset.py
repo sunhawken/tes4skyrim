@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from asset_convert.game_paths import namespace_for, set_namespace
+from output_layout import record_dir
 from tes5_import.base.text_reader import parse_export_file
 from script_convert import pipeline
 
@@ -114,7 +115,7 @@ def main(argv=None) -> int:
     ap.add_argument('--compile', action='store_true')
     args = ap.parse_args(argv)
 
-    export_dir = str(ROOT / 'export' / args.plugin)
+    export_dir = str(record_dir(str(ROOT / 'export'), args.plugin))
     out = args.out or str(ROOT / 'temp' / 'subset_scripts' / args.plugin)
     os.makedirs(out, exist_ok=True)
     set_namespace(namespace_for(export_dir))
@@ -126,7 +127,7 @@ def main(argv=None) -> int:
     scpt, info, qust = _select(args, export_dir, scpt_work, info_work,
                                qust_work)
 
-    pipeline._script_worker_init(*ctx['initargs'])
+    pipeline.script_worker_init(*ctx['initargs'])
     stats = pipeline._new_stats()
     if scpt:
         pipeline._merge_stats(stats, pipeline._script_worker_run(('scpt', scpt)))
@@ -135,9 +136,8 @@ def main(argv=None) -> int:
     if qust:
         pipeline._merge_stats(stats, pipeline._script_worker_run(('qust', qust)))
     pipeline._WORKER_CTX.clear()
-    # The dangling-reference pass now runs at the WRITE (pipeline.write_psc),
-    # so only the cross-script UDF cast pass is still a sweep.
-    pipeline._fix_udf_call_arg_types(out, stats['udf_sigs'])
+    pipeline._fix_udf_call_arg_types(out, stats['udf_sigs'],
+                                     stats['udf_callers'])
     print(f'  wrote {len(scpt)} SCPT / {len(info)} INFO / {len(qust)} QUST -> {out}')
     for e in stats['errors'][:20]:
         print('  ERR', e)

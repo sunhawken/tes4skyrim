@@ -25,8 +25,17 @@ TES5 record order: EDID VMAD FULL MDOB KSIZ/KWDA DATA ESCE* SNDD DNAM CTDA
 """
 
 import struct
-import threading
 
+from tes4_export.record_types.morrowind import MW_ENCHANT_SKILL
+
+from . import magic_art, magic_art_morrowind
+from .common import pack_keywords
+from ..generated.vanilla_mgef_data import VANILLA_MGEF_DATA
+from ..base.constants import ENGINE_GLOBAL_FORMIDS, mgef_family_keyword_name
+from ..base.conditions import (FUNC_GET_GLOBAL_VALUE, FUNC_HAS_KEYWORD,
+                               FUNC_HAS_MAGIC_EFFECT_KEYWORD, FUNC_IS_IN_INTERIOR,
+                               build_ctda)
+from ..base.owned_records import MGEF_FAMILY_KEYWORDS, WELL_KNOWN_PROPERTIES
 from ..base.text_reader import get_float, get_formid, get_int, get_str
 from ..base.writer import (
     pack_formid_subrecord,
@@ -38,44 +47,45 @@ from ..base.writer import (
 # --- TES5 MGEF DATA offsets (152 bytes) -----------------------------------
 MGEF_DATA_SIZE = 152
 
-_O_FLAGS = 0
-_O_BASE_COST = 4
-_O_ASSOC_ITEM = 8
-_O_MAGIC_SKILL = 12
-_O_RESIST_VALUE = 16
-_O_COUNTER_COUNT = 20          # u16 + 2 unused
-_O_CASTING_LIGHT = 24
-_O_TAPER_WEIGHT = 28
-_O_HIT_SHADER = 32
-_O_ENCHANT_SHADER = 36
-_O_MIN_SKILL = 40
-_O_SPELLMAKING_AREA = 44
-_O_SPELLMAKING_TIME = 48
-_O_TAPER_CURVE = 52
-_O_TAPER_DURATION = 56
-_O_SECOND_AV_WEIGHT = 60
-_O_ARCHETYPE = 64
-_O_ACTOR_VALUE = 68
-_O_PROJECTILE = 72
-_O_EXPLOSION = 76
-_O_CASTING_TYPE = 80
-_O_DELIVERY = 84
-_O_SECOND_AV = 88
-_O_CASTING_ART = 92
-_O_HIT_EFFECT_ART = 96
-_O_IMPACT_DATA = 100
-_O_SKILL_USAGE_MULT = 104
-_O_DUAL_CAST_ART = 108
-_O_DUAL_CAST_SCALE = 112
-_O_ENCHANT_ART = 116
-_O_HIT_VISUALS = 120
-_O_ENCHANT_VISUALS = 124
-_O_EQUIP_ABILITY = 128
-_O_IMAGE_SPACE_MOD = 132
-_O_PERK_TO_APPLY = 136
-_O_CASTING_SOUND_LEVEL = 140
-_O_AI_SCORE = 144
-_O_AI_DELAY = 148
+O_FLAGS = 0
+O_BASE_COST = 4
+O_ASSOC_ITEM = 8
+O_MAGIC_SKILL = 12
+O_RESIST_VALUE = 16
+#: Counter Effect Count: a u16 followed by 2 unused bytes.
+O_COUNTER_COUNT = 20
+O_CASTING_LIGHT = 24
+O_TAPER_WEIGHT = 28
+O_HIT_SHADER = 32
+O_ENCHANT_SHADER = 36
+O_MIN_SKILL = 40
+O_SPELLMAKING_AREA = 44
+O_SPELLMAKING_TIME = 48
+O_TAPER_CURVE = 52
+O_TAPER_DURATION = 56
+O_SECOND_AV_WEIGHT = 60
+O_ARCHETYPE = 64
+O_ACTOR_VALUE = 68
+O_PROJECTILE = 72
+O_EXPLOSION = 76
+O_CASTING_TYPE = 80
+O_DELIVERY = 84
+O_SECOND_AV = 88
+O_CASTING_ART = 92
+O_HIT_EFFECT_ART = 96
+O_IMPACT_DATA = 100
+O_SKILL_USAGE_MULT = 104
+O_DUAL_CAST_ART = 108
+O_DUAL_CAST_SCALE = 112
+O_ENCHANT_ART = 116
+O_HIT_VISUALS = 120
+O_ENCHANT_VISUALS = 124
+O_EQUIP_ABILITY = 128
+O_IMAGE_SPACE_MOD = 132
+O_PERK_TO_APPLY = 136
+O_CASTING_SOUND_LEVEL = 140
+O_AI_SCORE = 144
+O_AI_DELAY = 148
 
 # --- TES5 MGEF DATA.Flags -------------------------------------------------
 F_HOSTILE = 0x00000001
@@ -267,6 +277,7 @@ SKILL_TO_AV = {
     30: AV_LOCKPICKING,    # Security
     31: AV_SNEAK,          # Sneak
     32: AV_SPEECH,         # Speechcraft
+    MW_ENCHANT_SKILL + 12: AV_ENCHANTING,
 }
 
 # TES4 ResistValue is an Oblivion actor-value index naming the resistance that
@@ -276,7 +287,6 @@ TES4_RESIST_AV_TO_TES5 = {
     62: AV_RESIST_FROST,     # ResistFrost
     63: AV_RESIST_DISEASE,   # ResistDisease
     64: AV_RESIST_MAGIC,     # ResistMagic
-    66: AV_PARALYSIS,        # ResistParalysis → Paralysis AV
     67: AV_POISON_RESIST,    # ResistPoison
     68: AV_RESIST_SHOCK,     # ResistShock
 }
@@ -326,9 +336,9 @@ EFFECT_ARCHETYPES = {
     # -- Alteration ---------------------------------------------------------
     'BRDN': (A_VALUE_MODIFIER, AV_CARRY_WEIGHT),     # Burden (detrimental)
     'FTHR': (A_VALUE_MODIFIER, AV_CARRY_WEIGHT),     # Feather
-    'FISH': (A_CLOAK, AV_NONE),                      # Fire Shield
-    'FRSH': (A_CLOAK, AV_NONE),                      # Frost Shield
-    'LISH': (A_CLOAK, AV_NONE),                      # Shock Shield
+    'FISH': (A_DUAL_VALUE_MODIFIER, AV_DAMAGE_RESIST),   # Fire Shield
+    'FRSH': (A_DUAL_VALUE_MODIFIER, AV_DAMAGE_RESIST),   # Frost Shield
+    'LISH': (A_DUAL_VALUE_MODIFIER, AV_DAMAGE_RESIST),   # Shock Shield
     'SHLD': (A_VALUE_MODIFIER, AV_DAMAGE_RESIST),    # Shield
     'LOCK': (A_LOCK, AV_NONE),
     'OPEN': (A_OPEN, AV_NONE),
@@ -429,7 +439,7 @@ EFFECT_ARCHETYPES = {
     'RSPO': (A_PEAK_VALUE_MODIFIER, AV_POISON_RESIST),
     'RSDI': (A_PEAK_VALUE_MODIFIER, AV_RESIST_DISEASE),
     'RSNW': (A_PEAK_VALUE_MODIFIER, AV_DAMAGE_RESIST),
-    'RSPA': (A_PEAK_VALUE_MODIFIER, AV_PARALYSIS),
+    'RSPA': (A_SCRIPT, AV_NONE),
     'RSWD': (A_PEAK_VALUE_MODIFIER, AV_RESIST_MAGIC),
     'CUDI': (A_CURE_DISEASE, AV_NONE),
     'CUPO': (A_CURE_POISON, AV_NONE),
@@ -441,6 +451,13 @@ EFFECT_ARCHETYPES = {
     # holds its duration, and still answers HasMagicEffect — which is what the
     # converted IsSpellTarget polling looks for.
     'SEFF': (A_SCRIPT, AV_NONE),
+}
+
+#: Dual Value Modifier code -> its second actor value, raised by the same magnitude as the armor rating.
+SECOND_ACTOR_VALUES = {
+    'FISH': AV_RESIST_FIRE,
+    'FRSH': AV_RESIST_FROST,
+    'LISH': AV_RESIST_SHOCK,
 }
 
 # Effects whose TES4 school is misleading once the archetype is chosen.
@@ -458,8 +475,37 @@ SCHOOL_OVERRIDES = {
 # player see them in the magic menu shows junk entries.
 _MARKER_CODES = frozenset({'POSN', 'DISE', 'DUMY', 'VAMP', 'DARK'})
 
+#: Archetypes whose engine constructor forces magnitude 1.0 under No Magnitude (1.6.1170 0x5d8210).
+VALUE_MODIFIER_ARCHETYPES = frozenset({A_VALUE_MODIFIER, A_DUAL_VALUE_MODIFIER, A_PEAK_VALUE_MODIFIER})
 
-def resolve_actor_value(code: str, effect_av: int) -> int:
+#: On/off actor values, where that forced 1.0 is the intended "on".
+SWITCH_ACTOR_VALUES = frozenset({AV_PARALYSIS, AV_INVISIBILITY, AV_NIGHT_EYE,
+                                 AV_WATER_BREATHING, AV_WATER_WALKING})
+
+
+def magnitude_flag_allowed(archetype: int, actor_value: int) -> bool:
+    """True unless No Magnitude would make the engine apply a value of 1.
+
+    See: docs/commentary/tes5_import_magic.md#no-magnitude-forces-one
+    """
+    return archetype not in VALUE_MODIFIER_ARCHETYPES or actor_value in SWITCH_ACTOR_VALUES
+
+
+def is_derived(code: str, rec: dict) -> bool:
+    """Whether this effect takes its actor value from the spell carrying it.
+
+    Imported in-function: magic_morrowind reads this module's archetype and
+    actor-value constants, so the dependency only runs one way at import.
+    """
+    from .magic_morrowind import MW_EFFECT_ARCHETYPES
+
+    index = morrowind_index(rec)
+    if index >= 0:
+        return MW_EFFECT_ARCHETYPES.get(index, (None, None))[1] == DERIVE_AV
+    return EFFECT_ARCHETYPES.get(code, (None, None))[1] == DERIVE_AV
+
+
+def resolve_actor_value(code: str, effect_av: int, rec: dict = None) -> int:
     """TES5 actor value for an effect instance.
 
     ``effect_av`` is the per-effect EFIT ActorValue from the owning
@@ -468,6 +514,11 @@ def resolve_actor_value(code: str, effect_av: int) -> int:
     (DGAT+Strength and DGAT+Endurance are different effects in Skyrim); for
     every other code the table's fixed AV wins.
     """
+    from .magic_morrowind import mw_actor_value
+
+    index = morrowind_index(rec) if rec else -1
+    if index >= 0:
+        return mw_actor_value(index, effect_av)
     entry = EFFECT_ARCHETYPES.get(code)
     if entry is None:
         return AV_NONE
@@ -481,17 +532,66 @@ def resolve_actor_value(code: str, effect_av: int) -> int:
     return ATTRIBUTE_TO_AV.get(effect_av, AV_NONE)
 
 
-def get_archetype(code: str) -> int:
-    """TES5 archetype for a TES4 effect code (Value Modifier if unknown)."""
+def morrowind_index(rec: dict) -> int:
+    """This record's TES3 effect index, or -1 when it is not a Morrowind one."""
+    raw = rec.get('MorrowindEffectIndex')
+    return int(raw) if raw not in (None, '') else -1
+
+
+def get_archetype(code: str, rec: dict = None) -> int:
+    """TES5 archetype for one effect (Value Modifier if unknown).
+
+    Imported in-function to break the cycle with magic_morrowind, which
+    reads this module's archetype constants at import time.
+    """
+    from .magic_morrowind import mw_archetype
+
+    index = morrowind_index(rec) if rec else -1
+    if index >= 0:
+        return mw_archetype(index)
     entry = EFFECT_ARCHETYPES.get(code)
     return entry[0] if entry else A_VALUE_MODIFIER
+
+
+def _effect_flags(rec: dict) -> int:
+    """This record's DATA.Flags in the TES4 bit layout.
+
+    A Morrowind MGEF stores TES3's own bits, whose meanings diverge from the
+    range flags onward, so they are translated before any reader sees them.
+    """
+    from .magic_morrowind import mw_tes4_flags
+
+    flags = get_int(rec, 'DATA.Flags')
+    if morrowind_index(rec) >= 0:
+        return mw_tes4_flags(flags)
+    return flags
+
+
+def _base_actor_value(code: str, rec: dict) -> int:
+    """The MGEF's own actor value, or AV_NONE when each effect decides it.
+
+    An attribute/skill-targeted effect has no single actor value: it comes
+    from whichever spell carries it, which is what the per-AV variants exist
+    for.  The base record keeps AV_NONE so a variant is always what an item
+    actually references.
+    """
+    from .magic_morrowind import MW_EFFECT_ARCHETYPES, NATIVE_NONE
+
+    index = morrowind_index(rec)
+    if index >= 0:
+        entry = MW_EFFECT_ARCHETYPES.get(index)
+        if entry is None or entry[1] in (DERIVE_AV, NATIVE_NONE):
+            return AV_NONE
+        return entry[1]
+    entry = EFFECT_ARCHETYPES.get(code)
+    return entry[1] if entry and entry[1] != DERIVE_AV else AV_NONE
 
 
 def is_known_code(code: str) -> bool:
     return code in EFFECT_ARCHETYPES
 
 
-def _convert_flags(t4: int, code: str, archetype: int) -> int:
+def _convert_flags(t4: int, code: str, archetype: int, actor_value: int) -> int:
     """TES4 MGEF DATA.Flags → TES5 MGEF DATA.Flags.
 
     The bit meanings diverge from bit 3 onward (TES4 0x8 is Magnitude Is
@@ -533,25 +633,29 @@ def _convert_flags(t4: int, code: str, archetype: int) -> int:
     if code in _MARKER_CODES:
         out |= F_HIDE_IN_UI
 
-    return out
+    if not magnitude_flag_allowed(archetype, actor_value):
+        out &= ~F_NO_MAGNITUDE
+    return out | _power_affects(out)
+
+
+def _power_affects(flags: int) -> int:
+    """The Power Affects bit for magnitude, else for duration, else none.
+
+    See: docs/commentary/tes5_import_magic.md#power-affects
+    """
+    if not flags & F_NO_MAGNITUDE:
+        return F_POWER_AFFECTS_MAGNITUDE
+    return 0 if flags & F_NO_DURATION else F_POWER_AFFECTS_DURATION
 
 
 def _delivery_and_cast(t4_flags: int) -> tuple:
-    """(casting type, delivery) from the TES4 Self/Touch/Target flags.
+    """Fire and Forget, and the farthest TES4 range: Target Aimed, Touch Target Actor.
 
-    wbCastEnum:     0 Constant Effect, 1 Fire and Forget, 2 Concentration, 3 Scroll
-    wbDeliveryEnum: 0 Self, 1 Contact (touch), 2 Aimed, 3 Target Actor, 4 Target Location
-
-    An Oblivion MGEF advertises *every* delivery it supports; the item that
-    carries it picks one.  Skyrim's MGEF commits to a single delivery, so the
-    most specific one the effect allows wins — Target beats Touch beats Self,
-    matching what the spells that use the effect overwhelmingly do.
+    See: docs/commentary/tes5_import_magic.md#owner-casting-type
     """
     if t4_flags & T4_TARGET:
-        return 1, 2       # Fire and Forget, Aimed
-    if t4_flags & T4_TOUCH:
-        return 1, 1       # Fire and Forget, Contact
-    return 1, 0           # Fire and Forget, Self
+        return 1, 2
+    return 1, 3 if t4_flags & T4_TOUCH else 0
 
 
 # --- Projectile resolution ------------------------------------------------
@@ -599,9 +703,7 @@ _PROJ_REANIMATE = 0x00075348      # ReanimateProjectile — conjuration
 _PROJ_TURN_UNDEAD = 0x0004BE35    # TurnUndeadProjectile — restoration
 _PROJ_PARALYZE = 0x0006EBC8       # ParalyzeProjectile — alteration
 
-# (resist actor value) -> (fire-and-forget projectile, concentration projectile).
-# Keyed on the same TES5 resist AV _build_data writes at _O_RESIST_VALUE, so an
-# effect's element picks its own projectile exactly as vanilla does.
+#: TES5 resist actor value (the effect's element) -> (fire-and-forget, concentration) projectile.
 _PROJ_BY_RESIST = {
     AV_RESIST_FIRE: (_PROJ_FIREBOLT, _PROJ_FLAMES),
     AV_RESIST_FROST: (_PROJ_FROST_ICICLE, _PROJ_FROST_SPRAY),
@@ -620,41 +722,80 @@ _PROJ_BY_SCHOOL = {
 }
 
 
-# {output MGEF FormID: projectile FormID} for every MGEF this module emits.
-# equipment._pack_effects consults it (through magic_effects.has_projectile) to
-# decide whether an Aimed item already reaches a projectile; without it the
-# converter's own effects are invisible to that check and every Aimed item made
-# of them ships with the null-deref described above.
-_emitted_projectiles: dict = {}
+#: Vanilla projectile -> the Impact Data Set most vanilla MGEFs flying it carry (HealFake and Paralyze carry none).
+IMPACT_BY_PROJECTILE = {
+    _PROJ_FIREBOLT: 0x0001C2AF, _PROJ_FLAMES: 0x00026113,
+    _PROJ_FROST_ICICLE: 0x00032DA7, _PROJ_FROST_SPRAY: 0x00018A2E,
+    _PROJ_SHOCK_BOLT: 0x00059ED9, _PROJ_SHOCK_CONC: 0x00038B05,
+    _PROJ_ABSORB_BEAM: 0x000ABF01, _PROJ_SPIDER_SPIT: 0x00046008,
+    _PROJ_ILLUSION: 0x00073320, _PROJ_ILLUSION_NEG: 0x00074798,
+    _PROJ_REANIMATE: 0x00075346, _PROJ_TURN_UNDEAD: 0x0004C6DA,
+}
 
-# {output MGEF FormID: (EditorID, DATA as hex)} for the MGEFs this module emits
-# from a source record.  bound_script_variant clones an entry rather than
-# rebuilding the DATA from scratch, so the scripted stand-in inherits the base
-# effect's school, cost, sounds and lights unchanged and differs only in the
-# fields the archetype swap requires.
-_emitted_data: dict = {}
-
-
-def register_emitted_projectile(fid: int, projectile: int) -> None:
-    """Record the projectile written into one emitted MGEF's DATA."""
-    if fid:
-        _emitted_projectiles[fid] = projectile
-
-
-def register_emitted_data(fid: int, edid: str, data: bytes) -> None:
-    """Retain one emitted MGEF's DATA so variants can clone it."""
-    if fid:
-        _emitted_data[fid] = (edid, data.hex())
-
-
-def emitted_projectile(fid: int) -> int:
-    """Projectile of an MGEF this module emitted (0 if none / not ours)."""
-    return _emitted_projectiles.get(fid, 0)
+#: Vanilla MagicHatMarker STAT: the generic menu art, on 646 of 950 vanilla MGEFs.
+MENU_ART_GENERIC = 0x000435A5
+#: Archetype -> the vanilla menu STAT spells led by that effect show (Skyrim.esm spells by first effect).
+MENU_ART_BY_ARCHETYPE = {
+    A_CALM: 0x000A59AD, A_RALLY: 0x000A59AD,
+    A_DEMORALIZE: 0x000A59AE, A_FRENZY: 0x000A59AE,
+    A_COMMAND_SUMMONED: 0x001097CD, A_SOUL_TRAP: 0x001097CD,
+    A_INVISIBILITY: 0x00109AC3, A_LIGHT: 0x000A0E7F,
+    A_BOUND_WEAPON: 0x0010AB43, A_SUMMON_CREATURE: 0x000A6459,
+    A_DETECT_LIFE: 0x00104F70, A_TELEKINESIS: 0x001097CB,
+    A_PARALYSIS: 0x0010A046, A_REANIMATE: 0x001097CC, A_TURN_UNDEAD: 0x001097CA,
+}
+#: Resist actor value (the element) -> vanilla menu STAT: FireballInvArt, IceSpellArt, ShockSpellArt, Absorb.
+MENU_ART_BY_RESIST = {AV_RESIST_FIRE: 0x0004E264, AV_RESIST_FROST: 0x0009DB72,
+                      AV_RESIST_SHOCK: 0x0009FA64, AV_RESIST_MAGIC: 0x0010FEF4}
+#: Magic school -> vanilla menu STAT when neither archetype nor element names one: Alteration, HealSpellArt.
+MENU_ART_BY_SCHOOL = {AV_ALTERATION: 0x00109AC2, AV_RESTORATION: 0x000A0E7D}
 
 
-def is_emitted_mgef(fid: int) -> bool:
-    """True when ``fid`` is an MGEF this converter emitted."""
-    return fid in _emitted_projectiles
+def menu_display_object(data) -> int:
+    """The vanilla menu STAT for an MGEF DATA: by archetype, then element, then school.
+
+    See: docs/commentary/tes5_import_magic.md#menu-display-object
+    """
+    archetype = struct.unpack_from('<I', data, O_ARCHETYPE)[0]
+    school, resist = struct.unpack_from('<ii', data, O_MAGIC_SKILL)
+    return (MENU_ART_BY_ARCHETYPE.get(archetype) or MENU_ART_BY_RESIST.get(resist)
+            or MENU_ART_BY_SCHOOL.get(school) or MENU_ART_GENERIC)
+
+
+#: {output MGEF FormID: its source record}, so a variant can clone any base MGEF before the MGEF pass writes it.
+_mgef_sources: dict = {}
+
+
+def source_record(fid: int):
+    """The export record a base MGEF of this plugin converts from, or None."""
+    return _mgef_sources.get(fid)
+
+
+def _vanilla_projectile(data) -> int:
+    """The vanilla bolt an MGEF DATA's delivery, casting type, school and element call for."""
+    flags = struct.unpack_from('<I', data, O_FLAGS)[0]
+    return _resolve_projectile(
+        struct.unpack_from('<I', data, O_DELIVERY)[0],
+        struct.unpack_from('<I', data, O_CASTING_TYPE)[0],
+        struct.unpack_from('<i', data, O_MAGIC_SKILL)[0],
+        struct.unpack_from('<i', data, O_RESIST_VALUE)[0],
+        bool(flags & F_HOSTILE))
+
+
+def fit_delivery(data: bytearray, cast: int, delivery: int, own_bolt: int = 0) -> None:
+    """Give an MGEF DATA a casting type and delivery, and the projectile and impact set they need.
+
+    An aimed delivery flies ``own_bolt``, else the projectile the DATA
+    carries, else the vanilla bolt for its element; its impact set is that
+    vanilla bolt's.  Other deliveries carry neither.
+    See: docs/commentary/tes5_import_magic.md#impact-data
+    """
+    struct.pack_into('<II', data, O_CASTING_TYPE, cast, delivery)
+    vanilla = _vanilla_projectile(data)
+    carried = struct.unpack_from('<I', data, O_PROJECTILE)[0]
+    bolt = (own_bolt or carried or vanilla) if vanilla else 0
+    struct.pack_into('<I', data, O_PROJECTILE, bolt)
+    struct.pack_into('<I', data, O_IMPACT_DATA, IMPACT_BY_PROJECTILE.get(vanilla, 0))
 
 
 def _resolve_projectile(delivery: int, cast_type: int, school: int,
@@ -696,7 +837,7 @@ def _resolve_projectile(delivery: int, cast_type: int, school: int,
 #   * confirming a bound-item target really is a WEAP/ARMO.
 # import_main registers the index before the MGEF pass runs.
 _lvlc_first_entry: dict = {}
-_known_sigs: dict = {}
+known_sigs: dict = {}
 
 
 def set_assoc_item_index(lvlc_first: dict, formid_sigs: dict) -> None:
@@ -708,8 +849,8 @@ def set_assoc_item_index(lvlc_first: dict, formid_sigs: dict) -> None:
     """
     _lvlc_first_entry.clear()
     _lvlc_first_entry.update(lvlc_first)
-    _known_sigs.clear()
-    _known_sigs.update(formid_sigs)
+    known_sigs.clear()
+    known_sigs.update(formid_sigs)
 
 
 def _resolve_assoc_item(fid: int, archetype: int, t4_flags: int) -> int:
@@ -723,7 +864,7 @@ def _resolve_assoc_item(fid: int, archetype: int, t4_flags: int) -> int:
     if not kind or not fid:
         return 0
 
-    sig = _known_sigs.get(fid)
+    sig = known_sigs.get(fid) or magic_art.master_signature(fid)
 
     if kind == 'NPC_':
         # Summons: a CREA converts to NPC_, an NPC_ stays one.  An LVLC becomes
@@ -750,497 +891,231 @@ def _resolve_assoc_item(fid: int, archetype: int, t4_flags: int) -> int:
     return 0
 
 
-def _build_data(rec: dict, code: str, archetype: int, actor_value: int,
+def mgef_school(rec: dict, code: str) -> int:
+    """The TES5 magic-skill actor value an MGEF's TES4 school converts to."""
+    return SCHOOL_OVERRIDES.get(
+        code, SCHOOL_TO_AV.get(get_int(rec, 'DATA.School', -1), AV_NONE))
+
+
+#: Borrowed-art role -> the DATA fields a Morrowind effect copies from its vanilla donor.
+_BORROWED_FIELDS = {'cast': (O_CASTING_ART, O_CASTING_LIGHT),
+                    'hit': (O_HIT_EFFECT_ART, O_HIT_SHADER)}
+
+#: DATA fields a master's effect takes from the master's own conversion, whatever the rebuild made.
+_INHERITED_FIELDS = (O_ASSOC_ITEM, O_CASTING_ART, O_HIT_EFFECT_ART, O_PROJECTILE)
+
+
+def _fill_art(data: bytearray, rec: dict) -> None:
+    """A master's effect takes its art and item from the master's conversion; a Morrowind one fills gaps from its donors.
+
+    The master's values replace the rebuilt ones: a FormID rebuilt from the
+    master's export is numbered in the master's own master list.
+    See: docs/commentary/tes5_import_magic.md#master-effects
+    """
+    master = magic_art.master_effect_data(rec)
+    for off in _INHERITED_FIELDS if master and len(master) >= MGEF_DATA_SIZE else ():
+        data[off:off + 4] = master[off:off + 4]
+    for role, donor in magic_art_morrowind.donors(rec):
+        src = bytes.fromhex(VANILLA_MGEF_DATA[donor][1])
+        for off in _BORROWED_FIELDS[role]:
+            if not struct.unpack_from('<I', data, off)[0]:
+                data[off:off + 4] = src[off:off + 4]
+
+
+def build_data(rec: dict, code: str, archetype: int, actor_value: int,
                 counter_count: int) -> bytes:
     """The 152-byte TES5 MGEF DATA for one effect.
 
-    Shared by the primary record and its per-actor-value variants, which differ
-    only in the Actor Value field (offset 68).
+    ``counter_count`` must equal the ESCE subrecords the record carries, or the
+    CK reads garbage counter slots.  TES4 ResistValue 0xFFFFFFFF means none.
+    The projectile is mandatory for Aimed delivery (see _resolve_projectile);
+    Dual Cast Scale is 1.0 on every vanilla MGEF, and 0.0 makes dual casting
+    collapse the effect to nothing.
     """
-    t4_flags = get_int(rec, 'DATA.Flags')
+    t4_flags = _effect_flags(rec)
     cast_type, delivery = _delivery_and_cast(t4_flags)
 
     data = bytearray(MGEF_DATA_SIZE)
-    struct.pack_into('<I', data, _O_FLAGS, _convert_flags(t4_flags, code, archetype))
-    struct.pack_into('<f', data, _O_BASE_COST, get_float(rec, 'DATA.BaseCost'))
-    struct.pack_into('<I', data, _O_ASSOC_ITEM,
+    struct.pack_into('<I', data, O_FLAGS,
+                     _convert_flags(t4_flags, code, archetype, actor_value))
+    struct.pack_into('<f', data, O_BASE_COST, get_float(rec, 'DATA.BaseCost'))
+    struct.pack_into('<I', data, O_ASSOC_ITEM,
                      _resolve_assoc_item(get_formid(rec, 'DATA.AssocItem'),
                                          archetype, t4_flags))
-
-    school = SCHOOL_OVERRIDES.get(
-        code, SCHOOL_TO_AV.get(get_int(rec, 'DATA.School', -1), AV_NONE))
-    struct.pack_into('<i', data, _O_MAGIC_SKILL, school)
-
-    # TES4 writes 0xFFFFFFFF for "no resistance"; anything else is an Oblivion
-    # actor-value index naming the resist stat.
-    resist_raw = get_int(rec, 'DATA.ResistValue', 0xFFFFFFFF)
-    resist = TES4_RESIST_AV_TO_TES5.get(resist_raw, AV_NONE)
-    struct.pack_into('<i', data, _O_RESIST_VALUE, resist)
-
-    # Projectile — mandatory for Aimed delivery.  Oblivion has no equivalent
-    # field (the cast art was a raw mesh path), but Skyrim's combat AI
-    # dereferences it without a null check, so an Aimed effect that leaves it 0
-    # crashes the game.  See _resolve_projectile for the exe trace.
-    struct.pack_into('<I', data, _O_PROJECTILE,
-                     _resolve_projectile(delivery, cast_type, school, resist,
-                                         bool(t4_flags & T4_HOSTILE)))
-
-    # Counter Effect Count MUST equal the number of ESCE subrecords or the CK
-    # reads garbage counter slots.
-    struct.pack_into('<H', data, _O_COUNTER_COUNT, counter_count)
-
-    struct.pack_into('<I', data, _O_CASTING_LIGHT, get_formid(rec, 'DATA.Light'))
-    struct.pack_into('<I', data, _O_HIT_SHADER, get_formid(rec, 'DATA.EffectShader'))
-    struct.pack_into('<I', data, _O_ENCHANT_SHADER, get_formid(rec, 'DATA.EnchantEffect'))
-    struct.pack_into('<f', data, _O_SPELLMAKING_TIME, 0.5)
-    struct.pack_into('<I', data, _O_ARCHETYPE, archetype)
-    struct.pack_into('<i', data, _O_ACTOR_VALUE, actor_value)
-    struct.pack_into('<I', data, _O_CASTING_TYPE, cast_type)
-    struct.pack_into('<I', data, _O_DELIVERY, delivery)
-    struct.pack_into('<i', data, _O_SECOND_AV, AV_NONE)
-    # Every vanilla MGEF writes 1.0 here; 0.0 makes dual-casting collapse the
-    # effect to nothing.
-    struct.pack_into('<f', data, _O_DUAL_CAST_SCALE, 1.0)
+    struct.pack_into('<i', data, O_MAGIC_SKILL, mgef_school(rec, code))
+    resist = TES4_RESIST_AV_TO_TES5.get(
+        get_int(rec, 'DATA.ResistValue', 0xFFFFFFFF), AV_NONE)
+    struct.pack_into('<i', data, O_RESIST_VALUE, resist)
+    struct.pack_into('<II', data, O_CASTING_ART, magic_art.casting_art(rec),
+                     magic_art.hit_art(rec))
+    struct.pack_into('<H', data, O_COUNTER_COUNT, counter_count)
+    struct.pack_into('<I', data, O_CASTING_LIGHT, get_formid(rec, 'DATA.Light'))
+    struct.pack_into('<I', data, O_HIT_SHADER, get_formid(rec, 'DATA.EffectShader'))
+    struct.pack_into('<I', data, O_ENCHANT_SHADER, get_formid(rec, 'DATA.EnchantEffect'))
+    _fill_art(data, rec)
+    struct.pack_into('<f', data, O_SPELLMAKING_TIME, 0.5)
+    struct.pack_into('<I', data, O_ARCHETYPE, archetype)
+    struct.pack_into('<i', data, O_ACTOR_VALUE, actor_value)
+    fit_delivery(data, cast_type, delivery,
+                 magic_art.projectile(rec) if delivery in (2, 4) else 0)
+    second_av = SECOND_ACTOR_VALUES.get(code, AV_NONE)
+    struct.pack_into('<i', data, O_SECOND_AV, second_av)
+    if second_av != AV_NONE:
+        struct.pack_into('<f', data, O_SECOND_AV_WEIGHT, 1.0)
+    struct.pack_into('<f', data, O_DUAL_CAST_SCALE, 1.0)
+    struct.pack_into('<I', data, O_PERK_TO_APPLY, _morrowind_perk(rec))
     return bytes(data)
 
 
-def convert_MGEF(rec: dict, writer=None) -> bytes:
-    """MGEF — Magic Effect.
+def _morrowind_perk(rec: dict) -> int:
+    """PerkToApply of a Morrowind effect (import cycle), else 0."""
+    from .magic_morrowind import mw_effect_perk
 
-    TES5 order: EDID VMAD FULL MDOB KSIZ/KWDA DATA ESCE* SNDD DNAM CTDA
+    index = morrowind_index(rec)
+    return mw_effect_perk(index) if index >= 0 else 0
+
+
+def mgef_parts(rec: dict) -> tuple:
+    """(EditorID, subrecords before DATA, DATA, subrecords after ESCE) of one source MGEF.
+
+    TES5 order: EDID VMAD FULL MDOB KSIZ/KWDA DATA ESCE* SNDD DNAM CTDA.  The
+    split is what lets a variant clone the record with only its DATA changed.
     """
     from ..base.object_scripts import get_object_vmad
 
     code = get_str(rec, 'EditorID')
-    subs = b''
-    if code:
-        subs += pack_string_subrecord('EDID', code)
-    subs += get_object_vmad(get_formid(rec, 'FormID'))
-
+    head = get_object_vmad(get_formid(rec, 'FormID'))
     full = get_str(rec, 'FULL')
     if full:
-        subs += pack_string_subrecord('FULL', full)
+        head += pack_string_subrecord('FULL', full)
+    data = build_data(rec, code, get_archetype(code, rec),
+                       _base_actor_value(code, rec),
+                       len(_counter_effect_fids(rec)))
+    head += pack_formid_subrecord('MDOB', menu_display_object(data))
+    return code, head, data, mgef_tail(rec)
 
-    # MDOB — the menu display object, i.e. the effect's art in the magic menu.
-    # Oblivion's Model.MODL is the cast art, which Skyrim keeps in an ARTO
-    # (Phase 2); pointing MDOB at a raw mesh path is not possible, so it is
-    # left absent until the ARTO writer lands.
 
-    archetype = get_archetype(code)
-    # An attribute/skill-targeted effect has no single actor value of its own
-    # — the AV comes from whichever spell carries it, which is what the
-    # per-AV variants below exist for.  The base record keeps None so a
-    # variant is always what an item actually references.
-    entry = EFFECT_ARCHETYPES.get(code)
-    base_av = entry[1] if entry and entry[1] != DERIVE_AV else AV_NONE
-
-    counters = _counter_effect_fids(rec)
-    # The projectile in this DATA — and, for bound items, the DATA a scripted
-    # stand-in clones — were already registered by register_mgef_formids
-    # (Phase 0): ENCH and SPEL both convert before MGEF, so neither registry
-    # can wait until here.
-    subs += pack_subrecord('DATA', _build_data(rec, code, archetype,
-                                               base_av, len(counters)))
-    for fid in counters:
-        subs += pack_formid_subrecord('ESCE', fid)
-
+def mgef_tail(rec: dict) -> bytes:
+    """The subrecords after ESCE: sound set, description, then Paralysis or Sun Damage conditions."""
     desc = get_str(rec, 'DESC')
-    if desc:
-        subs += pack_string_subrecord('DNAM', desc)
-
-    return pack_record('MGEF', get_formid(rec, 'FormID'),
-                       get_int(rec, 'RecordFlags'), subs)
-
-
-# ---------------------------------------------------------------------------
-# Per-actor-value variants
-#
-# Oblivion parameterises one MGEF by the attribute or skill each *effect*
-# names: a single `DGAT` record is Damage Strength on one spell and Damage
-# Endurance on the next, because the AV lives in the item's EFIT, not in the
-# MGEF.  Skyrim moved the actor value INTO the MGEF, so a single converted
-# DGAT could only ever damage one stat.
-#
-# Fix: emit one MGEF per (code, actor value) pair the plugin actually uses —
-# ~100 extra records for Oblivion, the same for Nehrim — and point each
-# effect at the variant matching its own EFIT ActorValue.  The base record
-# stays as the AV-less fallback for an effect whose AV we cannot map.
-# ---------------------------------------------------------------------------
-
-# TES4 attribute index → display name, for the variant's FULL/EDID.
-_ATTR_NAMES = {
-    0: 'Strength', 1: 'Intelligence', 2: 'Willpower', 3: 'Agility',
-    4: 'Speed', 5: 'Endurance', 6: 'Personality', 7: 'Luck',
-}
-_SKILL_NAMES = {
-    12: 'Armorer', 13: 'Athletics', 14: 'Blade', 15: 'Block', 16: 'Blunt',
-    17: 'HandToHand', 18: 'HeavyArmor', 19: 'Alchemy', 20: 'Alteration',
-    21: 'Conjuration', 22: 'Destruction', 23: 'Illusion', 24: 'Mysticism',
-    25: 'Restoration', 26: 'Acrobatics', 27: 'LightArmor', 28: 'Marksman',
-    29: 'Mercantile', 30: 'Security', 31: 'Sneak', 32: 'Speechcraft',
-}
-
-# (code, tes4 av) -> output FormID of the emitted variant.
-_av_variants: dict = {}
+    tail = magic_art.sound_set(rec) + (pack_string_subrecord('DNAM', desc) if desc else b'')
+    code = get_str(rec, 'EditorID')
+    if get_archetype(code, rec) == A_PARALYSIS:
+        tail += PARALYSIS_CONDITIONS
+    if code == 'SUDG' or morrowind_index(rec) == MW_SUN_DAMAGE:
+        tail += SUN_CONDITIONS
+    return tail
 
 
-def build_av_variants(mgef_records: list, effect_records: list, writer) -> int:
-    """Emit one MGEF per (DERIVE_AV code, actor value) the plugin uses.
+#: Skyrim.esm KYWD ImmuneParalysis: what a Resist Paralysis effect grants instead of an actor value.
+KW_IMMUNE_PARALYSIS = 0x000F23C5
+#: Skyrim.esm KYWD ActorTypeDragon, which vanilla Paralysis effects skip.
+KW_ACTOR_TYPE_DRAGON = 0x00035D59
+#: Morrowind's Resist Paralysis effect index.
+MW_RESIST_PARALYSIS = 99
 
-    ``effect_records`` is every record carrying EFID/EFIT pairs (SPEL, ENCH,
-    ALCH, INGR, SGST); scanning them is what tells us which pairs exist.
-    Returns the number of variants written.
+#: Vanilla's two Paralysis-effect conditions, plus the one an immunity ability's keyword needs.
+PARALYSIS_CONDITIONS = b''.join(
+    pack_subrecord('CTDA', build_ctda(func, param1=kw, comp_value=0.0))
+    for func, kw in ((FUNC_HAS_KEYWORD, KW_ACTOR_TYPE_DRAGON),
+                     (FUNC_HAS_KEYWORD, KW_IMMUNE_PARALYSIS),
+                     (FUNC_HAS_MAGIC_EFFECT_KEYWORD, KW_IMMUNE_PARALYSIS)))
+
+
+#: Morrowind's Sun Damage effect index, Oblivion's SUDG.
+MW_SUN_DAMAGE = 135
+
+#: Skyrim.esm's own sun window on its vampire sun-damage spells: outdoors, GameHour 5 through 19.
+SUN_CONDITIONS = b''.join(
+    pack_subrecord('CTDA', build_ctda(func, param1=glob, comp_value=value, operator=op))
+    for func, glob, value, op in ((FUNC_IS_IN_INTERIOR, 0, 0.0, 0x00),
+                                  (FUNC_GET_GLOBAL_VALUE, ENGINE_GLOBAL_FORMIDS['gamehour'], 5.0, 0x60),
+                                  (FUNC_GET_GLOBAL_VALUE, ENGINE_GLOBAL_FORMIDS['gamehour'], 19.0, 0xA0)))
+
+
+def effect_keywords(rec: dict, family: int = 0) -> bytes:
+    """KSIZ/KWDA: the family keyword, plus ImmuneParalysis on Resist Paralysis.
+
+    See: docs/commentary/tes5_import_magic.md#resist-paralysis
     """
-    _av_variants.clear()
-    if writer is None:
-        return 0
+    resists = (get_str(rec, 'EditorID') == 'RSPA'
+               or morrowind_index(rec) == MW_RESIST_PARALYSIS)
+    return pack_keywords([family, KW_IMMUNE_PARALYSIS if resists else 0])
 
-    by_code = {}
+
+def convert_MGEF(rec: dict, writer=None) -> bytes:
+    """MGEF — Magic Effect, packed from `mgef_parts` plus its ESCE array."""
+    code, head, data, tail = mgef_parts(rec)
+    fid = get_formid(rec, 'FormID')
+    subs = pack_string_subrecord('EDID', code) if code else b''
+    subs += head + effect_keywords(rec, MGEF_FAMILY_KEYWORDS.get(fid))
+    subs += pack_subrecord('DATA', data)
+    for counter in _counter_effect_fids(rec):
+        subs += pack_formid_subrecord('ESCE', counter)
+    subs += tail
+    return pack_record('MGEF', fid, get_int(rec, 'RecordFlags'), subs)
+
+
+#: TES4 effect code -> this plugin's MGEF FormID (output space), filled before the MGEF pass.
+code_to_fid: dict = {}
+
+
+def register_mgef_formids(mgef_records: list, master_index=None, own_records=()) -> None:
+    """Index every source MGEF by code and output FormID, and reset the per-plugin registries.
+
+    Phase 1 converts types alphabetically, so ENCH and SPEL run before MGEF:
+    every variant clone reads what is indexed here, never a side effect of
+    convert_MGEF.  A master's effect is found by EditorID in the master's
+    converted plugin; its export FormID counts the master's own masters.
+    magic_variants is imported here, not at module scope, because it imports
+    this module.
+    See: docs/commentary/tes5_import_magic.md#master-effects
+    """
+    from .magic_variants import reset
+
+    reset()
+    code_to_fid.clear()
+    _mgef_sources.clear()
+    own = {get_str(r, 'EditorID') for r in own_records}
     for rec in mgef_records:
         code = get_str(rec, 'EditorID')
-        if code and EFFECT_ARCHETYPES.get(code, (None, None))[1] == DERIVE_AV:
-            by_code[code] = rec
-    if not by_code:
-        return 0
+        if code:
+            master = master_index.find_by_edid(b'MGEF', code) if master_index and code not in own else 0
+            fid = master or get_formid(rec, 'FormID')
+            code_to_fid[code] = fid
+            _mgef_sources[fid] = rec
 
-    # Collect the (code, av) pairs in a deterministic order: the output ESM
-    # must stay byte-reproducible, so FormIDs cannot depend on dict iteration
-    # of a parallel scan.
-    wanted = set()
-    for rec in effect_records:
-        for i in range(get_int(rec, 'EffectCount')):
-            code = get_str(rec, f'Effect[{i}].EFID')
-            if code in by_code:
-                wanted.add((code, get_int(rec, f'Effect[{i}].ActorValue', -1)))
 
+def settle_family_keywords(own_records: list, writer, master_index=None) -> int:
+    """Give every indexed MGEF its family KYWD; returns how many this plugin wrote.
+
+    The keyword is what a converted HasMagicEffect tests, since the effect's
+    copies do not share its FormID.  A master's keyword is adopted by
+    EditorID; this plugin writes one only for its own effects the masters lack.
+    See: docs/commentary/tes5_import_magic.md#effect-families
+    """
+    MGEF_FAMILY_KEYWORDS.clear()
+    own = {get_str(r, 'EditorID') for r in own_records}
     written = 0
-    for code, av in sorted(wanted):
-        tes5_av = resolve_actor_value(code, av)
-        if tes5_av == AV_NONE:
-            continue          # unmappable AV — the base record stands in
-        src = by_code[code]
-        name = _ATTR_NAMES.get(av) or _SKILL_NAMES.get(av)
-        if not name:
-            continue
-        archetype = get_archetype(code)
-        fid = writer.derive_formid('MGEF_AV', (code, av))
-
-        subs = pack_string_subrecord('EDID', f'TES4{code}{name}')
-        full = get_str(src, 'FULL')
-        if full:
-            # "Damage Attribute" + Strength -> "Damage Strength", which is
-            # what Oblivion's own item cards showed.
-            subs += pack_string_subrecord('FULL', _variant_name(full, name))
-        # Variants carry no ESCE of their own (the count must then be 0).
-        data = _build_data(src, code, archetype, tes5_av, 0)
-        subs += pack_subrecord('DATA', data)
-        register_emitted_projectile(
-            fid, struct.unpack_from('<I', data, _O_PROJECTILE)[0])
-        desc = get_str(src, 'DESC')
-        if desc:
-            subs += pack_string_subrecord('DNAM', desc)
-        writer.add_record('MGEF', pack_record('MGEF', fid, 0, subs))
-        _av_variants[(code, av)] = fid
-        written += 1
+    for code, fid in sorted(code_to_fid.items()):
+        edid = mgef_family_keyword_name(code)
+        kw = master_index.find_by_edid(b'KYWD', edid) if master_index else 0
+        if not kw and code in own and writer is not None:
+            kw = writer.derive_formid('KYWD_MGEF_FAMILY', code)
+            writer.add_record('KYWD', pack_record(
+                'KYWD', kw, 0, pack_string_subrecord('EDID', edid)))
+            written += 1
+        if kw:
+            MGEF_FAMILY_KEYWORDS[fid] = kw
+            WELL_KNOWN_PROPERTIES[edid] = kw
     return written
-
-
-def _variant_name(base_full: str, stat_name: str) -> str:
-    """"Damage Attribute" + "Strength" -> "Damage Strength"."""
-    for tail in (' Attribute', ' Skill'):
-        if base_full.endswith(tail):
-            return f'{base_full[:-len(tail)]} {stat_name}'
-    return f'{base_full} ({stat_name})'
-
-
-# ---------------------------------------------------------------------------
-# Script-effect (SEFF) variants
-#
-# Oblivion attaches the script to the EFFECT, not the MGEF: the single `SEFF`
-# record is a different script on every item, named by the owning record's
-# `ScriptEffect[i].FormID`.  Skyrim moved the script onto the MGEF (archetype 1
-# Script + a VMAD holding an ActiveMagicEffect), so one MGEF is emitted per
-# distinct script and each effect points at the one carrying its own.
-#
-# Without this, SEFF was the single most-dropped code in the game (143 uses in
-# Oblivion, 176 in Nehrim) and every script-effect item — the Scroll of Icarian
-# Flight among them — converted to an inert filler.
-# ---------------------------------------------------------------------------
-
-# TES4 SCPT FormID (raw hex string) -> output FormID of its MGEF.
-_seff_variants: dict = {}
-
-
-def build_seff_variants(mgef_records: list, effect_records: list, writer,
-                        fid_to_edid: dict = None) -> int:
-    """Emit one Script-archetype MGEF per distinct TES4 magic-effect script."""
-    _seff_variants.clear()
-    if writer is None:
-        return 0
-
-    from ..base.object_scripts import get_magic_effect_vmad
-
-    seff = next((r for r in mgef_records
-                 if get_str(r, 'EditorID') == 'SEFF'), None)
-    if seff is None:
-        return 0
-
-    # (script fid, the effect's TES4 delivery) — an Oblivion script effect can
-    # be Self on one spell and Target on another, and Skyrim's delivery lives
-    # on the MGEF, so the pair is what identifies a variant.
-    wanted = {}
-    for rec in effect_records:
-        for i in range(get_int(rec, 'EffectCount')):
-            if get_str(rec, f'Effect[{i}].EFID') != 'SEFF':
-                continue
-            scpt = get_str(rec, f'ScriptEffect[{i}].FormID')
-            if not scpt:
-                continue
-            etype = get_str(rec, f'Effect[{i}].Type')
-            wanted.setdefault((scpt, etype), None)
-
-    fid_to_edid = fid_to_edid or {}
-    written = 0
-    # Sorted so FormID allocation is deterministic — the output ESM must stay
-    # byte-reproducible (docs/commentary/performance.md).
-    for scpt, etype in sorted(wanted):
-        vmad = get_magic_effect_vmad(scpt)
-        if not vmad:
-            # No converted script — the plain SEFF record still stands in, so
-            # the effect keeps its duration and HasMagicEffect still answers.
-            continue
-        fid = writer.derive_formid('MGEF_SEFF', (scpt, etype))
-        name = fid_to_edid.get(scpt, scpt)
-
-        subs = pack_string_subrecord('EDID', f'TES4SEFF{name}{etype or "Self"}')
-        subs += vmad
-        full = get_str(seff, 'FULL')
-        if full:
-            subs += pack_string_subrecord('FULL', full)
-
-        # The script drives everything, so the DATA is the SEFF record's own
-        # with the archetype forced to 1 and the delivery taken from THIS
-        # effect rather than from the MGEF's advertised flag set.
-        data = bytearray(_build_data(seff, 'SEFF', A_SCRIPT, AV_NONE, 0))
-        delivery = {'Touch': 1, 'Target': 2}.get(etype, 0)
-        struct.pack_into('<I', data, _O_DELIVERY, delivery)
-        struct.pack_into('<I', data, _O_CASTING_TYPE, 1)   # Fire and Forget
-        # The delivery just changed, so the projectile _build_data picked for
-        # SEFF's own advertised delivery no longer applies — recompute it, or a
-        # Target-delivery script effect ships Aimed with a null projectile.
-        projectile = _resolve_projectile(
-            delivery, 1,
-            struct.unpack_from('<i', data, _O_MAGIC_SKILL)[0],
-            struct.unpack_from('<i', data, _O_RESIST_VALUE)[0],
-            bool(struct.unpack_from('<I', data, _O_FLAGS)[0] & F_HOSTILE))
-        struct.pack_into('<I', data, _O_PROJECTILE, projectile)
-        subs += pack_subrecord('DATA', bytes(data))
-
-        register_emitted_projectile(fid, projectile)
-        writer.add_record('MGEF', pack_record('MGEF', fid, 0, subs))
-        _seff_variants[(scpt, etype)] = fid
-        written += 1
-    return written
-
-
-def get_seff_variant(scpt_fid: str, effect_type: str) -> int:
-    """FormID of the Script MGEF carrying one effect's script (0 if none)."""
-    return _seff_variants.get((scpt_fid, effect_type), 0)
-
-
-# ---------------------------------------------------------------------------
-# Scripted bound-item variants
-#
-# Skyrim's Bound Weapon archetype (17) only fires when the spell carrying it is
-# CAST.  Oblivion also hands out bound gear through Abilities (SPIT.Type 4) and
-# Lesser Powers (Type 3) — the Mythic Dawn assassins in the Imperial Dungeon
-# wear `AbBoundArmorMaceNoHelmetMD`, an ABILITY — and a Skyrim ability is a
-# passive, never-cast effect that never reaches BoundItemEffect, so the gear
-# silently never appears.
-#
-# Census of references/Skyrim.esm confirms the engine limit rather than a
-# convention: archetype 17 is used by 8 effect slots, ALL under SPIT.Type 0,
-# and by zero under Type 3 or Type 4.  Vanilla abilities carry only passive
-# archetypes (Value Modifier, Script, Peak Value Modifier, ...).
-#
-# So for exactly those spells the effect is re-pointed at a Script-archetype
-# (1) clone whose VMAD carries TES4_BoundItemEffect, which adds and force-
-# equips the item on OnEffectStart and takes it back on OnEffectFinish.  The
-# teardown hook is what preserves Oblivion's semantics: bound gear is not real
-# equipment and must vanish when the effect drops, including on death (Skyrim
-# dispels an actor's active effects when it dies), so the corpse is never
-# lootable for conjured armor.
-#
-# Spells that DO cast (Type 0) keep the native archetype 17 — the engine path
-# is better than any script, per "prefer the engine's own mechanism".
-# ---------------------------------------------------------------------------
-
-BOUND_ITEM_SCRIPT = 'TES4_BoundItemEffect'
-
-# TES4 spell types whose effects never get cast, so archetype 17 cannot fire.
-# 3 = Lesser Power, 4 = Ability.  (Both are applied, not cast, in Skyrim.)
-UNCASTABLE_SPELL_TYPES = frozenset({3, 4})
-
-# (source MGEF FormID) -> FormID of its scripted clone.
-_bound_script_variants: dict = {}
-_bound_lock = threading.Lock()
-
-
-def bound_item_assoc(mgef_fid: int) -> int:
-    """Output WEAP/ARMO an emitted bound-item MGEF equips (0 if not one).
-
-    Read back out of the DATA the MGEF pass built, so this is exactly the
-    FormID _resolve_assoc_item already type-checked — no second resolution
-    that could disagree with the record we shipped.
-    """
-    src = _emitted_data.get(mgef_fid)
-    if src is None:
-        return 0
-    data = bytes.fromhex(src[1])
-    return struct.unpack_from('<I', data, _O_ASSOC_ITEM)[0]
-
-
-def bound_assoc_is_armor(mgef_fid: int) -> bool:
-    """True when a bound effect's Assoc. Item is armor rather than a weapon.
-
-    SKYRIM HAS NO BOUND ARMOR.  xEdit types the Assoc. Item field as
-    [WEAP, ARMO, NULL], but that is only what the field ACCEPTS — it is not
-    evidence the engine equips armor.  Census of references/Skyrim.esm: all
-    seven archetype-17 effects name a WEAP, and not one names an ARMO.
-    BoundItemEffect is a bound *weapon* implementation, so a converted bound
-    cuirass/greaves/helmet does nothing at all under the native archetype no
-    matter how the spell is delivered (user-confirmed in-game: casting the
-    converted Bound Greaves spell had no effect).
-
-    Oblivion, by contrast, has a full bound-armor family — BACU/BAGR/BAGA/
-    BAHE/BABO/BASH plus the Mythic Dawn set — so those effects only survive
-    conversion as a script.
-    """
-    assoc = bound_item_assoc(mgef_fid)
-    if not assoc:
-        return False
-    return _known_sigs.get(assoc) in ('ARMO', 'CLOT')
-
-
-def bound_script_variant(mgef_fid: int, assoc_item: int, writer) -> int:
-    """FormID of a scripted bound-item clone of ``mgef_fid`` (0 if impossible).
-
-    Generated on first use and cached, so every ability referencing the same
-    bound effect shares one MGEF.  ``assoc_item`` is the already-resolved
-    output WEAP/ARMO FormID, which becomes the script's BoundItem property.
-    """
-    if not mgef_fid or not assoc_item or writer is None:
-        return 0
-
-    from script_convert.pipeline import build_vmad_object_script
-
-    with _bound_lock:
-        cached = _bound_script_variants.get(mgef_fid)
-        if cached:
-            return cached
-
-        src = _emitted_data.get(mgef_fid)
-        if src is None:
-            return 0
-        edid, data_hex = src
-        data = bytearray(bytes.fromhex(data_hex))
-
-        # Archetype 1 (Script) drives everything from Papyrus, so the engine
-        # must stop treating this as a bound item: the Assoc. Item field is
-        # meaningless under archetype 1 (wbMGEFAssocItemDecider -> "Unused")
-        # and the item now travels as the script's property instead.
-        struct.pack_into('<I', data, _O_ARCHETYPE, A_SCRIPT)
-        struct.pack_into('<I', data, _O_ASSOC_ITEM, 0)
-        # Self delivery, Fire and Forget: the ability applies to its holder,
-        # and a Self delivery needs no projectile.
-        struct.pack_into('<I', data, _O_CASTING_TYPE, 1)
-        struct.pack_into('<I', data, _O_DELIVERY, 0)
-        struct.pack_into('<I', data, _O_PROJECTILE, 0)
-        # The clone carries no ESCE subrecords; a stale count makes the CK read
-        # garbage counter slots.
-        struct.pack_into('<H', data, _O_COUNTER_COUNT, 0)
-
-        fid = writer.derive_formid('MGEF_BOUND', (mgef_fid, assoc_item))
-        subs = pack_string_subrecord('EDID', f'TES4{edid}Scripted')
-        subs += pack_subrecord(
-            'VMAD',
-            build_vmad_object_script(BOUND_ITEM_SCRIPT,
-                                     {'BoundItem': assoc_item}))
-        subs += pack_subrecord('DATA', bytes(data))
-
-        writer.add_record('MGEF', pack_record('MGEF', fid, 0, subs))
-        register_emitted_projectile(fid, 0)
-        _bound_script_variants[mgef_fid] = fid
-        return fid
-
-
-# TES4 effect code → this plugin's MGEF FormID (output space).  Filled by
-# register_mgef_formids() before the MGEF pass so ESCE can turn a counter
-# effect's 4-char code into the FormID of the record we emit for it.
-_code_to_fid: dict = {}
-
-
-def register_mgef_formids(mgef_records: list) -> None:
-    """Index {effect code: output FormID} from the export's MGEF records.
-
-    Also pre-computes each base MGEF's projectile.  Phase 1 converts record
-    types in alphabetical order, so ENCH runs BEFORE MGEF — registering the
-    projectile as a side effect of convert_MGEF would leave the registry empty
-    for exactly the record type that crashes without it.  Both passes derive
-    the value from the same _build_data inputs, so they cannot disagree.
-    """
-    _code_to_fid.clear()
-    # Runs once before the MGEF pass, so this is where the per-plugin
-    # projectile registry is reset.
-    _emitted_projectiles.clear()
-    _emitted_data.clear()
-    _bound_script_variants.clear()
-    for rec in mgef_records:
-        code = get_str(rec, 'EditorID')
-        if not code:
-            continue
-        fid = get_formid(rec, 'FormID')
-        _code_to_fid[code] = fid
-
-        t4_flags = get_int(rec, 'DATA.Flags')
-        cast_type, delivery = _delivery_and_cast(t4_flags)
-        school = SCHOOL_OVERRIDES.get(
-            code, SCHOOL_TO_AV.get(get_int(rec, 'DATA.School', -1), AV_NONE))
-        resist = TES4_RESIST_AV_TO_TES5.get(
-            get_int(rec, 'DATA.ResistValue', 0xFFFFFFFF), AV_NONE)
-        register_emitted_projectile(
-            fid, _resolve_projectile(delivery, cast_type, school, resist,
-                                     bool(t4_flags & T4_HOSTILE)))
-
-        # Bound-item DATA must also be available BEFORE the MGEF pass: Phase 1
-        # converts record types alphabetically, so SPEL (which is what decides
-        # a bound effect needs the scripted stand-in) runs first and would
-        # otherwise find nothing to clone.
-        archetype = get_archetype(code)
-        if archetype == A_BOUND_WEAPON:
-            base_av = AV_NONE
-            register_emitted_data(
-                fid, code,
-                _build_data(rec, code, archetype, base_av, 0))
-
-
-def get_mgef_formid(code: str, effect_av: int = -1) -> int:
-    """Output FormID of the MGEF to use for one effect instance.
-
-    Prefers the per-actor-value variant when the code is attribute/skill
-    targeted; falls back to the plugin's base MGEF for that code.
-    """
-    variant = _av_variants.get((code, effect_av))
-    if variant:
-        return variant
-    return _code_to_fid.get(code, 0)
 
 
 def _counter_effect_fids(rec: dict) -> list:
     """ESCE targets as output FormIDs, dropping codes with no MGEF of ours."""
     out = []
     for i in range(get_int(rec, 'CounterEffects')):
-        fid = _code_to_fid.get(get_str(rec, f'ESCE[{i}]'))
+        fid = code_to_fid.get(get_str(rec, f'ESCE[{i}]'))
         if fid and fid not in out:
             out.append(fid)
     return out

@@ -3,7 +3,7 @@ against the EXACT grammar from ck-cmd (references/ck-cmd-master/include/bs/*.h,
 the Arcane University reference implementation of the Skyrim animation cache).
 
 The converter no longer writes the singlefiles: each plugin ships a fragment
-under SKSE/Plugins/TESRuntime/animation that TESRuntime.dll composes onto the
+under SKSE/Plugins/CreatureRuntime/animation that CreatureRuntime.dll composes onto the
 vanilla base at load.  `--plugin` reproduces that composition offline (the same
 `compose_*` the DLL mirrors) and validates the RESULT, which is the file the
 engine will actually parse.
@@ -195,6 +195,7 @@ def compose_for_plugins(plugins, base_dir=None, write_dir=None,
         FRAGMENT_DIR, VANILLA_SINGLEFILES, compose_singlefiles,
         get_vanilla_singlefiles, read_fragments, write_composed)
     from asset_convert import paths
+    from output_layout import plugin_out_root
     if base_dir:
         base = {fn: open(os.path.join(base_dir, fn), encoding='latin-1')
                 .read().splitlines() for fn in VANILLA_SINGLEFILES}
@@ -206,7 +207,8 @@ def compose_for_plugins(plugins, base_dir=None, write_dir=None,
     root = out_root or str(paths.OUTPUT)
     fragments = []
     for plug in plugins:
-        fragments += read_fragments(os.path.join(root, plug, FRAGMENT_DIR))
+        fragments += read_fragments(os.path.join(
+            plugin_out_root(root, plug, paths.EXPORT), FRAGMENT_DIR))
     out_dir = write_dir or tempfile.mkdtemp(prefix='animcache_')
     write_composed(compose_singlefiles(base, fragments), out_dir)
     print(f'composed {len(fragments)} fragment(s) from {plugins} -> {out_dir}')
@@ -218,7 +220,7 @@ def main():
     ap.add_argument('meshes_dir', nargs='?',
                     help='dir holding the two singlefiles to validate')
     ap.add_argument('--plugin', action='append',
-                    help='compose output/<plugin>/SKSE/Plugins/TESRuntime/'
+                    help='compose output/<plugin>/SKSE/Plugins/CreatureRuntime/'
                          'animation/*.json onto the vanilla base and '
                          'validate the result')
     ap.add_argument('--base', help='dir with the vanilla singlefiles '

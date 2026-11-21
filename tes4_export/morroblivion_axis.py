@@ -1,115 +1,196 @@
-"""Pitch a placed reference needs when Morroblivion built its mesh on Y or X.
+"""Rotation and height corrections Morroblivion hand-applied to its placements.
 
-The original Morroblivion converter shipped a set of meshes whose geometry runs
-along Y or X instead of Z, then compensated by baking a pitch into every
-reference IT placed.  Morrowind's own references carry no such pitch, so a
-plugin converted against Morroblivion's meshes renders those objects on their
-side unless the same pitch is added here.
+Morroblivion shipped meshes on the wrong axis and re-seated others, then
+corrected every reference IT placed.  Morrowind's own references carry neither
+correction, so a plugin converted against Morroblivion's meshes renders those
+objects on their side, or floating, unless the same correction is applied here.
 
-Measured on the exports: Morroblivion's 686 references to these bases are 99%
-already pitched, while Tamriel Rebuilt's 2,997 are 96% upright — which is why
-the correction keys on who placed the reference, not on the base.  Only a
-plugin that does NOT own the mesh needs it.
+Every entry is a measured DELTA -- Morroblivion's value minus Morrowind's, per
+reference, paired by cell and horizontal position.  A delta is the only correct
+measure: an object Morrowind itself places rotated, and Morroblivion leaves
+alone, cancels to zero and never becomes a candidate.  An absolute reading
+needed a veto for that case, and the veto in turn hid real fixes -- the lava
+rocks are tilted in Morrowind AND turned a further 180 by Morroblivion.
 
-`AXIS_PITCH_DEG` holds the meshes one right-angle pitch demonstrably fixes;
-`AXIS_PITCH_UNSURE` records the mis-authored ones it cannot, with the
-measurement that disqualified each, so a later pass re-measures instead of
-rediscovering them.
+The fixes were made BY HAND, so they are not uniform: a base may be re-seated
+while another base sharing the mesh is not.  Entries are therefore accepted on
+a spike -- one value carrying >=80% of the references -- and `Z_RESEAT` keys on
+the base EditorID rather than the mesh.
+
+A pitch is applied two ways, matching how Morroblivion placed its own refs:
+`AXIS_PITCH_DEG` turns the MODEL about its own X before the reference's
+rotation, so a yawed ref stays upright; `ROTX_ADD_DEG` adds to RotX alone,
+which is what Morroblivion did to its lava rocks.
+
+`SUBSTITUTION_BLACKLIST` names Morroblivion replacements that are a DIFFERENT
+object, not a moved one -- a hanging lamp became a floor candlestick, and three
+entries name a mesh no game ships at all.  Those are never substituted, so the
+Morrowind mesh converts instead.
 
 See: docs/audits/morroblivion_mesh_axis_rotation.md#the-correction
+See: docs/audits/morroblivion_mesh_axis_rotation.md#substitution-blacklist
+See: docs/audits/morroblivion_mesh_axis_rotation.md#pitch-must-compose
 """
 
 import math
 
-#: Morroblivion mesh (archive path, lowercase '/') -> pitch degrees to add.
+#: Mesh (archive path, lowercase '/') -> model-side pitch degrees, composed.
 AXIS_PITCH_DEG: dict = {
+    'fire/fireopenmedium.nif': 270,
+    'fire/fireopenmediumsmoke.nif': 270,
     'morroblivion/lights/common/candle_01.nif': 270,
-    'morroblivion/lights/common/candle_03.nif': 270,
+    'morroblivion/lights/common/candle_02.nif': 270,
     'morroblivion/lights/common/candle_05.nif': 270,
-    'morroblivion/lights/common/candle_08.nif': 270,
-    'morroblivion/lights/common/candle_09.nif': 270,
-    'morroblivion/lights/common/candle_10.nif': 270,
-    'morroblivion/lights/common/candle_14.nif': 270,
-    'morroblivion/lights/common/candle_16.nif': 270,
-    'morroblivion/lights/common/lantern_01.nif': 270,
-    'morroblivion/lights/common/lantern_02.nif': 270,
-    'morroblivion/lights/common/lantern_02_green.nif': 270,
-    'morroblivion/lights/common/lantern_02_red.nif': 270,
-    'morroblivion/lights/common/lantern_02_yellow.nif': 270,
-    'morroblivion/lights/dunmer/buglamp_01.nif': 270,
-    'morroblivion/lights/dunmer/candle_05.nif': 270,
+    'morroblivion/lights/common/candle_12.nif': 270,
+    'morroblivion/lights/dunmer/candle_13.nif': 270,
     'morroblivion/lights/dunmer/candle_16.nif': 270,
+    'morroblivion/lights/dunmer/candle_17.nif': 270,
 }
 
-#: Mis-authored but NOT corrected: (refs, pitch, share agreeing, why).
-AXIS_PITCH_UNSURE: dict = {
-    'morroblivion/lights/torchnohavok.nif': (
-        602, 270, 0.77, 'bimodal: 463 refs at 270, 101 at +90 - torches '
-        'mount pointing up or down, so intent is per-ref'),
-    'morroblivion/lights/dunmer/lantern_06s.nif': (
-        136, 270, 0.52, 'bimodal 43%; geometry diagonal (sizeY 34.9, '
-        'sizeZ 36.2) - lantern plus chain, no right-angle fix'),
-    'morroblivion/lights/dunmer/lantern_02.nif': (
-        130, 270, 0.83, 'bimodal 11%; long axis measures Z'),
-    'morroblivion/lights/dunmer/lantern_06.nif': (
-        114, 270, 0.83, 'bimodal 6%; long axis measures Z'),
-    'morroblivion/lights/dunmer/candle_06.nif': (
-        86, 270, 0.78, 'bimodal 15%; long axis measures Z'),
-    'morroblivion/lights/dunmer/candle_ivory_01.nif': (
-        135, 270, 0.98, 'diagonal: sizeY 14.9 AND sizeZ 28.5 - leans in the '
-        'YZ plane, so a right-angle pitch does not stand it upright'),
-    'morroblivion/lights/dunmer/candle_red_01.nif': (
-        47, 270, 0.96, 'diagonal, geometry identical to candle_ivory_01'),
-    'morroblivion/lights/dunmer/candle_blue_01.nif': (
-        34, 270, 1.0, 'diagonal: sizeY 28.3, sizeZ 28.5'),
-    'morroblivion/lights/dunmer/candle_blue_02.nif': (
-        30, 270, 1.0, 'diagonal, long axis measures Z'),
-    'morroblivion/lights/dunmer/candle_green_01.nif': (
-        9, 270, 1.0, 'diagonal, long axis measures Z'),
-    'morroblivion/lights/dunmer/candle_13.nif': (
-        23, 270, 1.0, 'long axis measures Z'),
-    'morroblivion/lights/dunmer/candle_15.nif': (
-        54, 270, 0.78, 'bimodal; Y-axis but pitch split'),
-    'morroblivion/lights/dunmer/candle_17.nif': (
-        46, 270, 0.74, 'bimodal; Y-axis but pitch split'),
-    'morroblivion/lights/dunmer/candle_18.nif': (
-        18, 270, 0.50, 'even +/-90 split'),
-    'morroblivion/lights/dunmer/candle_19.nif': (
-        15, 90, 0.53, 'even +/-90 split'),
-    'morroblivion/lights/common/candle_12.nif': (
-        26, 270, 0.77, 'bimodal; Y-axis but pitch split'),
-    'morroblivion/lights/common/candle_02.nif': (
-        6, 270, 1.0, 'long axis measures Z'),
-    'morroblivion/lights/dunmer/lantern_01cc.nif': (
-        55, 270, 0.76, 'bimodal'),
-    'morroblivion/lights/dunmer/lantern_07cc.nif': (
-        19, 270, 0.84, 'bimodal'),
-    'morroblivion/lights/dunmer/lantern_10cc.nif': (
-        13, 270, 0.77, 'bimodal'),
-    'morroblivion/lights/dunmer/lantern_02s.nif': (
-        4, 90, 0.50, 'even +/-90 split'),
-    'morro/f/furnucolonyuhook01.nif': (
-        24, 90, 0.58, 'STAT; bimodal, no Morrowind counterpart'),
-    'morroblivion/fire/smokemedium.nif': (
-        7, 270, 0.71, 'ACTI; too few refs to call'),
-    'morroblivion/clutter/books/paudcutls.nif': (
-        4, 270, 0.75, 'BOOK; Morrowind originals ARE tilted (100%)'),
-    'morroblivion/clutter/books/paudcucpu02.nif': (
-        4, 90, 1.0, 'BOOK; Morrowind originals ARE tilted (100%)'),
+#: Mesh -> degrees Morroblivion added to RotX alone, yaw untouched.
+ROTX_ADD_DEG: dict = {
+    'morro/i/inulavaurocku14.nif': 180,
+    'morro/i/inulavaurocku16.nif': 180,
+    'morro/i/inulavaurocku17.nif': 180,
+    'morro/i/inulavaurocku18.nif': 180,
+    'morro/i/inumoldurocku17.nif': 180,
+    'morro/i/inupyurocku13.nif': 180,
 }
+
+#: Base EditorID (lowercase) -> Z offset its references gained.
+Z_RESEAT: dict = {
+    '0lightufireu400': 13.30,
+    '0lightufire': 13.30,
+    '0lightufireunosmokeu400': 13.30,
+    '0lightufireunosmokeu177': 13.30,
+    '0lightufireunosmokeu128': 13.30,
+    '0lightufireunosmoke': 13.30,
+    '0barrelu01udeupos1': 3.00,
+    '0barrelu01ucheapfood5': 3.00,
+    '0barrelu01ucheapfood20': 3.00,
+    '0barrelu01udrinks': 3.00,
+    '0barrelu01uashyams': 3.00,
+    '0lightudeucandleu24u64': -2.80,
+    '0chestusmallu02uingfine3': -0.80,
+    '0chestusmallu02uingfine4': -0.80,
+    '0bkuoldways': -0.60,
+}
+
+#: Morroblivion replacements too unlike the original to substitute.
+SUBSTITUTION_BLACKLIST: frozenset = frozenset((
+    'lights/middlecandlestickfloor02.nif',
+    'lights/candlefat02.nif',
+    'lights/candleskinny01.nif',
+    'lights/torch01fake.nif',
+    'dungeons/misc/fx/fxmist01.nif',
+    'dungeons/misc/fx/fxcloudthick01.nif',
+    'dungeons/misc/cobweb04.nif',
+    'dungeons/misc/root03.nif',
+    'clutter/sack01.nif',
+    'mip/container/barrels/mwbarrel10.nif',
+    'mip/container/urns/clay_urn02.nif',
+    'mip/container/urns/clay_urn03.nif',
+    'mip/container/urns/clay_urn05.nif',
+    'clutter/ingredskooma.nif',
+    'clutter/morro/n/nbbread01.nif',
+    'clutter/morro/m/misculwucup.nif',
+    'mip/container/crates/common_chest01.nif',
+    'clutter/morro/m/nbgold025.nif',
+    'clutter/morro/m/nbpitcher01.nif',
+    'clutter/morro/m/nbtankard02.nif',
+    'mip/container/chests/chest02.nif',
+    'morro/f/furnudeubenchu03.nif',
+    'morro/f/furnudeubookshelfu02.nif',
+    'morro/f/furnudeutableu01.nif',
+    'morro/o/containudeuchestu01.nif',
+    'morroblivion/lights/common/candle_03.nif',
+    'morroblivion/lights/common/candle_07.nif',
+    'morroblivion/lights/common/candle_08.nif',
+    'morroblivion/lights/common/candle_09.nif',
+    'morroblivion/lights/common/candle_10.nif',
+    'morroblivion/lights/common/candle_14.nif',
+    'morroblivion/lights/common/candle_16.nif',
+    'morroblivion/lights/common/lantern_01.nif',
+    'morroblivion/lights/common/lantern_02.nif',
+    'morroblivion/lights/dungeons/tikilamp.nif',
+    'morroblivion/lights/dunmer/buglamp_01.nif',
+    'morroblivion/lights/dunmer/candle_01.nif',
+    'morroblivion/lights/dunmer/candle_02.nif',
+    'morroblivion/lights/dunmer/candle_04.nif',
+    'morroblivion/lights/dunmer/candle_05.nif',
+    'morroblivion/lights/dunmer/candle_07.nif',
+    'morroblivion/lights/dunmer/candle_08.nif',
+    'morroblivion/lights/dunmer/candle_09.nif',
+    'morroblivion/lights/dunmer/candle_15.nif',
+    'morroblivion/lights/dunmer/candle_18.nif',
+    'morroblivion/lights/dunmer/candle_19.nif',
+    'morroblivion/lights/dunmer/candle_blue_01.nif',
+    'morroblivion/lights/dunmer/candle_blue_02.nif',
+    'morroblivion/lights/dunmer/candle_green_01.nif',
+    'morroblivion/lights/dunmer/candle_ivory_01.nif',
+    'morroblivion/lights/dunmer/candle_red_01.nif',
+    'morroblivion/lights/dunmer/lamp_05.nif',
+    'morroblivion/lights/dunmer/lamp_06.nif',
+    'morroblivion/lights/dunmer/lantern_01cc.nif',
+    'morroblivion/lights/dunmer/lantern_06s.nif',
+    'morroblivion/lights/dunmer/lantern_02.nif',
+    'morroblivion/lights/dunmer/lantern_02s.nif',
+    'morroblivion/lights/dunmer/lantern_06.nif',
+    'morroblivion/lights/dunmer/lantern_07cc.nif',
+    'morroblivion/lights/dunmer/lantern_10cc.nif',
+    'morroblivion/lights/torchnohavok.nif',
+))
+
+#: Mesh -> (refs, delta, share, why) for deltas one value cannot express.
+AXIS_PITCH_UNSURE: dict = {
+    'morro/f/furnucolonyuhook01.nif': (
+        24, 90, 0.58, 'STAT; bimodal, no Morrowind counterpart to diff'),
+}
+
+
+def _key(model: str) -> str:
+    """A model path in the tables' spelling: lowercase, '/', no leading slash."""
+    return model.lower().replace('\\', '/').lstrip('/')
 
 
 def pitch_for_model(model: str) -> float:
-    """Radians to add to a reference's RotX for this Morroblivion model."""
-    if not model:
-        return 0.0
-    key = model.lower().replace('\\', '/').lstrip('/')
-    deg = AXIS_PITCH_DEG.get(key)
+    """Radians the model turns about its own X before the ref's rotation."""
+    deg = AXIS_PITCH_DEG.get(_key(model)) if model else None
     return math.radians(deg) if deg else 0.0
+
+
+def rotx_add_for_model(model: str) -> float:
+    """Radians to add to a reference's RotX alone for this model."""
+    deg = ROTX_ADD_DEG.get(_key(model)) if model else None
+    return math.radians(deg) if deg else 0.0
+
+
+def compose_pitch(rx: float, ry: float, rz: float, pitch: float) -> tuple:
+    """(RotX, RotY, RotZ) placing the model pitched about its own X, then as authored.
+
+    Same `(Rz·Ry·Rx)ᵀ` convention as `rot_matrix`; with RotY = RotZ = 0 it
+    equals adding `pitch` to RotX.  `rot_matrix` is imported here to break the
+    cycle navmesh.world -> record_types -> dialogue -> morrowind_patch -> here.
+    See: docs/audits/morroblivion_mesh_axis_rotation.md#pitch-must-compose
+    """
+    from tes5_import.navmesh.world import rot_matrix
+    n = (rot_matrix(rx, ry, rz) @ rot_matrix(pitch, 0.0, 0.0)).T
+    sy = max(-1.0, min(1.0, -float(n[2][0])))
+    y = math.asin(sy)
+    if math.cos(y) > 1e-9:
+        return (math.atan2(n[2][1], n[2][2]), y, math.atan2(n[1][0], n[0][0]))
+    return (math.atan2(sy * n[0][1], sy * n[0][2]), y, 0.0)
+
+
+def z_reseat_for_base(editor_id: str) -> float:
+    """Z offset a reference to this base must add (0.0 if none)."""
+    if not editor_id:
+        return 0.0
+    return Z_RESEAT.get(editor_id.lower(), 0.0)
 
 
 def is_unsure(model: str) -> bool:
     """Whether this model is mis-authored but deliberately not corrected."""
     if not model:
         return False
-    return model.lower().replace('\\', '/').lstrip('/') in AXIS_PITCH_UNSURE
+    return _key(model) in AXIS_PITCH_UNSURE

@@ -19,6 +19,8 @@
 - [Status after the 2026-08-17 fix pass](#status-after)
 - [PACK conversion: verified-correct behaviour](#pack-conversion-2)
 - [Verified correct — do NOT "fix" these](#section)
+- [Shop doors: Unlock Doors At Location becomes Unlock At Start](#shop-doors-unlock-at-location)
+- [Follow with a destination is FollowTo](#follow-with-a-destination-is-followto)
 
 ## PACK Conversion Plan (TES4 → TES5)
 <a id="pack-conversion-plan"></a>
@@ -206,8 +208,8 @@ every field we need (`PKDT.Flags/Type/Format`, `PSDT.*`, `PLDT.Type/Location/Rad
 | 0 Find | 741 | `Activate` / `ForceGreet` / `Sandbox` | **partial** — see §2.1, §3.2 |
 | 4 Sleep | 725 | `Sleep` | **exact** — dedicated tree w/ bed-find + LockDoors |
 | 1 Follow | 208 | `Follow` | **exact** |
-| 9 Ambush | 80 | `HoldPosition` + Weapon Drawn / No Combat Alert | **close** |
-| **2 Escort** | **75** | `EscortPlayerWhenNear` | **exact** ← *fgc01rats* |
+| 9 Ambush | 80 | player target: `ForceGreet`; actor target at a place: `TES4AmbushNear` ([§](#ambush-at-a-place)); actor target, no place: `Follow`; no target: `HoldPosition` + Weapon Drawn / No Combat Alert | **close** |
+| **2 Escort** | **75** | `TES4EscortWhenNear` (converter-owned root) | **exact** ← *fgc01rats*; see [§ escort restarts](#escort-restarts-when-the-target-returns) |
 | 7 Accompany | 40 | `Follow` w/ `Accompany?=1` | **exact** — Skyrim models Accompany as a Follow input |
 | 10 FleeNotCombat | 11 | `FleeTo` | **exact** |
 | 11 CastMagic | 5 | `UseMagicRepeat` | **close** |
@@ -255,10 +257,12 @@ the *activation logic* (`GetStage`, `GetDayOfWeek`, disposition checks).
    the destination — the parts a player observes — are exact; the "locate this
    object" tail is dropped.
 
-3. **Ambush (80)** — Skyrim has no Ambush procedure. `HoldPosition` + `Weapon
-   Drawn` + `No Combat Alert` reproduces "wait hidden, weapon out, don't call for
-   help," which is behaviorally most of it, but the trigger-on-detection nuance is
-   the combat AI's, not the package's.
+3. **Ambush (80)** — Skyrim has no Ambush procedure. A targetless Ambush is
+   `HoldPosition` + `Weapon Drawn` + `No Combat Alert` ("wait hidden, weapon out,
+   don't call for help"); the trigger-on-detection nuance is the combat AI's, not
+   the package's. 64 of the 80 target the PLAYER and are scripted approaches, not
+   attacks: those convert to ForceGreet (an actor target gets Follow)
+   ([Ambush is an approach](../reference/package_ai_contracts.md#ambush-is-an-approach-not-an-attack)).
 
 4. **PKDT flag bits without TES5 equivalents.** TES4 "Once per day" → TES5 `0x400`
    (same concept, different bit). TES4 "Always run" → `PreferredSpeed=Run` +
@@ -354,14 +358,33 @@ set. Getting this wrong stalls scripted sequences with no error and no log
 line: `CGRatAmbushAPushBricks` (rat → `CGCrumbleWall01REF`) meant the
 CharacterGen wall never crumbled, `setstage MQ01 24` never ran, and the
 tutorial rats never turned hostile no matter how long the player waited.
-- **Follow (1)** → `Follow`, `PTDA` = target, `Accompany?=0`.
+- **Follow (1)** → `Follow`, `PTDA` = target, `Accompany?=0`, radii from `PTDT.Count`
+  ([§ authored distance](#follow-keeps-its-authored-distance)). With a
+  same-cell `PLDT` destination → `FollowTo`
+  ([§ follow with a destination](#follow-with-a-destination-is-followto)).
+
+  <a id="follow-keeps-its-authored-distance"></a>**A follow keeps its authored distance.** On
+  a TES4 Follow or Accompany, `PTDT.Count` is the distance the follower keeps: Oblivion.esm's
+  values are round distances (300 x23, 256 x18, 400 x17, 128 x15, 350 x14, 150 x13, 500 x12,
+  up to 2000; 45 have 0). The converter used it for an Ambush at an actor but dropped it on
+  Follow, so every follower crowded its leader at the template's 128 / 256. Run 58a: Astav
+  Wirich (MQ05AstavFollowBaurus, 400) ended up in front of Baurus on his way to the cellar
+  door of Luther Broad's, about 47 away; Baurus does not walk through him and Astav, already
+  close enough, does not move, so both stood for good. In a 60-trip loop it came on trip 19;
+  moving Astav aside, Baurus reached the cellar at once. Now Max Radius = Count, Min = half
+  of it (at least 64), the rule the Ambush already used (`converter.keep_within`); 0 keeps the
+  template's radii.
 - **Accompany (7)** → `Follow`, `Accompany?=1` — Skyrim models Accompany as a
   Follow input, so this is exact, not an approximation.
-- **Escort (2)** → `EscortPlayerWhenNear`. `PTDT` → *Target to Escort*,
-  `PLDT` → *Destination*.
+- **Escort (2)** → `TES4EscortWhenNear`, the converter's own root
+  ([§ escort restarts](#escort-restarts-when-the-target-returns)). `PTDT` →
+  *Target to Escort*, `PLDT` → *Destination*.
 - **FleeNotCombat (10)** → `FleeTo`. `PLDT` → *Flee To Location*, `PTDT` →
   *Flee From Target*.
-- **Ambush (9)** → `HoldPosition` at `PLDT` + `Weapon Drawn` + `No Combat Alert`.
+- **Ambush (9)** → at the PLAYER: `ForceGreet` (`_pick_ambush`), weapon and sneak
+  flags suppressed; at another actor: `Follow` to `PTDT.Count`; targetless:
+  `HoldPosition` at `PLDT` + `Weapon Drawn` + `No Combat
+  Alert` ([contract](../reference/package_ai_contracts.md#ambush-is-an-approach-not-an-attack)).
 - **CastMagic (11)** → `UseMagicRepeat`.
 
 ### 3.3 Reference targets → aliases
@@ -407,8 +430,9 @@ exist:
 - `PKID` = the actor's converted packages, **in TES4 order** (Skyrim, like
   Oblivion, takes the first package whose conditions pass — order is behavior).
 - Keep `DPLT` (`DefaultMasterPackageList`) as the fallback beneath them.
-- Keep the creature path (`DefaultMasterPackageCreature`) — creature AI is driven
-  by the behavior-graph work, not by TES4 packages.
+- Creatures get the same list, with `DefaultMasterPackageCreature` appended as
+  the fallback. Dropping their authored packages stranded scripted creatures
+  ([why](tes5_import_actors.md#creature-class-and-package)).
 - `packages.py` shrinks to the creature default + a fallback for actors whose
   packages all failed to convert.
 
@@ -521,6 +545,14 @@ script and the read ref gains its own copy. Scope: 94 actors relocated across
 ~142 gated refs. Scripts `extends Actor`, which attaches fine to a placed actor
 reference. Regression: `test_actor_script_relocated_to_placed_ref`,
 `test_shared_base_keeps_script_and_adds_ref`.
+
+🛑 **Correction (2026-10-02): the "100% of vanilla" census above is wrong.**
+Re-measured over Skyrim.esm: 27 of 62 `GetVMScriptVariable` targets carry the
+script only on their BASE, and for package conditions alone 8 of 28 do
+(`MG01FaraldaBridgeForcegreet` reads `MG05WinterholdTriggerRef::BridgeWarning`).
+A base-attached script does satisfy the condition. What kept these actors still
+was §8's PLDT type. The relocation is harmless and stays.
+See: [wiring audit](../audits/wiring.md#disproven-rules).
 
 ## 8. `PLDT` alias locations must be type 8, not type 9 (2026-07-20)
 <a id="player-target-is-the-reference"></a>
@@ -724,6 +756,18 @@ UseItemAt Sandbox 662 → 656   Activate 87        Sit 0 → 6        SitTarget 
     into the live package left the fighter standing (type 4/5 are dead in the
     engine); the mine's navmesh is one component (`tools/navmesh/reach.py`).
     Oblivion: 6 hunts → 46 seek links;
+  * Why a chain and not one in-cell Sandbox (FGC06, measured live): a SPHERICAL
+    Sandbox location is truncated to a cylinder (`fSandboxCylinderBottom` = -100
+    in Skyrim.esm, top 150 by exe default), so a wanderer never descends 350 units
+    to targets on another level. A type-1 "in cell" location has no centre and no
+    cylinder (vanilla `MQ202SandboxInRatway`; all 448 vanilla in-cell PLDTs are
+    INTERIORS, never hand it an exterior cell), but it still wanders only ~300
+    units locally, hence the Follow chain with the in-cell Sandbox as tail. Every
+    FormID written into a PLDT/PTDA, the cell included, goes through
+    `remap_formid` (`PackContext.search_ground`): the raw cell id resolved to
+    nothing and the fighters stood still. For UseWeapon, slot 1 is the
+    weapon-type selector and "Target to Attack" is slot 4; the console has no
+    `AddScriptPackage`, `resetai` restarts a package.
   * item base/type (WEAP/INGR/MISC/ALCH/BOOK/… incl. `SEBruscusDannusFind*`,
     `HeroLoot`, the goblins' totem staffs) → **Acquire** with the same
     criteria and `PTDT.Count` as num-to-acquire (vanilla
@@ -757,10 +801,10 @@ UseItemAt Sandbox 662 → 656   Activate 87        Sit 0 → 6        SitTarget 
   script and gated on a quest are attached to the actor's alias as ALPCs
   (`pack_aliases.build_script_assigned_packages`; 15 Oblivion / 4 Nehrim,
   incl. `MQ12MartinPlaceWelkyndStone`, `MQ14MartinPlaceSigilStone`,
-  `MQ15MartinOpenPortal`, `MQ00CalebroPackage04`). Unconditioned forced
-  packages (52 / 20) are NOT attached — with no gate they would run whenever
-  the quest runs — and remain the known `AddScriptPackage → EvaluatePackage`
-  gap.
+  `MQ15MartinOpenPortal`, `MQ00CalebroPackage04`). Since 2026-11-14 a forced
+  package that no actor lists, gated or not, sits on the forced host behind
+  its armed faction ([package hosts](#package-hosts)); the unconditioned ones
+  (52 / 20) are attached that way too.
 
 ### The audit was wrong about
 
@@ -809,3 +853,473 @@ Recorded so a later session does not re-litigate them.
 | Structural contract | `tools/esm/pack_validate.py output/Oblivion.esm/Oblivion.esm` → **clean, 7,209 records**. Every defect below is *semantic*, which is exactly why the structural validator passes. |
 
 ---
+
+## Shop doors: Unlock Doors At Location becomes Unlock At Start
+<a id="shop-doors-unlock-at-location"></a>
+
+Oblivion opens a shop through the owner's daytime package flag `0x100` Unlock
+Doors At Location; the door itself is authored locked (Edgar's Discount Spells:
+inside door `0002C243`, lock 50, owned by `EdgarVautrine`). His
+`aaaServicesEditorLoc8x12LockAtEnd` is a Travel to his editor location with flags
+`0x311`. TES5 bit 8 is Request Block Idles, so the bit was dropped, and the Travel
+template has no UnlockDoors procedure: the door stayed locked all day, and a
+player who got in anyway was a trespasser, so the owner asked them to leave
+instead of trading. Confirmed fixed in-game.
+
+The TES4 bit now maps to TES5 `0x40` Unlock Doors At Package Start, which is how
+vanilla writes shop hours (`MarkarthGeneralStoreVendor8x16xPackage` `0xC1`,
+`LucanValeriusTraderServices7x13` `0x251`; 35 of 5,961 vanilla packages set
+`0x40`). Oblivion.esm has 165 packages with `0x100`.
+
+Still dropped: TES4 Lock Doors At Package End (`0x10`, 92 packages) and At
+Location (`0x20`, 141). TES5 has no named flag for either (the vanilla bits
+`0x10`/`0x20` appear on 33/2 packages but are unnamed in xEdit and the CK).
+Relocking comes from the Sleep template's LockDoors procedure, so a shop whose
+owner sleeps elsewhere stays unlocked overnight.
+
+---
+
+## An Ambush on an actor waits at its place
+<a id="ambush-at-a-place"></a>
+
+**Code:** `packages/ambush_near.py` (root `TES4AmbushNear`), `packages/custom_roots.py`
+(shared with the escort root), `converter._pick_ambush`.
+
+TES4 Ambush means: wait at the PLDT location; once the target is within its radius,
+act on it (non-hostile: walk up to PTDT.Count). `MQ04CyrusGreetJauffre` waits at
+MQ04CyrusWaitMarker (r 1800) and walks up to Jauffre (210); `MQ13NarinaCarvainToMartin`
+waits at MarkerMQ11ChapelNarinaCarvain in the Chapel (r 500) for Martin (180).
+
+We converted an Ambush on an actor to a plain Follow of the target, dropping the
+place. Run 41a: the Countess stood still in BrumaCastleGreatHall on that Follow
+while Martin was already in the Chapel (another cell) -- the follow only moves her
+while he is near -- so "Let the battle begin." never came (36c passed only because
+Martin was still walking out with her).
+
+`TES4AmbushNear` is the escort root's pattern: Stacked { Follow (vanilla Follow's
+procedure inputs) while `GetWithinDistance(target, radius)` ; Travel to the place,
+flag 0 so it does not complete and the actor waits there }. An Ambush on an actor
+with a location and a radius (PLDT.Radius, else PTDT.Count) uses it; one without a
+location stays on Follow. Census (temp/ambush_census.py): Oblivion 2 packages
+(the two above), Nehrim 16. (The 43rd import's root users: those two plus
+E3SkeletonPACK, near its editor location, and SECaldanaMonriusBugPeople, near a
+reference, r 10000.)
+
+The radius is the PLACE's: Travel stops the actor at the edge of the location's
+radius, so a gate measured from the actor misses a target standing inside the
+place. Measured (run 56a, then on the same save, temp/ambush_ab): the Countess
+stopped 498.55 from MarkerMQ11ChapelNarinaCarvain with Martin 165 from it but
+516.7 from her, and stood there. So the gate runs on a 10th input `Place` (a
+SingleRef, editor index 16: the location's reference or reference alias, else
+Self, which keeps the actor-based check for an editor-location place) with
+Run On = Package Data, the form vanilla UseWeaponCreature uses. Same save after
+the fix: she walked up to Martin (181 away). Pictures:
+temp/ambush_ab/shots/before.png, after.png.
+
+---
+
+## Sit in a seat in another cell
+<a id="sit-in-a-seat-in-another-cell"></a>
+
+**Code:** `packages/sit_at.py` (root `TES4SitAt`), `packages/custom_roots.py` (`branch`),
+`converter._sit_in`. Headless runs 54c-55b, 2026-11-15; NOT yet confirmed in game by the user.
+
+A TES4 Travel (or UseItemAt) whose exact destination is one furniture reference means
+"go and sit in it". It converts to vanilla Sit (location = the seat, radius 500,
+criteria = that reference). Vanilla Sit's tree is Sequence { Simultaneous { Find,
+Sequence { Travel, Wander } }, Simultaneous { Sit, Wait } }: its Find never finds a seat
+in another cell. Measured on `MQ05BaurusTakePoint` (the chair is in
+ImperialSewersElvenGardens02): with his own cell 01 loaded and the player beside him,
+Baurus stood in the lower hall, AI procedure 49, for 3600 ticks; in 02, 919 from the
+chair, he walked to it and sat at once. Earlier passes only worked because the case sent
+the player ahead, so the engine moved the unloaded Baurus through the door; that move
+failed outright in another run (9000 ticks in 01).
+
+`TES4SitAt` is vanilla Sit's tree node for node (checked against Skyrim.esm's `Sit`),
+with one condition on its Find: `GetDistance(seat) < 500`. While the seat is farther, the
+Travel beside the Find takes the actor to the seat's location, through doors; once near,
+Find runs as in vanilla. Its inputs are vanilla Sit's seven plus an eighth, a SingleRef
+`Seat` (editor index 14) holding the same seat as the search criteria.
+
+🛑 A package-data parameter in a condition names an input by its EDITOR index (UNAM), and
+it must be a SingleRef for a reference function: every vanilla package-data `GetDistance`
+/ `GetWithinDistance` points at one (HoldPositionWithTravel's parameter 12 = its SingleRef;
+WIGamesHideAndSeekPackage's 0 / 45-48 = SingleRefs). A first build pointed the condition at
+Sit's input 1, a TargetSelector; loading a save in which Baurus ran the package faulted
+(access violation at SkyrimSE+0x4a0a5f, 1.6.1170: the engine fetches the input, 0x444830,
+and calls a reference method on it). Measured on patched plugin copies: the same root with
+no condition loads that save; with the condition it faults, whatever the input count or
+PKCU version. So a template change itself is safe for saves; the bad parameter was not.
+
+## Escorts restart when the target returns
+<a id="escort-restarts-when-the-target-returns"></a>
+
+**Code:** `packages/escort_when_near.py`; created in
+`base/owned_records.py::create_tes4_special_records`, adopted by dependent
+plugins in `base/adopted_records.py`. Confirmed in-game (SE02).
+
+Symptom: Jayred Ice-Veins (SE02 "Through the Fringe of Madness") led the player,
+but once the player got far enough away he froze for good, even with the player
+standing next to him. His "Follow me" line (`set LeadToGardens to 1` + `evp`) did
+nothing; "Wait, let's do this later" then "Lead on" revived him.
+
+Cause, from the 1.6.1170 exe and the live game:
+
+- The escort package stayed current (`GetIsCurrentPackage` 1) while its
+  procedure was dead (`GetCurrentAIProcedure` −1). `EvaluatePackage` re-picks
+  the same package and does **not** restart it, so `evp` cannot revive it. The
+  toggle works because the package genuinely changes (conditions go false,
+  then true), which starts a fresh `BGSProcedureEscortExecState`.
+- `BGSProcedureEscort`'s per-frame update (RVA `0x45E360`) keeps a waiting
+  byte and path state that only a fresh start resets. The follower check
+  (`0x6ED6D0`) waits once the follower is past the package's *Distance to Wait*
+  (or `fAIEscortWaitDistanceInterior` 512 / exterior 2.0 × max(200, …) when the
+  package has none) and resumes inside 2/3 of it (factor 0.444 = (2/3)² at
+  `0x18A39C8`), with `fAIEscortHysteresisWidth` 50. Oblivion ships the same two
+  wait defaults (2.0 and 512).
+- `ResetAI` from the console also revives it; Papyrus has no equivalent.
+
+Vanilla's answer is `EscortPlayerWhenNear` (`00069665`): a Stacked tree whose
+Escort branch is gated on `GetWithinDistance(input 11, input 15) == 1` (CTDA
+flag 0x08, both parameters package inputs), falling through to Travel. When the
+player leaves the radius the Escort procedure ends; when they return it starts
+fresh. Its Travel walks the escorter to the goal alone, which Oblivion never
+did (Jayred would reach the gardens and fire FindBones without the player).
+
+`TES4EscortWhenNear` is that root byte for byte except:
+
+| | EscortPlayerWhenNear | TES4EscortWhenNear |
+|---|---|---|
+| fallback | Travel (inputs 3, 13, 17), FNAM 1 | **Wait** (inputs 20 ActualSeconds = 0, 21 StopMovement = 1), **FNAM 0** — vanilla `StayAtCurrentLocation`'s stay-put Wait |
+| inputs / XNAM | 10 / 20 | 12 / 22 |
+| defaults | wait 300, radius 500, preferred path 1 | wait 512, radius **1500**, preferred path 0 (the converter's existing Escort values) |
+
+FNAM bit 0 is "success completes the package": the Escort keeps it (arriving
+ends the package) and the Wait must not. The 1500 radius is MQ102
+Hadvar/Ralof's (open-terrain player escorts; vanilla spans 300–5000). Every
+converted escort uses it — TES4 Escort, a Use Horse TES4 Follow with a
+destination, and Morrowind `AIEscort` — and falls back to vanilla `Escort` only
+when no root is installed (a master built before this change). Adding the root
+moved no FormID (1,187,406 records before, the same plus one after). Test:
+`tests/test_escort_when_near.py`.
+
+**The Wait branch does not always hand back to Escort.** Measured on Baurus's
+`MQ05BaurusGoToSewerGate` (runs 42a, 42b): after he takes a loading door ahead of
+the player he stands on the package with no procedure running (`GetCurrentAIProcedure`
+−1), and the player arriving beside him -- teleported, or through the same door
+(1 of 3) -- leaves him there for 3,600 ticks. Within one cell the switch works (player
+moved from 551 to beside him: he walked on within 5 s). Two states were measured:
+one an `evp` ends (42a), and one only the Escort gate turning false then true ends
+(43a, at the 03 -> 01 door: `evp` and `resetai` did nothing; the player stepping out
+of range and back sent him through the door at once) -- the dead-Escort state above.
+🛑 REMOVED (run 60, user 11-17: runtime hooks had been masking real bugs). Those
+stalls were the HARNESS: `follow` / `approach` left the test player standing in
+Baurus's path, and Skyrim's pathing waits for a player in the way (measured: player
+40 in front -> he stands, 40 behind or beside -> he walks; fixed by the runner's
+StepAside / StepBack, rows 60b / 60a-11th of the worklog). With the restart off,
+meeting + sewer in one session passed 3 of 3. The hold condition is gone from the
+root; the `TES4EscortHold` FACT is still written only so FormIDs do not move. The
+text below records what had been built.
+
+So the Escort branch also required `GetInFaction TES4EscortHold == 0` (a hidden
+one-rank FACT, `owned_records.one_rank_faction`), and the runtime restarted a stalled
+escort (MorrowindRuntime `game_calls_escort.cpp` `RestartStalledEscorts`, every 10
+ticks): an actor running one of the plugin's player escorts -- `escortplayer` rows of
+`attributes_formid.txt`, written by `attribute_tables.global_lines` from
+`escort_when_near.player_escorts()`, beside an `escorthold` row -- that has moved
+under 16 units over two checks with the player within 512 in the same place, out of
+combat and out of dialogue, is put in the faction and re-evaluated (Wait), then taken
+out and re-evaluated 5 s of real time later (a fresh Escort). A one-check hold
+(10 ticks) changed nothing in 179 tries (run 44c), and a six-check hold (~2.2 s at test
+pace) nothing in 20+ (run 54b), while the player out of range for 4-5 s restarted him at
+once both times, so the hold matches that measured duration. A member
+found while not being held (a save made mid-hold) is released. These freezes come in
+one session -- straight out of the meeting conversation into the escort -- and almost
+never from a loaded checkpoint, which starts every package fresh. Oblivion.esm lists 29 player escorts
+(NPC escorts keep the engine's own wait). The runtime sidecars are staged after the
+PACK phase so the list is complete (`pipeline_records._phases23_records`).
+Confirmed: `mq05_baurus_meeting` + `mq05_sewer_plan` in one session 3 of 3 (44g),
+restarts logged 7, 5 and 8 times (every full new-game run 42a / 43a / 44a had failed there).
+
+## A quest package that ran today steps aside
+<a id="script-packages-go-first"></a>
+
+<a id="package-hosts"></a>
+### Packages live on host quests that never stop; a forced package is armed
+
+**Code:** `tes5_import/packages/hosts.py`, `aliases.py` (`_own_quests`, `_arm_unlisted`),
+`dialogue/quest.py` `package_host`, `TES4Polyfill.AddScriptPackage` / `RemoveScriptPackage`,
+`TES4_ScriptPackageDone.psc`. Built 2026-11-14 from the failures listed below; NOT yet confirmed in
+game by the user.
+
+Oblivion keeps a package on its actor for good: its conditions are tested whether the quest they
+name is running, stopped or never started (`GetStage` works on all three). A Skyrim alias package
+exists only while its quest runs, so every package of a quest died at that quest's `stopquest`
+(MQ14 stage 100 stops MQ14 while `MQ14MartinPlaceSigilStone`, `GetStageDone MQ14 60`, still has
+work to do). And `AddScriptPackage` puts a package ABOVE the actor's list from the call until the
+package completes, is removed, or another is added.
+
+* **One host quest** (`TES4Packages`): start-game-enabled, never stopped, priority 100, no
+  stages. An actor with any quest-gated package gets ONE alias there carrying its WHOLE authored
+  package list in authored order, ungated packages included, because Oblivion picks the first
+  package in the list whose conditions hold. `PACK.QNAM` and the alias indices in PTDA / PLDT name
+  the host; a source quest keeps only its objective aliases. Each package alias runs
+  `TES4_StagePackageAlias` with `Source1..8` = the quests that gate its packages (more than eight:
+  `Every`, the any-stage event). A plugin with masters keeps the old layout (hosts off).
+* **Tried first and wrong: one host per source quest** (run 33g). Order between hosts is quest
+  priority, not list order: Baurus's list has `MQ05BaurusAtLutherBroads` (35th) above
+  `CGBaurusGuardEmperor` (38th, `GetStage Charactergen >= 88`, true for good), and once
+  Charactergen's packages outlived its `stopquest` the tutorial package won and he never left the
+  sewer exit.
+* **A script-forced package on NO actor's list** goes first on the actor's alias. It gets a hidden
+  faction `TES4Armed_<package>`, a first condition `GetInFaction == 1`, and the OnEnd fragment
+  `TES4_ScriptPackageDone`, which takes the actor out of the faction and re-evaluates. The
+  converted `AddScriptPackage` disarms the actor's other forced packages, adds the faction and
+  re-evaluates; `RemoveScriptPackage` disarms. The package and faction are paired by index in two
+  FormLists (`TES4ScriptPackageList`, `TES4ScriptPackageArmed`).
+* A forced package that IS on some actor's list (32 of Oblivion's 107, 5 of Nehrim's 36) keeps its
+  list position and its own conditions and is not armed: one PACK record cannot be gated for one
+  actor and open for another. Its `AddScriptPackage` is a re-evaluation, as before.
+
+### What led here (history)
+
+**Code:** `tes5_import/packages/aliases.py` `_wire_script_assigned`. Found by headless runs 30c,
+30f and 31a (2026-11-14); the mechanism below is NOT built.
+
+Two measured failures and one reverted attempt:
+
+* Appended after the list packages, a script package loses to a list package with the same gate
+  (Martin, below).
+* Moved to the FRONT (tried in the 10th import of 2026-11-14, reverted), it runs as soon as its own
+  conditions hold, before any `AddScriptPackage`: `CGBaurusSearchAmbushBRoom` ran during the
+  Ambush B fight, its `OnPackageDone` set CharacterGen 38 before 36, 36 then reset the conversation
+  to line 30, and the scene stopped after "I know he did." for good (new-game run 31a).
+* On its quest's alias it dies when that quest stops: MQ14 stage 60 adds
+  `MQ14MartinPlaceSigilStone` and then sets 100, which stops MQ14, so Martin never walks back to
+  Cloud Ruler Temple (run 30f).
+
+Oblivion's script package is active from the `AddScriptPackage` call until it completes or is
+removed, whatever its quest does. The converted call is a bare `EvaluatePackage()`. What is needed:
+a per-package flag the converted `AddScriptPackage` sets (cleared by `RemoveScriptPackage` and by
+completion), a first condition on it, front position, and a host that does not stop with the quest.
+
+Oblivion's `AddScriptPackage` overrides the actor's whole package list. The converted package is an
+ALPC on the actor's quest alias, and it was appended AFTER the list packages the same quest gates.
+Martin's list holds `MQ15MartinWaitDuringPortalOpening` (`GetStage MQ15 == 15`), and stage 15 adds
+`MQ15MartinOpenPortal` by script with the same gate: the list package won, the ritual package never
+ran (its completion latch stayed 0), and the portal to Paradise never opened.
+
+<a id="use-item-at-a-disabled-reference"></a>
+### UseItemAt at a reference that starts disabled is a Travel
+
+**Code:** `packages/converter.py` `_pick_use_item`, `_operate_target`; `aliases.initially_disabled`.
+Headless run 36c, 2026-11-14; NOT yet confirmed in game by the user.
+
+`MQ14MartinPlaceSigilStone` is UseItemAt on `MQRitualSigilRef`, the Great Sigil Stone activator in
+Cloud Ruler Temple, placed Initially Disabled; `MartinScript`'s `OnPackageDone` for it enables the
+stone. It was converted to the Activate template, and Skyrim's Activate procedure does not move
+toward a disabled target: on the right package, Martin stood on the Bruma battlefield for 7,200
+ticks. Enabling the stone by console sent him to the temple at once. An object that starts
+disabled cannot be operated, so such a package is a Travel to the reference; arriving completes it.
+Only UseItemAt: a Find at a disabled door (`MS14RytheGoesHome`, whose door a script enables) keeps
+Activate. Rule measured over Oblivion.esm: 2 of 7,340 packages change.
+
+<a id="run-on-target-conditions"></a>
+### A run-on-target condition runs on the package's target reference
+
+**Code:** `packages/converter.py` `_source_conditions`. Headless run 37e, 2026-11-14; NOT yet
+confirmed in game by the user.
+
+TES4's run-on-target bit on a package condition tests the package's target. Written as Skyrim's
+Run On = Target it is on 141 Oblivion.esm packages, and Skyrim.esm has none among its 4,699 package
+conditions (Subject 4,273, Reference 238, Linked Ref 15, Quest Alias 68, Package Data 105).
+`MQ15EldamilFindPlayer` (Find the player; `GetInCell ParadiseGrotto03` on the target, stage 68) was
+never picked with both the stage and the player's cell right; with the change it was picked in the
+next run. A package aimed at one reference (PTDT type 0) writes those conditions as Run On =
+Reference on it.
+
+<a id="find-the-player-anywhere"></a>
+### A Find at the player with no location seeks the player anywhere
+
+**Code:** `packages/converter.py` `_pick_find`. NOT yet confirmed in game by the user.
+
+The ForceGreet template's third input is its Trigger Location ("Player here causes forcegreet";
+`pack_template_dump.py ForceGreet`), and until the player is inside it the actor hangs out at its
+wait location. Our default was "within 1000 of where the package started". Picked at last (above),
+Eldamil stepped back and forth between two points 8 units apart with the player 1,750 away in the
+same cell. A TES4 Find at the player with no PLDT (61 of Oblivion.esm's 73: the Thieves Guild
+couriers, `MQ10JauffreFindPlayerAtCloudRuler`, ...) has no such limit, so its trigger location is
+the package start with radius 1,000,000. The 12 with a location keep the default.
+
+<a id="use-item-at-with-a-spell"></a>
+
+### UseItemAt with a spell is UseMagic
+
+**Code:** `tes5_import/packages/use_magic.py` `spell_item_inputs`, called from `_pick_use_item`.
+NOT yet confirmed in game by the user (found by the headless main-quest run 30b, 2026-11-14).
+
+A TES4 UseItemAt (type 8) whose Object-ID item is a spell means "go there and cast it `Count`
+times". It was written as a Sandbox at the location, which never completes. `MQ15MartinOpenPortal`
+(spell `MQ15OpenPortalSpell`, count 5, at `MQ15MartinSummonPortalMarker`) is what Martin runs to
+open the portal to Paradise: `MartinScript`'s `OnPackageDone MQ15MartinOpenPortal` activates the
+ritual drawing, so with a Sandbox the portal never opened and MQ15 stayed at 15.
+
+Skyrim's `UseMagic` procedure does the same thing: walk to Location, cast the Spell selector's
+spell, complete when the cast count is reached, and "if a specific spell is assigned by Object ID,
+an actor will attempt to cast the spell even if it is not in his/her spell list" (CK wiki). The
+spell goes in as an Object-ID target, the count into both cast-count inputs (0 reads as 1).
+Oblivion.esm has 29 such packages of 751 UseItemAt (Mages Guild practice casting, Relmyna's
+experiments, Mraaj-Dar's training); Nehrim.esm none. `SPEL` joins the package indexes' base
+signatures so the item can be told from a carried object.
+
+<a id="once-per-day-completion-latch"></a>
+
+**Code:** `packages/done_latch.py`, `static_scripts/TES4_PackageDone.psc`. NOT yet confirmed in game by the
+user (found by the headless main-quest run 24g-24j, 2026-11-13).
+
+Oblivion's Once Per Day retires a package once it has COMPLETED, until the next day. Quest designers sequence
+with it: Baurus's `MQ05BaurusGoToSewerGate` (escort to within 300 of the wheel) and `MQ05BaurusOpenSewerDoor`
+(use the wheel) carry the SAME conditions (`GetStage MQ05 == 75`, wheel `opened == 0`) and sit in that order in
+his list; the first completing is what lets the second run. `convert_flags` strips Skyrim's own Once Per Day
+from quest-gated packages (the Renault regression: Skyrim's flag dropped a package it had only just started),
+so the converted escort completed, was picked again at once, and Baurus stood 415 from the wheel for good
+(measured live: on GoToSewerGate, not moving, player beside him and then at the wheel).
+
+Fix: such a package (TES4 Once Per Day, quest-gated, not a force greet, which keeps Skyrim's flag) gets its own
+short GLOB `TES4PackDone_<fid>`, a first condition `GetGlobalValue(GameDaysPassed) >= <that global>` (0 at
+start, so it passes), and an OnEnd fragment that sets the global to the next whole day and re-evaluates the
+actor. OnEnd fires on completion only, never on an interruption, which is Oblivion's rule.
+
+The re-evaluation waits until the ended package is no longer current (`TES4Polyfill.ReevaluateAfterEnd`, at
+most 2 s; `TES4_ScriptPackageDone` uses it too). Run 54c: the escort completed (latch set) and Baurus stood 375
+from the wheel on `MQ05BaurusOpenSewerDoor` with AI procedure -1 for 3600 ticks -- the next package chosen,
+never started. One console `evp` with it current started it at once (27c measured the same). A re-check made
+inside the end is the one that leaves it unstarted. Headless only, not confirmed in game.
+
+## Follow with a destination is FollowTo
+<a id="follow-with-a-destination-is-followto"></a>
+
+**Code:** `packages/converter.py::_pick_follow`, `packages/templates.py::FOLLOW_TO`.
+Confirmed in-game (CharacterGen).
+
+Symptom: in the CharacterGen prison cell, Uriel reached his marker, then turned
+and ran back toward the door for a few seconds before force-greeting the
+player.
+
+Cause: TES4 Follow with a `PLDT` destination means "trail the target, stop at
+the destination" (OpenMW `aifollow.cpp` ends Morrowind's AiFollow when the
+*follower* nears the destination). Skyrim's plain Follow never ends, so it was
+rerouted to Escort to keep `OnPackageDone` firing — but Escort makes the actor
+the *leader*. `CGEmperorToMarkerB` (stage 15, follow Renault to
+`CGMarkerBEmperor`, radius 70) became "Uriel leads Renault"; Uriel arrived
+first, his `OnPackageDone` set stage 16, and `CGEmperorFollowRenote` (stage 16,
+until his reaction line ends) sent him back after Renault, who was still behind
+him. Bethesda authors the two apart: Glenroy leading the Emperor is an Escort
+(`CGGlenroyEscortEmperorToF`).
+
+Vanilla's `FollowTo` (`00025E6D`, 6 instances incl. MQ101's
+`FriendFollowToKeepMarker*`) is the exact match: *Target to Follow*, min/max
+radius, *Destination (stop following at)*, *Accompany?*; procedures
+`FollowTo → Travel`. It ends at the destination, so stage 16 still fires.
+
+- Cross-cell destinations stay plain Follow (no route; Celebro, see
+  `test_cross_cell_follow_stays_follow_not_escort`).
+- `FollowTo` has no ride-horse input, so a Use Horse follow keeps the riding
+  Escort (`MS45DarMaFollowOutside`, Nehrim `MQ14BarateonReitenZumTor01Package`).
+
+Blast radius, Oblivion.esm: exactly 14 packages Escort → FollowTo (player
+targets: Amusei ×2, ArenaFan1, Dark19 bow, FGC09, Motierre; NPC targets: Uriel,
+MS26 Itius guard; area-style: OnStaya, Guilbert, Hackdirt, Cindanwe ×3). Only
+`CGEmperorToMarkerB` has an end hook there. By census of the source, also
+Morrowind_ob 14 (10 with `OnPackageEnd`/`OnPackageDone` quest hooks), FalloutNV
+11, Nehrim 3, Knights 1 — not yet rebuilt or tested in-game. No FormID moved.
+
+## Every placed copy gets its quest package
+<a id="every-placed-copy-gets-its-quest-package"></a>
+
+Oblivion runs a base actor's AI packages on every copy placed from it. A
+quest-gated package reaches a Skyrim actor only through a quest alias, and an
+alias fills one reference, so `PackagePlan._build_base_to_refs`
+(`packages/aliases.py`) maps each base to **all** its placements and each one
+gets its own alias carrying the package. It used to keep only the first
+placement, so the other copies never ran the package.
+
+Nehrim's mine-exit trolls are the visible case: `MQ00TrollTravel`, the march
+into the fire at MQ00 stage 35, is authored on the shared base
+`MQ00troll01Ausgang` placed twelve times, and only `MQ00TrollA01` got it
+(MQ00 went from 13 to 24 aliases). The same fix reached 15 Nehrim quests (the
+largest, the tower-defense wave quest NQ15W02, gained 177 aliases) and 20
+Oblivion quests (DASheogorath's sheep, SE08Xed's knights, Charactergen's
+ambush assassins). Confirmed in game on the Nehrim exit and Charactergen.
+
+A script's `AddScriptPackage` on a BASE still goes to its first placement.
+Quests that gained aliases renumber existing ones, so a save made midway
+through one may hold a stale alias fill. Test:
+`tests/test_packages.py::test_every_placed_copy_gets_its_quest_package`.
+
+## Quest-only actors hold in place
+<a id="quest-only-actors-hold-in-place"></a>
+
+**Code:** `default_package_list` in `packages/actor_wiring.py`
+
+When none of an actor's packages is valid, Oblivion leaves it standing where it
+is (UESP: Kiara "never moves because she has no AI packages"; the Blackwood
+Company guards "stand in place when not engaged in combat"). Skyrim instead runs
+the NPC's Default Package List (`DPLT`), and every converted NPC carried
+vanilla's `DefaultMasterPackageList`, which sandboxes. A sandboxing actor is
+placed at a sandbox spot when its cell loads, so an actor authored to stand on
+one spot turned up somewhere else each time.
+
+Nehrim's nightmare shows it. `Celebro02`'s only packages are MQ00's
+(`MQ00Cel02ZumTroll` and the `AddScriptPackage`d `MQ00CalebroPackage04`, both
+`GetStage MQ00 == 20`), so before stage 20 he had nothing valid. In game he
+loaded 257 units to the left of his placement, once in the entrance doorway,
+instead of in front of the player where the scene expects him.
+
+An NPC whose every authored package is quest-owned (it reaches the actor through
+a quest alias, so the author gave it AI only for quest moments) now carries
+vanilla's `DefaultHoldPositionCurrentLoc64List` (Skyrim.esm `000A6853`, holding
+`DefaultHoldPositionCurrentLoc64`: HoldPosition, "near package start location",
+radius 64) instead. It holds wherever the actor is when the fallback takes
+over, so it neither pulls back an actor a script `MoveTo`'d nor lets one wander.
+Other NPCs keep `DefaultMasterPackageList`. Creatures are unchanged, since their
+PKID always ends in vanilla's always-valid `DefaultMasterPackageCreature`.
+
+<a id="a-completion-gate-replaces-once-per-day"></a>
+## A completion gate replaces Once Per Day
+
+**Code:** `packages/converter.py` (`_forcegreet_flags`, the `quest_gated` argument of `convert_flags`).
+
+A package with its own completion gate -- the armed faction of a script-forced package
+([package hosts](#package-hosts)) or the latch global of a quest-gated Once Per Day package -- is
+written WITHOUT Skyrim's Once Per Day. The gate already lets it run once until it completes; Skyrim's
+flag also spends the day on a run that was cut off, so the package is never picked again. Measured in
+the finale (run 60): Ocato's armed force-greet `MQ16OcatoToTempleEND` (TES4 flags Once Per Day |
+Must Complete | Always Run) began before the outro movie, was replaced after it by his list's
+`MQ16OcatoWaitInTemplePostQuest`, and stayed armed but never picked again: 3 of 6 replays lost his
+greeting. With only that bit cleared in the instance's plugin copy: 3 of 3 passed.
+
+<a id="no-spectators"></a>
+## No spectators
+
+A converted TES3 / TES4 package never allows interrupt flag 0x04 "Observe combat
+behavior" (CK wiki Package_Flags: "allow the actor to do 'observe combat' behavior when
+near combat that he is not part of" = the engine's Spectator package, type 24).
+Oblivion has no such procedure: its NPCs join a fight or keep their package. The
+converter had set 0x04 on every package (`DEFAULT_INTERRUPT` 0x44, force-greets
+0xFEFF), and in the finale (run 60a, 29th) Martin spectated the endless Dagon fight
+instead of running his stage-30 force-greet `MQ16MartinAskPC`; the spectator GMSTs at
+0 did not stop it (another start path), and a runtime hook that refused converted
+actors only masked this. `build_pkdt` now drops the bit for non-Fallout sources (FNV
+authors its own). Finale replays without any hook: Martin's walk and greeting pass.
+
+The same goes for 0x08 "Greet corpse behavior". MEASURED (1.6.1170): the dead-body
+reaction check 0x70ae90 calls 0x661f50(actor, 3), which reads bit 3 of the RUNNING
+package's interrupt word (+0x28), and starts an engine ReactToDead package (procedure
+type 25) that walks the actor to the body. Oblivion's reaction to a corpse is a
+detection bark (DIAL `Corpse`, type 6), not a walk. Ordinary converted packages never
+set the bit; force-greets (0xFEFF) and "operate an object" packages (0xFFFF), copied
+from vanilla, did. With the escort restart removed, Baurus (run 60, sewer replays) ran
+MQ05BaurusOpenSewerDoor (0xFFFB), went to react to a rat the player killed by the
+wheel (lying 17 above the floor), and stood on type-25 package FF000EB8 for 3600 ticks
+("Over here!"); `evp` ended it. `build_pkdt` drops 0x08 too.

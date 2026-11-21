@@ -33,6 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+from output_layout import DEFAULT_EXPORT, plugin_esm
 from tes5_import.base.tes5_reader import REC_HDR, subrecords, walk
 
 # ---------------------------------------------------------------------------
@@ -186,20 +187,15 @@ def master_edids(esm_path, header, sig: str) -> dict:
     """{FormID in THIS plugin's index space -> EditorID} for one record type,
     read from every converted master in the plugin's own MAST list.
 
-    A dependent plugin's records freely reference its masters (Morroblivion's
-    topics name Oblivion.esm quests; its actors use Oblivion.esm voice types),
-    so any tool that resolves a FormID to an EditorID from THIS plugin's
-    records alone silently reports the reference as missing — and then agrees
-    with whatever bug it was written to catch. Masters are enumerated in MAST
-    order, which is exactly the load-order index their records carry here.
+    A dependent's records freely reference its masters, so resolving a FormID
+    from THIS plugin alone reports the reference as missing. Masters go in
+    MAST order, the load-order index their records carry here; one with no
+    converted build (Skyrim.esm) is skipped.
     """
-    from pathlib import Path as _Path
     out = {}
     masters = [_zstring(s.data) for s in header.subrecords if s.type == 'MAST']
     for idx, name in enumerate(masters):
-        # Only converted TES4 masters have a build beside ours; Skyrim.esm is
-        # vanilla and owns nothing we convert.
-        path = _Path(esm_path).parent.parent / name / name
+        path = plugin_esm(Path(esm_path).parent.parent, name, DEFAULT_EXPORT)
         if not path.is_file():
             continue
         try:
@@ -287,7 +283,6 @@ def _dec_weap_data(data: bytes) -> list:
 _WEAP_ANIM = {0:'HandToHand', 1:'OneHandSword', 2:'OneHandDagger', 3:'OneHandAxe',
               4:'OneHandMace', 5:'TwoHandSword', 6:'TwoHandAxe', 7:'Bow',
               8:'Staff', 9:'Crossbow'}
-_WEAP_STAGGER = {0:'None',1:'Small',2:'Medium',3:'Large',4:'ExtraLarge',5:'Knockdown',6:'Ragdoll'}
 
 
 def _dec_weap_dnam(data: bytes) -> list:
@@ -309,9 +304,8 @@ def _dec_weap_dnam(data: bytes) -> list:
     lines.append(f'DNAM.RumbleLeft={struct.unpack_from("<f", data, 48)[0]:.4f}')
     crit_fid = struct.unpack_from('<I', data, 52)[0]
     lines.append(f'DNAM.CritEffectFID={crit_fid:08X}')
-    stagger = struct.unpack_from('<I', data, 76)[0]
-    lines.append(f'DNAM.Stagger={stagger} ({_WEAP_STAGGER.get(stagger, "?")})')
-    lines.append(f'DNAM.ColorRemapIdx={struct.unpack_from("<f", data, 96)[0]:.4f}')
+    lines.append(f'DNAM.Skill={struct.unpack_from("<i", data, 76)[0]}')
+    lines.append(f'DNAM.Stagger={struct.unpack_from("<f", data, 96)[0]:.4f}')
     return lines
 
 
@@ -928,6 +922,11 @@ _CTDA_RUNON_NAMES = {
     0: 'Subject', 1: 'Target', 2: 'Reference', 3: 'CombatTarget',
     4: 'LinkedRef', 5: 'QuestAlias', 6: 'PackageData', 7: 'EventData',
 }
+
+
+def ctda_func_name(idx: int) -> str:
+    """The TES5 condition function name for a CTDA function index."""
+    return _CTDA_FUNC_NAMES.get(idx, f'Func{idx}')
 
 
 # ---------------------------------------------------------------------------

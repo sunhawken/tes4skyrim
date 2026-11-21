@@ -1,21 +1,25 @@
 """Morph emulation: NiGeomMorpherController rebuilt as baked shape swaps.
 
 Skyrim has no morph-controller class, so each animated target is baked into a
-hidden sibling copy and the sequence gains NiVisController entries swapping
-base -> target as the weight curve crosses 0.5.  The block-cloning machinery
+sibling copy, every swapped shape gets its own wrapper NiNode, and the sequence
+gains NiVisController entries on those wrappers swapping base -> target as the
+weight curve crosses 0.5.  The block-cloning machinery
 that bake needs lives here too, as does the NiBlend*Interpolator header fixup
 that must run after every pass which synthesizes one.
 
 See: docs/commentary/asset_convert_nif.md#morph-emulation
 """
 
+import numpy as np
 from pyffi.object_models.xml.array import Array as _Arr
 
+from asset_convert.lod.mesh_decimate import vertex_normals
 from asset_convert.nif.pyffi_monkey_patch import apply_patches
 apply_patches()
 from pyffi.formats.nif import NifFormat
 
-from asset_convert.nif.sequences import CB_OFFSETS
+from asset_convert.nif.sequences import (CB_OFFSETS, append_sibling_entry, shallow_clone,
+                                         palette_bytes, palette_lookup)
 
 
 def _all_attr_names(cls):
@@ -88,26 +92,11 @@ def _morph_weight_curve(interp):
     return [(k.time, k.value) for k in keys]
 
 
-def _vis_toggle_times(curve):
-    """Times at which a weight curve crosses 0.5, plus the initial state.
+#: Frames per second the morph flipbook samples each weight curve at.
+FLIPBOOK_FPS = 30
 
-    Returns (initially_on, [t0, t1, ...]) — each t toggles the state.
-    """
-    if not curve:
-        return False, []
-    on = curve[0][1] >= 0.5
-    times = []
-    state = on
-    for (t0, v0), (t1, v1) in zip(curve, curve[1:]):
-        nxt = v1 >= 0.5
-        if nxt != state:
-            if v1 != v0:
-                tc = t0 + (0.5 - v0) * (t1 - t0) / (v1 - v0)
-            else:
-                tc = t1
-            times.append(max(t0, min(tc, t1)))
-            state = nxt
-    return on, times
+#: A frame whose every vertex lies within this many game units of the shown shape reuses it.
+FLIPBOOK_TOLERANCE = 1.0
 
 
 #: unknown_short = Flags 0x01 | Array Size 0x02. See: docs/commentary/asset_convert_nif.md#blend-interp-flags
@@ -128,13 +117,59 @@ _BLEND_INTERP_TYPES = tuple(
         'NiBlendColorInterpolator')) if t is not None)
 
 
+#: A sequence interpolator's class -> (the NiBlend* class its managed controller holds, value field, unset value).
+_BLEND_OF = {
+    'NiPoint3Interpolator': ('NiBlendPoint3Interpolator', 'point_value', None),
+    'NiFloatInterpolator': ('NiBlendFloatInterpolator', 'float_value', -3.4028234663852886e+38),
+    'NiBoolInterpolator': ('NiBlendBoolInterpolator', 'bool_value', 2),
+    'NiBoolTimelineInterpolator': ('NiBlendBoolInterpolator', 'bool_value', 2),
+}
+
+
+def _own_blend(interp):
+    """The interpolator a managed controller holds in place of its sequence's `interp`, as vanilla writes it."""
+    kind = _BLEND_OF.get(type(interp).__name__)
+    if kind is None:
+        return shallow_clone(interp)
+    blend = _init_blend_interpolator(getattr(NifFormat, kind[0])())
+    if kind[2] is None:
+        for axis in 'xyz':
+            setattr(getattr(blend, kind[1]), axis, -3.4028234663852886e+38)
+    else:
+        setattr(blend, kind[1], kind[2])
+    return blend
+
+
+def _unshare_controller_interpolators(root):
+    """Give each controller that holds its sequence entry's own interpolator a separate one; returns the count.
+
+    Vanilla never shares them (census: 0 of 158 managed controllers); a color
+    controller sharing its AutoLoop entry's NiPoint3Interpolator crashed the
+    engine deactivating that sequence with blend slot 0xFF (clawstandcontainer).
+    See: docs/commentary/asset_convert_nif.md#controller-owns-its-interpolator
+    """
+    shared = {}
+    for blk in root.tree():
+        if isinstance(blk, NifFormat.NiControllerSequence):
+            for cb in blk.controlled_blocks:
+                ctrl = cb.controller
+                if cb.interpolator is not None and getattr(ctrl, 'interpolator', None) is cb.interpolator:
+                    shared[id(ctrl)] = ctrl
+    for ctrl in shared.values():
+        ctrl.interpolator = _own_blend(ctrl.interpolator)
+    return len(shared)
+
+
 def normalize_blend_interpolators(root, stats=None):
-    """Force every NiBlend*Interpolator to vanilla's manager-driven header.
+    """Give every sequence-driven controller its own interpolator and every NiBlend*Interpolator vanilla's header.
 
     Blocks COPIED from an Oblivion source hit the same trap as synthesized ones:
     the flags do not survive PyFFI's round trip.
     See: docs/commentary/asset_convert_nif.md#blend-interp-flags
     """
+    unshared = _unshare_controller_interpolators(root)
+    if unshared and stats is not None:
+        stats['ctrl_interp_unshared'] = stats.get('ctrl_interp_unshared', 0) + unshared
     fixed = 0
     if not _BLEND_INTERP_TYPES:
         return fixed
@@ -157,16 +192,49 @@ def _palette_add(pal, obj):
     pal.num_objs += 1
     pal.objs.update_size()
     entry = pal.objs[pal.num_objs - 1]
-    entry.name = bytes(obj.name)
+    entry.name = obj.name
     entry.av_object = obj
 
 
-def _vis_controller(geom):
-    """The shape's NiVisController, created on the vanilla pattern if absent.
+def object_palette(objects):
+    """A NiDefaultAVObjectPalette listing each object under its own name."""
+    pal = NifFormat.NiDefaultAVObjectPalette()
+    for obj in objects:
+        _palette_add(pal, obj)
+    return pal
+
+
+def complete_object_palette(root, stats=None):
+    """List every sequence target the scene holds in the manager's object palette, as vanilla does.
+
+    A manager without a palette gets one.
+    See: docs/commentary/asset_convert_nif.md#palette-lists-every-target
+    """
+    mgr = root.controller
+    if not isinstance(mgr, NifFormat.NiControllerManager):
+        return 0
+    if mgr.object_palette is None:
+        mgr.object_palette = object_palette(())
+    listed = {bytes(o.name) for o in mgr.object_palette.objs}
+    wanted = {bytes(cb.node_name) for seq in mgr.controller_sequences for cb in seq.controlled_blocks}
+    wanted -= listed | {b''}
+    added = 0
+    for blk in root.tree():
+        if isinstance(blk, NifFormat.NiAVObject) and bytes(blk.name) in wanted:
+            wanted.discard(bytes(blk.name))
+            _palette_add(mgr.object_palette, blk)
+            added += 1
+    if added and stats is not None:
+        stats['palette_targets_added'] = stats.get('palette_targets_added', 0) + added
+    return added
+
+
+def _vis_controller(node):
+    """The node's NiVisController, created on the vanilla pattern if absent.
 
     See: docs/commentary/asset_convert_nif.md#morph-swap-block-mechanics
     """
-    ctrl = geom.controller
+    ctrl = node.controller
     while ctrl is not None:
         if isinstance(ctrl, NifFormat.NiVisController):
             return ctrl
@@ -181,9 +249,9 @@ def _vis_controller(geom):
     _init_blend_interpolator(blend)
     blend.bool_value = 2
     ctrl.interpolator = blend
-    ctrl.target = geom
-    ctrl.next_controller = geom.controller
-    geom.controller = ctrl
+    ctrl.target = node
+    ctrl.next_controller = node.controller
+    node.controller = ctrl
     return ctrl
 
 
@@ -210,13 +278,13 @@ def _bool_key_data(initially_on, toggles):
     return bd, values[0]
 
 
-def _add_vis_cb(seq, geom, initially_on, toggles):
-    """Append a NiVisController entry swapping `geom` on and off."""
+def _add_vis_cb(seq, node, initially_on, toggles):
+    """Append a NiVisController entry swapping wrapper `node` on and off."""
     bd, first = _bool_key_data(initially_on, toggles)
     ip = NifFormat.NiBoolInterpolator()
     ip.bool_value = bool(first)
     ip.data = bd
-    ctrl = _vis_controller(geom)
+    ctrl = _vis_controller(node)
     ctrl.stop_time = max(ctrl.stop_time, seq.stop_time)
     seq.num_controlled_blocks += 1
     seq.controlled_blocks.update_size()
@@ -225,7 +293,7 @@ def _add_vis_cb(seq, geom, initially_on, toggles):
     cb.controller = ctrl
     if hasattr(cb, 'priority'):
         cb.priority = 0
-    cb.node_name = bytes(geom.name)
+    cb.node_name = bytes(node.name)
     cb.property_type = b''
     cb.controller_type = b'NiVisController'
     cb.variable_1 = b''
@@ -250,37 +318,96 @@ def _morph_target_index(entry, morphs):
     return idx
 
 
-def _bake_morph_clone(geom, md, vectors, name, frame, idx, parents, pal):
-    """A hidden sibling shape carrying the morph target's vertex positions."""
+def _wrap_shape(geom, parent, pal):
+    """Put `geom` under its own identity NiNode "<shape> Swap" in `parent`.
+
+    Vanilla sequence-driven NiVisController entries target a NiNode in
+    1221/1221 cases and geometry in none, so the swap drives this wrapper.
+    See: docs/commentary/asset_convert_nif.md#morph-emulation
+    """
+    wrapper = NifFormat.NiNode()
+    wrapper.name = bytes(geom.name) + b' Swap'
+    wrapper.flags = 14
+    wrapper.rotation.set_identity()
+    wrapper.scale = 1.0
+    for i in range(parent.num_children):
+        if parent.children[i] is geom:
+            parent.children[i] = wrapper
+            break
+    else:
+        parent.add_child(wrapper)
+    wrapper.add_child(geom)
+    _palette_add(pal, wrapper)
+    return wrapper
+
+
+def _own_properties(clone):
+    """Replace the clone's shared shader/alpha property pointers with copies.
+
+    The engine keeps per-shape render state in the shader property, so a shape
+    shown mid-view through its twin's property stays semi-transparent until it
+    leaves the screen (measured live on ctrigtripwire01).
+    See: docs/commentary/asset_convert_animation.md#morph-emulation
+    """
+    for i, prop in enumerate(clone.bs_properties):
+        if prop is None:
+            continue
+        mine = prop.__class__()
+        _copy_block_fields(prop, mine)
+        mine.controller = None
+        tex = getattr(prop, 'texture_set', None)
+        if tex is not None:
+            mine.texture_set = tex.__class__()
+            _copy_block_fields(tex, mine.texture_set)
+        clone.bs_properties[i] = mine
+
+
+def _xyz(vectors):
+    """An (n, 3) float64 array of a PyFFI vector list."""
+    return np.array([(v.x, v.y, v.z) for v in vectors], dtype=np.float64)
+
+
+def _set_xyz(vectors, arr):
+    """Write an (n, 3) array back into a PyFFI vector list."""
+    for v, (x, y, z) in zip(vectors, arr.tolist()):
+        v.x, v.y, v.z = x, y, z
+
+
+def _frame_normals(data, base, pos):
+    """The authored normals bent by how far the smooth normals moved base -> pos.
+
+    Adding the smooth-normal CHANGE keeps the authored hard edges and seams.
+    """
+    tris = np.array(data.get_triangles(), dtype=np.int64)
+    bent = (_xyz(data.normals) + vertex_normals(pos, tris)
+            - vertex_normals(base, tris))
+    length = np.linalg.norm(bent, axis=1, keepdims=True)
+    length[length < 1e-10] = 1.0
+    return bent / length
+
+
+def _bake_morph_clone(geom, base, pos, name):
+    """A sibling shape at vertex positions `pos`, normals and tangents rebuilt."""
     gdata = geom.data
     clone = geom.__class__()
     _copy_block_fields(geom, clone)
     cdata = gdata.__class__()
     _copy_block_fields(gdata, cdata)
-    relative = bool(getattr(md, 'relative_targets', 1))
-    for i in range(getattr(gdata, 'num_vertices', 0)):
-        v = cdata.vertices[i]
-        d = vectors[i]
-        if relative:
-            v.x += d.x
-            v.y += d.y
-            v.z += d.z
-        else:
-            v.x, v.y, v.z = d.x, d.y, d.z
+    _set_xyz(cdata.vertices, pos)
+    if cdata.has_normals:
+        _set_xyz(cdata.normals, _frame_normals(gdata, base, pos))
     try:
         cdata.update_center_radius()
     except Exception:
         pass
     clone.data = cdata
-    suffix = frame if frame else str(idx).encode('ascii')
-    clone.name = bytes(name) + b'Mrph' + suffix
+    clone.name = name
     clone.controller = None
     clone.collision_object = None
-    clone.flags = int(geom.flags) | 0x01
-    parent = parents.get(id(geom))
-    if parent is not None:
-        parent.add_child(clone)
-    _palette_add(pal, clone)
+    clone.flags = int(geom.flags) & ~0x01
+    if cdata.has_normals and int(getattr(cdata, 'extra_vectors_flags', 0)) & 16:
+        clone.update_tangent_space(as_extra=False)
+    _own_properties(clone)
     return clone
 
 
@@ -295,22 +422,57 @@ def _curve_value_at(curve, t):
     return None
 
 
-def _base_visibility(curves):
-    """(initial state, toggle times) for a base shape under `curves`.
+def _frame_times(seq):
+    """The sequence's span sampled at FLIPBOOK_FPS, both ends included."""
+    start, stop = float(seq.start_time), float(seq.stop_time)
+    count = max(1, int(round((stop - start) * FLIPBOOK_FPS)))
+    return [start + (stop - start) * k / count for k in range(count + 1)]
 
-    The base is visible exactly while NO target weight is >= 0.5.
+
+def _frame_positions(geom, md, targets, times):
+    """(base positions, [positions at each time]) blending every target's weight."""
+    base = _xyz(geom.data.vertices)
+    relative = bool(getattr(md, 'relative_targets', 1))
+    deltas = []
+    for vectors, curve in targets.values():
+        d = _xyz(vectors)
+        deltas.append((d if relative else d - base, curve))
+    frames = []
+    for t in times:
+        pos = base.copy()
+        for d, curve in deltas:
+            pos += (_curve_value_at(curve, t) or 0.0) * d
+        frames.append(pos)
+    return base, frames
+
+
+def _flipbook_states(base, frames):
+    """(kept shapes, shape index per frame); index 0 is the base shape.
+
+    A frame within FLIPBOOK_TOLERANCE of the shape on screen keeps showing it,
+    else reuses the closest kept shape within tolerance (a looping clip repeats
+    its poses), else becomes a new kept shape.
     """
-    cut = sorted({t for c in curves for t in _vis_toggle_times(c)[1]})
-    probes = [0.0] + cut
-    states = []
-    for i, t in enumerate(probes):
-        nxt = cut[i] if i < len(cut) else (t + 0.001)
-        mid = (t + nxt) / 2 if nxt > t else t
-        on = any((_curve_value_at(c, mid) or 0.0) >= 0.5 for c in curves)
-        states.append(not on)
-    toggles = [cut[i] for i in range(len(cut))
-               if states[i + 1] != states[i]]
-    return states[0], toggles
+    kept, states = [base], []
+    for pos in frames:
+        shown = states[-1] if states else 0
+        if np.abs(pos - kept[shown]).max() <= FLIPBOOK_TOLERANCE:
+            states.append(shown)
+            continue
+        errors = [np.abs(pos - shape).max() for shape in kept]
+        best = int(np.argmin(errors))
+        if errors[best] > FLIPBOOK_TOLERANCE:
+            kept.append(pos)
+            best = len(kept) - 1
+        states.append(best)
+    return kept, states
+
+
+def _state_toggles(states, times, index):
+    """(initially shown, toggle times) for shape `index` over the frames."""
+    shown = [s == index for s in states]
+    toggles = [times[k] for k in range(1, len(shown)) if shown[k] != shown[k - 1]]
+    return shown[0], toggles
 
 
 def _morph_geometry_index(root):
@@ -358,56 +520,79 @@ def _collect_morph_swaps(root):
     return swaps
 
 
-def _emit_target_swaps(swaps, geoms, parents, pal):
-    """Bake each morph target and add its show/hide entry.
-
-    ({(shape, index): clone}, {(sequence id, shape): [weight curve]}).
-    """
-    made = {}
-    base_toggles = {}
+def _group_targets(swaps, geoms):
+    """{(sequence id, shape): (sequence, geometry, morph data, {index: (vectors, curve)})}."""
+    groups = {}
     for entry in swaps:
         plan = _morph_swap_plan(entry, geoms)
-        if plan is None:
+        curve = _morph_weight_curve(entry['interp'])
+        if plan is None or not curve:
             continue
         geom, md, idx, vectors = plan
-        curve = _morph_weight_curve(entry['interp'])
-        on, toggles = _vis_toggle_times(curve)
-        if not on and not toggles:
+        group = groups.setdefault((id(entry['seq']), entry['shape']),
+                                  (entry['seq'], geom, md, {}))
+        group[3][idx] = (vectors, curve)
+    return groups
+
+
+def _shader_entries(seq, name):
+    """The sequence's shader-controller entries driving shape `name`."""
+    raw = palette_bytes(getattr(seq, 'string_palette', None))
+    out = []
+    for cb in seq.controlled_blocks:
+        ctrl = cb.controller
+        if ctrl is None or 'ShaderProperty' not in ctrl.__class__.__name__:
             continue
-        key = (entry['shape'], idx)
-        clone = made.get(key)
-        if clone is None:
-            clone = _bake_morph_clone(geom, md, vectors, entry['shape'],
-                                      entry['frame'], idx, parents, pal)
-            made[key] = clone
-        _add_vis_cb(entry['seq'], clone, on, toggles)
-        base_toggles.setdefault((id(entry['seq']), entry['shape']),
-                                []).append(curve)
-    return made, base_toggles
+        own = (bytes(getattr(cb, 'node_name', b'') or b'')
+               or palette_lookup(raw, getattr(cb, 'node_name_offset', None)))
+        if own == name:
+            out.append(cb)
+    return out
+
+
+def _emit_flipbook(group, parent, base_wrapper, pal):
+    """Bake one sequence's in-between shapes of one shape; how many were made.
+
+    Each baked shape owns its shader, so it gets its own copy of every shader
+    entry animating the base shape (an emissive fade, a UV scroll).
+    See: docs/commentary/asset_convert_animation.md#morph-emulation
+    """
+    seq, geom, md, targets = group
+    times = _frame_times(seq)
+    base, frames = _frame_positions(geom, md, targets, times)
+    kept, states = _flipbook_states(base, frames)
+    seq_name = bytes(seq.name or b'')
+    entries = _shader_entries(seq, bytes(geom.name))
+    for index in range(1, len(kept)):
+        name = bytes(geom.name) + b'Mrph' + seq_name + str(index).encode('ascii')
+        clone = _bake_morph_clone(geom, base, kept[index], name)
+        _add_vis_cb(seq, _wrap_shape(clone, parent, pal),
+                    *_state_toggles(states, times, index))
+        for cb in entries:
+            append_sibling_entry(seq, cb, name)
+    _add_vis_cb(seq, base_wrapper, *_state_toggles(states, times, 0))
+    return len(kept) - 1
 
 
 def emulate_morphs(root, stats=None):
-    """Rebuild dropped NiGeomMorpherController animation as shape swaps.
+    """Rebuild dropped NiGeomMorpherController animation as a shape flipbook.
 
     See: docs/commentary/asset_convert_nif.md#morph-emulation
     """
     swaps = _collect_morph_swaps(root)
     if not swaps:
         return
-
     geoms, parents = _morph_geometry_index(root)
     mgr = root.controller
     pal = (mgr.object_palette
            if isinstance(mgr, NifFormat.NiControllerManager) else None)
-    made, base_toggles = _emit_target_swaps(swaps, geoms, parents, pal)
-
-    seq_by_id = {id(e['seq']): e['seq'] for e in swaps}
-    for (sid, name), curves in base_toggles.items():
-        geom = geoms.get(name)
-        seq = seq_by_id.get(sid)
-        if geom is None or seq is None:
-            continue
-        first, toggles = _base_visibility(curves)
-        _add_vis_cb(seq, geom, first, toggles)
+    base_wrappers = {}
+    made = 0
+    for (_, name), group in _group_targets(swaps, geoms).items():
+        geom = group[1]
+        parent = parents[id(geom)]
+        if name not in base_wrappers:
+            base_wrappers[name] = _wrap_shape(geom, parent, pal)
+        made += _emit_flipbook(group, parent, base_wrappers[name], pal)
     if stats is not None:
-        stats['morph_swaps'] = stats.get('morph_swaps', 0) + len(made)
+        stats['morph_swaps'] = stats.get('morph_swaps', 0) + made

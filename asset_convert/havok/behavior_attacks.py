@@ -15,8 +15,10 @@ See: docs/commentary/asset_convert_creature.md#attacks-are-gated-by-nesting
 from asset_convert.havok.behavior_clips import (
     EQUIP_STANCES,
     SINGLE_PLAY,
+    SWIM_ATTACK_FIRST_ID,
     build_attack_events,
     clip_state_name,
+    swim_attacks,
 )
 from asset_convert.havok.behavior_nodes import (
     F_GLOBAL,
@@ -83,6 +85,8 @@ def add_interrupts(gb, root, clips, hit_times):
         end_evt = 'returnToDefault' if st != 'Death' else None
         clip = gb.clip(st, clips['single'][st], False,
                        gb.clip_triggers(hit_times.get(st, []), end_evt))
+        if st != 'Death':
+            clip = gb.holding(st, clip.ref, ['bAnimationDriven'])
         state = gb.state(root.next_id, f'{st}State', clip.ref,
                          exit_events=[stop_evt] if stop_evt else None)
         state_id = root.add(state, eid[enter],
@@ -95,25 +99,63 @@ def add_interrupts(gb, root, clips, hit_times):
 # Attacks
 # ---------------------------------------------------------------------------
 
+def _attack_generator(gb, st_name, kf, hit_times, attack_ml, end_evt):
+    """One attack clip inside the IsAttacking modifier list; the wrapper's ref."""
+    clip = gb.clip(st_name, kf, False, gb.clip_triggers(
+        hit_times.get(st_name, []), end_evt))
+    mg = gb.add('hkbModifierGenerator')
+    mg.param('variableBindingSet', 'null')
+    mg.param('userData', 1)
+    mg.param('name', f'{st_name}_MG')
+    mg.param('modifier', attack_ml.ref)
+    mg.param('generator', clip.ref)
+    return mg.ref
+
+
 def _attack_specs(gb, clips, hit_times, attack_ml, multi_stance):
-    """One `(stance, state name, generator ref, event)` per attack clip."""
+    """One `(stance, state name, generator ref, event)` per land attack clip."""
     stance_of = clips.get('attack_stance', {})
+    swim = set(swim_attacks(clips))
     specs = []
     for kf, evt in zip(clips['attacks'], build_attack_events(clips)):
+        if kf in swim:
+            continue
         st_name = f'Attack_{clip_state_name(kf)}'
-        clip = gb.clip(st_name, kf, False, gb.clip_triggers(
-            hit_times.get(st_name, []), 'returnToDefault'))
-        mg = gb.add('hkbModifierGenerator')
-        mg.param('variableBindingSet', 'null')
-        mg.param('userData', 1)
-        mg.param('name', f'{st_name}_MG')
-        mg.param('modifier', attack_ml.ref)
-        mg.param('generator', clip.ref)
+        gen_ref = _attack_generator(gb, st_name, kf, hit_times, attack_ml,
+                                    'returnToDefault')
         stance = stance_of.get(kf) if multi_stance else None
         if stance not in clips.get('equip', {}):
             stance = None
-        specs.append((stance, st_name, mg.ref, evt))
+        specs.append((stance, st_name, gen_ref, evt))
     return specs
+
+
+def swim_attack_states(gb, clips, hit_times, attack_ml):
+    """An amphibian's swim attacks, as states of its swim sub-machine.
+
+    Returns `(states, entries)`: one state per swim attack clip, and the
+    local transition every swim gait state carries into it.  The clip's END
+    fires `attackStop`, which leads back to the swim idle, as in vanilla's
+    horker.  The state also sends `attackStop` on exit, as a land attack
+    state does, so an attack cut short still clears.  Both are empty for a
+    creature with no such clips, and nothing is built.
+    See: docs/commentary/asset_convert_creature.md#swim-attacks
+    """
+    swim = set(swim_attacks(clips))
+    states, entries = [], []
+    for kf, evt in zip(clips['attacks'], build_attack_events(clips)):
+        if kf not in swim:
+            continue
+        st_name = f'Attack_{clip_state_name(kf)}'
+        state_id = SWIM_ATTACK_FIRST_ID + len(states)
+        gen_ref = _attack_generator(gb, st_name, kf, hit_times, attack_ml,
+                                    'attackStop')
+        states.append(gb.state(
+            state_id, f'{st_name}State', gen_ref,
+            transitions=[(gb.eid['attackStop'], 0, F_LOCAL)],
+            exit_events=['attackStop'], root=True))
+        entries.append((gb.eid[evt], state_id, F_LOCAL, True))
+    return states, entries
 
 
 def attack_modifier_list(gb):
@@ -124,12 +166,14 @@ def attack_modifier_list(gb):
 
     While the state is active it drives IsAttacking=1 (the combat
     controller's in-progress flag), bAllowRotation=1 (target tracking during
-    the swing) and bDisableHeadTrack=1.  Without IsAttacking the engine
-    keeps steering mid-swing.
+    the swing), bDisableHeadTrack=1 and bAnimationDriven=1 (motion from the
+    clip, not the commanded velocity).
+    See: docs/commentary/asset_convert_creature.md#attack-pin
     """
     bind = gb.binding_set([('bIsActive0', 'IsAttacking'),
                            ('bIsActive1', 'bAllowRotation'),
-                           ('bIsActive2', 'bDisableHeadTrack')])
+                           ('bIsActive2', 'bDisableHeadTrack'),
+                           ('bIsActive3', 'bAnimationDriven')])
     iso = gb.add('BSIsActiveModifier')
     iso.param('variableBindingSet', bind.ref)
     iso.param('userData', 2)
@@ -187,7 +231,7 @@ def _stance_machine(gb, entries, unstanced, stance):
                                             F_LOCAL)]))
         trans.append((eid[evt], idx, F_WILD))
     return gb.state_machine(f'Attack_{stance}_SM', inner, start_id=0,
-                            wildcard_ref=gb.trans_array(trans).ref)
+                            wildcard_ref=gb.trans_array(trans, root=True).ref)
 
 
 def _stance_selector(gb, root, specs, clips):
@@ -221,7 +265,8 @@ def _stance_selector(gb, root, specs, clips):
                                 binding_ref=bind.ref)
     state_id = root.next_id
     root.add(gb.state(state_id, 'AttackStanceState', selector.ref,
-                      transitions=[(gb.eid['returnToDefault'], 0, F_LOCAL)]))
+                      transitions=[(gb.eid['returnToDefault'], 0, F_LOCAL)],
+                      root=True))
     for _stance, _st_name, _gen, evt in specs:
         root.default_trans.append((gb.eid[evt], state_id, F_LOCAL))
     return True
@@ -268,11 +313,11 @@ def add_equips(gb, root, clips, hit_times):
                 continue
             st_name = f'{kind.capitalize()}_{stance}'
             evt = f'{kind}Start_{stance}'
-            clip = gb.clip(st_name, kf, False, gb.clip_triggers(
-                hit_times.get(st_name, []), reply))
+            clip = gb.holding(st_name, gb.clip(st_name, kf, False, gb.clip_triggers(
+                hit_times.get(st_name, []), reply)).ref, ['bAnimationDriven'])
             root.add(gb.state(root.next_id, f'{st_name}State', clip.ref,
                               transitions=[(gb.eid['returnToDefault'], 0,
-                                            F_LOCAL)]),
+                                            F_LOCAL)], root=True),
                      gb.eid[evt])
             dispatch.append((kind, evt, hand_types))
     return dispatch
@@ -287,7 +332,8 @@ def add_vocal_idles(gb, root, clips, hit_times, vocal_states):
         clip = gb.clip(st_name, clips['idle'], False, gb.clip_triggers(
             hit_times.get(st_name, []), 'returnToDefault'), anim=stem)
         root.add(gb.state(root.next_id, f'{st_name}State', clip.ref,
-                          transitions=[(gb.eid['IdleStop'], 0, F_LOCAL)]),
+                          transitions=[(gb.eid['IdleStop'], 0, F_LOCAL)],
+                          root=True),
                  gb.eid[evt])
 
 

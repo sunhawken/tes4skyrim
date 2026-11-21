@@ -1,0 +1,433 @@
+"""Navmesh for exterior cells with no pathgrid, grown in across their neighbours' seams.
+
+Navmesh jobs come from pathgrids, so a land cell without one got no mesh and no actor could path
+through it. Each wave takes the cells a built mesh reaches on a seam -- the border edges where an
+edge link can form -- seeds them there, floods a synthetic pathgrid from the seeds over the cell's
+walkable ground, and builds it like any authored pathgrid. Terrain under water floods the same
+way and comes out water-flagged, as vanilla's bed-following water triangles do.
+See: docs/commentary/tes5_import_navmesh.md#seeded-cells
+"""
+
+import math
+import struct
+
+import numpy as np
+
+from ..base.text_reader import get_float, get_formid, get_hex_bytes, get_int
+from . import native_loader, params
+from .corridor_grow import walkable_sampler, wall_slab_sampler
+from .door_reach import join_missing_doors
+from .edge_links import CELL_SIZE, border_edges, exterior_views, master_view
+from .world import land_field, open_water_z, placements
+
+#: Spacing of the flood lattice; the terrain grow widens each ribbon to the walls between nodes.
+LATTICE_SPACING = 512.0
+
+#: Step of the walk test along a lattice edge; MAX_CLIMB per step is the walkable slope.
+WALK_STEP = 32.0
+
+#: Border edges further apart than this along a seam start a new seed run.
+RUN_GAP = 96.0
+
+#: A long run gets a seed every this many units, so its whole width is reached.
+RUN_SEED_SPACING = 512.0
+
+#: How far inside its cell a seed sits, so it samples that cell's ground.
+SEED_INSET = 4.0
+
+#: Each side of a cell: (dx, dy, seam axis, whether the seam is the cell's upper edge).
+_SIDES = ((1, 0, 0, True), (-1, 0, 0, False), (0, 1, 1, True), (0, -1, 1, False))
+
+#: Most cells an all-water seeded cell lies from a cell with land above its water.
+MAX_SEA_CELLS = 2
+
+#: CELL DATA flag: the cell has water.
+_HAS_WATER = 0x02
+
+#: WRLD DATA flag Small world: its pathgrids cover what is played, except cells a door lands travellers in.
+_SMALL_WORLD = 0x01
+
+#: The offer key a seeded cell's own door landings take beside its neighbours' seam squares.
+_LANDINGS = ('landings',)
+
+#: REGN record flag Border Region: the player never leaves its areas.
+_BORDER_REGION = 0x40
+
+
+# ----------------------------------------------------------------------------
+# The authored playable area
+# ----------------------------------------------------------------------------
+
+def _border_polygons(regions) -> dict:
+    """{worldspace fid: [[(x, y), ...], ...]} of every Border region's areas."""
+    out = {}
+    for rec in regions:
+        if not get_int(rec, 'RecordFlags') & _BORDER_REGION:
+            continue
+        polys = out.setdefault(get_formid(rec, 'WNAM.Worldspace'), [])
+        for i in range(get_int(rec, 'AreaCount')):
+            raw = get_hex_bytes(rec, f'Area[{i}].PointsHex')
+            polys.append(list(struct.iter_unpack('<ff', raw[:len(raw) // 8 * 8])))
+    return out
+
+
+def inside_any(px, py, polys):
+    """Even-odd test of every point (px[i], py[i]) against each polygon; True where any holds it."""
+    out = np.zeros(px.shape, dtype=bool)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        for poly in polys:
+            hit = np.zeros(px.shape, dtype=bool)
+            for (x1, y1), (x2, y2) in zip(poly, poly[1:] + poly[:1]):
+                hit ^= ((y1 > py) != (y2 > py)) & (px < x1 + (py - y1) * (x2 - x1) / (y2 - y1))
+            out |= hit
+    return out
+
+
+def _within(polys, squares):
+    """Per (wrld, gx, gy) square: whether a corner, edge midpoint or centre of the cell is in a polygon."""
+    grid = np.asarray([s[1:] for s in squares], dtype=np.float64).reshape(-1, 2)
+    steps = np.array([0.0, 0.5, 1.0])
+    px = np.repeat((grid[:, :1] + steps) * CELL_SIZE, 3, axis=1)
+    py = np.tile((grid[:, 1:] + steps) * CELL_SIZE, 3)
+    return inside_any(px, py, polys).any(axis=1)
+
+
+def drop_unplayable(seedable: dict, worlds, regions) -> None:
+    """Remove the squares outside the authored playable area from `seedable`.
+
+    A Small world is skipped except for the cells a door lands travellers in (template `landings`);
+    where a worldspace authors Border regions, only cells touching their areas stay. `worlds` and
+    `regions` are WRLD and REGN records, masters' included.
+    See: docs/commentary/tes5_import_navmesh.md#seeded-cells
+    """
+    small = {get_formid(w, 'FormID') for w in worlds if get_int(w, 'DATA.Flags') & _SMALL_WORLD}
+    for square in [s for s in seedable if s[0] in small and not seedable[s].get('landings')]:
+        del seedable[square]
+    for wrld, polys in _border_polygons(regions).items():
+        squares = [s for s in seedable if s[0] == wrld]
+        if polys and squares:
+            for square, keep in zip(squares, _within(polys, squares)):
+                if not keep:
+                    del seedable[square]
+
+
+# ----------------------------------------------------------------------------
+# Seeds from built meshes
+# ----------------------------------------------------------------------------
+
+def _runs(edges):
+    """Border edges (sorted along the seam) split into runs at gaps and height jumps."""
+    runs, cur = [], []
+    for e in edges:
+        if cur and (e[2] - cur[-1][2] > RUN_GAP or abs(e[3] - cur[-1][3]) > params.MAX_CLIMB * 2):
+            runs.append(cur)
+            cur = []
+        cur.append(e)
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def _run_seeds(run):
+    """(along, z) seed points for one run: its middle, plus one per RUN_SEED_SPACING."""
+    span = run[-1][2] - run[0][2]
+    count = max(1, int(span // RUN_SEED_SPACING) + 1)
+    out = []
+    for k in range(count):
+        target = run[0][2] + span * (k + 0.5) / count
+        edge = min(run, key=lambda e: (abs(e[2] - target), e[2]))
+        out.append((edge[2], edge[3]))
+    return out
+
+
+def _seam_points(view, side, gx, gy):
+    """Seed points in the neighbour across one side of the view's cell."""
+    _dx, _dy, axis, upper = side
+    base = gx if axis == 0 else gy
+    coord = (base + 1) * CELL_SIZE if upper else base * CELL_SIZE
+    inset = SEED_INSET if upper else -SEED_INSET
+    edges = sorted(border_edges(view, axis, coord), key=lambda e: (e[2], e[3]))
+    out = []
+    for run in _runs(edges):
+        for along, z in _run_seeds(run):
+            out.append((coord + inset, along, z) if axis == 0 else (along, coord + inset, z))
+    return out
+
+
+def _unmet(points, own_views, side, gx, gy):
+    """The seed points no border edge of the target's own meshes already meets across one side."""
+    axis, upper = side[2], side[3]
+    coord = (((gx if axis == 0 else gy) + 1) if upper else (gx if axis == 0 else gy)) * CELL_SIZE
+    edges = [e for view in own_views for e in border_edges(view, axis, coord)]
+    along = 1 if axis == 0 else 0
+    return [p for p in points
+            if not any(abs(e[2] - p[along]) <= e[4] + RUN_GAP and abs(e[3] - p[2]) <= params.MAX_CLIMB * 2
+                       for e in edges)]
+
+
+def seam_seeds(views: dict, targets, own=None) -> dict:
+    """{(wrld, gx, gy): {neighbour square: seed points}} for every `targets` cell a view's seam reaches.
+
+    `views` is {(wrld, gx, gy, fid): NavMeshView}; a target in `own` ({square: [its views]}) is offered
+    only the points its own mesh does not already meet on that seam.
+    """
+    out, own = {}, own or {}
+    for (wrld, gx, gy, fid) in sorted(views):
+        for side in _SIDES:
+            target = (wrld, gx + side[0], gy + side[1])
+            points = _seam_points(views[(wrld, gx, gy, fid)], side, gx, gy) if target in targets else ()
+            if points and target in own:
+                points = _unmet(points, own[target], side, gx, gy)
+            if points:
+                out.setdefault(target, {}).setdefault((wrld, gx, gy), []).extend(points)
+    return out
+
+
+def seeded_record(cell_rec: dict) -> dict:
+    """A seeded cell's synthetic pathgrid, keyed by the cell's FormID, without points."""
+    fid = cell_rec.get('FormID')
+    return {'Signature': 'PGRD', 'FormID': fid, 'ParentCELL': fid,
+            'ParentWRLD': cell_rec.get('ParentWRLD')}
+
+
+def master_views(master_index, master_navms, empty) -> dict:
+    """{(wrld, gx, gy, fid): view} for the masters' meshes on a seam of an `empty` cell."""
+    if master_index is None or not master_navms:
+        return {}
+    wanted = {(w, gx + s[0], gy + s[1]) for (w, gx, gy) in empty for s in _SIDES}
+    out = {}
+    for cell in sorted(wanted):
+        fid = master_navms.get(cell)
+        entry = master_view(master_index, fid) if fid else None
+        if entry is not None and entry[0].exterior:
+            out[cell + (fid,)] = entry[0]
+    return out
+
+
+def _is_dry(job) -> bool:
+    """True when some of the cell's land stands above its water."""
+    cell = job['cell_rec']
+    land = land_field(job['land_rec'], 0.0, 0.0)
+    if land is None or not get_int(cell, 'DATA.Flags') & _HAS_WATER:
+        return True
+    return float(land.grid.max()) > get_float(cell, 'XCLW.WaterHeight', 0.0)
+
+
+def _sea_cells(square, job, sea, meshed) -> int:
+    """0 for a cell with dry land, else one more than its nearest meshed neighbour's count."""
+    if _is_dry(job):
+        return 0
+    wrld, gx, gy = square
+    near = [sea.get((wrld, gx + s[0], gy + s[1]), 0) for s in _SIDES
+            if (wrld, gx + s[0], gy + s[1]) in meshed]
+    return 1 + min(near, default=0)
+
+
+def _wave_jobs(offers, seedable, sides, sea, meshed) -> list:
+    """This wave's (square, job)s: each cell a new neighbour offers seeds, if land or near it.
+
+    `sides` holds {square: {neighbour: seed points}} each cell has built from; a job seeds from all of them.
+    """
+    jobs = []
+    for square in sorted(offers):
+        taken = sides.setdefault(square, {})
+        new = {src: points for src, points in offers[square].items() if src not in taken}
+        depth = _sea_cells(square, seedable[square], sea, meshed)
+        if new and depth <= MAX_SEA_CELLS:
+            taken.update(new)
+            sea[square] = depth
+            seeds = sorted({p for points in taken.values() for p in points})
+            jobs.append((square, dict(seedable[square], seeds=seeds)))
+    return jobs
+
+
+def _own_views(sources, regrow) -> dict:
+    """{square: [views]} of the `regrow` cells' own meshes among `sources`."""
+    out = {}
+    for key, view in sources.items():
+        if key[:3] in regrow and key[3] == regrow[key[:3]]['navm_fid']:
+            out.setdefault(key[:3], []).append(view)
+    return out
+
+
+def _settle(results, jobs, built, meshed, regrow) -> None:
+    """Record which seeded cells built a mesh; a regrown pathgrid cell that built none keeps its old one."""
+    for square, job in jobs:
+        ok = (results.get(job['key']) or (None,))[0]
+        if square in regrow:
+            if not ok:
+                results.pop(job['key'], None)
+        elif ok:
+            built.setdefault(square, job['pgrd_rec'])
+            meshed.add(square)
+        else:
+            built.pop(square, None)
+            meshed.discard(square)
+
+
+def _prepare(jobs, regrow, derive_fid, cache) -> None:
+    """A seeded cell gets its FormID; a pathgrid cell keeps its own, takes its seeds as `edge_seeds`
+    and its `cache` result as `previous` (regrow_unchanged)."""
+    for square, job in jobs:
+        if square in regrow:
+            job['edge_seeds'] = job.pop('seeds')
+            job['previous'] = cache.get(job['key'])
+        else:
+            job['navm_fid'] = derive_fid(job['key'])
+
+
+def grow_into_empty(cache, seedable, sources, derive_fid, run, regrow=None) -> list:
+    """Build seeded cells wave by wave into `cache`; return the pathgrids that built a mesh.
+
+    `seedable` maps (wrld, gx, gy) to a job template, `regrow` a pathgrid cell's square to its job,
+    rebuilt with the seeds its own mesh does not meet. A cell rebuilds from every seed it was offered
+    when a new neighbour offers some, at most once per side; a seeded cell's door landings are offered
+    too (a walled-off cell meshes where its doors land). `run(jobs)` builds jobs.
+    See: docs/commentary/tes5_import_navmesh.md#seeded-cells
+    """
+    regrow = regrow or {}
+    targets = {**seedable, **regrow}
+    built, sides, sea = {}, {}, {}
+    meshed = {key[:3] for key in sources}
+    own = _own_views(sources, regrow)
+    landed = {sq: {_LANDINGS: list(t['landings'])} for sq, t in seedable.items()
+              if sq not in regrow and t.get('landings')}
+    while True:
+        offers = seam_seeds(sources, targets, own)
+        for square, offer in landed.items():
+            offers.setdefault(square, {}).update(offer)
+        jobs = _wave_jobs(offers, targets, sides, sea, meshed)
+        if not jobs:
+            return list(built.values())
+        _prepare(jobs, regrow, derive_fid, cache)
+        results = run([job for _square, job in jobs])
+        _settle(results, jobs, built, meshed, regrow)
+        cache.update(results)
+        sources = exterior_views(results)[0]
+        own.update(_own_views(sources, regrow))
+        print(f"    Seeded {len(jobs)} cells ({sum(1 for s, _j in jobs if s in regrow)} with a pathgrid); "
+              f"{sum(1 for v in results.values() if v[0])} built a navmesh")
+
+
+# ----------------------------------------------------------------------------
+# The flood, in the worker
+# ----------------------------------------------------------------------------
+
+class Ground:
+    """Walkable height and wall tests over one cell's collision and terrain."""
+
+    def __init__(self, walkable, blocking, land):
+        """Index the soups once; `land` is the cell's LandField or None."""
+        self.height = walkable_sampler(walkable)
+        self.wall = wall_slab_sampler(blocking)
+        self.land = land
+
+    def floor(self, x, y, near):
+        """Walkable Z at (x, y) nearest `near`, or None."""
+        return self.height(x, y, near)
+
+    def blocked(self, x, y, z, ux, uy):
+        """True when a wall stands in the actor's body at (x, y, z), facing (ux, uy)."""
+        return self.wall(x, y, ux, uy, -uy, ux, z + params.RIBBON_GROW_SLAB_Z_BOTTOM,
+                         z + params.AGENT_HEIGHT)
+
+    def walk(self, a, b):
+        """True when an actor can walk the straight line from point a to point b."""
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6:
+            return True
+        ux, uy = dx / dist, dy / dist
+        z = a[2]
+        steps = max(1, int(math.ceil(dist / WALK_STEP)))
+        for k in range(1, steps + 1):
+            x, y = a[0] + dx * k / steps, a[1] + dy * k / steps
+            nz = self.floor(x, y, z)
+            if nz is None or abs(nz - z) > params.MAX_CLIMB or self.blocked(x, y, nz, ux, uy):
+                return False
+            z = nz
+        return abs(z - b[2]) <= params.MAX_CLIMB
+
+
+def _lattice(ground, ox, oy):
+    """{(i, j): (x, y, z)} lattice nodes standing on open walkable ground."""
+    count = int(CELL_SIZE // LATTICE_SPACING)
+    nodes = {}
+    for j in range(count):
+        for i in range(count):
+            x = ox + (i + 0.5) * LATTICE_SPACING
+            y = oy + (j + 0.5) * LATTICE_SPACING
+            near = ground.land.z(x, y) if ground.land is not None else 0.0
+            z = ground.floor(x, y, near)
+            if z is not None and not ground.blocked(x, y, z, 1.0, 0.0):
+                nodes[(i, j)] = (x, y, z)
+    return nodes
+
+
+def pathgrid_order(points, edges):
+    """(points, edges) as a pathgrid record reads back: float points, edges by node then neighbour."""
+    nbrs = [[] for _ in points]
+    for a, b in edges:
+        nbrs[a].append(b)
+        nbrs[b].append(a)
+    ordered, seen = [], set()
+    for i in range(len(points)):
+        for t in sorted(nbrs[i]):
+            key = (min(i, t), max(i, t))
+            if t != i and key not in seen:
+                seen.add(key)
+                ordered.append(key)
+    return [tuple(float(c) for c in p) for p in points], ordered
+
+
+def _ground_args(job, base_model_by_fid, door_fids, get_collision) -> tuple:
+    """The native flood's ground arguments for the job's cell: placements, land grid, origin, water.
+
+    Door panels are left out of the blocking soup, as the corridor build leaves them out.
+    """
+    cell = job['cell_rec']
+    ox = float(cell.get('XCLC.X') or 0) * CELL_SIZE
+    oy = float(cell.get('XCLC.Y') or 0) * CELL_SIZE
+    bases = set(door_fids.keys()) if isinstance(door_fids, dict) else set(door_fids or ())
+    land = land_field(job['land_rec'], ox, oy)
+    return (*placements(job['refr_recs'], base_model_by_fid, get_collision, bases),
+            None if land is None else land.grid, ox, oy, open_water_z(cell, True))
+
+
+def seeded_graph(job, base_model_by_fid, door_fids, get_collision):
+    """The job's flooded (points, edges) in pathgrid order, or None when nothing walks in.
+
+    When the lattice floods nothing, the job's door landings are walked to its other seeds: a porch
+    smaller than the lattice still meshes where a door lands travellers beside a neighbour's seam.
+    See: docs/commentary/tes5_import_navmesh.md#seeded-cells
+    """
+    points, edges = native_loader.native_core().seed_graph(
+        *_ground_args(job, base_model_by_fid, door_fids, get_collision),
+        np.asarray(job['seeds'], dtype=np.float64).reshape(-1, 3))
+    if edges:
+        return pathgrid_order(points, edges)
+    landed = {tuple(p) for p in job.get('landings') or ()}
+    others = [tuple(p) for p in job['seeds'] if tuple(p) not in landed]
+    graph = None
+    if landed and others:
+        graph = join_missing_doors(job, (others, []), sorted(landed), base_model_by_fid, door_fids, get_collision)
+    return pathgrid_order(*graph) if graph and graph[1] else None
+
+
+def regrow_unchanged(job, base_model_by_fid, door_fids, get_collision) -> bool:
+    """True when the regrow job's last result stands: no seed it was not built with links into the open
+    lattice any of that result's builds left (meta['flood_opens']), so every flood comes out the same.
+    See: docs/commentary/tes5_import_navmesh.md#regrow-reuse
+    """
+    meta = (job.get('previous') or (None, None))[1]
+    opens = list(((meta or {}).get('flood_opens') or {}).values())
+    if not opens or None in opens:
+        return False
+    opens = [mask for mask, _ran in opens]
+    built = set(map(tuple, meta.get('edge_seeds') or ()))
+    new = [p for p in job['edge_seeds'] if tuple(p) not in built]
+    if not new or job['land_rec'] is None:
+        return True
+    return not native_loader.native_core().seeds_link(
+        *_ground_args(job, base_model_by_fid, door_fids, get_collision),
+        np.asarray(new, dtype=np.float64).reshape(-1, 3), opens)

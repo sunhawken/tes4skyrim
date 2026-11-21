@@ -8,6 +8,7 @@ worse, get stale geometry:
   * one changed mesh must invalidate only the cells that place it,
   * the pre-push gate must fire for every file that can change cached geometry.
 """
+import contextlib
 import glob
 import json
 import os
@@ -72,6 +73,34 @@ def test_tag_ignores_collision_mtime(tmp_path, monkeypatch):
     st = os.stat(col)
     os.utime(col, (st.st_atime, st.st_mtime + 3600))
     assert navm_pool.navmesh_geom_cache(str(col))[1] == first[1]
+
+
+def test_each_generator_keeps_its_own_cache_folder(tmp_path, monkeypatch):
+    """The lattice never writes over the corridor's (published) cache folder, and its tag differs."""
+    from core.navmesh_options import NAVMESH_GENERATOR_ENV_VAR
+    col = tmp_path / 'collision_cache.bin'
+    col.write_bytes(b'x')
+    monkeypatch.setenv(NAVMESH_GENERATOR_ENV_VAR, 'corridor')
+    corridor = navm_pool.navmesh_geom_cache(str(col))
+    monkeypatch.setenv(NAVMESH_GENERATOR_ENV_VAR, 'lattice')
+    lattice = navm_pool.navmesh_geom_cache(str(col))
+    assert os.path.basename(corridor[0]) == 'navmesh_geom_cache'
+    assert lattice[0] != corridor[0] and lattice[1] != corridor[1]
+
+
+def _hashes_lattice():
+    """True when the current generator's tag hashes any lattice/ source."""
+    return any(os.sep + 'lattice' + os.sep in s for s in navm_pool.tag_sources())
+
+
+def test_lattice_sources_never_feed_the_published_tag(monkeypatch):
+    """Only a lattice run hashes lattice/, so editing it neither misses the corridor cache nor gates a push."""
+    from core.navmesh_options import NAVMESH_GENERATOR_ENV_VAR
+    monkeypatch.setenv(NAVMESH_GENERATOR_ENV_VAR, 'corridor')
+    assert not _hashes_lattice()
+    monkeypatch.setenv(NAVMESH_GENERATOR_ENV_VAR, 'lattice')
+    assert _hashes_lattice()
+    assert hook.touches_navmesh(['tes5_import/navmesh/lattice/simplify.py']) == []
 
 
 def test_tag_tracks_navmesh_sources(tmp_path):
@@ -846,16 +875,19 @@ def test_auto_install_respects_download_opt_out(tmp_path, monkeypatch):
                            allow_download=False) is False
 
 
-def test_api_repo_falls_back_without_a_git_remote(monkeypatch):
-    """A source drop has no .git, and must still be able to download.
+def test_api_repo_never_spawns_git(monkeypatch):
+    """git is not a prerequisite, so the download path must never run it.
 
-    The README tells users to "paste a new download over your existing
-    folder", so most installs are an unzipped archive.  `git remote get-url
-    origin` fails there; api_repo() used to return '' and _api_releases()
-    then returned [] -- the download silently did nothing.
+    A machine with no `git` on PATH raised WinError 2 at spawn time, which
+    aborted auto_install() and disabled the download entirely.
+    See: docs/commentary/tes5_import_navmesh.md#the-download-path-never-runs-git
     """
-    monkeypatch.setattr(nc, 'gh_repo', lambda: [])
-    assert nc.api_repo() == nc.FALLBACK_REPO
+    def no_git(*a, **k):
+        """Stand in for a machine with no git executable."""
+        raise FileNotFoundError(2, 'The system cannot find the file specified')
+
+    monkeypatch.setattr(nc.subprocess, 'run', no_git)
+    assert nc.api_repo() == nc.CACHE_REPO
     assert '/' in nc.api_repo()
 
 
@@ -1032,7 +1064,7 @@ def test_no_download_env_var_is_shared_not_duplicated():
     """
     assert nc.NO_DOWNLOAD_ENV_VAR == 'TESCONV_NO_CACHE_DOWNLOAD'
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    for name in ('core/gui/runner.py', 'convert.py'):
+    for name in ('core/gui/runner.py',):
         with open(os.path.join(root, name), encoding='utf-8') as fh:
             src = fh.read()
         assert 'NO_DOWNLOAD_ENV_VAR' in src, name
@@ -1044,6 +1076,16 @@ def test_no_download_env_var_is_shared_not_duplicated():
         assert not code, (
             '%s hardcodes the env var in code; import NO_DOWNLOAD_ENV_VAR: %s'
             % (name, code))
+
+
+def test_download_allowed_honors_saved_setting_and_env(monkeypatch):
+    """A CLI run must obey the saved GUI setting, not only the env var."""
+    monkeypatch.delenv(nc.NO_DOWNLOAD_ENV_VAR, raising=False)
+    assert nc.download_allowed({}) is True
+    assert nc.download_allowed({nc.DOWNLOAD_CONFIG_KEY: True}) is True
+    assert nc.download_allowed({nc.DOWNLOAD_CONFIG_KEY: False}) is False
+    monkeypatch.setenv(nc.NO_DOWNLOAD_ENV_VAR, '1')
+    assert nc.download_allowed({nc.DOWNLOAD_CONFIG_KEY: True}) is False
 
 
 def test_auto_install_explains_the_download_opt_out(
@@ -1176,7 +1218,7 @@ def test_geom_equal_ignores_ledge_order():
 
 
 def test_geom_quantize_matches_what_the_cache_stores():
-    """The demotion must agree with _geom_cache_store's float32 array."""
+    """The demotion must agree with geom_cache_store's float32 array."""
     verts = [(1.0000001, 2.0, 3.0)]
     stored = np.asarray(verts, dtype=np.float32).tolist()
     assert geom_quantize(verts) == [tuple(v) for v in stored]
@@ -1193,6 +1235,62 @@ def test_uncertify_removes_only_the_stamp(tmp_path):
     assert (cdir / '00000001_00000002.pkl').exists()
 
 
+def _failing_convert(monkeypatch, cdir, outcomes):
+    """Patch the worker's build to replay `outcomes`, recording if the entry existed."""
+    from tes5_import.navmesh import worker as navm_worker
+    seen = []
+
+    def convert(_job, geom_cache):
+        """Raise or return the next outcome; note whether the entry is on disk."""
+        seen.append((geom_cache is not None,
+                     (cdir / '00000001_00000002.pkl').exists()))
+        got = outcomes.pop(0)
+        if isinstance(got, Exception):
+            raise got
+        return got
+    monkeypatch.setattr(navm_worker, '_convert', convert)
+    monkeypatch.setattr(navm_worker, '_GEOM_CACHE', (str(cdir), 'tag'))
+    return navm_worker, seen
+
+
+def test_a_failed_cell_drops_its_entry_and_builds_once_more(tmp_path, monkeypatch):
+    """An adopted entry that cannot be packed must not keep failing the cell.
+
+    See: docs/commentary/tes5_import_navmesh.md#a-failed-cell-keeps-no-cache-entry
+    """
+    cdir = tmp_path / 'navmesh_geom_cache'
+    cdir.mkdir()
+    (cdir / '00000001_00000002.pkl').write_bytes(b'payload')
+    worker, seen = _failing_convert(
+        monkeypatch, cdir, [ValueError('bad cached geometry'), (b'NAVM', {})])
+    key, (navm, meta) = worker.run_job({'key': (1, 2)})
+    assert key == (1, 2) and navm == b'NAVM' and 'error' not in meta
+    assert seen == [(True, True), (True, False)]
+
+
+def test_a_cell_that_fails_twice_leaves_no_entry(tmp_path, monkeypatch):
+    """A retry that fails too reports the error and deletes what it stored."""
+    cdir = tmp_path / 'navmesh_geom_cache'
+    cdir.mkdir()
+    (cdir / '00000001_00000002.pkl').write_bytes(b'payload')
+    boom = ValueError('overflow')
+    worker, _seen = _failing_convert(monkeypatch, cdir, [boom, boom])
+    _key, (navm, meta) = worker.run_job({'key': (1, 2)})
+    assert navm is None and 'overflow' in meta['error']
+    assert not (cdir / '00000001_00000002.pkl').exists()
+
+
+def test_a_prover_never_retries_or_deletes(tmp_path, monkeypatch):
+    """A prove job builds without the cache, so it has no entry to drop."""
+    cdir = tmp_path / 'navmesh_geom_cache'
+    cdir.mkdir()
+    (cdir / '00000001_00000002.pkl').write_bytes(b'payload')
+    worker, seen = _failing_convert(monkeypatch, cdir, [ValueError('x')])
+    worker.run_job({'key': (1, 2), 'prove': True})
+    assert seen == [(False, True)]
+    assert (cdir / '00000001_00000002.pkl').exists()
+
+
 def test_rekey_rewrites_only_the_hash(tmp_path):
     """Adoption changes the KEY, never the geometry."""
     path = tmp_path / 'e.pkl'
@@ -1200,13 +1298,88 @@ def test_rekey_rewrites_only_the_hash(tmp_path):
             'tris': np.zeros((1, 3), dtype=np.int32), 'ledges': [(1, 2)]}
     with open(path, 'wb') as fh:
         pickle.dump(blob, fh)
-    assert adopt.rekey(str(path), 'new') is True
+    assert navm_verify.rekey_entry(str(path), 'new') is True
     got = pickle.load(open(path, 'rb'))
     assert got['hash'] == 'new'
     assert np.array_equal(got['verts'], blob['verts'])
     assert np.array_equal(got['tris'], blob['tris'])
     assert got['ledges'] == [(1, 2)]
-    assert adopt.rekey(str(path), 'new') is False
+    assert navm_verify.rekey_entry(str(path), 'new') is False
+
+
+def test_rekey_drops_the_other_builds(tmp_path):
+    """A re-key stamps the new tag; the old tag's other builds could never hit again.
+
+    See: docs/commentary/tes5_import_navmesh.md#one-file-every-build
+    """
+    from tes5_import.navmesh.from_pgrd import geom_cache_load, geom_cache_store
+    path = str(tmp_path / 'e.pkl')
+    geom_cache_store(path, 'a', [(0.0, 0.0, 0.0)], [(0, 0, 0)], (), 'T0')
+    geom_cache_store(path, 'b', [(1.0, 0.0, 0.0)], [(0, 0, 0)], (), 'T0')
+    assert navm_verify.rekey_entry(path, 'b1', tag='T1') is True
+    assert geom_cache_load(path, 'b1') is not None
+    assert geom_cache_load(path, 'a') is None
+
+
+def test_a_cell_keeps_every_build(tmp_path):
+    """A cell built several times in one run hits each build on the next.
+
+    See: docs/commentary/tes5_import_navmesh.md#one-file-every-build
+    """
+    from tes5_import.navmesh.from_pgrd import geom_cache_load, geom_cache_store
+    path = str(tmp_path / 'e.pkl')
+    for n, key in enumerate('abc'):
+        geom_cache_store(path, key, [(float(n), 0.0, 0.0)], [(0, 0, 0)], [(n, n, 1.0)], 'T')
+    assert [geom_cache_load(path, k)[0][0][0] for k in 'abc'] == [0.0, 1.0, 2.0]
+    assert pickle.load(open(path, 'rb'))['hash'] == 'c'
+    geom_cache_store(path, 'a', [(5.0, 0.0, 0.0)], [(0, 0, 0)], (), 'T')
+    assert geom_cache_load(path, 'a')[0][0][0] == 5.0
+    assert geom_cache_load(path, 'c')[0][0][0] == 2.0
+
+
+def test_a_new_tag_drops_the_old_builds(tmp_path):
+    """Builds stored under an older cache tag are not carried into the new file."""
+    from tes5_import.navmesh.from_pgrd import geom_cache_load, geom_cache_store
+    path = str(tmp_path / 'e.pkl')
+    geom_cache_store(path, 'a', [(0.0, 0.0, 0.0)], [(0, 0, 0)], (), 'T0')
+    geom_cache_store(path, 'b', [(1.0, 0.0, 0.0)], [(0, 0, 0)], (), 'T1')
+    assert geom_cache_load(path, 'a') is None
+    assert 'more' not in pickle.load(open(path, 'rb'))
+
+
+def test_a_cell_keeps_at_most_the_cap(tmp_path):
+    """The oldest builds fall off past GEOM_CACHE_BUILDS."""
+    from tes5_import.navmesh.from_pgrd import GEOM_CACHE_BUILDS, geom_cache_load, geom_cache_store
+    path = str(tmp_path / 'e.pkl')
+    keys = ['k%d' % n for n in range(GEOM_CACHE_BUILDS + 2)]
+    for key in keys:
+        geom_cache_store(path, key, [(0.0, 0.0, 0.0)], [(0, 0, 0)], (), 'T')
+    assert [geom_cache_load(path, k) is not None for k in keys[:3]] == [False, False, True]
+    assert geom_cache_load(path, keys[-1]) is not None
+
+
+def test_rekey_keeps_a_cell_whose_pins_changed_stale(tmp_path, monkeypatch):
+    """A re-key stamps new pins' hash only onto geometry built with those pins.
+
+    See: docs/commentary/tes5_import_navmesh.md#adopt-and-pins
+    """
+    from tes5_import.navmesh import from_pgrd
+    monkeypatch.setattr(navm_verify, '_job_key',
+                        lambda job, gc: '%s|%s' % (gc[1], job['pins']))
+    monkeypatch.setattr(from_pgrd, 'cell_pins',
+                        lambda rec, cell: ({}, rec['pins']))
+    stored = {1: 'T0|', 2: 'T0|p1', 3: 'T0|'}
+    pins = {1: '', 2: 'p1', 3: 'p2'}
+    jobs = []
+    for n, was in stored.items():
+        with open(tmp_path / ('%08X_%08X.pkl' % (n, n)), 'wb') as fh:
+            pickle.dump({'hash': was}, fh)
+        jobs.append({'key': (n, n), 'pins': pins[n], 'cell_rec': {},
+                     'pgrd_rec': {'pins': pins[n]}})
+    navm_verify.rekey_cache(jobs, (str(tmp_path), 'T1'), 'T0')
+    got = {n: pickle.load(open(tmp_path / ('%08X_%08X.pkl' % (n, n)), 'rb'))['hash']
+           for n in stored}
+    assert got == {1: 'T1|', 2: 'T1|p1', 3: 'T0|'}
 
 
 def test_environment_records_what_the_tag_cannot_see():
@@ -1220,6 +1393,37 @@ _GEOM_A = ([(0.0, 0.0, 0.0)], [(0, 0, 0)], [])
 _GEOM_B = ([(9.0, 0.0, 0.0)], [(0, 0, 0)], [])
 
 
+def _stale_entries(monkeypatch, current=()):
+    """Stub every cell's entry as stored by OLDER code, except the keys in `current`."""
+    monkeypatch.setattr(navm_verify, '_stored_hash',
+                        lambda _g, key: 'new' if key in current else 'old')
+    monkeypatch.setattr(navm_verify, '_job_key', lambda _j, _g: 'new')
+
+
+def test_proving_never_samples_entries_the_current_code_built(monkeypatch):
+    """A half-regenerated cache must be proven on its STALE half.
+
+    A stopped run left Morrowind_ob with 2,508 cells rebuilt by the new code;
+    the next import sampled only those, found 40/40 identical, and adopted the
+    2,777 cells nothing had rebuilt.
+    See: docs/commentary/tes5_import_navmesh.md#adoption-samples-only-stale-entries
+    """
+    from tes5_import.navmesh import from_pgrd
+    monkeypatch.setattr(from_pgrd, 'cached_geometry', lambda *_a: _GEOM_A)
+    jobs = [_job('interior', i) for i in range(6)]
+    _stale_entries(monkeypatch, current={(i, i) for i in range(3)})
+    seen = []
+
+    def _rebuild(js):
+        """Record which cells were proven; every one reproduces."""
+        for j in js:
+            seen.append(j['key'][0])
+            yield j['key'], (b'', {'geometry': _GEOM_A})
+
+    assert navm_verify.prove_cache(jobs, ('dir', 'tag'), 6, _rebuild) == (3, [])
+    assert seen == [3, 4, 5]
+
+
 def _prove_with_stub(monkeypatch, geoms, jobs):
     """Run prove_cache over stubbed cells; returns (checked, bad, rebuilt).
 
@@ -1227,6 +1431,7 @@ def _prove_with_stub(monkeypatch, geoms, jobs):
     geometry is always _GEOM_A, so any other value reads as a mismatch.
     """
     from tes5_import.navmesh import from_pgrd, worker as navm_worker
+    _stale_entries(monkeypatch)
     rebuilt = []
 
     def _run(job):
@@ -1275,6 +1480,7 @@ def test_proving_uses_the_rebuild_callable_it_was_given(monkeypatch):
 
     monkeypatch.setattr(from_pgrd, 'cached_geometry', lambda *_a: _GEOM_A)
     monkeypatch.setattr(navm_worker, 'run_job', _boom)
+    _stale_entries(monkeypatch)
     jobs = [_job('interior', i) for i in range(3)]
     checked, bad = navm_verify.prove_cache(
         jobs, ('dir', 'tag'), 3,
@@ -1290,6 +1496,7 @@ def test_proving_reports_the_first_mismatch_in_submission_order(monkeypatch):
     """
     from tes5_import.navmesh import from_pgrd
     monkeypatch.setattr(from_pgrd, 'cached_geometry', lambda *_a: _GEOM_A)
+    _stale_entries(monkeypatch)
     jobs = [_job('interior', i) for i in range(4)]
     geoms = {0: _GEOM_A, 1: _GEOM_B, 2: _GEOM_B, 3: _GEOM_A}
 
@@ -1314,8 +1521,8 @@ def test_import_proves_on_the_pool_not_in_the_parent(monkeypatch):
                         lambda *a: ('dir', 'tag'))
     monkeypatch.setattr(navm_pool, 'navm_worker_count', lambda n: 4)
     monkeypatch.setattr(navm_verify, 'init_context', lambda *a, **k: None)
-    monkeypatch.setattr(navm_pool, '_run_inline', lambda jobs: {})
-    monkeypatch.setattr(navm_pool, '_run_pooled', lambda *a: {})
+    monkeypatch.setattr(navm_pool, '_pool', lambda *a: contextlib.nullcontext())
+    monkeypatch.setattr(navm_pool, '_run_jobs', lambda *a: {})
     monkeypatch.setattr(navm_pool, 'get_formid_index_offset', lambda: 0)
     monkeypatch.setattr(navm_pool, 'get_injected_formids', lambda: {})
     monkeypatch.setattr(navm_pool, 'stamp_navmesh_cache_tag', lambda *a: None)
@@ -1359,6 +1566,63 @@ def test_prepare_is_a_noop_without_a_cache():
     assert not any(j.get('verify') for j in jobs)
 
 
+def test_speedtree_models_key_to_the_converted_nif():
+    """A TREE keys to <ns>/speedtrees/<EditorID>.nif, the NIF convert_TREE names.
+
+    The speedtree stage writes one NIF per TREE record, so the shared `.spt`
+    name (DementiaTree01L -> \\DTree01Leaves.spt) matches no cache entry and
+    the tree carves nothing.
+    See: docs/commentary/tes5_import_navmesh.md#speedtree-model-keys
+    """
+    tree = {'Signature': 'TREE', 'EditorID': 'DementiaTree01L',
+            'Model.MODL': '\\DTree01Leaves.spt'}
+    assert (navm_pool.base_model_key(tree)
+            == 'tes4/speedtrees/dementiatree01l.nif')
+    nameless = {'Signature': 'TREE', 'Model.MODL': 'Trees\\Mania\\ManiaTree01.spt'}
+    assert (navm_pool.base_model_key(nameless)
+            == 'tes4/speedtrees/maniatree01.nif')
+    chair = {'Signature': 'FURN', 'Model.MODL': 'Furniture\\ChairNoble01.NIF'}
+    assert navm_pool.base_model_key(chair) == 'tes4/furniture/chairnoble01.nif'
+
+
+def test_a_ref_reaching_past_its_cell_is_indexed_in_the_neighbour():
+    """A big static is gathered by every square its geometry covers.
+
+    AnvilBoardwalkComplete01 is parented to the cell holding its ORIGIN and
+    reaches 1,192 units into the next one, which saw none of it.
+    See: docs/commentary/tes5_import_navmesh.md#refs-overhang-their-cell
+    """
+    cell = {'FormID': '0000AC27', 'ParentWRLD': '0000003C',
+            'XCLC.X': '-48', 'XCLC.Y': '-9', 'RecordFlags': '0'}
+    refr = {'FormID': '00014CFB', 'NAME': '00014CF5',
+            'PosX': '-193042.25', 'PosY': '-33222.15'}
+    index = navm_pool._overhang_index(
+        [cell], {0xAC27: [refr]}, {0x14CF5: 1721.96})
+
+    assert index[(0x3C, -47, -9)] == [refr]
+    assert (0x3C, -48, -9) not in index, 'never re-indexed into its own square'
+
+
+def test_a_ref_inside_its_own_cell_is_not_indexed():
+    """A small static reaching nowhere adds no work to any neighbour."""
+    cell = {'FormID': '0000AC27', 'ParentWRLD': '0000003C',
+            'XCLC.X': '-48', 'XCLC.Y': '-9', 'RecordFlags': '0'}
+    refr = {'FormID': '00000001', 'NAME': '00000002',
+            'PosX': '-194560.0', 'PosY': '-35000.0'}
+    assert not navm_pool._overhang_index([cell], {0xAC27: [refr]},
+                                         {0x2: 32.0})
+
+
+def test_persistent_cells_never_enter_the_overhang_index():
+    """Their refs are scattered worldwide, so XCLC says nothing about place."""
+    cell = {'FormID': '0000AC27', 'ParentWRLD': '0000003C',
+            'XCLC.X': '0', 'XCLC.Y': '0', 'RecordFlags': str(0x400)}
+    refr = {'FormID': '00000001', 'NAME': '00000002',
+            'PosX': '-193042.25', 'PosY': '-33222.15'}
+    assert not navm_pool._overhang_index([cell], {0xAC27: [refr]},
+                                         {0x2: 1721.96})
+
+
 class _StubWriter:
     """Hands out one fixed NAVM FormID."""
 
@@ -1392,3 +1656,65 @@ def test_worker_context_is_initialized_before_any_rebuild(monkeypatch):
 
     navm_pool.precompute_navmeshes({}, _StubWriter(), {}, set())
     assert calls == ['init', 'prepare']
+
+
+def test_a_seeded_cell_template_gets_its_door_landings(monkeypatch):
+    """Castle Bruma's front door: its landing lies in a seeded square (no pathgrid), whose template must carry it."""
+    template = {'cell_rec': {'FormID': '00000B01', 'ParentWRLD': '0001C318', 'XCLC.X': '4', 'XCLC.Y': '36'}}
+
+    def gather_exteriors(jobs, by_type, cells, indexes, pers_doors, overhang, seedable, regrow):
+        seedable[(0x1C318, 4, 36)] = template
+
+    monkeypatch.setattr(navm_pool, '_gather_exteriors', gather_exteriors)
+    monkeypatch.setattr(navm_pool, '_merged', lambda *a: [])
+    monkeypatch.setattr(navm_pool, '_overhang_index', lambda *a: {})
+    monkeypatch.setattr(navm_pool, 'build_base_radius_index', lambda *a: {})
+    monkeypatch.setattr(navm_pool, 'landings_by_cell', lambda refrs: {0x3497: [(20441.4, 148639.9, 27252.2)]})
+    persistent = {'FormID': '00003497', 'ParentWRLD': '0001C318', 'RecordFlags': '1024'}
+    by_type = {'CELL': [persistent], 'PGRD': [{'FormID': '00000C01'}], 'WRLD': []}
+    seedable = {}
+    navm_pool.gather_navm_jobs(by_type, set(), {}, seedable=seedable)
+    assert seedable[(0x1C318, 4, 36)]['landings'] == [(20441.4, 148639.9, 27252.2)]
+
+
+def test_a_small_world_keeps_only_the_cells_a_door_lands_travellers_in():
+    """BrumaWorld is a small world: its castle forecourt (a door landing) is seeded, an empty cell is not."""
+    from tes5_import.navmesh.seeding import drop_unplayable
+    seedable = {(0x1C318, 4, 36): {'landings': [(20441.4, 148639.9, 27252.2)]},
+                (0x1C318, 3, 36): {'landings': []},
+                (0x3C, 4, 36): {}}
+    worlds = [{'FormID': '0001C318', 'DATA.Flags': '1'}, {'FormID': '0000003C', 'DATA.Flags': '0'}]
+    drop_unplayable(seedable, worlds, [])
+    assert sorted(seedable) == [(0x3C, 4, 36), (0x1C318, 4, 36)]
+
+
+def test_a_walled_off_seeded_cell_floods_from_its_door_landing():
+    """Castle Bruma's forecourt: no neighbour seam reaches it, so its landing seeds it, once."""
+    from tes5_import.navmesh.seeding import grow_into_empty
+    template = {'key': 'forecourt', 'pgrd_rec': {}, 'land_rec': None, 'cell_rec': {'XCLC.X': '4', 'XCLC.Y': '36'},
+                'landings': [(20441.4, 148639.9, 27252.2)]}
+    waves = []
+
+    def run(jobs):
+        waves.append(jobs)
+        return {}
+
+    grow_into_empty({}, {(0x1C318, 4, 36): template}, {}, lambda key: 0x01000001, run)
+    assert len(waves) == 1 and waves[0][0]['seeds'] == [(20441.4, 148639.9, 27252.2)]
+
+
+def test_landings_stay_in_their_own_worldspace():
+    """A Tamriel landing at grid 4,36 is not BrumaWorld's 4,36."""
+    tamriel = {'cell_rec': {'FormID': '00000A01', 'ParentWRLD': '0000003C', 'XCLC.X': '4', 'XCLC.Y': '36'}}
+    bruma = {'cell_rec': {'FormID': '00000B01', 'ParentWRLD': '0001C318', 'XCLC.X': '4', 'XCLC.Y': '36'}}
+    navm_pool._attach_landings([tamriel, bruma], {0x3497: [(20441.4, 148639.9, 27252.2)]}, {0x3497: 0x1C318})
+    assert tamriel['landings'] == [] and bruma['landings'] == [(20441.4, 148639.9, 27252.2)]
+
+
+def test_no_pathgrids_gathers_no_jobs_and_still_stamps_cell_grids(monkeypatch):
+    """Without PGRDs no master index is built, yet a grid-less exterior CELL still gets XCLC 0,0."""
+    monkeypatch.setattr(navm_pool, '_merged', lambda *a: pytest.fail('master merge built'))
+    cell = {'FormID': '00000A01', 'ParentWRLD': '0000003C', 'RecordFlags': '0'}
+    by_type = {'CELL': [cell], 'WRLD': [{'FormID': '0000003C'}]}
+    assert navm_pool.gather_navm_jobs(by_type, set(), {'REFR': {}}) == []
+    assert (cell['XCLC.X'], cell['XCLC.Y']) == ('0', '0')

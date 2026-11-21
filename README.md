@@ -3,20 +3,26 @@
 </p>
 
 <p align="center">
-  A complete pipeline for converting <b>TES4 (Oblivion)</b> master and plugin files into
-  <b>TES5 (Skyrim)</b> format — records, meshes, textures, collision,
+  A complete pipeline for converting <b>Morrowind</b>, <b>Oblivion</b>,
+  <b>Fallout 3</b> and <b>Fallout: New Vegas</b> into
+  <b>Skyrim Special Edition</b>: records, meshes, textures, collision,
   animations, sounds, dialogue, and scripts.
 </p>
 
+<p align="center">
+  <img src="docs/assets/readme_img.png" alt="An Oblivion Vista" width="720">
+</p>
+
+
 ---
 
-**This project is pre-alpha. Expect issues.** Conversions are incomplete, and some features are only half implemented. Bugs are common across every stage, and output can change or break between releases. Make sure to back up your saves before installing converted content
+**This project is pre-alpha. Expect issues.** Conversions are incomplete, and some features are only half implemented. Bugs are common across every stage, and output can change or break between releases. Updates will likely break your saves from converted games, so expect to start a new game after updating. Back up your saves before installing converted content.
 
 ---
 
 > [!IMPORTANT]
 > **No Bethesda assets are included in this repository.** This project ships only
-> code — it reads the Oblivion and Skyrim data you already own, on your own machine,
+> code. It reads the game data you already own, on your own machine,
 > and performs every conversion locally. **Do not redistribute converted Bethesda
 > assets.** If you want the converted mod, download this project and run it against
 > your own legally-owned copies of the games.
@@ -25,160 +31,150 @@
 
 ## What it does
 
-This is a full data-conversion pipeline. It takes an Oblivion `.esm`/`.esp` (plus its BSA or lose file assets) and produces a working Skyrim mod. Plugin, meshes, animations, everything. Ready to drop into your `Data` folder. It's in early alpha with a long bug list, but each individual part is already more fully featured than most equivalent tools and is self-contained all in one package.
+This is a full data-conversion pipeline. It takes an `.esm`/`.esp` (plus its BSA or loose file assets) and produces a working Skyrim mod. Plugin, meshes, animations, everything. Ready to drop into your `Data` folder. It's in early alpha with a long bug list, but every part of the conversion is handled in one package.
 
-- **Record conversion** — Every TES4 record type is remapped to its TES5 equivalent
-  (`CREA`→`NPC_`, `CLOT`→`ARMO`, `LVLC`→`LVLN`, …), with all the structural fixups Skyrim
-  requires and the companion records it expects alongside them (`ARMA`, `TXST`, `SNDR`, `VTYP`, …).
-- **Creatures** — Oblivion's `CREA` records become real Skyrim actors: skeletons and skinned meshes are ported, animations are recompiled to Havok `.hkx`, and, since Oblivion has no equivalent, a full Havok **behavior graph is generated from scratch** per creature (locomotion state machine, ragdoll, attack events, foot IK) based on Oblivion data instead of reusing a donor from Skyrim. There are a lot of bugs here, but nothing like this has been done before.
-- **Mesh conversion** — Oblivion NIFs → Skyrim NIFs (v20.2.0.7): NiTriStrips→NiTriShape, shader system upgrade, texture path rewriting, bone remapping, and root-node conversion. Only a handful of base-game meshes are currently unsupported.
+### Which games
+
+Four source games are supported: **Morrowind**, **Oblivion**, **Fallout 3** and **Fallout: New Vegas**. Total conversions such as **Nehrim** and **Arktwend** are also supported.
+
+Morrowind is the odd one out and has [its own section](#morrowind) below.
+
+- **Record conversion** — Every record type is remapped to its Skyrim equivalent, with all the structural fixups Skyrim
+  requires and the companion records it expects alongside them.
+- **Creatures** — Creature records become real Skyrim actors: skeletons and skinned meshes are ported, animations are recompiled to Havok `.hkx`, and, since the source games have no equivalent, a full Havok **behavior graph is generated from scratch** per creature (locomotion state machine, ragdoll, attack events, foot IK) based on the original data instead of reusing a donor from Skyrim. There are still a lot of bugs here.
+- **Mesh conversion** — Source NIFs → Skyrim NIFs (v20.2.0.7): NiTriStrips→NiTriShape, shader system upgrade, texture path rewriting, bone remapping, and root-node conversion. Only a handful of meshes are currently unsupported or buggy.
 - **Havok collision** — Full rigid-body, constraint, and mesh-collision conversion with real MOPP generation via a bundled Havok bridge. No crash-prone collision like the original Skyblivion generator.
-- **Skeleton retargeting** — Armor and clothing meshes are re-posed from the Oblivion
-  skeleton onto the Skyrim skeleton using an animation-corpus + optimization solver. Weapons, armor, and clothing (including pants/greaves) are fully functional and wearable alongside your existin Skyrim outfits without major clipping — a few meshes still clip slightly, and the torso/legs can currently go invisible when only one is equipped.
-- **Navmesh generation** — Skyrim has no equivalent to Oblivion's pathgrids, so navmeshes are built from scratch:  Collision is voxelized and triangulated per-cell into Skyrim `NAVM`/`NAVI` data using the original Oblivion pathgrid as a guide so NPCs can actually path around the world. Still needs a lot of refinement, but it mostly works.
+- **Skeleton retargeting** — Armor and clothing meshes are re-posed from the source
+  skeleton onto the Skyrim skeleton using an animation-corpus + optimization solver. Weapons, armor, and clothing (including pants/greaves) are fully functional and wearable alongside your existing Skyrim outfits without major clipping — a few meshes still clip slightly, and the torso/legs can currently go invisible when only one is equipped.
+- **Navmesh generation** — Skyrim has no equivalent to the older games' pathgrids, so navmeshes are built from scratch:  Collision is voxelized and triangulated per-cell into Skyrim `NAVM`/`NAVI` data using the original pathgrid as a guide so NPCs can actually path around the world. Could use a bit more refinement, but it mostly works well.
 - **Particles, fire & animated objects** — Particle systems, flame nodes, flip-book fire, and keyframed collision are all converted to their Skyrim equivalents.
-- **SpeedTree conversion** — Oblivion `.spt` trees are procedurally rebuilt as Skyrim flora NIFs, one per `TREE` record. They aren't exactly 1-1, but they are fairly convincing replicas with proper collision and wind sway.
-- **Dialogue & quests** — `DIAL`/`INFO`/`QUST` converted into Skyrim's branch/voice-type architecture (`DLBR`, `DLVW`, `VTYP`), including voice-file renaming, topic/quest restructuring so NPCs greet and respond correctly, and barter/training menu hookup. Like everything else, it's still a work in progress.
-- **Scripts** — Oblivion scripts are transpiled to Papyrus (`.psc`) source and compiled,
-  which combined with the dialogue work means some quests are already partially playable.
+- **SpeedTree conversion** — `.spt` trees are procedurally rebuilt as Skyrim flora NIFs. The converter hooks directly into your Oblivion.exe so they are faithful replicas, but with leaves in an X shape instead of billboards.
+- **Dialogue & quests** — Converted into Skyrim's branch/voice-type architecture, including voice-file renaming, topic/quest restructuring so NPCs greet and respond correctly, and barter/training menu hookup.
+- **Scripts** — Source scripts are transpiled to Papyrus (`.psc`) source and compiled,
+  which combined with the dialogue work means many quests are already playable.
+- **Guns (Fallout)** — Guns get a purpose-built animation graph using faithfully converted animations.
 - **Sounds** — Voice and sound files are converted (via ffmpeg + xWMAEncode), and lip-sync
   tracks are generated for every transcribed line using the Creation Kit's LipGenerator
   (voice ships as `.fuz`). Expect the occasional silent line.
 
-In short, this project aims to be nothing less than a complete, faithful Oblivion→Skyrim
-conversion, and it's getting closer all the time. Contributions are very welcome — see
+In short, this project aims to be nothing less than a complete, faithful conversion of these
+games into Skyrim, and it's getting closer all the time. Contributions are very welcome, see
 `TODO.txt` for the current bug list and roadmap.
-
-<p align="center">
-  <img src="docs/assets/readme_img.png" alt="An Oblivion Vista" width="720">
-</p>
 
 ---
 
-## Requirements
+## Morrowind
 
-A decent PC. The more cores and ram the better. The more cores, the more ram it uses. Validated with a 7950X3D and 32GB of system ram (uses a peak of ~16 GB RAM converting Oblivion.esm)
+Morrowind converts from its own files like any other game here, with two differences.
 
-First, make sure you have Python 3.14 installed
+**Dialogue runs natively.** Morrowind's conversation system is a searchable topic list with
+its own filtering, journal and scripting language, none of which Skyrim can represent.
+Rather than flatten it and lose most of it, this project runs the real thing: a port of the
+[OpenMW](https://openmw.org/) dialogue engine and script interpreter, shipped as a game
+plugin (`MorrowindRuntime.dll`) with a Morrowind-style menu. It is set up automatically.
 
-> **Note** Make sure your installed python version is **3.14** or you will run into issues
-> The navmesh build requires a compiled module, for **CPython 3.14 / 64-bit Windows**
-> A `.pyd` only loads in a matching interpreter, so you run with any other version you would need to rebuild
-> That can be done with `python native/build.py`
-> which needs "Build Tools for Visual Studio" with the C++ workload installed.
->See `native/dist/README.md`.
+**Morroblivion mode.** The converter can be made to use Morroblivion as a base instead of Morrowind so you can use all of its upgraded assets and worldspace.
 
-Once you have python, open powershell and paste the following line:
+| Mode | Objects come from |
+|---|---|
+| **Vanilla** | Your own converted `Morrowind.esm`, `Tribunal.esm` and `Bloodmoon.esm`. |
+| **Morroblivion + patch** | [Morroblivion](https://morroblivion.com/), the fan remake of Morrowind in Oblivion, converted through the normal Oblivion path. |
 
-```bash
-pip install PyFFI numpy scipy shapely Pillow lz4 mapbox_earcut setuptools
-```
-
-This will install most of the following dependencies:
-
-| Dependency | Purpose | Install |
-|------------|---------|---------|
-| **Python 3.14** | Runs the whole pipeline | — |
-| **[PyFFI](https://pyffi.sourceforge.net/)** | NIF mesh reading/writing | `pip install PyFFI` |
-| **[numpy](https://numpy.org/)** | Skin retargeting math | `pip install numpy` |
-| **[scipy](https://scipy.org/)** | Navmesh triangulation, collision hulls, trees | `pip install scipy` |
-| **[shapely](https://shapely.readthedocs.io/)** | Navmesh corridor boolean union | `pip install shapely` |
-| **[Pillow](https://pypi.org/project/pillow/)** | Terrain-LOD texture compositing, object-LOD atlas normals, book inventory art. **Terrain LOD produces no tiles at all without it** | `pip install Pillow` |
-| **[lz4](https://pypi.org/project/lz4/)** | Reading Skyrim SE BSAs (v105) — how vanilla assets are fetched when `export/skyrim_assets/` has no cached copy yet | `pip install lz4` |
-| **[mapbox_earcut](https://pypi.org/project/mapbox-earcut/)** | Navmesh triangulation fallback when Delaunay fails on a piece | `pip install mapbox_earcut` |
-| **[setuptools](https://pypi.org/project/setuptools/)** | Supplies `distutils`, which PyFFI imports, but Python **removed from the stdlib in 3.12**. | `pip install setuptools` |
-| **[tkinterdnd2](https://pypi.org/project/tkinterdnd2/)** | *Optional.* Dragging a mod archive onto the GUI; **Mods ▸ Import** works without it | `pip install tkinterdnd2` |
-| **Skyrim SE Creation Kit** | Supplies `LipGenerator.exe` (lip sync) and the Papyrus source headers every converted script compiles against | Free on Steam |
-| **xWMAEncode.exe** | xWMA voice compression | See note below |
-
-Once that is done, there are two more things you need to do. First, install the Skyrim SE Creation Kit on Steam, and then acquire xWMAEncode.exe
-
-> **xWMAEncode.exe** ships with the [Microsoft DirectX SDK (June 2010)](https://www.microsoft.com/en-us/download/details.aspx?id=6812)
-> and cannot be redistributed. You should extract it from the SDK installer using 7-zip to avoid having to do a full install.
-> Then, copy it to `external/xwmaencode/`. (If you choose to install the SDK instead, find it in `Utilities\bin\x86\`.)
-
-The pipeline checks each phase's dependencies before it starts: anything missing
-stops that phase and every phase after it, and says what to install at the bottom
-of the console. Run `python preflight.py` to check without starting a conversion.
+Morroblivion mode needs a compatibility patch. Choosing **Settings ▸ Morrowind source ▸ Morroblivion + patch** builds it
+for you from your Morrowind `Data Files` if it doesn't exist yet (convert `Morrowind_ob.esm` first). If the patch already
+exists, it asks whether to rebuild it.
 
 ---
 
 ## Quick start
 
-The easiest way to run a conversion is the GUI. Either double click gui.pyw or in the terminal:
+### Setting up
 
-```bash
-python gui.py
-```
+1. **Install the Skyrim Special Edition Creation Kit**, free on Steam.
+2. **Install [SKSE](https://skse.silverlock.org/)** by copying its files straight into your Skyrim folder.
+3. **Install the [Address Library for SKSE Plugins](https://www.nexusmods.com/skyrimspecialedition/mods/32444)** with your mod manager.
+4. **Download the converter:** on the latest [release](https://github.com/bryantmh/tes4skyrim/releases), under **Assets** click **TES Auto-Convert &lt;version&gt; (zip)**, then unzip it somewhere like your Documents folder (not `Program Files`).
+5. **Double-click `TES Auto-Convert.cmd`** in the unzipped folder.
 
-The GUI:
+The first time, it sets itself up. That needs internet and takes a few minutes, and it asks to download a free
+Microsoft tool used for voice lines; say yes. After that, double-clicking it just opens the converter.
 
-- Auto-detects your Oblivion data directory from the Windows registry
-- **Source** lists every game folder (Oblivion, Nehrim, ...) and every imported
-  mod; `+` and `−` add and remove folders
-- Scans the selected source for all `.esm` / `.esp` plugins
-- Lets you pick an output directory (saved to `conversion_config.json`)
-- Offers per-step checkboxes with **All** / **Default** shortcuts
-- Streams the pipeline log live
-- **Settings ▸ Download navmesh cache** toggles the prebuilt-cache download
-- **Tools ▸ Check Dependencies** reports what's missing before you start a run
+You'll want a strong PC: it was tested with 32 GB of RAM, and converting Oblivion uses about 16 GB.
+
+### Converting
+
+1. **Convert a game.** Your Oblivion install is found automatically; add Morrowind and Fallout installs with `+`
+   under **Source**. Pick the game, leave the steps on **Default**, and click **Run Selected Steps**. If anything is missing, the
+   converter tells you what to install.
+2. **Click each of these buttons once** (click them again after converting another game or updating the converter):
+   - **Pack SKSE Mod**: the converter's SKSE plugins. Converted games don't work without it.
+   - **Pack Start Mod**: the new-game menu where you pick which world to start in.
+   - **Body Slot Patch**: splits Skyrim's body into torso, legs and each hand, so converted armor pieces like
+     greaves or a single gauntlet hide only the part they cover.
+   - **Create LOD**, then **Pack LOD**: the distant view of the converted worlds.
+3. **Install everything in `output/Finished Mods/`** with your mod manager.
+4. **Start the game through SKSE** (`skse64_loader.exe`, or your mod manager's SKSE button) and pick your world
+   from the new-game menu.
+
+Also in the converter:
+
+- **Build ▸ Quest Journal Stage Text** makes a quest's objectives clickable in Skyrim's journal: clicking
+  one shows the journal text the quest had when that objective appeared, and clicking it again returns to
+  the current text. It works for every quest, converted or not. It patches whichever journal you run
+  (vanilla, SkyUI or Quest Journal Overhaul) into `output/Finished Mods/Quest Journal Stage Text.zip`;
+  install that after your UI mod. Needs **MorrowindRuntime.dll**, and covers objectives that appear after
+  it is installed.
+
+If you'd like to use modded source-game models or textures, run the **Extract** step
+first, then copy your modded files into `export/<plugin name>/`, overwriting what's there.
+
+The Import step downloads a [prebuilt navmesh cache](https://github.com/bryantmh/tes4skyrim/releases)
+automatically, which turns minutes of work into seconds. It only saves time and
+never changes the result. To skip the download, untick **Settings ▸ Download
+navmesh cache**. Offline, drop the release's `.zip` into `navmesh_cache/`.
 
 ### Converting a downloaded mod
 
-Drag a `.zip` / `.7z` / `.rar` onto the left panel, or use **Mods ▸ Import Mod
+Drag a `.zip` / `.7z` / `.rar` onto the left panel, or use **Plugins ▸ Import Mod
 Archive…**, and it becomes a source like any folder in the list. Loose files,
-BSAs and nested archives are all handled; nothing is written to your Oblivion
+BSAs and nested archives are all handled; nothing is written to your game
 install. A mod with no plugin (a texture pack) imports too — the steps that need
 one are greyed out.
 
 A copy of the archive is kept under `export/<plugin>/_source/` so steps can be
-re-run after you delete the download. **Mods ▸ Manage Imported Mods…** removes
+re-run after you delete the download. **Plugins ▸ Manage Imported Mods…** removes
 them. If a master has not been converted yet, the import says so.
 
-```bash
-python convert.py --import-mod "C:\Downloads\SomeMod.rar"
-python convert.py -f SomeMod.esp          # then convert it normally
-python convert.py --list-mods
-python convert.py --remove-mod SomeMod.esp
-```
+### What to install
 
+Everything you install ends up in **`output/Finished Mods/`**. Install these with
+your mod manager:
 
-Or run the full pipeline from the command line:
+- One `.zip` per converted game or mod, from **Run Selected Steps**
+- `TESRuntime.zip`, from **Pack SKSE Mod**, required (see [TESRuntime](#tesruntime-skse-plugin)). It needs
+  [SKSE](https://skse.silverlock.org/) and the
+  [Address Library for SKSE Plugins](https://www.nexusmods.com/skyrimspecialedition/mods/32444)
+  installed, and the game launched through SKSE (`skse64_loader.exe`, or your mod
+  manager's SKSE entry). Without them the runtime DLLs never load.
+- `TESGameSelect.zip`, from **Pack Start Mod**: the new-game menu (see [Starting a converted game](#starting-a-converted-game))
+- `Body Slots Patch.zip`, from **Body Slot Patch**
+- `AutoConvertLOD.zip`, from **Create LOD** then **Pack LOD**: the distant view. Install it after the mods it covers.
 
-```bash
-python convert.py -f Oblivion.esm
-```
-
-The output plugin and assets are written to `output/` (override with `--output-dir`).
-
-Everything you actually **install** is collected in **`output/Finished Mods/`** —
-each converted plugin's `.zip`, the LOD archive, the starter mod, and the loose
-`Slot44 Patch.esp`. The rest of `output/` is the working area the pipeline builds
-them from (one folder per plugin, the baked `AutoConvertLOD/`, caches and
-manifests); you do not need to install anything from there directly.
-
-The Import step downloads a [prebuilt navmesh cache](https://github.com/bryantmh/tes4skyrim/releases)
-for you, turning minutes of navmesh generation into seconds. Each cache serves the
-version it was built for **and every version above it**, until a newer cache
-replaces it. Offline, drop the release's `.zip` into `navmesh_cache/` and Import
-picks it up. To skip the download on a metered connection, untick
-**Settings ▸ Download navmesh cache** in the GUI. The conversion is
-identical either way — a cache only ever saves time, never changes the result.
+The rest of `output/` is working space. Don't install anything from it directly.
 
 ### Upgrading
 
-Paste a new download over your existing folder. The version is in the title bar,
-and the **Upgrade** button ticks only the steps that changed since the version
-you last converted with — usually three or four instead of twelve. It greys out
-to **Up to date** when nothing is owed, and selects everything if the range
-can't be resolved.
+Paste a new download over your existing folder. The **Upgrade** button ticks only
+the steps that changed since your last conversion. If you're already current it
+says **Up to date**. If it can't tell, it selects every step.
 
 ### Starting a converted game
 
 The intended way in is the **TESGameSelect** plugin (*Threads of Prophecy*), a
 small standalone Skyrim SE plugin built separately from the conversion itself.
 It takes over Skyrim's opening quest so that starting a **new game** shows a
-menu asking which world to begin in — Skyrim, Cyrodiil, Nehrim or Vvardenfell.
+menu asking which world to begin in: Skyrim, Cyrodiil, Vvardenfell, Nehrim,
+the Mojave or Morrowind.
 Choosing Skyrim runs the vanilla Helgen opening untouched; choosing a converted
 game hands off to that game's own character generation, with its real starting
 equipment and start location. Games whose plugin is not in your load order are
@@ -204,21 +200,31 @@ or simply teleport to the worldspace with a command like
 cow tes4tamriel 20 20
 ```
 
-If you'd like to use any modded Oblivion assets such as models or textures, first complete the "extract" step and then place your modded assets in the export/"plugin you are trying to convert" directory and overwrite
-
-**IMPORTANT NOTE** This project is still under rapid development and it's possible that Formids can change from underneath you. Updates WILL likely break your save file and you'll have to start anew
-
-
 ### TESRuntime (SKSE plugin)
 
-`TESRuntime.dll` is the converter's own required SKSE plugin. It currently composes the animation cache singleton for converted creatures, so that multiple mods can edit it and add creatures as well as runs the fallout gun handling that Skyrim has no equivalent for. Its log is
-`Documents\My Games\Skyrim Special Edition\SKSE\TESRuntime.log`.
+`TESRuntime.zip` holds the converter's own SKSE plugins, one DLL each. They need
+[SKSE](https://skse.silverlock.org/) and the
+[Address Library for SKSE Plugins](https://www.nexusmods.com/skyrimspecialedition/mods/32444);
+HavokWorldSize alone needs only SKSE.
+
+- **TESRuntime.dll**, needed by every converted game: sends an arrested player to
+  the nearest jail as the source games do, and lets a clicked quest objective
+  show the journal text it came with.
+- **CreatureRuntime.dll**: registers converted creatures' animations, so several
+  mods can each add creatures without fighting over Skyrim's animation cache.
+- **FalloutRuntime.dll**: the Fallout 3 / New Vegas gun handling Skyrim has no
+  equivalent for.
+- **HavokWorldSize.dll** (below).
+- **MorrowindRuntime.dll**: runs Morrowind's dialogue and scripts.
+
+Each logs to `Documents\My Games\Skyrim Special Edition\SKSE\<name>.log`.
 See [tes_runtime/README.md](tes_runtime/README.md) for the details and for
-building it yourself.
+building them yourself. Build the zip with the **Package SKSE Mod** button, or
+`python tools/release/package_runtime_dll.py`.
 
 #### HavokWorldSize
 
-`HavokWorldSize.dll` installs alongside TESRuntime as a separate plugin. Skyrim's
+`HavokWorldSize.dll` stands on its own and is useful with any large worldspace. Skyrim's
 physics only works within 64 cells of the world center — past that, NPCs bounce
 in and out of the ground and you can't open doors or hit anything. Big
 worldspaces like Tamriel Rebuilt go well beyond that, so this widens the limit.
@@ -229,7 +235,7 @@ smallest that fits your worldspace).
 
 The reload key defaults to **mouse button 4** and the iron-sight (zoom) key to
 **right mouse**. To change either, create
-`Data\SKSE\Plugins\TESRuntime\TESRuntime.ini` and give it a `[Guns]`
+`Data\SKSE\Plugins\FalloutRuntime\FalloutRuntime.ini` and give it a `[Guns]`
 section with the [virtual-key code](https://learn.microsoft.com/windows/win32/inputdev/virtual-key-codes)
 of the key you want, in decimal:
 
@@ -246,6 +252,9 @@ game after editing it. Omit a key, or the file entirely, to keep the default.
 ---
 
 ## Command line
+
+Open a terminal in this folder and run `.venv\Scripts\activate` first, so `python`
+is the converter's own.
 
 ### Run the full pipeline
 
@@ -270,7 +279,6 @@ python convert.py -f Oblivion.esm --speedtrees-only    # Convert SpeedTree (.spt
 python convert.py -f Oblivion.esm --creatures-only     # Convert creature models & animations
 python convert.py -f Oblivion.esm --sounds-only        # Copy/convert sound files
 python convert.py -f Oblivion.esm --scripts-only       # Transpile scripts → Papyrus
-python convert.py -f Oblivion.esm --lod-only           # Generate object & terrain LOD (slow)
 python convert.py -f Oblivion.esm --pack-only          # Pack output assets into Skyrim BSAs
 python convert.py -f Oblivion.esm --pack-zip-only      # Zip plugin + BSAs → output/Finished Mods/
 python convert.py --modify-body-meshes                 # Build ARMA slot-44 patch (takes no -f)
@@ -287,7 +295,8 @@ python convert.py -f Oblivion.esm --mesh-bounds-only   # Rescan mesh bounds → 
 | `-f, --files FILE…` | Plugin(s) to process (default: all listed in the config) |
 | `--output-dir PATH` | Output directory (default: `output/`) |
 | `--config PATH` | Path to `conversion_config.json` |
-| `--mesh-subdirs SUB…` | Limit mesh conversion to specific root subfolders (e.g. `architecture clutter`) |
+| `--mesh-subdirs SUB…` | Limit mesh conversion to folders or single meshes under `meshes/` (e.g. `architecture dungeons/caves/triggers`) |
+| `--skip-hair` | Skip the hair baking pass after mesh conversion |
 
 ### Running individual tools directly
 
@@ -323,14 +332,14 @@ These are the steps as presented (and run) by the GUI, in order:
 
 | # | Phase | What happens |
 |---|-------|--------------|
-| 1 | **Export** | Parse the TES4 binary into a per-record-type KEY=VALUE text cache (`export/<name>/`). A pure dump — no transformation. |
-| 2 | **Extract** | Pull meshes, textures, and sounds out of the Oblivion BSA archives (cached via a manifest). |
-| 3 | **Meshes** | Convert Oblivion NIFs → Skyrim NIFs and copy textures. |
+| 1 | **Export** | Parse the source binary into a per-record-type KEY=VALUE text cache (`export/<name>/`). A pure dump — no transformation. |
+| 2 | **Extract** | Pull meshes, textures, and sounds out of the source game's BSA archives (cached via a manifest). |
+| 3 | **Meshes** | Convert source NIFs → Skyrim NIFs and copy textures. |
 | 4 | **SpeedTrees** | Procedurally rebuild `.spt` trees as Skyrim flora NIFs. |
 | 5 | **Creatures** | Convert creature models and animations (skeletons, ragdolls, behavior graphs). |
-| 6 | **Import** | Read the text cache and write the TES5 binary ESM/ESP — all record transformations happen here. |
+| 6 | **Import** | Read the text cache and write the Skyrim binary ESM/ESP — all record transformations happen here. |
 | 7 | **Sounds** | Convert voice files to XWM and copy sound files. |
-| 8 | **Scripts** | Transpile Oblivion scripts to Papyrus and compile. |
+| 8 | **Scripts** | Transpile source scripts to Papyrus and compile. |
 | 9 | **Pack BSAs** | *(opt-in, off by default)* Pack the converted assets into Skyrim BSA archives. |
 | 10 | **Pack Mod Zip** | Zip the plugin(s) and BSAs into a single archive for installation. |
 
@@ -339,7 +348,7 @@ that edits a worldspace, so baking them per plugin would generate each contested
 tile once per plugin and then throw all but one away. It is a Global action
 instead, baked once for the whole load order.
 
-Four actions belong to **no single plugin**, so they are buttons under
+Some actions belong to **no single plugin**, so they are buttons under
 **Global** in the sidebar rather than numbered steps. Each runs once and covers
 everything you have converted:
 
@@ -347,11 +356,11 @@ everything you have converted:
 |--------|--------------|
 | **Create LOD** | Generate all object and terrain LOD in one pass, into a standalone `output/AutoConvertLOD/` mod. The button opens a panel choosing which plugins and worldspaces to include; the plugin order decides which one wins a contested tile (defaults to your `plugins.txt` order). **Install it after the mods it covers.** |
 | **Pack LOD** | Zip `output/AutoConvertLOD/` into `output/Finished Mods/AutoConvertLOD.zip` for installation. |
-| **Patch Skyrim** | Build the ARMA slot-44 body patch for your whole Skyrim load order (*select plugins...* chooses which), as `output/Finished Mods/Slot44 Patch.esp`. |
+| **Body Slot Patch** | Build the ARMA slot-44 body patch for your whole Skyrim load order (*select plugins...* chooses which), as `output/Finished Mods/Body Slots Patch.zip`. |
 | **Start Mod** | Zip the prebuilt TESGameSelect starter mod (see *Starting a converted game*) to `output/Finished Mods/TESGameSelect.zip`. |
-
-A Global button greys out with a check once its result is current, and lights up
-again when something it depends on changes.
+| **Package SKSE Mod** | Zip the five runtime plugins (see *TESRuntime*) to `output/Finished Mods/TESRuntime.zip`. |
+| **Convert to Master** | Flag converted plugins as masters. A non-master plugin has every reference treated as always-active, and the engine hangs on the main menu past about a million of them. Applies to a whole master chain at once. |
+| **Convert Oblivion UI** | *(Build menu)* Build a standalone mod that reskins Skyrim's message boxes and cursor with Oblivion's artwork, read from your Oblivion install. |
 
 > **Design principle:** the export is a *pure* dump of TES4 data — no type mapping, no path
 > prefixing, no derived fields. **All** transformations live in the import and asset steps.
@@ -370,7 +379,7 @@ TESConversion/
 │   ├── nif_converter.py  #   NIF mesh conversion (strips, shaders, bones, collision, skin)
 │   ├── collision.py      #   Havok collision conversion
 │   ├── cms_builder.py    #   Compressed-mesh collision + MOPP generation
-│   ├── skin_retarget.py  #   Oblivion → Skyrim skeleton retargeting
+│   ├── skin_retarget.py  #   Source → Skyrim skeleton retargeting
 │   ├── spt_converter.py  #   SpeedTree (.spt) → Skyrim flora NIF
 │   ├── bsa_extract.py    #   BSA extraction with caching
 │   └── asset_pipeline.py #   Extract → convert → output orchestrator
@@ -401,15 +410,21 @@ covered by this project's MIT license.
 | [russo-2025 — papyrus-compiler](https://github.com/russo-2025/papyrus-compiler) | Papyrus compiler, `external/papyrus-compiler/papyrus.exe` | **MIT** (© 2025 russo-2025) — redistributed; license text in `external/papyrus-compiler/LICENSE` |
 | [LvxMagick — DovahNifWorkbench](https://www.nexusmods.com/skyrimspecialedition/mods/183399) | Mopp Bridge, `external/mopp_bridge/dovah_hkp_mesh_mopp_bridge.exe` | No stated license (Nexus-only, no public source). **Statically links Havok** — see the Havok note below |
 | [Bad Dog — PyNifly](https://github.com/BadDogSkyrim/PyNifly) | Pure-Python Havok hk_2010 packfile reader + hkaSplineCompressedAnimation codec (vendored in `external/pynifly_hkx/`) — the heart of creature animation conversion | **GPL-3.0** (vendored from PyNifly 27.4.0; local changes marked `# TESConversion:`) — see the GPL note below |
+| [OpenMW](https://openmw.org/) | The Morrowind dialogue engine and MWScript interpreter, vendored into `external/openmw/` and linked into `MorrowindRuntime.dll` | **GPL-3.0** — see the GPL note below. Vendored by `tools/generators/vendor_openmw.py`; license text in `external/openmw/LICENSE` |
 | [figment — hkxcmd](https://github.com/figment/hkxcmd) | Havok packfile XML↔binary compiler, `external/hkxcmd/hkxcmd.exe`, used to build skeleton/behavior/animation `.hkx` | **BSD-3-Clause** for hkxcmd's own sources (© 2011; text in `external/hkxcmd/LICENSE.TXT`). **Statically links Havok** — see the Havok note below |
 | [Monitor221hz — HKX2-Enhanced-Library](https://github.com/Monitor221hz/HKX2-Enhanced-Library) | Skyrim SE 64-bit Havok packfile ↔ XML, `external/hkxconv/hkxconv.exe`, used to patch the vanilla humanoid behavior graphs (`hkxcmd` cannot read 64-bit files). Forked from [ret2end](https://github.com/ret2end/HKX2Library), in turn from [katalash](https://github.com/katalash/DSMapStudio) / [krenyy](https://gitlab.com/HKX2/HKX2Library); bundles `BinaryReaderEx` from [JKAnderson — SoulsFormats](https://github.com/JKAnderson/SoulsFormats) | **No stated license** anywhere in that chain (no LICENSE file upstream) — community project, publicly distributed and freely forked; redistributed here on that basis. Full chain and rebuild steps in `external/hkxconv/README.md` |
-| [Microsoft DirectX SDK (June 2010)](https://www.microsoft.com/en-us/download/details.aspx?id=6812) | `external/xwmaencode/xWMAEncode.exe`, xWMA voice compression | Microsoft — **not redistributed**; obtain from the SDK (see [Requirements](#requirements)) |
-| [FFmpeg](https://ffmpeg.org/) | `external/ffmpeg/ffmpeg.exe`, decoding Oblivion MP3/WAV voice and sound files | **LGPL v2.1 or later** — redistributed; license text in `external/ffmpeg/COPYING.LGPLv2.1`. See the LGPL note below |
+| [Microsoft DirectX SDK (June 2010)](https://www.microsoft.com/en-us/download/details.aspx?id=6812) | `external/xwmaencode/xWMAEncode.exe`, xWMA voice compression | Microsoft — **not redistributed**; the launcher fetches it from Microsoft (see [Quick start](#quick-start)) |
+| [Microsoft — mimalloc](https://github.com/microsoft/mimalloc) | Memory allocator compiled into the navmesh extension (`native/dist/_navgrow_native*.pyd`), so cells build on many threads without queueing on the process heap; vendored v2.1.7 sources in `external/mimalloc/` | **MIT** (© 2018-2021 Microsoft Corporation, Daan Leijen) — redistributed; license text in `external/mimalloc/LICENSE` |
+| [FFmpeg](https://ffmpeg.org/) | `external/ffmpeg/ffmpeg.exe`, decoding MP3/WAV voice and sound files | **LGPL v2.1 or later** — redistributed; license text in `external/ffmpeg/COPYING.LGPLv2.1`. See the LGPL note below |
 | Oblivion banner font ([dafont](https://www.dafont.com/oblivion.font)) | Project banner | *Free for personal use only*, based on Bethesda's trademarked logo. **Not** bundled in this repo; the banner ships as pre-rendered vector outlines. |
 
-> **Note on GPL-3.0:** `external/pynifly_hkx/` is GPL-3.0. It is used by the creature
-> animation conversion path (`asset_convert/havok/hkx_anim.py`). If you redistribute a build
-> that includes it, the GPL's terms apply to that distribution.
+> **Note on GPL-3.0:** `external/pynifly_hkx/` (creature animation conversion,
+> `asset_convert/havok/hkx_anim.py`) and `external/openmw/` (linked into
+> `MorrowindRuntime.dll`) are both GPL-3.0. If you redistribute a build that includes
+> either, the GPL's terms apply to that distribution. `MorrowindRuntime.dll` is kept a
+> separate DLL for this reason. `TESRuntime.dll` carries a line-for-line port of
+> OpenMW's alchemy apparatus formula (`tes_runtime/tes/alchemy.cpp`), so it is
+> GPL-3.0 as well.
 
 > **Note on LGPL (FFmpeg):** `external/ffmpeg/ffmpeg.exe` is built from **unmodified**
 > FFmpeg 7.1.2 sources under LGPL v2.1, with no GPL components (`--enable-gpl` and

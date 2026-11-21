@@ -39,7 +39,7 @@ is 613 MB), 0.01s -> 1.63s before the window first paints.
 EXECUTING. The one-process fast path fires when the selection IS the default,
 computed the way the checkboxes are. It lists its steps explicitly rather than
 using a bare `convert.py -f <plugin>`, which would take convert's own default
-path and switch Patch Skyrim on -- rewriting the shared patch behind the user's
+path and switch Body Slot Patch on -- rewriting the shared patch behind the user's
 back. The summary is emitted by the DRAIN, never the worker: the worker finishes
 while its last lines are still queued.
 
@@ -56,19 +56,23 @@ import time
 from pathlib import Path
 
 import version as version_info
+from asset_convert.sources import source_registry
 from core import run_log
 from core.gui.config import (
     CLR,
     EXPORT_DIR,
     GLOBAL_ACTIONS,
-    RC_CANCELLED,
     REPO_ROOT,
     STEPS,
     default_on_steps,
     load_config,
+    navmesh_pins_dir,
     run_process,
     step_names,
 )
+from core.gui.selection import runnable
+from core.process_job import RC_CANCELLED
+from output_layout import BODY_SLOTS_PATCH
 
 # ---------------------------------------------------------------------------
 #  Classifying a log line
@@ -545,6 +549,12 @@ def winding_flag(app) -> str:
             else "--no-collision-winding-fix")
 
 
+def navmesh_flags(app) -> list:
+    """The navmesh-generator and pin-folder flags matching the settings."""
+    return ["--navmesh-generator", app.navmesh_gen_var.get(),
+            "--navmesh-pins", navmesh_pins_dir()]
+
+
 def _mesh_flags(app, selected_subdirs) -> list:
     """The extra flags the Meshes step takes."""
     flags = []
@@ -562,7 +572,7 @@ def build_cmd(app, step_key: str, fname: str, out_dir: str,
               selected_subdirs=None) -> list:
     """The convert.py command for a single pipeline step."""
     _, flag, _, _, _, needs_file = next(s for s in STEPS if s[0] == step_key)
-    cmd = [sys.executable, "-u", str(REPO_ROOT / "convert.py"), flag]
+    cmd = [sys.executable, "-u", str(REPO_ROOT / "convert.py"), flag] + navmesh_flags(app)
     if needs_file and fname:
         cmd += ["-f", fname]
     if out_dir:
@@ -588,7 +598,7 @@ def _cmd_start_mod(app, out_dir: str) -> list:
 
 
 def _cmd_runtime_dll(app, out_dir: str) -> list:
-    """Zip the built TESRuntime.dll as its own SKSE mod."""
+    """Zip the built runtime DLLs as one SKSE mod."""
     return _with_out(_tool("tools", "release", "package_runtime_dll.py"),
                      out_dir)
 
@@ -685,7 +695,7 @@ _ARTIFACTS = {
     "package_runtime_dll": lambda: "TESRuntime.zip",
     "convert_ui": _artifact_convert_ui,
     "pack_lod": _artifact_pack_lod,
-    "modify_body_meshes": lambda: "Slot44 Patch.esp",
+    "modify_body_meshes": lambda: f"{BODY_SLOTS_PATCH}.zip",
 }
 
 
@@ -769,9 +779,12 @@ def _stamp_start_mod(app) -> str:
 
 
 def _stamp_runtime_dll(app) -> str:
-    """The built DLL alone, not the tree: obj/ churns on every compile."""
-    return _stat_part(REPO_ROOT / "tes_runtime" / "TESRuntime.dll",
-                      "dll", "missing")
+    """The built DLL, not the tree (obj/ churns on every compile), and
+    whether a Morrowind install is registered, since packaging composes the
+    Morrowind menu from it."""
+    morrowind = bool(source_registry.directory_for(EXPORT_DIR, "Morrowind.esm"))
+    return (_stat_part(REPO_ROOT / "tes_runtime" / "dist" / "TESRuntime.dll",
+                       "dll", "missing") + f"|morrowind:{int(morrowind)}")
 
 
 def _convert_ui_wanted(ui, cur, ob_dir, sk_dir) -> list:
@@ -930,7 +943,8 @@ def validate_run(app, info):
     """
     fname = app.file_var.get()
     out_dir = app.output_var.get().strip()
-    steps = [key for key, *_ in STEPS if app.step_vars[key].get()]
+    steps = [key for key, *_ in STEPS
+             if app.step_vars[key].get() and runnable(app, key)]
     if not steps:
         info("No Steps", "Select at least one pipeline step.")
         return None
@@ -960,6 +974,7 @@ def log_run_header(app, fname, steps, out_dir, subdirs) -> None:
     log(f"Workers: {app.get_workers()} (of {app.cpu_max})")
     if subdirs:
         log(f"Mesh subdirs: {', '.join(subdirs)}")
+    log(f"Navmesh generator: {app.navmesh_gen_var.get()}")
     if "meshes" in steps:
         log(f"Collision winding fix: {'on' if app.winding_on() else 'off'}")
         parallax = app.parallax_var.get()
@@ -985,7 +1000,7 @@ def pipeline_argv(app, fname, out_dir, steps, subdirs) -> list:
     """
     if _is_default_selection(app, steps) and fname and not subdirs:
         cmd = [sys.executable, "-u", str(REPO_ROOT / "convert.py"),
-               "-f", fname, winding_flag(app)]
+               "-f", fname, winding_flag(app)] + navmesh_flags(app)
         cmd += [flag for key, flag, *_ in STEPS if key in set(steps)]
         if out_dir:
             cmd += ["--output-dir", out_dir]
@@ -1174,14 +1189,16 @@ def run_clicked(app, missing_dep) -> None:
 
 def start_global_action(app, key: str, record_done) -> None:
     """Launch one global action with the selection already settled."""
-    from core.worker_budget import WORKERS_ENV_VAR
-
     if app.running.is_set():
         return
-    out_dir = app.output_var.get().strip()
-    cmd = global_cmd(app, key, out_dir)
+    cmd = global_cmd(app, key, app.output_var.get().strip())
     label = next(l for k, l, _t, _s, _r in GLOBAL_ACTIONS if k == key)
+    start_command(app, label, cmd, key, record_done)
 
+
+def start_command(app, label: str, cmd: list, key: str, on_success) -> None:
+    """Stream one command's run into the log pane; `on_success(key)` runs if it exits 0."""
+    out_dir = app.output_var.get().strip()
     _begin_run(app, {"Command": label, "Output": out_dir})
     app.log(label)
     app.log(f"Output: {out_dir}")
@@ -1190,9 +1207,8 @@ def start_global_action(app, key: str, record_done) -> None:
 
     q = queue.Queue()
     want_summary = [False]
-    env = {WORKERS_ENV_VAR: str(app.get_workers())}
-    env.update(app.log_sink.env())
-    start_global_worker(app, cmd, q, env, key, want_summary, record_done)
+    start_global_worker(app, cmd, q, _run_env(app), key, want_summary,
+                        on_success)
     app.root.after(50, make_drain(app, q, want_summary,
                                   lambda ws: _run_finished(app, ws)))
 

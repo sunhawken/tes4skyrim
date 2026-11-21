@@ -16,6 +16,7 @@ import pytest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
+from asset_convert.havok import hkx_behavior
 from asset_convert.havok.kf_decode import (decode_kf, eval_bspline,
                                      split_root_motion, knots,
                                      basis_weights)
@@ -279,6 +280,29 @@ class TestPerPluginProjectNamespace:
             assert obl[key] != fnv[key], key
         assert fnv['project_txt'] == 'falloutnvoblivion_scampproject.txt'
 
+    def test_project_files_are_named_by_the_layouts_last_segment(
+            self, tmp_path, monkeypatch):
+        """The layout's backslash paths contribute a file name, not folders."""
+        import types
+        from asset_convert.game_paths import set_namespace
+        from asset_convert.havok import hkx_behavior
+        set_namespace('tes4')
+        written = []
+        monkeypatch.setattr(hkx_behavior, '_write_and_compile',
+                            lambda xml, path: written.append(path))
+        for build in ('build_behavior_xml', 'build_character_xml',
+                      'build_project_xml'):
+            monkeypatch.setattr(hkx_behavior, build, lambda *a, **k: '')
+        clip_set = types.SimpleNamespace(clips={}, clip_meta=[],
+                                         cast_release_offset=None)
+        hkx_behavior._write_project_files(
+            hkx_behavior.project_layout('rat', 'oblivion'), str(tmp_path),
+            clip_set, [], {}, None, [], [])
+        assert written[1:] == [
+            os.path.join(str(tmp_path), 'characters',
+                         'tes4oblivion_ratcharacter.hkx'),
+            os.path.join(str(tmp_path), 'tes4oblivion_ratproject.hkx')]
+
     def test_namespace_is_the_plugin_stem(self):
         from asset_convert.havok.creature_pipeline import plugin_namespace
         assert plugin_namespace('Oblivion.esm') == 'oblivion'
@@ -317,6 +341,33 @@ class TestPerPluginProjectNamespace:
         assert all(0 <= i < n_files for i in idx.values())
 
 
+def _stop_with_path(skeleton_nif, _out_hkx):
+    """Stand in for `generate_skeleton_hkx`: stop, naming the nif it was given."""
+    raise LookupError(skeleton_nif)
+
+
+class TestProjectFilePaths:
+    """Where a creature project reads and writes on the build filesystem."""
+
+    def test_a_capitalised_skeleton_is_found(self, tmp_path, monkeypatch):
+        """A loose mod's `Skeleton.NIF` is the skeleton the project is built from."""
+        creature = tmp_path / 'Rat'
+        creature.mkdir()
+        (creature / 'Skeleton.NIF').write_bytes(b'')
+        monkeypatch.setattr(hkx_behavior, 'classify_clips', lambda folder: {'idle': 'idle.kf'})
+        monkeypatch.setattr(hkx_behavior, 'generate_skeleton_hkx', _stop_with_path)
+        with pytest.raises(LookupError) as seen:
+            hkx_behavior.generate_creature_project(
+                str(creature), 'Rat', str(tmp_path / 'out'))
+        assert os.path.isfile(seen.value.args[0])
+        assert isinstance(seen.value.args[0], str)
+
+    def test_a_folder_without_a_skeleton_names_the_usual_path(self, tmp_path):
+        """With no skeleton in any case, the path handed on is `skeleton.nif`."""
+        assert hkx_behavior._skeleton_nif(str(tmp_path)) == os.path.join(
+            str(tmp_path), 'skeleton.nif')
+
+
 def _manifest(ns, folder, n_clips=2):
     """A minimal project manifest the block emitters accept."""
     return {'name': folder, 'namespace': ns,
@@ -345,10 +396,22 @@ def _base_asd():
 
 
 class TestAnimCacheFragments:
-    """The converter writes fragments; TESRuntime.dll composes them onto
+    """The converter writes fragments; CreatureRuntime.dll composes them onto
     the vanilla singlefiles at load. compose_* here is the DLL's reference:
     the same rule (append, dedupe by name) the old build-time merge used.
     See docs/reference/tes_runtime_fragments.md."""
+
+    def test_writing_a_fragment_removes_its_pre_split_copy(self, tmp_path):
+        """A rebuild deletes the plugin's fragment from the old TESRuntime
+        folder, and only that plugin's."""
+        from asset_convert.havok.animation_data import write_fragment
+        legacy = tmp_path / 'SKSE' / 'Plugins' / 'TESRuntime' / 'animation'
+        legacy.mkdir(parents=True)
+        (legacy / 'Oblivion.json').write_text('{}', encoding='utf-8')
+        (legacy / 'Other.json').write_text('{}', encoding='utf-8')
+        write_fragment([_manifest('oblivion', 'dog')], str(tmp_path / 'meshes'),
+                       'Oblivion.esm')
+        assert sorted(p.name for p in legacy.iterdir()) == ['Other.json']
 
     def test_fragment_holds_only_own_projects(self, tmp_path):
         """A plugin's fragment lists its own projects, sorted, and no
@@ -358,7 +421,7 @@ class TestAnimCacheFragments:
         path = write_fragment([_manifest('oblivion', 'scamp'),
                                _manifest('oblivion', 'dog')],
                               str(tmp_path / 'meshes'), 'Oblivion.esm')
-        assert path == str(tmp_path / 'SKSE' / 'Plugins' / 'TESRuntime'
+        assert path == str(tmp_path / 'SKSE' / 'Plugins' / 'CreatureRuntime'
                            / 'animation' / 'Oblivion.json')
         frag = json.load(open(path, encoding='utf-8'))
         assert frag['version'] == 1 and frag['source'] == 'Oblivion.esm'
@@ -422,24 +485,41 @@ class TestAnimCacheFragments:
         assert asd[2] == '2' and asd[3:5] == ['FullCharacter.txt', '_gun.txt']
         assert asd[-8:] == frag['animsetdata_append'][0]['block']
 
+    def test_singlefile_copy_adds_only_new_projects(self, tmp_path):
+        """A mod's full singlefile copies, moved into a folder of their own,
+        register the projects the base lacks and skip the ones it has, so
+        base + copy reproduces the copy exactly."""
+        from asset_convert.havok.animation_data import (
+            compose_singlefiles, manifest_fragment, read_fragments,
+            write_composed)
+        ad, asd = manifest_fragment(_manifest('nehrim', 'dog'))
+        base = {'animationdatasinglefile.txt': _base_ad(),
+                'animationsetdatasinglefile.txt': _base_asd()}
+        copy = compose_singlefiles(base, [{'animdata': [ad],
+                                           'animsetdata': [asd]}])
+        write_composed(copy, str(tmp_path / 'SomeMod'))
+        (tmp_path / 'Broken').mkdir()
+        (tmp_path / 'Broken' / 'animationdatasinglefile.txt').write_text('5\n')
+        assert compose_singlefiles(base, read_fragments(str(tmp_path))) == copy
+
     def test_cpp_composer_matches_python(self, tmp_path):
-        """tes_runtime/compose_test.exe (the DLL's composer, built by
-        tes_runtime/build.bat) must produce byte-identical files to the
+        """tes_runtime/creature/compose_test.exe (the DLL's composer, built by
+        tes_runtime/creature/build.bat) must produce byte-identical files to the
         Python reference over the same base and fragments."""
         import json
         import subprocess
         from asset_convert.havok.animation_data import (
-            compose_singlefiles, read_fragments, write_composed,
-            write_fragment)
-        exe = os.path.join(REPO, 'tes_runtime', 'compose_test.exe')
+            compose_singlefiles, manifest_fragment, read_fragments,
+            write_composed, write_fragment)
+        exe =os.path.join(REPO, 'tes_runtime', 'creature', 'compose_test.exe')
         if not os.path.isfile(exe):
-            pytest.skip('tes_runtime/compose_test.exe not built')
+            pytest.skip('tes_runtime/creature/compose_test.exe not built')
         base_dir = tmp_path / 'base'
         base_dir.mkdir()
         base = {'animationdatasinglefile.txt': _base_ad(),
                 'animationsetdatasinglefile.txt': _base_asd()}
         write_composed(base, str(base_dir))
-        frag_dir = tmp_path / 'SKSE' / 'Plugins' / 'TESRuntime' / 'animation'
+        frag_dir = tmp_path / 'SKSE' / 'Plugins' / 'CreatureRuntime' / 'animation'
         write_fragment([_manifest('oblivion', 'scamp', 3),
                         _manifest('oblivion', 'dog')],
                        str(tmp_path / 'meshes'), 'Oblivion.esm')
@@ -455,6 +535,10 @@ class TestAnimCacheFragments:
                 'set_file': '_gun.txt',
                 'block': ['V3', '0', '1', 'iRightHandType', '10', '10',
                           '0', '0']}]}))
+        ad, asd = manifest_fragment(_manifest('nehrim', 'wolf'))
+        write_composed(compose_singlefiles(base, [{'animdata': [ad],
+                                                   'animsetdata': [asd]}]),
+                       str(frag_dir / 'SomeMod'))
         py_dir, cpp_dir = tmp_path / 'py', tmp_path / 'cpp'
         py_dir.mkdir()
         cpp_dir.mkdir()
@@ -1543,16 +1627,13 @@ class TestRagdollBijection:
 
     @needs_landdreugh
     def test_forward_authored_joint_is_reversed_not_dropped(self):
-        # landdreugh's FIRST body (Pelvis) holds a joint to Spine01, a LATER
-        # body.  The root cannot have a parent, so the same joint is given to
-        # Spine01 with its ends exchanged -- an authored joint, not a
-        # synthetic one.
+        """The dreugh roots at NonAccum, the common ancestor of every body; Pelvis's joint to Spine01 is reversed, not synthetic."""
         _bones, parts = self._parts(LANDDREUGH_SKEL)
         plan, dfs = self._dfs_bodies(LANDDREUGH_SKEL)
         assert [p.name for p in parts] == dfs
-        assert parts[0].name == 'Ragdoll_Bip01 Pelvis'
+        assert parts[0].name == 'Ragdoll_Bip01 NonAccum'
         spine = next(p for p in parts if p.name == 'Ragdoll_Bip01 Spine01')
-        assert parts[spine.parent].name == 'Ragdoll_Bip01 Pelvis'
+        assert parts[spine.parent].name == 'Ragdoll_Bip01 NonAccum'
         rev = [r for (_con, r) in plan['edge_con'].values() if r]
         assert len(rev) == 1
         assert not plan['synthetic']
@@ -1731,7 +1812,8 @@ ASHVAMP_DIR = os.path.join(REPO, 'export', 'Morrowind_ob.esm', 'meshes',
 
 @needs_assets
 class TestAccumBindPoseLeak:
-    """The accum bone flattens to its authored frame-0 pose, never identity.
+    """NonAccum keeps its authored frame-0 pose, never identity, and is never
+    the root-motion bone while a Bip01 track exists (its sway is pose).
 
     See: docs/commentary/asset_convert_falloutnv.md#accum-root-identity
     """
@@ -1739,8 +1821,8 @@ class TestAccumBindPoseLeak:
     @pytest.mark.parametrize('kf,yaw', [('turnleft.kf', 54.18),
                                         ('stagger.kf', 67.11),
                                         ('idle.kf', 54.18)])
-    def test_accum_rotation_flattens_to_first_sample(self, kf, yaw):
-        """The accum track ends static at the source's authored `yaw`."""
+    def test_nonaccum_keeps_authored_pose(self, kf, yaw):
+        """NonAccum starts at the source's authored `yaw` after the split."""
         from asset_convert.havok.kf_decode import split_root_motion
         path = os.path.join(ASHVAMP_DIR, kf)
         if not os.path.exists(path):
@@ -1749,18 +1831,16 @@ class TestAccumBindPoseLeak:
         pre = {t.bone: np.array(t.rotations[0], copy=True)
                for t in clip.tracks if t.rotations is not None}
         motion = split_root_motion(clip)
-        assert motion is not None
-        w, x, y, z = pre[motion['bone']]
+        assert motion is None or motion['bone'] == 'Bip01'
+        non = next(t for t in clip.tracks if t.bone == 'Bip01 NonAccum')
+        assert non.rotations[0] == pytest.approx(pre['Bip01 NonAccum'])
+        w, x, y, z = non.rotations[0]
         got = np.degrees(np.arctan2(2 * (w * z + x * y),
                                     1 - 2 * (y * y + z * z)))
         assert abs(got) == pytest.approx(yaw, abs=0.1)
-        for t in clip.tracks:
-            if t.bone == motion['bone']:
-                assert t.rotations == pytest.approx(
-                    np.tile(pre[t.bone], (len(clip.times), 1)))
 
     def test_accum_translation_is_preserved(self):
-        """Flattening the rotation must not disturb the accum height."""
+        """The split must not disturb the NonAccum height (the turn's sway is pose)."""
         from asset_convert.havok.kf_decode import split_root_motion
         path = os.path.join(ASHVAMP_DIR, 'turnleft.kf')
         if not os.path.exists(path):
@@ -1768,10 +1848,9 @@ class TestAccumBindPoseLeak:
         clip = decode_kf(path)[0]
         pre = {t.bone: np.array(t.translations[0], copy=True)
                for t in clip.tracks if t.translations is not None}
-        motion = split_root_motion(clip)
-        for t in clip.tracks:
-            if t.bone == motion['bone'] and t.translations is not None:
-                assert t.translations[0] == pytest.approx(pre[t.bone])
+        split_root_motion(clip)
+        non = next(t for t in clip.tracks if t.bone == 'Bip01 NonAccum')
+        assert non.translations[0] == pytest.approx(pre['Bip01 NonAccum'])
 
 
 @needs_assets
@@ -1799,6 +1878,27 @@ class TestSpeedBakeFrameFloor:
         assert natural * factor == pytest.approx(formula, rel=0.01)
         assert int(round(dur / factor * 30)) + 1 >= MIN_BAKED_FRAMES
 
+    def test_only_attacks_get_a_hit_window(self):
+        """A recoil or stagger kf may carry a Hit key, but the engine's swing
+        handlers act on weaponSwing/HitFrame in any state and only attackStop
+        clears them; a hit window on a recoil left the intro's black troll
+        stuck mid-attack for good.  No vanilla recoil/stagger clip has one."""
+        from asset_convert.havok.hkx_behavior import _ClipSet
+
+        class _Clip:
+            duration = 1.0
+
+            def __init__(self, keys):
+                self.text_keys = keys
+
+        cs = object.__new__(_ClipSet)
+        cs.enum_map, cs.cast_stem_map = None, {}
+        hit = _Clip([(0.5, 'Hit')])
+        assert cs._meta('Recoil', 'recoil', hit, False, None, False)['hits'] == []
+        assert cs._meta('Attack_a', 'a', hit, False, None, True)['hits'] == [0.5]
+        keyless = _Clip([])
+        assert cs._meta('Attack_b', 'b', keyless, False, None, True)['hits'] == [0.4]
+
     def test_floor_never_lowers_the_old_cap(self):
         """A clip too short to keep the floor must still get the old cap."""
         from asset_convert.havok.hkx_anim import speed_bake_factor
@@ -1810,3 +1910,29 @@ class TestSpeedBakeFrameFloor:
         for cap in (1.4, 2.0):
             got = speed_bake_factor((10000.0, cap), _Clip(), motion, 30.0)
             assert got == pytest.approx(cap)
+
+
+class TestCreepLadder:
+    """A gait blend's same-clip rungs step at most LADDER_STEP apart from the creep up.
+
+    Havok sync blends durations, so the two-anchor creep/walk blend played the
+    legs at a fraction of the ground speed between them: the land dreugh slid
+    at every speed change (in game 2026-10-10).
+    See: docs/commentary/asset_convert_creature.md#forward-blend-layout
+    """
+
+    def test_dreugh_walk_rungs(self):
+        """Creep first, natural clip last, rates = anchor/natural, no gap over LADDER_STEP."""
+        from asset_convert.havok.behavior_clips import (CREEP_SPEED, LADDER_STEP,
+                                                  creep_ladder)
+        plan = creep_ladder('MoveForward', 'forward.kf', 155.0)
+        anchors = [a for _n, _kf, _r, a in plan]
+        assert anchors[0] == CREEP_SPEED and anchors[-1] == 155.0
+        assert plan[0][0] == 'MoveForwardSlow' and plan[-1] == ('MoveForward', 'forward.kf', 1.0, 155.0)
+        assert all(b / a <= LADDER_STEP + 1e-6 for a, b in zip(anchors[1:], anchors[2:]))
+        assert anchors[1] >= CREEP_SPEED * 2.0
+        assert all(r == pytest.approx(a / 155.0, abs=0.002) for _n, _kf, r, a in plan)
+
+    def test_creep_speed_clip_stands_alone(self):
+        from asset_convert.havok.behavior_clips import creep_ladder
+        assert creep_ladder('SwimMove', 'swim.kf', 5.0) == [('SwimMove', 'swim.kf', 1.0, 5.0)]

@@ -102,8 +102,8 @@ game, see the `oblivion-dialog-system`, `skyrim-dialog-system`, and
 - **🔴 QUST VMAD MUST end with the alias-script array count — THE cause of "no quest markers" (2026-07-11)**. Per xEdit `wbVMADFragmentedQUST`, a QUST's VMAD is `Version, ObjectFormat, Scripts, ScriptFragmentsQuest, **Aliases**`, where Aliases is an array with an **S16 count prefix**. Our builder stopped after the fragments and never wrote that count. **The engine parses VMAD strictly: running off the end of the buffer where it expects the count makes it abandon the record's entire script/alias binding.** Result: EVERY quest alias fills as `NONE` *and* every QF script property comes back `None` — so an objective's QSTA points at an empty alias and no marker can ever be drawn, while the journal objective (which needs no alias) displays perfectly.
   - **Diagnosis that finally cracked it**: in-game console `sqv <questID>` showed **all four aliases NONE** with the quest running at the right stage and the target ref alive and selectable — and the QF script's object properties were `None` too. Two independent systems failing identically ⇒ one shared cause upstream of both ⇒ VMAD. Verified against Skyrim.esm: vanilla `DBSideContract03`'s 643-byte QUST VMAD only parses to 643/643 once the trailing S16 is read. `tests/test_script_converter.py::test_vmad_quest_parses_to_exactly_its_length` now round-trips the VMAD and requires every byte be consumed — a truncated tail is invisible to every other check.
   - **Lesson**: when a record's scripts AND its aliases are both empty at runtime but the record looks perfect field-by-field, suspect a **truncated/misparsed binary tail**, not the individual fields. And `sqv` is the fastest way to find it — it prints alias fill state directly.
-- **Quest markers (targets)**: TES4 QSTA is QUEST-level (REFR + flags + GetStage conditions saying *when* that target's marker is live). TES5 QSTA is per-OBJECTIVE — and **vanilla leaves it UNCONDITIONAL**: across Skyrim.esm, objectives read `QOBJ FNAM NNAM QSTA [QSTA…]` with CTDAs a rare exception; the right target simply sits on the right objective, and the objective being *Displayed* is what selects the marker.
-  - So resolve Oblivion's gates at BUILD time rather than replaying them: `_target_live_at_stage()` (tes5_import/dialogue/converter.py) evaluates each target's TES4 condition chain (AND of OR-groups; GetStage/GetStageDone understood, any other function treated as passing so a maybe never loses a marker) with GetStage == the objective's stage, and each objective emits only its live targets, with no CTDAs. FGC01Rats then walks Arvena→basement door→Arvena→Pinarus→…→Quill-Weave exactly as Oblivion did. (Carrying every target on every objective was a genuine defect, but it was NOT what suppressed the markers — the VMAD truncation above was.)
+- **Quest markers (targets)**: TES4 QSTA is QUEST-level (REFR + flags + conditions saying *when* that target's marker is live). TES5 QSTA is per-OBJECTIVE and takes its own CTDAs; the engine shows every target of a displayed objective whose conditions pass.
+  - The quest's own GetStage/GetStageDone gates are settled at BUILD time against the objective's stage; every other condition rides on the QSTA as a runtime CTDA. See [tes5_import_quest.md](tes5_import_quest.md#resolving-target-markers-per-stage). FGC01Rats walks Arvena→basement door→Arvena→Pinarus→…→Quill-Weave exactly as Oblivion did. (What once suppressed every marker was the VMAD truncation above, not target CTDAs.)
   - **Aliases** (one forced-ref per unique target): `ALST, ALID, FNAM, ALFR, VTCK, ALED` — **VTCK is present on 2687/2687 vanilla forced-ref aliases and on all 255 vanilla objective+forced-ref quests; a 100% invariant we were omitting.** FNAM=0x0292 (Optional 0x0002 — a fill failure must not block quest start — + AllowDead + AllowDisabled + AllowReserved), an attested vanilla combination; the old 0x109A appears nowhere in vanilla. ANAM = alias count. Objectives: ONE per stage index (engine keys by index; index = stage so the generated `SetObjectiveDisplayed(stage)` matches). Layout: stages, objectives, ANAM, aliases.
 - **Known remaining gap — city map markers live in CHILD worldspaces**: Oblivion puts each city's map markers *inside* its city worldspace (AnvilWorld, ChorrolWorld, the IC districts — 37 markers total), and its map drew them. Skyrim's world map only renders markers in the root map worldspace (vanilla: 296/~300 marker-Locations anchor a marker in Tamriel 0x3C). So a converted Location whose MNAM marker sits in a child worldspace has nothing the *map* can draw (the compass, which works off the target ref's world position, is unaffected). Child worldspaces share Tamriel's coordinate space (AnvilWorld NAM0/NAM9 lie inside Tamriel's, grids match), so the fix is to anchor those Locations to a root-worldspace marker. Not yet implemented.
   - **Per-target QSTA conditions — export bug fixed 2026-07-11**: the QSTA→marker gating depends on the CTDAs that FOLLOW each QSTA in the TES4 stream (xEdit `wbDefinitionsTES4` QUST: `wbRArray('Targets', QSTA + wbCTDAs)`). The exporter previously used a flat `get_all_subrecords(rec,'CTDA')`, which (a) lost every per-target condition — so imported objectives carried all target aliases with NO gate and markers never advanced with the objective — and (b) mislabeled per-log-entry result-script CTDAs as quest-level `Condition[]`. `export_QUST` now walks the subrecord stream positionally, bucketing CTDAs into quest-level / per-log-entry / per-target and emitting `Target[i].Condition[k].Raw`. The importer's `convert_ctda_list(rec, prefix='Target[t].')` was already wired for this; it just had no data. Verified end-to-end on SE46 (funcs 58 GetStage / 79 GetQuestVariable / 84 GetDeadCount, quest FormID param remapped to output load order).
@@ -125,6 +125,7 @@ game, see the `oblivion-dialog-system`, `skyrim-dialog-system`, and
   sprintf(out, "%s_%s", A, B)
   ```
   A pair totalling <=25 is used VERBATIM — which is why the failing lines (23 and 18 chars) needed no cut at all. This matches Skyblivion's `Skyblivion - Copy voice files.pas` (`InfoFileName`), which was correct all along. **Do NOT re-derive this by fitting Oblivion's own filenames**: those follow Oblivion's rule, not Skyrim's — "no truncation" scores 99.8% against them and is WRONG for the engine (the engine rule scores 77.6%, the old bug 52.4%). Agreement with source names is irrelevant because `organize_voice_files` renames by INFO FormID. **Never mirror the rule** — `tools/dialog/voice_audit.py` kept a private copy that drifted and made the audit agree with the bug it existed to catch; it now imports `voice_file_prefix` directly.
+- **A SYNTHETIC bark quest must register its EditorID, or every line it owns gets a `_`-prefixed voice path.** `_bark_owner_quest` mints one always-running quest per bark subtype (`TES4GenericHELO`, `TES4GenericATCK`, …) for INFOs that carry no `QSTI`, but `quest_edid_by_fid` is built up front and knew only `TES4DialogueGeneric`. `voice_file_prefix` then saw an empty quest name and produced `_hello_<fid>` instead of `tes4generichelo_hello_<fid>` — a path the engine never asks for, so the line is silent. Oblivion never hit this (**0 of 17,338** voicemap prefixes start with `_`, because its barks all carry a real `QSTI`); Morrowind's barks carry none, so **all 391** of Tamriel Rebuilt's did. The quest is registered at the point it is created, where the two cannot drift apart.
 - **Lip sync (2026-07-16)**: generated per voice line with the SSE Creation Kit's own `LipGenerator.exe` (`<SSE install>/Tools/LipGen/LipGenerator/`, auto-detected via registry; needs its sibling `FonixData.cdf`). Inputs are the intermediate 44.1 kHz WAV (it resamples internally — writes a `tmp16khz.wav` into its CWD, so every parallel job runs in a private temp dir) and the line's transcript. Transcripts come from the importer: `build_dialog_groups` collects `{(info_fid24, response_number): NAM1 text}` at the same site that fills the voicemap, and `_write_lip_text` emits `<esm>.liptext.txt` next to the ESM. **SSE only reads lip data from `.fuz` containers** (loose `.lip` files are LE-only), so `convert_file_to_xwm` packs lip+xwm as `.fuz` (`FUZE` magic, u32 version=1, u32 lip size, lip, xwm); lines with no transcript stay bare `.xwm` (audio plays, mouth doesn't move). Oblivion's own `.lip` files are an older FaceFX format and stay skipped at BSA extraction. The INFO `ENAM 0x0800 "No LIP File"` bit is intentionally never set. CLI: `LipGenerator <wav> "<text>"` → `<wav basename>.lip`.
 - **Lip generation parallelism (2026-07-19)**: the Fonix engine inside LipGenerator.exe serializes ALL running instances machine-wide through a named mutex (`FonixMemoryMutex`, cleartext in the exe), capping aggregate throughput at **~8 lips/s no matter how many processes run** — the symptom is dozens of LipGenerator processes each at ~0.1% CPU (0.2s CPU per 6–9s wall; the tool's 1s sleep-poll loop waits on the contended mutex, so latency balloons too). The exe creates **no file mapping** (imports checked), so the mutex guards nothing shared between processes and renaming it is safe. `build_lipgen_pool()` (asset_convert/audio/audio_converter.py) writes per-worker copies of the exe with unique same-length mutex names (`FonixMemMtx_0000`…) + hard-linked `FonixData.cdf` into a temp pool dir; workers check exes out of a `queue.Queue`. Measured: ~8.5 → ~105 lips/s at 32 workers (128/s at 64), per-call latency 6–9s → ~0.3s; full-chain smoke (mp3→wav→lip→xwm→fuz) ~75 lines/s. Voice batches with transcripts use `_LIP_WORKER_COUNT` (2×CPU, ≤64) threads since jobs are mostly subprocess-wait. Fallback: if the mutex string isn't found exactly once (unknown exe version), the stock exe is used unpatched. Lip output is nondeterministic run-to-run even stock (gesture track seeding) — don't byte-compare .lip files. Nukem9's FaceFXWrapper was evaluated and rejected: same Fonix core, same machine-wide cap, and its copy of the mutex name is compressed (unpatchable).
 - **Race→VoiceType mapping** is derived, not tabulated: `asset_convert/audio/voice_races.py` reads the RACE records of the plugin AND its masters, keying each voice folder on the race's `FULL` display name (the folder on disk IS that name). This replaced a hardcoded 39-entry table; measured equivalent on all 466 real (folder, gender) pairs across every export. See: asset_convert_audio.md#race-identity-spans-the-masters
@@ -142,15 +143,17 @@ game, see the `oblivion-dialog-system`, `skyrim-dialog-system`, and
 - **🔴 Voice prefix is EMPTY for master-owned topics in a dependent plugin (2026-08-05)** — cause of Morroblivion's Jiub intro being silent, and of 907 topics' worth of dead audio. `quest_edid_by_fid` was built from `by_type['QUST']` only — **this plugin's** quests. A dependent plugin routinely files topics under a quest that lives in a MASTER (907 of Morroblivion's 4,400 DIALs name an Oblivion.esm quest: `Generic 0x010602`, `bed 0x19360a`, …), and the engine builds the voice filename from that quest's EditorID exactly the same way. With no entry the prefix came out **empty**, so every one of those lines was written as `_<topic>_<fid8>_<n>.fuz` — a leading-underscore name the engine never asks for. 234 of the 389 converted voice files (60%) had it. Fix: fall back to `fid_to_edid` for any `Quest[0]` this plugin doesn't own. **`fid_to_edid` is keyed by the RAW source FormID** while `get_formid` has already added the load-order `offset` to the high byte, so the fallback must un-shift (`((high - offset) & 0xFF) << 24 | low24`) before looking up — a master quest is `0x00010602` in Oblivion's own export but `0x01010602` after remap. Diagnosis method that found it: `tools/dialog/say_topic_ab.py --explain` (added in the same pass) cleared every CTDA as passing, which ruled out conditions and left the filename; the voicemap then proved the importer was right and the file on disk was wrong.
   - **Corollary — importer changes invalidate the voice OUTPUT, not just the ESM.** The importer writes `<esm>.voicemap.txt`, but the files are renamed by the SOUND stage. Any fix that changes quest ownership, topic EDIDs, or VTYP assignment silently leaves the previous run's filenames in place until `--sounds-only` re-runs; `prune_stale_voice_files` only cleans folders that run actually writes into. Jiub's `.fuz` files were dated 2026-07-27 against a voicemap regenerated the same day as the fix — correct map, stale audio. **After any dialogue/voice change, run `--import-only` AND `--sounds-only`, then `tools/dialog/voice_audit.py`.**
 - **Conversion stats**: 3817 DIAL topics (851 barks, 2966 conversation), 19278 INFOs, 954 DLBR branches, 1 DLVW view, 2908 quest-owned conversation topics, 27 fallback greetings
+- **A topic owned by a MASTER's quest needs the master's quest EditorID in its voice prefix.** The engine builds the voice path from the owning QUEST's EditorID plus the topic's (`voice_file_prefix`). `quest_edid_by_fid` was built from this plugin's `by_type['QUST']` only, but a dependent plugin routinely files topics under a master quest (907 of Morroblivion's 4,400 DIALs name an Oblivion.esm quest, e.g. `Generic 0x010602`, `bed 0x19360a`). No entry gave prefix `''`, so the file was written `_<topic>_<fid8>_<n>.fuz` (234 of 389 converted voice files, 60%), a name the engine never requests: no audio, no subtitle. Fix: fall back to `fid_to_edid` for any `Quest[0]` the plugin does not own. Key-space trap: `fid_to_edid` is keyed by the RAW source FormID while `get_formid` has already added the load-order offset to the high byte, so un-shift first (a master quest is `0x00010602` in Oblivion's export, `0x01010602` after remap). The importer only writes `<esm>.voicemap.txt`; the SOUND stage does the renaming, so any change to quest ownership, topic EDIDs or VTYP assignment needs `--import-only` AND `--sounds-only`, then `tools/dialog/voice_audit.py` (`_prune_stale_voice_files` only cleans folders the run writes into). `tools/dialog/say_topic_ab.py --explain` prints per-condition PASS/FAIL on both engines, which ruled out conditions and pointed at the filename.
 - **Dialog filtering stats**: 18,761 INFOs with conditions, 20 conditionless (down from 958 before voice type fallback fix). 17,784 INFOs with GetIsVoiceType. 3,704 GetInCell CTDAs (preserved for location gating). 3,169 DLBR branches (555 Type 1 chain topics excluded). 9,365 INFOs quest-gated with GetQuestRunning (non-SGE QSTI quests).
 - **Quest running gating (QSTI restoration, 2026-07 design)**: In Oblivion, each INFO only shows while its OWN `QSTI.Quest` is running. Single-quest topics get this natively via quest ownership. For shared topics (owned by TES4DialogueGeneric), `_build_one_topic()` injects `GetQuestRunning(info's own QSTI.Quest)==1.0` as the FIRST CTDA on each INFO whose quest is non-SGE and ≠ the topic owner. **Gate by the INFO's OWN quest, never the DIAL's Quest[0]** — gating all of GREETING's children by one arbitrary Quest[0] blocks ALL greetings (a hard-won earlier lesson). SGE quests are exempt (running from new game via the .seq file).
 - **AddTopic unlock system (2026-07)**: Oblivion's CENTRAL visibility mechanic — a topic only appears once ADDED via an INFO's Add-Topics data list (export: `AddTopic[i]=` FormIDs, 1044 INFOs), an `AddTopic X` result-script command, a quest-stage script, or automatically when a spoken line's text mentions the topic's FULL name (Oblivion highlights + auto-adds mentioned names). Skyrim has no AddTopic → re-expressed via `tes5_import/dialogue/unlocks.py`: one GLOB `TES4Unlock_<topic>` per gated topic (206); every INFO of a gated topic gets `GetGlobalValue(GLOB)==1` (func 74, same both games); every reveal event sets the global from a Papyrus fragment (INFO fragments fire OnEnd; reveal-only INFOs get a generated TIF fragment with just the SetValue call). The plan is built identically by the importer (GLOBs, conditions, VMAD property bindings) and script_convert/pipeline (fragment .psc bodies) — keys are low-24 FormIDs so it's load-order-offset independent. Gating rules (each violation caused a real in-game bug):
   - Gate ONLY topics explicitly added somewhere; mention-only topics stay ungated (name-match miss = dead content).
-  - **Topics revealed by BARK lines (GREETING/HELLO) are NOT gated** — the bark fires on first contact, so in Oblivion they're effectively visible on first talk (Azzan's "Join the Fighters Guild" via his FG-ad greeting). Gating them makes topics go missing (fragment races the menu / a different greeting plays). 409 of 615 explicit targets are bark-revealed → 206 gated.
+  - **Topics revealed by BARK lines (GREETING/HELLO) are NOT gated when every speaker of the topic says a revealing bark** (see [the bark-ungating exception](#the-bark-ungating-exception)) — the bark fires on first contact, so in Oblivion they're effectively visible on first talk (Azzan's "Join the Fighters Guild" via his FG-ad greeting). Gating them makes topics go missing (fragment races the menu / a different greeting plays). 409 of 615 explicit targets are bark-revealed → 206 gated.
   - Gated TCLT targets keep the gate; their TCLT-parent INFOs are added as revealers.
   - Example that must stay gated: contract INFO (0003571C) lists AddTopic[0]=ratsTOPIC → TES4_TIF__0003571C sets TES4Unlock_ratsTOPIC OnEnd → "Rats" appears only after the contract line. Quest-running does NOT hide it — FGC01Rats starts at guild join (FGD00JoinFG stage 100 `StartQuest` → `.Start()` fragment).
 - **'AnswerStatus' and 'TRANSITION'** are Oblivion NPC-to-NPC conversation system topics — classify as barks (IDLE/88/cat 7) or they leak into player topic menus.
 - **Barter/Training services (2026-07)**: Skyrim opens the barter menu via a Papyrus fragment (`akSpeaker.ShowBarterMenu()` — there is NO Barter DIAL subtype, only BarterExit) and the training menu via `Game.ShowTrainingMenu(trainer)` (the Training subtype exists in the enum but even vanilla never uses it — zero `TRAI` SNAMs in Skyrim.esm). Vanilla contracts (decoded from Skyrim.esm): vendors = `OfferServicesTopic` (Custom, quest DialogueGeneric) with INFOs gated `GetInFaction(JobMerchantFaction)==1 + GetOffersServicesNow(func 255)==1` + TIF fragment calling ShowBarterMenu; trainers = `OffersTrainingTopic` (Custom, quest DialogueTrainers) with per-trainer INFOs gated `GetIsID + GetBaseActorValue(skill)<cap RunOn=Target` + TIF fragment, NPC in JobTrainerFaction + JobTrainer<Skill>Faction, and the menu's skill/cap read from the trainer's **CLAS** (DATA Teaches/MaxTrainingLevel). Our conversion (`dialog_converter.SERVICE_MENU_TOPICS`): the Oblivion Service-type topics `Barter` (57 voiced per-merchant lines) and `Training` (10 generic voiced lines) — previously dropped with all type-5 topics — convert to Custom player topics with synthesized prompts ("What have you got for sale?" / "I would like some training."); every INFO gets an injected service gate (barter: `GetInFaction` OR-chain over the synthesized vendor factions; training: `GetInFaction(TES4JobTrainerFaction)`) and a menu-opening fragment: script-less INFOs share the static scripts `TES4_ShowBarterMenu`/`TES4_ShowTrainingMenu` (in script_convert/static_scripts, auto-deployed + compiled with the generated scripts), while INFOs WITH result scripts (10 TG fence lines) get the menu call appended to their per-INFO TES4_TIF__ fragment by script_convert (same ParentDIAL classification on both sides). A synthetic text-only catch-all INFO ("Take a look." / "Let's begin.") is appended last so every vendor/trainer offers the topic even when no original line's conditions match. Service topics are EXCLUDED from identity/voice-gate inheritance and from the quest-NPC prescan (their 57 merchant GetIsIDs would pollute sibling-topic identity gating). Other Service topics (ServiceRefusal, BarterExit, Repair, Recharge, Travel, ...) stay skipped — no Skyrim mechanic fires them.
+- <a id="service-topics-by-formid"></a>**Service topics are found by FormID, not EditorID**: `SERVICE_MENU_TOPICS` is keyed by the raw export FormID of the engine's hardcoded topics: `0x10F` (barter) and `0x113` (training). Plugins rename them: Nehrim (and its Translation.esp override) call `0x10F` `BarterStart`, so the old EditorID lookup never matched. Nehrim shipped with no barter topic at all, and no Nehrim merchant could open the barter menu. FalloutNV's Training is also `0x113`. The match is on the full raw id (master index `00`, the base game file that owns the engine topic), so a plugin's own new DIAL at `xx00010F` is not taken for it. The other Service topics stay skipped even though Skyrim's subtype table defines the whole family (SERU, REPA, TRAV, TRAI, BAEX, REEX, RECH, RCEX, TREX): zero Skyrim.esm DIALs carry a Service subtype, because Skyrim drives services from Papyrus menus, so the engine would never ask for them.
 - **Trainer data source (2026-07)**: Oblivion stores trainer skill/cap per-NPC in **AIDT** (Teaches S8 @8, MaxTraining U8 @9), NOT the class — 92 of 114 vanilla trainers disagree with their CLAS values (classes are mostly 0/0; even the dedicated Trainer* classes have max=0). Skyrim reads them from the NPC's CLAS, so Phase 0c (`actors.create_trainer_records`) clones each trainer's class with Teaches/MaxTraining replaced from AIDT (deduped per class+skill+cap), points the trainer's CNAM at the clone, and adds the NPC to `TES4JobTrainerFaction`. Trainers of dead skills (Athletics/Acrobatics) or cap 0 are not converted. Vendor buying power: TES5 has no ACBS.BarterGold — a chest-less vendor trades from its own inventory, so barter gold becomes carried Gold001 in CNTO (kept OUT of the DOFT outfit item list).
 - **Run-on-Target conditions are DEAD in Say()-driven topics (2026-07-19)**: Skyrim's `Actor.Say(Topic)` has no dialogue target, so a converted `RunOn=Target` CTDA evaluates against nothing and can never pass. Oblivion drives NPC-NPC/NPC-player scripted dialogue with `Say`/`SayTo`/`StartConversation`, and its INFOs routinely pick lines by the TARGET's race/sex/identity — CharacterGen's Valen Dreth taunts are all race-of-target gated, so the intro froze at stage 6 (no taunt → tauntCount never increments → stage 9/10 never set → the Emperor's escort never descends). Scope: 319 Say-driven topics; 1,924 of their 8,083 INFOs carry ≥1 run-on-target condition. Fix (`dialog_converter.build_say_topic_dispositions` + `convert_ctda(run_on_target_ref/drop_run_on_target)`): scan SCPT bodies + INFO/QUST result scripts for Say/SayTo/StartConversation call sites; a topic whose script target is UNIQUE gets its target-conditions retargeted to `RunOn=Reference` on that ref (player → 0x14 PlayerRef — also correct for menu dialogue, where the target IS the player); topics with mixed/unknown targets DROP target-conditions (call sites already select speaker+topic; auto-pass ≈ intent, never-pass = frozen quest). 156 topics retargeted, 163 drop. Regression: `TestSayTopicRetarget`.
   **Engine-fixed CTDA params must NEVER be load-order remapped (2026-07-22, second cause of the same symptom)**: `GetIsID(Player 0x00000007) [Target]` ("am I addressing the player?") appears on 3,761 INFOs — every stage-gated reveal greeting uses it. A condition evaluates against the RUNTIME actor, and the in-game player's base form is vanilla Skyrim's `0x00000007`, never our converted copy of the TES4 Player record — so remapping the param to `0x01000007` makes the condition unpassable, the reveal greeting never fires, its TIF fragment never sets the `TES4Unlock_*` global, and every unlock-gated topic vanishes (FGC01Rats: Arvena's stage-40 "Please, go find Pinarus, and those mountain lions!" is a revealer for `MountainLionsTOPIC`, which is gated `GetGlobalValue(TES4Unlock_MountainLionsTOPIC)==1`). `dialog_conditions._remap_formid` originally passed engine-fixed ids (index 0, object id < 0x100 — Bethesda hardcodes the same ids in every game) through unchanged; the override-conversion work unified it with `text_reader.remap_formid` (passthrough set = only PlayerRef 0x14) and silently regressed it. The two contracts are genuinely DIFFERENT: record FIELDS referencing the player NPC_ must keep shifting to the converted copy, but CONDITION params must stay engine-fixed. The passthrough now lives in `_remap_formid` itself with a regression test (`test_engine_fixed_param_never_remapped`). Diagnosis method: build the last-known-good commit in a worktree against the same export (skip navmesh via a hardlinked export dir without PGRD.txt), dump both ESMs with `tools/esm/tes5_esm_reader.py`, normalize the synthesized-FormID shift, and diff per-record — the regression was invisible on the affected topics' own records (byte-identical) and only showed on the greeting INFOs.
@@ -264,6 +267,15 @@ have been on that channel. Do not attempt to fix this by writing GMSTs.
 ## Problem 1 — GREETING lines are on the ambient channel
 <a id="problem-1-greeting-lines-are"></a>
 
+**Fixed (run 60a, 2026-11-16), the vanilla way.** Vanilla Skyrim keeps hello lines off the ambient timer with a
+condition: of its 5,287 HELO INFOs, **267 test `IsInDialogueWithPlayer == 1`** (11 test `== 0`; census
+temp/run59/helo_census.py), so they play only when the speaker is in dialogue with the player -- activation or a
+force-greet. Every INFO the converter takes from a TES4 `GREETING` topic now gets that condition
+(`converter.in_dialogue_gate`, `groups._group_bark_infos` marks them, `_convert_topic_infos` adds it); `HELLO` lines,
+Oblivion's real ambient channel, are untouched. Found by Baurus repeating his stage-86 greeting "We've failed..."
+seven times aloud (a choice greeting has reset 0 since 39e), while the harness waited for him to stop speaking.
+Test: `test_a_greeting_line_plays_only_when_talked_to`. What follows is the original analysis.
+
 `tes5_import/dialogue/converter.py:859-860` maps both channels to one subtype:
 
 ```python
@@ -307,7 +319,7 @@ That is a conversation opener, not a bark.
 
 ### ⚠ A previous fix moved the wrong channel
 
-Memory (`project_hello_channel_split`, 2026-07-19) records a fix setting
+An earlier fix set
 `_EDID_SUBTYPE['HELLO'] = (88, b'IDLE', 7)`. **That mapping is not in the
 current code** — `git log -S` finds no trace of it, and both entries read
 `HELO` today. It was reverted or never landed.
@@ -490,6 +502,40 @@ for other reasons.)
 `tests/test_import.py::TestNpcToNpcConversationDrop` (5 tests, incl. the
 fail-safe and the CharGen keep).
 
+#### <a id="engine-fired-say-topics"></a>A script `Say` must not strip an engine topic's target tests
+
+**Code:** `say_topics.build_say_topic_dispositions` (`engine_fired`, `ENGINE_TARGET`),
+`groups._fill_say_dispositions`, `conditions.convert_ctda_list_with_strings(drop_identity_target=)`.
+
+The Say/SayTo scan decides per TOPIC, not per call site. A single bare `Say`
+(no target, so disposition `drop`) therefore stripped every RunOn=Target test
+from a topic the engine also fires. In Oblivion.esm, Baurus's and Glenroy's
+CharacterGen `OnStartCombat` blocks each run `Say Attack`. That dropped the target
+race/faction/sex tests from all 69 `Attack` INFOs, 7 `Hit` INFOs and 444
+`GOODBYE` INFOs. "Die, you Orc filth!" (`0018BD75`) kept only *speaker is not
+an Orc* and fired at players of every race.
+
+A topic `classify_topic` marks as a bark (ATCK, HIT_, GBYE, …) is fired by the
+engine, which supplies a real target: the combat target, or the player for
+GBYE. When such a topic would otherwise be `drop`, it becomes `('target', None)`:
+- **State tests** (race, sex, faction, IsGuard, items) keep RunOn=Target.
+- **Identity tests** (`GetIsID`/`GetIsClass`, `_NO_TARGET_RETARGET_FUNCS`) still
+  drop. They name the NPC a script addressed. The CharacterGen 26→27 bridge is
+  a GOODBYE line (`0005144A`) gated on `GetIsID(UrielSeptim)[Target]` that Baurus
+  speaks via `Say`, which has no target.
+
+Topics already retargeted (`ref`) are unchanged: GREETING, HELLO and Assault
+point at PlayerRef, which is correct for both callers.
+
+Measured on Oblivion.esm: 3 topics switch (`Attack`, `Hit`, `GOODBYE`). 157
+INFOs gain conditions and none lose any: GetInFaction 114, GetIsRace 22,
+GetIsSex 14, IsGuard 11, GetIsCreature 6, other 6. No CharacterGen-owned INFO
+changes. The other scripted GOODBYE speakers (Faustina in MS04, Savlian Matius)
+have no changed lines. Known compromise: a script `Say` of these topics can't
+pass the kept target tests, so Baurus and Glenroy shout the untargeted combat
+lines. Confirmed in game.
+Tests: `tests/test_dialog.py::TestCTDAConversion::test_engine_fired_say_topic_*`.
+
 ---
 
 ### Step 2 — Take GREETING off the ambient channel
@@ -617,6 +663,23 @@ SulinusVassinus. No CharacterGen script changes and `TES4NPCConv<plugin>.psc`
 is byte-identical, because those chains are HELLO-headed and belong to the
 scheduler path below, not this one.
 
+### <a id="walk-survives-a-dropped-line"></a>The walk asks again for a line that did not start
+
+**Code:** `TES4Polyfill.ConverseLine`, `_BegunLate`; the walk itself is the generated
+`TES4_ConvRoute_<plugin>.Run` (`tes5_import/dialogue/conversation_routes.py`).
+
+A polled conversation survives a dropped `Say`: its script asks again on the next pass. The
+generated walk has nothing behind it, and it ended for good at the first line that did not begin.
+MQ12's Jauffre / Martin exchange (six lines gated `MQ12.convStage == 0..5`) stopped after line 3 in
+4 of 5 headless runs (29p, 29r1-3; `convStage` stayed 3, stage 26 never set). `ConverseLine` now
+waits 1.5 s for `LineBegan` to name a line `SayLine` gave up on, and asks again up to twice; a
+topic under which nothing qualifies costs about 4 s more before the walk ends. After: 6 of 6
+(29s, 29t1-2, 29u1-3). Why line 4 was dropped is NOT measured: with Papyrus tracing on, the walk
+never dropped a line (29t), so the trace changes the timing it would have shown.
+
+The same runs found the lifted stage advance guarded `GetStage() < N` where the quest already
+stood past N ([script_convert.md](script_convert.md#stage-advances-survive)).
+
 ---
 
 ## The NPC-to-NPC conversation scheduler
@@ -697,6 +760,33 @@ sequence, each hop's speaker, and the expected line length; which INFO plays
 within a topic is decided by that INFO's own converted conditions — exactly
 Oblivion's rule. So per-line CTDA fidelity is preserved and the INFO End
 fragments (the `setstage` payloads) fire as they do for any other `Say()`.
+
+### Heads the old plan missed (#82)
+
+Three authored shapes were dropped or cut short; each is restored generically:
+
+* **The reply names the listener** (`_reply_listener`). TG04Mistake's head
+  "You are in good spirits today, milady" names only Hlidara; Countess Alessia
+  is named only by the reply lines. Accepted only when the head has one
+  subject, no target-side `GetIsID` at all (a negative one marks a player
+  greeting), `NextSpeaker` 0, a Conversation-type first Choice, and every INFO
+  there names a speaker, together exactly one other NPC. A looser first rule
+  restored ~30 SEConversations chatter chains.
+* **A reply filed under another quest** (`_follow_ups`). MQ15's Orthe opens,
+  but the replies, including Eldamil's "Of course, kynreeve." that sets 58,
+  belong to MQConversations. Oblivion's scheduler took a Choice topic's INFO
+  from any running quest; same-quest follow-ups are still tried first.
+* **`GetDistance(Player)` gates** are kept, run on the speaker as Oblivion ran
+  them on the initiator (`Conv<N>A.GetDistance(Game.GetPlayer()) < 400`), so
+  the talk waits for the player instead of firing anywhere.
+
+Chain indexes are DIAL FormIDs, so reply-named chains append after the
+identity-pinned ones: no existing id moves. Oblivion.esm: 15 -> 16 chains.
+Verified on the test instance (3/3 each, `TG04Mistake` 50 and `MQ15` 58; the
+pre-fix ESM stays at 10 and 56). TG04 plays only at castle dinner, 20-23,
+the one time Hlidara and the Countess share a room in Leyawiin.
+SE05EavesDropDetected cannot run in Oblivion either and stays dropped.
+Regression: `tests/test_dialog.py::TestNpcConversationChains`.
 
 ### The MQ04 gate conversation: what actually stalled it
 <a id="chain-atomicity"></a>
@@ -782,8 +872,8 @@ logged, not silent.
 the quest VMAD from it, `script_convert.pipeline` generates the matching
 `.psc` from it. **Any divergence leaves VMAD properties unbound** — the
 generated script guards every property against `None` and disables that chain
-rather than aborting the whole poll function (see
-`project_unbound_vmad_property_aborts`), but it cannot repair the binding.
+rather than aborting the whole poll function (an unbound property aborts the
+fragment on first use), but it cannot repair the binding.
 Both sides gate on masterless plugins only.
 
 Verify the contract holds after any change:
@@ -1084,14 +1174,149 @@ invention: it teleports the marker out of its authored position permanently
 (nothing moves it back) and costs the line its audio. Vanilla's one
 repositioning case (DA05, following a ghost's head) uses `SetPosition`.
 
-**Known open defect:** a scripted `Say()` on a NON-ACTOR does not retire its
-subtitle -- measured live, a direct `Say` on the announcer's TACT played its
-audio and left the subtitle onscreen indefinitely. The engine's countdown /
-`SubtitleManager::KillSubtitles` path is `TESObjectREFR` vtable slot 0x40
-(rva 0x2d9d80, SkyrimSE 1.6.1170), which nothing drives for a plain
-reference. **No verified fix exists**; the two attempts above cost the audio
-and were reverted. Audio is the higher-value behaviour, so the stuck subtitle
-stands until a fix is demonstrated in-game rather than reasoned about.
+**Superseded 2026-09-24 -- delivery is now a scene (confirmed in game
+2026-09-25: the Arena announcer speaks each line with audio and its subtitle
+clears).** A scripted `Say()` on a NON-ACTOR never retires its subtitle, and the
+cause is now measured in the running 1.6.1170 game, not reasoned about:
+
+* A non-actor's line lives in its say-topic extra (`ExtraDataList` type 0x71):
+  done flag +0x18, countdown +0x1c (-1 until the voice's length is known), the
+  voice's `BSSoundHandle` +0x28. `TESObjectREFR` vtable slot 0x40 (rva 0x2d9d80)
+  is its per-frame driver: once the voice loads it sets countdown =
+  duration_ms * 0.001 + 0.5, subtracts the frame time each call, and at 0 calls
+  `SubtitleManager::KillSubtitles` (rva 0x96cd00) and frees the extra.
+* Papyrus `Say` (rva 0xa2fb40) calls the driver ONCE. After an announcer line
+  the countdown sat at -1 with the voice finished (`BSSoundHandle::IsPlaying`, id 67621, -> 0 at
+  16.1s of a 16.5s line); calling the driver by hand from the bridge counted it
+  down and removed both stuck subtitles (subtitle count 2 -> 0).
+* The only engine code that calls the driver every frame for a non-actor is
+  `BGSSceneActionDialogue` slot 19 (rva 0x3a48d0: `formType == 0x3e` goes to the
+  actor path, everything else to slot 0x40); slot 17 (0x3a47f0) sets the done
+  flag at the action's end. Vanilla speaks through a TACT exactly that way: 19
+  scene dialogue actions in Skyrim.esm (Azura, Night Mother, Potema, Namira's
+  shrine, the Augur). All 7426 vanilla scene topics are category Scene
+  (SNAM `SCEN`) with no BNAM and no FULL, and every one of them belongs to
+  its scene's own quest (1706 scenes: the topic's `QNAM` equals the scene's
+  `PNAM` on all 7426 actions, none borrowed).
+
+So every speak-as call site gets a one-action SCEN in DA11NamiraScene's exact
+layout, owned by the start-game quest `TES4SpeakAs` (one forced-ref alias per
+speaker TACT), its topic becomes a Scene topic, and `TES4Polyfill.SpeakAs`
+`ForceStart`s it.
+
+**The INFO must name its speaker (measured 2026-09-24).** The first scene
+build played the line with NO audio and a 0.5s subtitle -- the same result the
+earlier "scene killed the audio" attempt reported. A scene starts a non-actor's
+line through `0x2da440` -> `0x2d99a0` with an empty sound handle and no speaker
+actor; the response constructor (`0x5de460`, which builds
+`Data\Sound\Voice\<plugin>\<voice type>\<quest>_<topic>_<INFO>_<n>`) then takes
+the voice type from the INFO's Speaker (`ANAM`) or else the speaker ref's base,
+and a scene gives it neither. Live, the line's sound had duration 0 and never
+played, with or without moving the TACT. Vanilla names the voice NPC on the
+INFO: every Night Mother and Augur scene line carries `ANAM` =
+`DBNightMotherVoiceNPC` / `MG04Augur` (no vanilla INFO names a TACT there).
+So every INFO of a speak-as topic gets `ANAM` = the NPC its own positive
+`GetIsID` names, else the call site's speak-as NPC -- TES4's third `Say`
+argument.
+
+TES4's fourth `Say` argument is `VoiceAudioPositionFlag` (CS wiki: the voice
+plays at the player's position), not "in the player's head". Vanilla's form of
+it is the INFO's Audio Output Override `ONAM` = `SOMDialogue2D` (Skyrim.esm
+000B5183, non-positional dialogue), as on Potema's mural lines; those INFOs
+get it and nothing is moved. Oblivion.esm: 61 call sites, 59 topics, 53 with
+the flag; 390 INFOs get a speaker, 350 the 2D output; no speak-as topic is
+also spoken by a plain `Say`.
+
+**The scene topic belongs to `TES4SpeakAs` (measured 2026-09-25, confirmed
+in game).** With `ANAM` in place the line was still silent with an
+instant subtitle. Live, the speaker lookup (`0x5de9b0`, a table keyed by INFO)
+returned ArenaMouth and its voice type `TES4MaleImperial`, but the Announcer
+topic's quest pointer (`TESTopic+0x40`, which the path builder `0x3e5fe0` reads
+for the `<quest>` part) was `TES4SpeakAs`, the scene's quest, although the
+DIAL's `QNAM` is ArenaAnnouncer. The engine asked for
+`tes4speakas_announcer_00046654_1` while the file on disk was
+`arenaannouncer_announcer_00046654_1`. Vanilla never meets this because a
+scene only speaks its own quest's topics. So a speak-as topic's owner (its
+`QNAM`, and so its voice-file prefix in the voice map) is `TES4SpeakAs`. Each
+INFO still keeps its `GetQuestRunning` gate on its TES4 quest. `TES4SpeakAs` is a
+start-game quest, so a speak-as line plays whenever its TES4 quest runs, as
+`Say` did. Whether `ANAM` alone was ever needed is untested: the earlier ANAM-less
+build had the same quest mismatch. The scene's `DATA` topic and the fallback
+`ANAM` NPC are written straight from `get_formid`, which already shifts the
+load-order index; they were once shifted twice (`0x02046652`) and resolved
+only because the plugin has a single master.
+
+**Two lines in a row (confirmed in game 2026-09-25).** `TES4Polyfill.SpeakAs`
+does two things `ForceStart` alone does not:
+
+* **Restart.** The announcer's second line comes 6.8s after a 6.6s first one,
+  while the same scene is still in the line's 0.5s tail. `ForceStart` on a
+  playing scene is ignored, so the second line was lost. `SpeakAs` stops a
+  playing scene first (waiting up to 1s for it to end), as a new TES4 `Say` cut
+  the old line off.
+* **Choose at the call.** TES4 `Say` chose its INFO at the call. The announcer
+  sets `CityAnnounced = 1` on the next line, and the welcome INFO requires 0,
+  while "fresh meat" requires 1. A scene chooses its line when its action starts,
+  so both calls spoke "fresh meat". In a poll (`_say_may_block`) the converter
+  emits `SpeakAs(topic, scene, True)`, which waits for the INFO's Begin fragment
+  (`LineBegan` -> the player's `Variable09`, capped at `SAY_START_WAIT`). Fragment
+  and engine-callback sites stay non-waiting: 134 waiting and 3 non-waiting on
+  Oblivion.esm.
+
+### <a id="speak-as-quest-in-the-seq"></a>`TES4SpeakAs` must be in the `.seq` (measured 2026-09-25)
+
+In a new game every speak-as scene ended 0.1s after `ForceStart` with no line,
+while a save+reload made all of them play. Live on 1.6.1170: the scene topics
+had **0 INFOs in memory** (`TESTopic+0x50`), Gaius's topics had theirs, and
+`TES4SpeakAs` was running with no pending promote task (`TESQuest+0x248` = 0).
+
+A quest's topic INFOs are loaded by one of two routines:
+
+* `0x3d3310`, run when the quest's `QueuedPromoteQuestTask` finishes. It returns
+  at once when the quest's in-memory flag `0x10` is set, and every Start Game
+  Enabled quest has it (DNAM `0x0011`, as on 256 vanilla quests).
+* `0x3d2e90`, which loads every listed quest's topics. Its only caller (via
+  `0x533a80`) is on the save-load path, so a reload filled the topics in.
+
+`TES4SpeakAs` was missing from `Oblivion.seq` (211 entries, `SE01Door` and
+`TES4ForceGreets` among them). `SE01Door`, which is listed, had its topics
+loaded in the same new game. That is the CK's purpose for the `.seq`: it lists
+start-game quests with dialogue. A synthesized quest had to be added to the list
+by hand, and this one never was. The `.seq` is now built from the written QUST
+records (`_own_sge_quests`): every quest this file defines whose DNAM has
+bit 0 set.
+
+Related engine facts: the scene system treats a quest as running only when flag
+bit 0 is set, bit 7 (Stage Wait) is clear, and `+0x248` is null. Line pick
+(`0x3e82f0`), `Scene.ForceStart` (logs "cannot force start scene because its
+parent quest was not running") and the per-frame scene update (`0x3a05f0`) all
+apply this rule. `sqv`'s "State: Running" reads only the flag.
+
+### <a id="startconversation-player-force-greet"></a>`StartConversation Player` is a real force greet (confirmed in game 2026-09-25)
+
+Papyrus cannot open the dialogue menu, so `X.StartConversation Player [topic]`
+used to become `Say(topic)`. SE01's `SE01GaiusForceGreet` then showed up as a
+plain topic in Gaius's menu instead of greeting the player. Vanilla's mechanism
+is a ForceGreet package (template `0003C1C4`). The importer writes one start-game
+quest, `TES4ForceGreets` (`tes5_import/dialogue/force_greets.py`), with a pool of
+optional reference aliases per topic:
+
+* `build_force_greet_slots` counts the `StartConversation Player` sites per
+  topic (at most 8 slots each) and assigns contiguous alias ids in sorted topic
+  order. The importer and the script converter compute the same plan from the
+  same export.
+* Each alias carries a ForceGreet package whose Topic input is the DIAL, a bark
+  topic's subtype, or `HELO` for the no-topic form. The package's OnEnd
+  fragment (`TES4_ForceGreetDone`, in the pattern of vanilla
+  `WITavernServerGreetPlayer`) clears the alias, so the actor goes back to
+  their own AI.
+* The call converts to `TES4Polyfill.ForceGreet(TES4ForceGreets, first, count,
+  actor)`. It reuses the alias already holding that actor, otherwise takes the
+  first free slot, then calls `ForceRefTo` and `EvaluatePackage`.
+* A forced topic that nothing else adds stops being a top-level topic, so it no
+  longer shows in the menu on its own.
+
+Any other `StartConversation` target still takes the `Say` path.
 
 ### Speak-as INFOs silently lost their quest-inherited conditions (fixed 2026-08-25)
 
@@ -1244,16 +1469,18 @@ sequencing wrong. The converter owns both writers, so the state is shadowed:
 `Game.DisablePlayerControls()` and `Game.EnablePlayerControls()` each also
 write this global, and the read returns it.
 
-### TES4CyrodiilCrimeFaction
+### The crime factions (formerly TES4CyrodiilCrimeFaction)
 
-Stands in for Oblivion's single global crime faction, and receives most
-converted `GetPCExpelled` / `GotoJail` / crime calls, so it must be a REAL
+The single stand-in `TES4CyrodiilCrimeFaction` is gone: every bounty realm now
+has its own crime faction that NPCs really report to, and converted crime calls
+read the realm list `TES4CrimeFactions` -- see
+[tes_runtime_crime.md](tes_runtime_crime.md#bounty-realms). Each is a REAL
 crime faction: DATA sets **Can Be Owner (bit 15) + Track Crime (bit 6)**, and
 CRVA carries the vanilla crime values (murder 1000, assault 40, trespass 5,
 pickpocket 25, steal x1.0, escape 100) that all 14 real Skyrim crime factions
 share.
 
-**REVERTED:** it previously set CanBeOwner plus bits 7-11/13/16, which are
+**REVERTED:** the stand-in once set CanBeOwner plus bits 7-11/13/16, which are
 Skyrim's *Ignore* Crimes flags — the opposite of the intent; xEdit decodes the
 old `0x0001AF80` as "IgnoreKills". It also never set Track Crime, without which
 the engine accumulates no crime gold at all, and its CRVA used the wrong struct
@@ -1302,6 +1529,13 @@ XNAM is (Faction, Modifier 0, Group Combat Reaction 1 = Enemy); DATA bit 0 is
 Hidden From PC. **REVERTED:** relationship rank -4 was tried as the hostile
 reaction and did not work.
 
+A plugin whose masters (at any depth, see
+[support records](tes5_import_pipeline.md#phase-0-dependent-skips-support-records))
+already define the pair adopts it by EditorID instead of writing its own, and
+likewise `TES4DestroyedRefs`; a second pair would split ForceCombat's two sides
+across plugins. The pair is adopted only whole, since each faction names the
+other in its XNAM.
+
 ### The GetDestroyed formlist
 
 TES4 keeps a per-reference "destroyed" flag: `SetDestroyed` writes it,
@@ -1345,8 +1579,18 @@ vanilla hostility idiom and works for ANY actors.
 
 `create_vtyp_records` never references Skyrim.esm VTYPs. Voice files live in
 `Sound/Voice/<plugin>/<EditorID>/` and must match the EditorIDs created here
-(`TES4Male*`, `TES4Female*`). DNAM bit 0 is AllowDefaultDialogue and bit 1 is
-Female, so male voices write DNAM=1 and female DNAM=3.
+(`TES4Male*`, `TES4Female*`). DNAM bit 0 is Allow Default Dialogue and bit 1 is
+Female; male voices write DNAM=0 and female DNAM=2.
+
+Allow Default Dialogue stays CLEAR. With it set, a voice type may say any line
+whose conditions don't exclude it (CK wiki, Voice_Type), and Skyrim.esm has 446
+non-scene lines in Start Game Enabled quests with no identity condition at all
+(155 CUST, 44 IDLE, 26 GBYE, 22 HELO, 110 combat barks), all of which converted
+NPCs could say. Clear, the engine only allows scene lines, linked lines, and
+lines naming the speaker (GetIsID, GetInFaction, GetIsVoiceType, ...). Every
+converted line carries one of those or the plugin-origin gate
+([origin faction](tes5_import_actors.md#origin-faction)). All 42 vanilla creature
+voice types clear it too.
 
 Two sources, in order:
 
@@ -1521,6 +1765,51 @@ who did not click Contract lost every topic and was left with the generic
 INFOGENERAL pool ("Rumors"), which is exactly the reported symptom. Keeping the
 gate makes the reveal explicit and idempotent from BOTH revealer kinds.
 
+It also keeps the gate when the barks are spoken by the WRONG NPCs. "Visible on
+first talk" holds only for an NPC who says the revealing bark, so a topic is
+ungated only when every speaker of the topic (its INFOs' positive `GetIsID`s; a
+line with none means anyone) is covered by a revealing bark's speakers (a bark
+with no `GetIsID` covers everyone). Shivering Isles proved it: Sheogorath's
+greeting 00081B68 AddTopics `SE04GreymarchTopic`/`SE04JyggalagTopic`/
+`SE04ObelisksTopic`, but Haskill speaks them too, gated only by
+`GetIsID(SEHaskill)` under the start-game-enabled SE04Shell, so the ungated
+topics showed on Haskill from game start. Keeping the gate took Oblivion.esm
+from 473 to 537 gated topics, with every existing global name unchanged.
+Confirmed in-game.
+
+A mention reveal unlocks EVERY gated topic sharing the mentioned FULL name. SI
+has one "Greymarch" DIAL per main quest (SE03, SE04, SE06-SE10); the name map
+used to keep one global per name, so a mention opened only whichever topic was
+written last.
+
+### <a id="never-added-topics"></a>A topic nothing adds never lists
+
+**Code:** `tes5_import/dialogue/unlocks.py:_unreachable_topics`,
+`groups.py:_branch_is_linked`
+
+Oblivion lists a regular (Type-0) topic only after something adds it: an Add-Topics
+list, an `AddTopic` in any script, a choice link, or a spoken line naming it. A
+topic with none of those never reaches the menu. Nehrim authors its scripted
+shouts this way (`SayTo Player NQ00Soldat01`, `SoldatenStehenBleiben`,
+`FuerDieFreiheit`), and some topics nothing uses at all (`FuerTaranor`). Skyrim has
+no "not yet added" state, so they all sat in every NPC's menu. They now get a
+Normal branch; `Say` still reaches them. The name match is by word sequence,
+punctuation ignored, so an ambiguous name errs toward listing.
+
+Only this plugin's own topics are judged (raw index byte `>= num_tes4_masters`): a
+dependent plugin's overrides were added by its master, whose scripts are not in
+this export. Counts: Nehrim.esm 622 topics, Oblivion.esm 39 topics / 146 lines
+(Martin's and Mankar's speeches, SE09Ceremony, `GlenmorilWitches`,
+`TGDirectGiveCoin`), Translation.esp 0. Confirmed in-game.
+
+**The same fix's second half:** `_quest_npc_sets` credited every line to its
+topic's `Quest[0]`. GREETING serves dozens of quests, so a quest whose NPCs are
+named only in its greeting lines got no NPCs, and a condition-free reply behind
+that greeting's choice (Nehrim `NQHeleneWorumGehts`, the bottles line) had no
+speaker fallback: Sentry Morten offered it. Each line now counts toward its own
+`QSTI.Quest`. On Oblivion.esm this widens the fallback on 3 topics / 4 lines
+(`Dark08Choice2A`/`3A` 5 -> 13 NPCs, `MS45Mother` 9 -> 11) and opens none.
+
 ## <a id="info-fragment-emission"></a>INFO fragment emission: one decision function
 
 **Code:** `tes5_import/dialogue/converter.py:_info_vmad`
@@ -1540,6 +1829,40 @@ dialogue path itself.
 the "reveals unlock globals?" and "opens a service menu?" questions that
 `info_needs_fragment` otherwise looks up in its maps, so they are handed over as
 single-entry maps rather than recomputed.
+
+## <a id="barter-training-services"></a>Barter and training services
+
+**Code:** `tes5_import/record_types/actor_common.py` (`create_trainer_records`,
+`create_vendor_factions`), `tes5_import/record_types/common.py` (`VENDOR_KYWD`),
+`script_convert/static_scripts/TES4_Show*Menu.psc`
+
+Engine contracts, decoded from Skyrim.esm:
+
+- There is NO Barter DIAL subtype, and vanilla never uses the Training subtype
+  (zero TRAI SNAMs). Both menus open from Papyrus fragments:
+  `akSpeaker.ShowBarterMenu()` and `Game.ShowTrainingMenu(trainer)`.
+- The training menu reads skill and cap from the trainer's **CLAS** (`DATA`
+  Teaches/MaxTrainingLevel). Oblivion keeps them per NPC in **AIDT** (Teaches at
+  byte 8, MaxTraining at 9) and 92 of 114 vanilla trainers disagree with their
+  class (classes are mostly 0/0). Trainers therefore get a per-NPC CLAS clone
+  (`create_trainer_records`) plus `TES4JobTrainerFaction` membership.
+- Barter filters through the vendor faction's `VEND` keyword FLST. Skyrim vendors
+  trade only items whose keywords appear in that list, so every sellable item
+  converter emits `KSIZ/KWDA` from `VENDOR_KYWD`; the service-bit to FLST table
+  must stay in sync with what items emit, or a vendor loses nearly its whole
+  inventory.
+- There is no TES5 `ACBS.BarterGold`: chest-less vendors trade from inventory, so
+  barter gold becomes carried `Gold001`, kept out of the DOFT outfit.
+
+Oblivion's Service-type (5) topics `Barter`/`Training` hold the voiced
+menu-opening lines. They convert to Custom player topics with synthesized prompts,
+`GetInFaction` gates, shared static fragment scripts and a synthetic catch-all
+INFO; fence lines with result scripts get the menu call appended to their
+`TES4_TIF__` fragment instead. The Barter topic is owned by `TES4DialogueGeneric`,
+so the engine looks up `tes4dialog_barter_<fid>_N` voice files: whenever dialogue
+quest OWNERSHIP changes, the voice organization step must be re-run.
+`papyrus.exe` has a compile cache that skips `.pex` generation silently (exit 0,
+no output file); pass `-nocache` when compiling single files.
 
 ## <a id="info-enam-reset-timer"></a>INFO ENAM: the re-play lockout timer
 
@@ -1566,6 +1889,14 @@ HELO lines = 53%), 2730=1h, 10922=4h, 32767=12h, 65535=24h.
 SAY-ONCE lines (flag 0x04) are already permanently locked after one play, so a
 reset would only weaken them; they keep 0.
 
+A line that writes choices (TCLT) keeps 0 too. Vanilla Skyrim.esm has 6 Hello or
+Greeting INFOs with choices, and all 6 have reset 0; the 0.5 h value is only on
+lines without choices (2,809 of 5,281). Oblivion re-offers a greeting's choices
+every time the player talks. With a reset, a quest greeting spoken once was
+skipped for half an hour, and its choices with it. Jauffre's "They've taken it!"
+(stage 27, choice "I found Martin. He is safe.", MQ04) was replaced by a hello
+with no choices, and the quest could not go on until the timer ran out (run 39e).
+
 ## <a id="info-tclt-choice-filter"></a>INFO TCLT: which choice links survive
 
 **Code:** `tes5_import/dialogue/converter.py:_info_tclt`
@@ -1582,3 +1913,105 @@ player cannot answer).
 
 Choices into a zero-INFO topic are dropped as well. Those topics are never
 emitted (`EMPTY_DIAL_FIDS`) and Oblivion never showed them either.
+
+**A bark keeps a choice only into a topic with no top-level branch**
+(`_menu_topic_fids` in `groups.py`). A Skyrim TCLT *replaces* the topic list:
+after a line that has one, MenuTopicManager (1.6.1170 0x5e1830, id 35287) shows
+only that line's choices. An Oblivion greeting's Choice only *adds* to the list.
+Oblivion ships the Shivering Isles generic greetings ("What?", "Hi.", "Yes?")
+with `Choice=INFOGENERAL`. Converted as TCLTs, 10 of Carahil's 13 passing
+greetings did it, so whenever the engine picked one of them at random she
+offered "Rumors" and nothing else. A target that already has a top-level branch
+(Rumors, or a greeting-reached response promoted with its inherited timing gate)
+is in the menu anyway, so the TCLT did nothing but hide the other topics. A
+target whose branch is Normal keeps the TCLT, because that is its only way in.
+
+## <a id="bark-pass"></a>The bark pass: one topic per quest and subtype
+
+**Code:** `tes5_import/dialogue/groups.py:_build_bark_pass`
+
+### <a id="bark-topic-ids"></a>Which group keeps the source DIAL's FormID
+
+Each group tries to reuse the original FormID of its donor source DIAL, but a
+DIAL FormID can be claimed by only one group -- and only when this plugin OWNS
+the donor. A dependent plugin's bark INFOs point at its MASTER's shared
+GREETING/HELLO record; reusing that fid emits an OVERRIDE of the master's topic,
+re-keyed to this plugin's quest. Morrowind_ob shipped Oblivion's
+GREETING_0102466E re-keyed to its own chargen quest (twice), which clobbered the
+CharacterGen Emperor's greeting topic -- his choices vanished and only 'Rumors'
+survived whenever Morrowind_ob was loaded.
+
+A quest's GREETING topic is remembered so a ForceGreet package can open it, and
+every (owner quest, subtype) -> output DIAL is recorded so the NPC-conversation
+driver can Say a bark-grouped hop (a chain's GOODBYE line lives in its quest's
+GBYE group, not at the source GOODBYE DIAL's FormID).
+
+### <a id="bark-group-context"></a>Per-group INFO context
+
+Voice types are pooled from THIS group's INFOs (a generic bark line inherits its
+siblings' voices). The voice-file prefix MUST use the EditorID actually written
+into the DIAL record (the split-suffixed one) -- the engine builds the voice path
+from the record's own EditorID, so a voicemap keyed on the pre-split name would
+name every file something the game never looks for (= silent lines).
+
+Barks carry no identity/unlock/service gates. Ownership is the group's quest, so
+quest gates never fire (owner == info's own quest). There is no fallback quest
+for quest-less INFOs: their owner IS the synthetic generic quest already, so no
+quest gate is injected.
+
+Conditionless lines inherit the audience the group's CONDITIONED siblings
+target -- but only when the owning quest's own CTDAs do not already scope the
+audience (NQDBeggars does: GetInFaction(Beggars), so its conditionless beggar
+lines must stay quest-scoped, NOT be narrowed to whichever NPCs a sibling
+happens to name).
+
+### <a id="bark-pnam-stays-default"></a>PNAM stays at the vanilla 50.0
+
+Quest arbitration rides on QUST.DNAM.Priority (see `compute_quest_priorities`),
+never on the topic. Skyrim.esm leaves PNAM at 50.0 on 659 of 664 Misc/greeting
+topics and 5375 of 6535 player topics; greetings are NEVER ranked above the
+topic list. Writing the quest priority here instead put FGC01Rats' GREETING at
+PNAM 161 against its player topics' 50.0, and Pinarus lost every topic he owned
+(mountain-lion AND training) -- two unrelated topics on one NPC, which no
+per-topic condition bug could explain.
+
+### <a id="arrest-force-greet"></a>The arrest force-greet (PFGT)
+
+**Code:** `tes5_import/dialogue/arrest.py`
+
+A quest's guard-only GREETING INFOs (an AND-ed `IsGuard == 1`) are also offered
+under a ForceGreet-subtype topic, the channel Skyrim's pursuing guard opens
+(vanilla `DGCrimeForcegreetTopic`, SNAM `PFGT`). Each copy is a shared INFO
+(`DNAM` = the converted greeting): vanilla carries 3,411 DNAM INFOs and none of
+them has TRDT or NAM1. Copies carry no replay lockout.
+
+## <a id="said-once-retires-at-the-chain-end"></a>A say-once line with choices retires at the end of its chain
+
+**Code:** `tes5_import/dialogue/unlocks.py` (`_said_once_reveals`, `_chain_ends`),
+`script_convert/pipeline.py` (`_said_once_lines`), `tes5_import/dialogue/converter.py`
+(`_said_once_gate`).
+
+A TES4 Say Once line that offers choices cannot keep the engine's Say Once: a conversation left
+before the player answers (Tab, a fight nearby, a menu) would spend the line and its choices with
+it. Each such line gets a global `TES4SaidOnce_<info>` and the condition `global < 2` instead of
+the flag; its Begin fragment moves the global 0 -> 1, and the lines that retire it move it 1 -> 2.
+
+Those used to be every line of its FIRST-level answer topics. Kathutet (MQ15, run 58c) shows why
+that is not enough: his greeting 0003C93C (Say Once) offers "I seek Mankar Camoran.", whose answer
+offers "What do you want, then?", whose answer offers battle / service / questions. A cave daedra
+attacked him after the first answer and closed the conversation; the first answer had already
+retired the greeting, so talking to him again gave only his generic greeting and goodbye and the
+quest could not go on (reproduced on demand, temp/run58/kathutet). Now a line retires the global
+only when it ENDS the chain below the greeting: it offers no further kept choices, or it is a
+Goodbye line. A conversation left anywhere earlier offers the greeting and its choices again.
+A chain that only loops never retires its line.
+
+Measured after the change (import 49, temp/run58/kathutet): with the daedra set on Kathutet after the
+first answer, talking to him again gives the greeting and its three choices, and the chain runs on to
+"I choose battle." and MQ15 32.
+
+A line offered again must not run its result script again: in Oblivion it ran once, when the line was
+first spoken, and 9 of these lines in Oblivion.esm give items (keys, SE39LLReward). The Begin fragment
+notes `TES4_firstSay` (the global still 0) before moving the global, and the result (both its Begin
+part and its End part) runs only when it is set (`script_convert/pipeline.py` `_first_say_only`). A
+line that is part of a polled conversation (it has a sequence gate) is left as it was.

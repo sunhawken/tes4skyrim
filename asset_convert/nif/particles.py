@@ -3,9 +3,9 @@
 NiPSysData's binary layout differs between UV2=11 and UV2=83, so a particle
 system is rebuilt rather than copied: the data block is replaced, the modifier
 chain is rewritten into the BS* types vanilla ships, and the shader is built
-from the same authored emissive the FX path reads.  Billboard axis correction
-lives here too, because Oblivion's and Skyrim's billboard modes disagree about
-which local axis faces the camera.
+from the same authored emissive the FX path reads.  Billboards that hold a
+particle system are demoted here too; every other billboard ships as authored,
+because both engines run the same billboard math.
 
 See: docs/commentary/asset_convert_nif.md#nif-particle-system-conversion
 """
@@ -20,8 +20,9 @@ from asset_convert.nif.shaders import (apply_fx_soft_effect,
                                        base_texture_path,
                                        collect_tex_transform_ctrls,
                                        find_flip_controller)
-from asset_convert.nif.tex_paths import (bs_pp_texture_slots,
-                                         rewrite_tex_path)
+from asset_convert.nif.tex_paths import (bs_pp_texture_slots, path_bytes,
+                                         path_text, rewrite_tex_path)
+from asset_convert.nif.uv_transform import apply_static_uv, base_map
 
 
 #: Vanilla modifier `order` bands. See: docs/commentary/asset_convert_nif.md#nif-particle-system-conversion
@@ -327,19 +328,13 @@ def _effective_psys_texture(flip_ctrl, diffuse_path, fix_textures):
     See: docs/commentary/asset_convert_nif.md#psys-shader-values
     """
     if flip_ctrl is not None:
-        for src_tex in flip_ctrl.sources:
-            if src_tex is not None and src_tex.file_name:
-                pth = src_tex.file_name
-                pth = (rewrite_tex_path(pth) if fix_textures
-                       else pth.decode('utf-8', errors='replace'))
-                src_tex.file_name = pth.encode('utf-8')
         srcs = [s for s in flip_ctrl.sources if s is not None and s.file_name]
-        return srcs[0].file_name if srcs else b''
+        diffuse_path = srcs[0].file_name if srcs else b''
     if not diffuse_path:
         return b''
     ep = (rewrite_tex_path(diffuse_path) if fix_textures
-          else diffuse_path.decode('utf-8', errors='replace'))
-    return ep.encode('utf-8')
+          else path_text(diffuse_path))
+    return path_bytes(ep)
 
 
 def _build_psys_shader(effective_path, emissive, alpha, curve_hue):
@@ -350,10 +345,6 @@ def _build_psys_shader(effective_path, emissive, alpha, curve_hue):
     See: docs/commentary/asset_convert_nif.md#psys-shader-values
     """
     shader = NifFormat.BSEffectShaderProperty()
-    shader.uv_offset.u = 0.0
-    shader.uv_offset.v = 0.0
-    shader.uv_scale.u = 1.0
-    shader.uv_scale.v = 1.0
     shader.shader_flags_1.slsf_1_z_buffer_test = 1
     sf2 = shader.shader_flags_2
     sf2.slsf_2_z_buffer_write = 0
@@ -397,6 +388,7 @@ def convert_particle_system(node, fix_textures):
     """
     psys_curve_hue = _color_curve_carries_hue(node)
     tex_transforms = collect_tex_transform_ctrls(node.properties)
+    tex_map = base_map(node.properties)
     (diffuse_path, flip_ctrl, alpha_prop,
      psys_emissive, psys_alpha) = _collect_psys_properties(node)
 
@@ -410,44 +402,25 @@ def convert_particle_system(node, fix_textures):
     shader = _build_psys_shader(
         _effective_psys_texture(flip_ctrl, diffuse_path, fix_textures),
         psys_emissive, psys_alpha, psys_curve_hue)
+    apply_static_uv(shader, tex_map)
     node.bs_properties[0] = shader
-    attach_tex_transform_ctrls(shader, tex_transforms)
+    attach_tex_transform_ctrls(shader, tex_transforms, tex_map)
 
     alpha_prop = _own_alpha_property(alpha_prop)
     node.bs_properties[1] = alpha_prop
     apply_fx_soft_effect(shader, alpha_prop, psys_emissive)
 
 
-#: The −90°-about-X billboard correction. See: docs/commentary/asset_convert_nif.md#billboard-axis-fix
-_BB_AXIS_FIX = ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), (0.0, -1.0, 0.0))
-
-
-def _compose_axis_fix(rot):
-    """rot ← rot · R_fix (PyFFI row-vector convention) in place."""
-    m = [[rot.m_11, rot.m_12, rot.m_13],
-         [rot.m_21, rot.m_22, rot.m_23],
-         [rot.m_31, rot.m_32, rot.m_33]]
-    f = _BB_AXIS_FIX
-    r = [[sum(m[i][k] * f[k][j] for k in range(3)) for j in range(3)]
-         for i in range(3)]
-    rot.m_11, rot.m_12, rot.m_13 = r[0]
-    rot.m_21, rot.m_22, rot.m_23 = r[1]
-    rot.m_31, rot.m_32, rot.m_33 = r[2]
-
-
 def wrap_in_billboard(child, bb_mode):
-    """Wrap a geometry block in a fresh NiBillboardNode so the quad faces camera.
+    """Wrap a geometry block in a fresh identity NiBillboardNode (source mode).
 
     Vanilla's campfire pattern: BSFadeNode -> NiBillboardNode -> NiTriShape.
-    The wrapper carries NO axis correction and is tagged `_axis_fixed` so the
-    later pass leaves it alone.
     See: docs/commentary/asset_convert_nif.md#billboard-axis-fix
     """
     bb = NifFormat.NiBillboardNode()
     bb.name = (child.name or b'') + b'-Billboard'
     bb.flags = NIF_FLAGS
     bb.billboard_mode = bb_mode
-    bb._axis_fixed = True
     bb.num_children = 1
     bb.children.update_size()
     bb.children[0] = child
@@ -471,12 +444,13 @@ def _is_emitter_marker(node):
 def _inherit_billboard_rotation(plain, bb):
     """Carry a demoted billboard's rotation across only if it is live data.
 
-    A NiBillboardNode discards its own rotation at runtime, so the demoted node
-    inherits identity -- EXCEPT on an emitter marker, whose orientation a
-    NiPSysEmitter reads as the emission DIRECTION.
+    Face-camera modes cancel a billboard's own rotation, so the demoted node
+    inherits identity -- EXCEPT in mode 1, where the rotation picks the spin
+    axis, and on an emitter marker, whose orientation a NiPSysEmitter reads as
+    the emission DIRECTION.
     See: docs/commentary/asset_convert_nif.md#billboard-demotion
     """
-    if not _is_emitter_marker(bb):
+    if bb.billboard_mode != 1 and not _is_emitter_marker(bb):
         plain.rotation.set_identity()
         return
     for row in (1, 2, 3):
@@ -537,20 +511,10 @@ def _demote_billboard(bb, bb_mode):
 
 
 def skyrimize_billboard(bb):
-    """Convert a (non-root) Oblivion NiBillboardNode for Skyrim.
+    """Demote a billboard over particles; any other billboard ships as authored.
 
-    A billboard holding a particle system is DEMOTED to a plain NiNode; a pure
-    geometry billboard keeps its type and gains the axis correction. A wrapper
-    this converter built is already in the right frame and is left alone.
-    See: docs/commentary/asset_convert_nif.md#billboard-demotion
+    See: docs/commentary/asset_convert_nif.md#billboard-axis-fix
     """
-    if getattr(bb, '_axis_fixed', False):
+    if not any(isinstance(b, NifFormat.NiParticleSystem) for b in bb.tree()):
         return bb
-    bb_mode = int(getattr(bb, 'billboard_mode', 1)) or 1
-    has_psys = any(isinstance(b, NifFormat.NiParticleSystem)
-                   for b in bb.tree())
-    if not has_psys:
-        _compose_axis_fix(bb.rotation)
-        bb._axis_fixed = True
-        return bb
-    return _demote_billboard(bb, bb_mode)
+    return _demote_billboard(bb, int(getattr(bb, 'billboard_mode', 1)) or 1)

@@ -93,7 +93,15 @@ import pickle
 import struct
 import logging
 
+from core.navmesh_options import edge_pins_only, keep_flood, navmesh_plugin
+from ..base.navmesh_pins import (apply_hand_edits, build_pins, cell_key, digest,
+                                 hand_edits_for)
 from ..base.text_reader import get_int, get_float, get_str, get_formid
+from . import native_loader
+from .lookup_grid import build_navmesh_grid
+from .spawn_nodes import add_spawn_nodes
+from .world import (MAX_PLACEMENT, base_fid, cell_water_z, finite_placement,
+                    open_water_z)
 from ..base.writer import pack_subrecord, pack_string_subrecord
 
 _log = logging.getLogger(__name__)
@@ -109,11 +117,14 @@ PATHING_DOOR_CRC = 0xE48B73F3
 #: NVNM version: 12 for Skyrim SE.
 NVNM_VERSION = 12
 
-# Triangle flags (wbDefinitionsTES5.pas wbNVNM triangle flags).
-_TRI_FLAG_WATER = 0x0200
+#: NVNM triangle flag (xEdit wbNVNM): the triangle lies under water.
+TRI_FLAG_WATER = 0x0200
+#: NVNM triangle flag: the triangle carries a door link.
 _TRI_FLAG_DOOR = 0x0400
-_TRI_FLAG_FOUND = 0x0800     # set on every vanilla generated triangle
-_TRI_EDGE_LINK = (0x0001, 0x0002, 0x0004)  # per-edge "has Edge Link" bits
+#: NVNM triangle flag set on every vanilla generated triangle.
+_TRI_FLAG_FOUND = 0x0800
+#: Per-edge "this edge has an Edge Link" triangle flag bits.
+_TRI_EDGE_LINK = (0x0001, 0x0002, 0x0004)
 
 # NVNM Edge Link types (xEdit wbNavmeshEdgeLinkEnum).  A DROP-DOWN is a pair:
 # Ledge Down on the upper triangle, Ledge Up on the lower.
@@ -131,6 +142,8 @@ GRID_DIVISOR_MAX = 12
 DOOR_LINK_MAX_DIST = 220.0
 #: Weight on the along-facing offset, preferring triangles on the threshold line.
 DOOR_LINK_ALONG_WEIGHT = 2.0
+#: Farthest a load door's point moves toward its landing before its Door Triangle is picked.
+DOOR_LANDING_NUDGE = 32.0
 
 
 _CELL_SIZE = 4096.0
@@ -146,36 +159,27 @@ _INTERCELL_MAX_REACH = 2.0 * _CELL_SIZE
 # Geometry helpers
 # ---------------------------------------------------------------------------
 
-def _collect_intercell(rec, points, origin_x, origin_y):
+def _collect_intercell(rec, index, origin_x, origin_y):
     """Cross-cell pathgrid links from PGRI, as [(local_point, (x, y, z)), ...].
 
-    Each PGRI entry names a LOCAL point in this cell and the world-space EXIT
-    point it connects to in a NEIGHBOURING cell.  Oblivion's PGRI is padded with
-    uninitialised CS memory: entries whose LocalPoint is out of range, or whose
-    exit coordinates are denormalized / absurdly far from this cell, are garbage
-    and dropped (InterCell[1] in AnvilExterior: LocalPoint=17292, X=0,
-    Y~2.5e-41).  Only a plausible exit — finite, non-denormal, and within
-    _INTERCELL_MAX_REACH of the cell origin — survives.
-
-    origin_x/origin_y are this exterior cell's world origin (SW corner).  The
-    resulting edges make the corridor ribbon reach across the seam so the
-    downstream edge-link pass has real border edges to stitch.
+    Each entry names a LOCAL point (a record index, mapped through `index` to
+    its place in the graph) and the world-space EXIT point in a neighbouring
+    cell.  An entry whose point was dropped or is out of range, or whose exit is
+    non-finite, (0,0) padding or beyond _INTERCELL_MAX_REACH of the cell at
+    origin_x/origin_y (its SW corner), is CS garbage and skipped.
+    See: docs/commentary/tes5_import_navmesh.md#wild-pathgrid-points-are-dropped
     """
     count = get_int(rec, 'InterCellCount', 0)
     if count <= 0:
         return []
     out = []
-    n = len(points)
     for i in range(count):
-        lp = rec.get(f'InterCell[{i}].LocalPoint')
-        if lp is None:
-            continue
         try:
-            lp = int(lp)
+            lp = index.get(int(rec.get(f'InterCell[{i}].LocalPoint')))
         except (TypeError, ValueError):
             continue
-        if not (0 <= lp < n):
-            continue                      # LocalPoint out of range -> garbage
+        if lp is None:
+            continue
         x = get_float(rec, f'InterCell[{i}].X')
         y = get_float(rec, f'InterCell[{i}].Y')
         z = get_float(rec, f'InterCell[{i}].Z')
@@ -195,11 +199,6 @@ def _collect_intercell(rec, points, origin_x, origin_y):
         out.append((lp, (x, y, z)))
     return out
 
-def _tri_area_2d(ax, ay, bx, by, cx, cy) -> float:
-    """Signed area of a 2D triangle (positive = CCW)."""
-    return 0.5 * ((bx - ax) * (cy - ay) - (cx - ax) * (by - ay))
-
-
 def compute_adjacency(tris: list) -> list:
     """Per-triangle (e01, e12, e20) adjacent-triangle indices, -1 for boundary."""
     edge_map: dict = {}
@@ -215,21 +214,6 @@ def compute_adjacency(tris: list) -> list:
             adj[ti][si] = tj
             adj[tj][sj] = ti
     return [tuple(a) for a in adj]
-
-
-def build_navmesh_grid(verts, tris, min_x, min_y, max_x, max_y, divisor):
-    """Bucket triangle indices into a divisor×divisor grid by centroid."""
-    g = divisor
-    span_x = max_x - min_x if max_x > min_x else 1.0
-    span_y = max_y - min_y if max_y > min_y else 1.0
-    grid = [[] for _ in range(g * g)]
-    for ti, (v0, v1, v2) in enumerate(tris):
-        cx = (verts[v0][0] + verts[v1][0] + verts[v2][0]) / 3.0
-        cy = (verts[v0][1] + verts[v1][1] + verts[v2][1]) / 3.0
-        gx = min(max(int((cx - min_x) / span_x * g), 0), g - 1)
-        gy = min(max(int((cy - min_y) / span_y * g), 0), g - 1)
-        grid[gy * g + gx].append(ti)
-    return grid
 
 
 # ---------------------------------------------------------------------------
@@ -256,17 +240,6 @@ _DOOR_WIDTH = {}
 _DOOR_PANEL_CTR = {}
 
 
-def door_threshold_axis(model_key):
-    """Unit local-space direction the door's threshold line runs along.
-
-    Returns (x, y) in the door mesh's LOCAL frame; the caller rotates it by the
-    REFR's RotZ.  Defaults to local +Y, which is the more common door layout.
-    """
-    if _DOOR_THRESH_LOCAL_Y.get(model_key, True):
-        return (0.0, 1.0)
-    return (1.0, 0.0)
-
-
 def _apply_door_axis(key, a):
     """Fill the axis/width/center/floor globals from one axis-cache entry.
 
@@ -290,8 +263,9 @@ def _apply_door_axis(key, a):
 def _load_door_axes(apath) -> None:
     """Read door_panel_axis_cache.json into the axis/width/center globals.
 
-    '__schema__' carries the cache version, not a door model.  A centers-cache
-    model absent here keeps its marker via _DOOR_NO_THRESHOLD.
+    '__'-prefixed keys ('__schema__', '__meshes__') describe the cache, not a
+    door model.  A centers-cache model absent here keeps its marker via
+    _DOOR_NO_THRESHOLD.
     See: docs/commentary/tes5_import_navmesh.md#door-base-line-is-local-y
     """
     if not os.path.exists(apath):
@@ -299,7 +273,7 @@ def _load_door_axes(apath) -> None:
     try:
         with open(apath, encoding='utf-8') as fh:
             axes = json.load(fh)
-        axes = {k: v for k, v in axes.items() if k != '__schema__'}
+        axes = {k: v for k, v in axes.items() if not k.startswith('__')}
         for k, a in axes.items():
             _apply_door_axis(k, a)
         for k in _DOOR_CENTROIDS:
@@ -411,10 +385,8 @@ def _door_threshold(refr, model_key):
 
 def _finite_door_point(pt, rot_z):
     """True if a door's threshold point is a usable finite coordinate."""
-    from ..navmesh.world import MAX_PLACEMENT
-    for v in pt:
-        if v is None or not math.isfinite(v) or abs(v) > MAX_PLACEMENT:
-            return False
+    if None in pt or not finite_placement(pt):
+        return False
     return rot_z is None or math.isfinite(rot_z)
 
 
@@ -433,14 +405,8 @@ def collect_doors(refr_recs, door_fids):
     is_map = isinstance(door_fids, dict)
     out = []
     for refr in refr_recs:
-        name = refr.get('NAME', '')
         is_teleport = bool(refr.get('XTEL.Door'))
-        base = None
-        if name:
-            try:
-                base = int(name, 16) & 0xFFFFFF
-            except ValueError:
-                base = None
+        base = base_fid(refr)
         base_is_door = base is not None and base in door_fids
         if not (is_teleport or base_is_door):
             continue
@@ -566,13 +532,10 @@ def build_door_links(verts, tris, doors):
     return links
 
 
-def _compute_water_flags(verts, tris, water_z) -> list:
-    flags = []
-    for tri in tris:
-        v0, v1, v2 = tri
-        cz = (verts[v0][2] + verts[v1][2] + verts[v2][2]) / 3.0
-        flags.append(_TRI_FLAG_WATER if cz < water_z else 0)
-    return flags
+def compute_water_flags(verts, tris, water_z) -> list:
+    """Water for each triangle whose centroid lies under `water_z`."""
+    return [TRI_FLAG_WATER if sum(verts[v][2] for v in tri[:3]) / 3.0 < water_z else 0
+            for tri in tris]
 
 
 # ---------------------------------------------------------------------------
@@ -777,18 +740,22 @@ def pack_navm_record(form_id: int, subrecords: bytes) -> bytes:
 # ---------------------------------------------------------------------------
 
 def geom_hash(tag, points, edges, refr_recs, base_model_by_fid, doors,
-              land_rec, origin_x, origin_y):
+              land_rec, origin_x, origin_y, pin_digest='', water_z=None, flood=()):
     """Hash of everything the geometry build consumes.
 
     The `geom-vN` literal is bumped when the CACHED PAYLOAD's shape changes,
     not only when its inputs do, so an older entry cannot silently restore
     geometry the current build would not produce.
+
+    An UNPINNED cell contributes no `pin_digest`, so its hash is byte-identical
+    to what it was before pins existed and its cached entry stays valid.
     See: docs/commentary/tes5_import_navmesh.md#geom-payload-version
+    See: docs/commentary/tes5_import_navmesh.md#pinned-navmesh-floor
     """
     from asset_convert.collision.collision_extract import collision_digest
     h = hashlib.sha1()
     h.update(b'geom-v4-permesh-collision')
-    h.update(repr((tag, origin_x, origin_y)).encode())
+    h.update(repr((tag, origin_x, origin_y, water_z) + (('flood-gaps', flood[0]) if flood else ())).encode())
     h.update(repr(points).encode())
     h.update(repr(edges).encode())
     base_model_by_fid = base_model_by_fid or {}
@@ -798,7 +765,7 @@ def geom_hash(tag, points, edges, refr_recs, base_model_by_fid, doors,
     for refr in refr_recs or ():
         name = refr.get('NAME', '')
         try:
-            key = base_model_by_fid.get(int(name, 16) & 0xFFFFFF, '')
+            key = base_model_by_fid.get(base_fid(refr), '')
         except ValueError:
             key = ''
         if key and key not in seen_models:
@@ -817,20 +784,31 @@ def geom_hash(tag, points, edges, refr_recs, base_model_by_fid, doors,
         h.update(repr((x, y, z, r, tp, w)).encode())
     if land_rec is not None:
         h.update((get_str(land_rec, 'VHGT') or '').encode())
+    if pin_digest:
+        h.update(('PIN|%s' % pin_digest).encode())
     return h.hexdigest()
 
 
-def _geom_cache_load(path, want_hash):
-    """(verts, tris) from a cache file, or None on any mismatch/problem."""
+#: Most builds one cell's cache file keeps (its newest at the top level, the rest under 'more').
+GEOM_CACHE_BUILDS = 24
+
+
+def _entry_geometry(entry):
+    """(verts, tris, ledges) lists from one stored build."""
+    return ([tuple(v) for v in entry['verts'].tolist()], [tuple(t) for t in entry['tris'].tolist()],
+            [tuple(l) for l in entry.get('ledges', ())])
+
+
+def geom_cache_load(path, want_hash):
+    """(verts, tris, ledges, open lattice or None) of the file's build stored under `want_hash`, or None
+    on any miss/problem.
+    See: docs/commentary/tes5_import_navmesh.md#one-file-every-build
+    """
     try:
         with open(path, 'rb') as fh:
             stored = pickle.load(fh)
-        if stored.get('hash') != want_hash:
-            return None
-        verts = [tuple(v) for v in stored['verts'].tolist()]
-        tris = [tuple(t) for t in stored['tris'].tolist()]
-        ledges = [tuple(l) for l in stored.get('ledges', ())]
-        return verts, tris, ledges
+        entry = stored if stored.get('hash') == want_hash else stored.get('more', {}).get(want_hash)
+        return None if entry is None else (*_entry_geometry(entry), entry.get('open'))
     except Exception:
         return None
 
@@ -860,22 +838,26 @@ def geom_equal(a, b):
 
 
 def _pathgrid_nodes(rec):
-    """(points, degrees) for a PGRD, or (None, None) when it has no usable graph."""
-    point_count = get_int(rec, 'DATA.PointCount', 0)
-    intercell = get_int(rec, 'InterCellCount', 0)
-    if point_count < 1 or (point_count < 2 and intercell <= 0):
-        return None, None
+    """(points, degrees, keep) for a PGRD, or (None, None, None) when it has no usable graph.
+
+    `keep` lists the record indices of the points within MAX_PLACEMENT; the rest are dropped.
+    See: docs/commentary/tes5_import_navmesh.md#wild-pathgrid-points-are-dropped
+    """
     points, degrees = [], []
-    for i in range(point_count):
+    for i in range(get_int(rec, 'DATA.PointCount', 0)):
         if rec.get('Point[%d].X' % i) is None:
             break
         points.append((get_float(rec, 'Point[%d].X' % i),
                        get_float(rec, 'Point[%d].Y' % i),
                        get_float(rec, 'Point[%d].Z' % i)))
         degrees.append(get_int(rec, 'Point[%d].Connections' % i, 0))
-    if not points or (len(points) < 2 and intercell <= 0):
-        return None, None
-    return points, degrees
+    keep = [i for i, p in enumerate(points) if finite_placement(p)]
+    if len(keep) < len(points):
+        _log.warning('PGRD %s: dropped %d of %d pathgrid points placed beyond %g units',
+                     rec.get('FormID'), len(points) - len(keep), len(points), MAX_PLACEMENT)
+    if not keep or (len(keep) < 2 and get_int(rec, 'InterCellCount', 0) <= 0):
+        return None, None, None
+    return points, degrees, keep
 
 
 def _explicit_edges(rec, n, degrees, edges, seen):
@@ -896,14 +878,14 @@ def _explicit_edges(rec, n, degrees, edges, seen):
                     edges.append(key)
 
 
-def _nearest_edges(points, n, degrees, edges, seen):
-    """Fallback topology: join each node to its `Connections` nearest others."""
-    for i in range(n):
+def _nearest_edges(points, keep, degrees, edges, seen):
+    """Fallback topology: join each kept node to its `Connections` nearest kept others."""
+    for i in keep:
         if degrees[i] == 0:
             continue
         others = sorted(((points[i][0] - points[j][0]) ** 2 +
                          (points[i][1] - points[j][1]) ** 2, j)
-                        for j in range(n) if j != i)
+                        for j in keep if j != i)
         for _d, j in others[:degrees[i]]:
             key = (min(i, j), max(i, j))
             if key not in seen:
@@ -911,30 +893,51 @@ def _nearest_edges(points, n, degrees, edges, seen):
                 edges.append(key)
 
 
-def _cell_graph(rec, cell_rec):
+def _indexed_graph(rec):
+    """(points, edges, index) the PGRD record stores, `index` mapping a record point index to its place
+    in `points`; (None, None, None) when it has no usable graph.  Dropped points lose their edges.
+    """
+    points, degrees, keep = _pathgrid_nodes(rec)
+    if points is None:
+        return None, None, None
+    edges, seen = [], set()
+    if rec.get('Point[0].Edge[0]') is not None:
+        _explicit_edges(rec, len(points), degrees, edges, seen)
+    else:
+        _nearest_edges(points, keep, degrees, edges, seen)
+    index = {old: new for new, old in enumerate(keep)}
+    edges = [(index[a], index[b]) for a, b in edges if a in index and b in index]
+    return [points[i] for i in keep], edges, index
+
+
+def record_graph(rec):
+    """(points, edges) of the PGRD, or (None, None) when it has no usable graph."""
+    return _indexed_graph(rec)[:2]
+
+
+def cell_graph(rec, cell_rec, graph=None):
     """(points, edges, origin_x, origin_y, is_exterior) for one PGRD.
 
     The pathgrid graph exactly as convert_PGRD derives it, including the
-    synthetic PGRI exit nodes.  Both callers MUST share this: the value feeds
-    the cache hash, so any divergence silently invalidates every entry.
+    synthetic PGRI exit nodes; `graph` is a seeded cell's flooded (points,
+    edges), in place of the record's own.  Both callers MUST share this: the
+    value feeds the cache hash, so any divergence silently invalidates every entry.
     """
-    points, degrees = _pathgrid_nodes(rec)
+    if graph:
+        points, edges = list(graph[0]), list(graph[1])
+        index = {i: i for i in range(len(points))}
+    else:
+        points, edges, index = _indexed_graph(rec)
     if points is None:
         return None, None, 0.0, 0.0, False
-    n = len(points)
-    edges, seen = [], set()
-    if rec.get('Point[0].Edge[0]') is not None:
-        _explicit_edges(rec, n, degrees, edges, seen)
-    else:
-        _nearest_edges(points, n, degrees, edges, seen)
-
+    seen = set(edges)
     is_exterior = get_formid(rec, 'ParentWRLD') != 0
     origin_x = origin_y = 0.0
     if is_exterior:
         gx = get_int(cell_rec, 'XCLC.X', 0) if cell_rec is not None else 0
         gy = get_int(cell_rec, 'XCLC.Y', 0) if cell_rec is not None else 0
         origin_x, origin_y = gx * _CELL_SIZE, gy * _CELL_SIZE
-        for (lp, exit_xy) in _collect_intercell(rec, points, origin_x, origin_y):
+        for (lp, exit_xy) in _collect_intercell(rec, index, origin_x, origin_y):
             new_idx = len(points)
             points.append(exit_xy)
             key = (min(lp, new_idx), max(lp, new_idx))
@@ -944,8 +947,35 @@ def _cell_graph(rec, cell_rec):
     return points, edges, origin_x, origin_y, is_exterior
 
 
+def cell_pins(rec, cell_rec):
+    """(hand edits by section, digest) a human recorded for this cell.
+
+    Both the hash and the build read pins through here, so the value that
+    invalidates a cached cell is exactly the value the build then honors.
+    Every build applies them, cached or not.
+
+    See: docs/commentary/tes5_import_navmesh.md#pinned-navmesh-floor
+    """
+    plugin = navmesh_plugin()
+    if not plugin:
+        return {}, ''
+    grid = None
+    wrld_fid = get_formid(rec, 'ParentWRLD')
+    if wrld_fid and cell_rec is not None:
+        grid = (get_int(cell_rec, 'XCLC.X', 0), get_int(cell_rec, 'XCLC.Y', 0))
+    key = cell_key(cell_rec, wrld_fid, grid)
+    if not key:
+        return {}, ''
+    edits = hand_edits_for(plugin, key)
+    if edge_pins_only():
+        edits = build_pins(edits, grid)
+        if not edits:
+            return {}, ''
+    return edits, digest(plugin, key)
+
+
 def cell_geom_key(rec, land_rec, cell_rec, refr_recs, base_model_by_fid,
-                  door_fids, geom_cache, extra_door_refrs=None):
+                  door_fids, geom_cache, extra_door_refrs=None, spawns=None):
     """This cell's cache hash, derived from its INPUTS with no geometry build.
 
     convert_PGRD computes the same value before deciding whether to build, so
@@ -959,9 +989,10 @@ def cell_geom_key(rec, land_rec, cell_rec, refr_recs, base_model_by_fid,
     """
     if geom_cache is None:
         return None
-    points, edges, origin_x, origin_y, is_exterior = _cell_graph(rec, cell_rec)
+    points, edges, origin_x, origin_y, is_exterior = cell_graph(rec, cell_rec)
     if points is None:
         return None
+    add_spawn_nodes(points, edges, spawns)
     doors = []
     if refr_recs:
         doors = collect_doors(refr_recs, door_fids)
@@ -969,7 +1000,14 @@ def cell_geom_key(rec, land_rec, cell_rec, refr_recs, base_model_by_fid,
         doors += collect_doors(extra_door_refrs, door_fids)
     return geom_hash(geom_cache[1], points, edges, refr_recs,
                      base_model_by_fid, doors,
-                     land_rec if is_exterior else None, origin_x, origin_y)
+                     land_rec if is_exterior else None, origin_x, origin_y,
+                     pin_digest=cell_pins(rec, cell_rec)[1],
+                     water_z=open_water_z(cell_rec, is_exterior), flood=((),) if is_exterior else ())
+
+
+def geom_cache_path(geom_cache, cell_fid, pgrd_fid):
+    """Path of one cell's entry in the navmesh geometry cache."""
+    return os.path.join(geom_cache[0], '%08X_%08X.pkl' % (cell_fid, pgrd_fid))
 
 
 def cached_geometry(geom_cache, cell_fid, pgrd_fid):
@@ -980,28 +1018,48 @@ def cached_geometry(geom_cache, cell_fid, pgrd_fid):
     """
     if not geom_cache:
         return None
-    path = os.path.join(geom_cache[0], '%08X_%08X.pkl' % (cell_fid, pgrd_fid))
     try:
-        with open(path, 'rb') as fh:
-            stored = pickle.load(fh)
-        return ([tuple(v) for v in stored['verts'].tolist()],
-                [tuple(t) for t in stored['tris'].tolist()],
-                [tuple(l) for l in stored.get('ledges', ())])
+        with open(geom_cache_path(geom_cache, cell_fid, pgrd_fid), 'rb') as fh:
+            return _entry_geometry(pickle.load(fh))
     except Exception:
         return None
 
 
-def _geom_cache_store(path, geom_key, verts, tris, ledges=()):
-    """Write one cell's geometry to the cache, keyed by its hash."""
+def _older_builds(path, geom_key, tag) -> dict:
+    """{hash: build} the file at `path` already holds besides `geom_key` under cache tag `tag`, newest
+    last, capped; none when it was written under another tag."""
+    try:
+        with open(path, 'rb') as fh:
+            stored = pickle.load(fh)
+    except Exception:
+        return {}
+    if stored.get('tag') != tag:
+        return {}
+    more = dict(stored.get('more') or {})
+    top = stored.get('hash')
+    if top:
+        more.pop(top, None)
+        more[top] = {k: stored[k] for k in ('verts', 'tris', 'ledges', 'open') if k in stored}
+    more.pop(geom_key, None)
+    return dict(list(more.items())[-(GEOM_CACHE_BUILDS - 1):])
+
+
+def geom_cache_store(path, geom_key, verts, tris, ledges=(), tag='', opened=None):
+    """Write one build of a cell (and its open lattice, `opened`) to its cache file under its hash,
+    keeping the cell's other builds made under the same cache `tag`.
+    See: docs/commentary/tes5_import_navmesh.md#one-file-every-build
+    """
     import numpy as np
     try:
+        blob = {'hash': geom_key, 'tag': tag, 'verts': np.asarray(verts, dtype=np.float32),
+                'tris': np.asarray(tris, dtype=np.int32), 'ledges': [tuple(l) for l in (ledges or ())],
+                'open': opened}
+        more = _older_builds(path, geom_key, tag)
+        if more:
+            blob['more'] = more
         tmp = path + '.tmp%d' % os.getpid()
         with open(tmp, 'wb') as fh:
-            pickle.dump({'hash': geom_key,
-                         'verts': np.asarray(verts, dtype=np.float32),
-                         'tris': np.asarray(tris, dtype=np.int32),
-                         'ledges': [tuple(l) for l in (ledges or ())]},
-                        fh, pickle.HIGHEST_PROTOCOL)
+            pickle.dump(blob, fh, pickle.HIGHEST_PROTOCOL)
         os.replace(tmp, path)
     except Exception:
         pass                      # a failed cache write must never fail the cell
@@ -1010,10 +1068,8 @@ def _geom_cache_store(path, geom_key, verts, tris, ledges=()):
 def _cell_frame(rec, cell_rec):
     """(cell_fid, wrld_fid, grid_x, grid_y, water_z) for one PGRD's cell.
 
-    grid_x/grid_y are 0 for an interior.  water_z is the cell's water height
-    only when the HasWater flag (DATA.Flags 0x02) is set and XCLW parses as a
-    float, else None -- an unflagged or malformed height must not stamp water
-    triangle flags.
+    grid_x/grid_y are 0 for an interior.  water_z is `cell_water_z`: an
+    unflagged or malformed height must not stamp water triangle flags.
     """
     cell_fid = get_formid(rec, 'ParentCELL')
     wrld_fid = get_formid(rec, 'ParentWRLD')
@@ -1021,64 +1077,69 @@ def _cell_frame(rec, cell_rec):
     if wrld_fid != 0 and cell_rec is not None:
         grid_x = get_int(cell_rec, 'XCLC.X', 0)
         grid_y = get_int(cell_rec, 'XCLC.Y', 0)
-
-    water_z = None
-    if cell_rec is not None and get_int(cell_rec, 'DATA.Flags', 0) & 0x02:
-        wz = cell_rec.get('XCLW.WaterHeight')
-        if wz is not None:
-            try:
-                water_z = float(wz)
-            except ValueError:
-                water_z = None
-    return cell_fid, wrld_fid, grid_x, grid_y, water_z
+    return cell_fid, wrld_fid, grid_x, grid_y, cell_water_z(cell_rec)
 
 
 def _cell_geometry(rec, cell_fid, points, edges, origin_x, origin_y,
                    is_exterior, land_rec, refr_recs, base_model_by_fid,
-                   door_fids, doors, geom_cache):
+                   door_fids, doors, geom_cache, cell_rec=None, lone=(), obstacles=(), flood=(), pins=True,
+                   flood_out=None, opens=None):
     """(verts, tris, ledges, geom_cached, geom_key) from real Havok collision.
 
-    Serves a cache hit matching this cell's input hash, else builds the corridor
-    mesh and stores it.  `geom_key` is the hash VALUE; `geom_hash` is the module
-    FUNCTION -- never name a local after it.
+    A cache hit for this cell's input hash, else the pathgrid bridged across `obstacles`,
+    built and stored.  `lone`: spawn nodes; `flood`: () or (neighbour points,); `pins`
+    false: none; `flood_out` (no cache): the flood's graph; `opens`: (known, out) {first-mesh
+    key: (open lattice, flood ran)} (#regrow-reuse).  `geom_key`: the hash.
 
     See: docs/commentary/tes5_import_navmesh.md#collision-geometry-and-the-cache-hit
+    See: docs/commentary/tes5_import_navmesh.md#a-removed-obstacle-is-bridged
     """
     geom_key = cache_path = None
     verts3d = tris = None
     ledges = []
-    if geom_cache is not None:
-        cache_dir, tag = geom_cache
-        geom_key = geom_hash(tag, points, edges, refr_recs,
+    edits, pin_digest = cell_pins(rec, cell_rec) if pins else ({}, '')
+    water_z = open_water_z(cell_rec, is_exterior)
+    first = hashlib.sha1(repr((points, edges)).encode()).hexdigest() if opens is not None else None
+    if geom_cache is not None and flood_out is None:
+        geom_key = geom_hash(geom_cache[1], points, edges, refr_recs,
                              base_model_by_fid, doors,
                              land_rec if is_exterior else None,
-                             origin_x, origin_y)
-        cache_path = os.path.join(
-            cache_dir, '%08X_%08X.pkl' % (cell_fid, get_formid(rec, 'FormID')))
-        cached = _geom_cache_load(cache_path, geom_key)
+                             origin_x, origin_y, pin_digest=pin_digest, water_z=water_z, flood=flood)
+        cache_path = geom_cache_path(geom_cache, cell_fid,
+                                     get_formid(rec, 'FormID'))
+        cached = geom_cache_load(cache_path, geom_key)
         if cached is not None:
-            verts3d, tris, ledges = cached
+            verts3d, tris, ledges, opened = cached
+            if opens is not None:
+                opens[1][first] = opened
             return verts3d, tris, ledges, True, geom_key
 
     from ..navmesh import build as navmesh_build
     from asset_convert.collision.collision_extract import get_collision
     import numpy as np
 
+    land = land_rec if is_exterior else None
+    door_bases = set(door_fids.keys()) if isinstance(door_fids, dict) else set(door_fids or ())
+    opened, known = [], (opens[0].get(first) if opens is not None else None)
     verts3d, tris = navmesh_build.build_navmesh(
         refr_recs or [], base_model_by_fid or {}, get_collision,
         points, edges,
-        land_rec=land_rec if is_exterior else None,
+        land_rec=land,
         origin_x=origin_x, origin_y=origin_y,
         doors=[(x, y, z, r, tp, w) for (x, y, z, r, _f, tp, w) in doors],
         ledges_out=ledges,
-        door_bases=(set(door_fids.keys())
-                    if isinstance(door_fids, dict)
-                    else set(door_fids or ())))
+        door_bases=door_bases,
+        lone=lone, water_z=water_z, obstacles=obstacles, flood=flood, flood_out=flood_out, opens_out=opened,
+        known_open=known[0] if known and known[1] else None)
+    opened = opened[0] if opened else None
+    if opens is not None:
+        opens[1][first] = opened
     if verts3d:
         verts3d = [tuple(v) for v in
                    np.asarray(verts3d, dtype=np.float32).tolist()]
+        verts3d, tris, ledges = apply_hand_edits(verts3d, tris, ledges, edits)
     if cache_path is not None:
-        _geom_cache_store(cache_path, geom_key, verts3d, tris, ledges)
+        geom_cache_store(cache_path, geom_key, verts3d, tris, ledges, geom_cache[1], opened)
     return verts3d, tris, ledges, False, geom_key
 
 
@@ -1094,11 +1155,21 @@ def convert_PGRD(rec: dict, writer=None,
                  door_fids: set = None,
                  navm_fid: int = None,
                  geom_cache: tuple = None,
-                 extra_door_refrs: list = None) -> tuple:
-    """Convert one TES4 PGRD to a TES5 NAVM record.
-
-    Returns (navm_bytes, meta), or (None, None) when the pathgrid is too sparse
-    to form a ribbon or the build yields under 3 verts.
+                 extra_door_refrs: list = None,
+                 spawns: list = None,
+                 obstacles: list = None,
+                 graph: tuple = None,
+                 door_spots: dict = None,
+                 door_landings: dict = None,
+                 seeded: bool = False,
+                 edge_seeds: list = None,
+                 pins: bool = True,
+                 opens: tuple = None) -> tuple:
+    """One TES4 PGRD as a TES5 NAVM: (navm_bytes, meta), or (None, None) when the pathgrid is too
+    sparse or the build has under 3 verts.  `spawns`: points to reach; `obstacles`: pairs to bridge;
+    `graph`: the points and edges to build over; `door_spots` / `door_landings`: door ref -> point;
+    `seeded`: no gap flood; `edge_seeds`: neighbour mesh points; `pins` false: no pins;
+    `opens` as _cell_geometry.
 
     See: docs/commentary/tes5_import_navmesh.md#convert-pgrd-arguments
     See: docs/commentary/tes5_import_navmesh.md#collision-geometry-and-the-cache-hit
@@ -1106,9 +1177,10 @@ def convert_PGRD(rec: dict, writer=None,
     if writer is None and navm_fid is None:
         return None, None
 
-    points, edges, origin_x, origin_y, is_exterior = _cell_graph(rec, cell_rec)
+    points, edges, origin_x, origin_y, is_exterior = cell_graph(rec, cell_rec, graph)
     if points is None:
         return None, None
+    lone = add_spawn_nodes(points, edges, spawns)
 
     cell_fid, wrld_fid, grid_x, grid_y, water_z = _cell_frame(rec, cell_rec)
 
@@ -1120,43 +1192,27 @@ def convert_PGRD(rec: dict, writer=None,
     if extra_door_refrs:
         doors += collect_doors(extra_door_refrs, door_fids)
 
+    flood_graph = [] if keep_flood() else None
+    if seeded and flood_graph is not None:
+        flood_graph.append((list(points), list(edges)))
+    flood_from = list(edge_seeds or ()) + list(cell_pins(rec, cell_rec)[0].get('nodes', ()) if pins else ())
     verts3d, tris, ledges, geom_cached, geom_key = _cell_geometry(
         rec, cell_fid, points, edges, origin_x, origin_y, is_exterior,
-        land_rec, refr_recs, base_model_by_fid, door_fids, doors, geom_cache)
+        land_rec, refr_recs, base_model_by_fid, door_fids, doors, geom_cache,
+        cell_rec=cell_rec, lone=lone, obstacles=obstacles,
+        flood=(tuple(map(tuple, flood_from)),) if is_exterior and not seeded else (), pins=pins,
+        flood_out=None if seeded else flood_graph, opens=opens)
     if verts3d is None or len(verts3d) < 3 or not tris:
         return None, None
 
-    tri_flags = (_compute_water_flags(verts3d, tris, water_z)
-                 if water_z is not None else [0] * len(tris))
-    adj = compute_adjacency(tris)
-
-    door_tris = build_door_links(verts3d, tris, doors)
-
-    # The ledge links name THIS navmesh, so its FormID must exist first.
     if navm_fid is None:
-        # Same key as the bulk pre-pass (_precompute_navmeshes) so the serial
-        # fallback and the parallel path agree on a cell's navmesh id.
         navm_fid = writer.derive_formid(
             'NAVM', (cell_fid, get_formid(rec, 'FormID')))
-
-    nvnm = pack_nvnm(verts3d, tris, adj, tri_flags,
-                      wrld_fid, cell_fid, grid_x, grid_y, is_exterior,
-                      door_tris=door_tris, ledges=ledges, navm_fid=navm_fid)
-    subs = b''
-    edid = get_str(rec, 'EditorID')
-    if edid:
-        subs += pack_string_subrecord('EDID', f'TES4Navm{edid}')
-    subs += pack_subrecord('NVNM', nvnm)
-    if base_objects:
-        onam = b''.join(struct.pack('<I', b) for b in base_objects)
-        subs += pack_subrecord('ONAM', onam)
-
-    navm_bytes = pack_navm_record(navm_fid, subs)
-
-    # Centroid for the NAVI NVMI entry.
-    cx = sum(v[0] for v in verts3d) / len(verts3d)
-    cy = sum(v[1] for v in verts3d) / len(verts3d)
-    cz = sum(v[2] for v in verts3d) / len(verts3d)
+    nvnm, door_tris, (cx, cy, cz) = packed_nvnm(
+        (verts3d, tris, ledges), at_spots(toward_landings(doors, door_landings), door_spots), water_z,
+        (cell_fid, wrld_fid, grid_x, grid_y, is_exterior), navm_fid)
+    navm_bytes = pack_navm_record(navm_fid,
+                                  _navm_subrecords(rec, nvnm, base_objects))
 
     meta = {
         'fid': navm_fid,
@@ -1170,6 +1226,7 @@ def convert_PGRD(rec: dict, writer=None,
         'geom_cached': geom_cached,
         'geometry': (verts3d, tris, ledges),
         'geom_hash': geom_key,
+        'flood': flood_graph[-1] if flood_graph else None,
         # NVMI Door Links mirror the mesh's own door triangles EXACTLY —
         # verified on all 15,462 vanilla NVMI entries (the engine joins the two
         # sides of a load door through the door refs' XTEL pairing, so each
@@ -1183,6 +1240,56 @@ def convert_PGRD(rec: dict, writer=None,
         'door_xndp': {fid: (navm_fid, ti) for (ti, fid) in door_tris},
     }
     return navm_bytes, meta
+
+
+def toward_landings(doors, landings) -> list:
+    """collect_doors rows, each door with a landing in `landings` (ref -> point) moved toward it in plan,
+    half the way and at most DOOR_LANDING_NUDGE: its Door Triangle is then the one a traveller arrives on.
+    See: docs/commentary/tes5_import_navmesh.md#door-triangle-on-the-landing-side
+    """
+    out = []
+    for d in doors:
+        land = (landings or {}).get(d[4])
+        gap = math.dist(land[:2], d[:2]) if land else 0.0
+        if gap < 1.0:
+            out.append(d)
+            continue
+        t = min(DOOR_LANDING_NUDGE, gap / 2.0) / gap
+        out.append((d[0] + (land[0] - d[0]) * t, d[1] + (land[1] - d[1]) * t, *d[2:]))
+    return out
+
+
+def at_spots(doors, spots) -> list:
+    """collect_doors rows, each door in `spots` (ref -> (x, y, z)) moved there."""
+    return [(*spots[d[4]], *d[3:]) if spots and d[4] in spots else d for d in doors]
+
+
+def packed_nvnm(geometry, doors, water_z, frame, navm_fid):
+    """(nvnm, door_tris, center) for a built cell, packed natively.
+
+    geometry is (verts, tris, ledges); doors are collect_doors rows; water_z is
+    cell_water_z or None; frame is (cell_fid, wrld_fid, grid_x, grid_y,
+    is_exterior).  door_tris are (triangle, door ref) pairs, center the vertex mean.
+    See: docs/plans/navmesh_native_rewrite.md#stages
+    """
+    verts, tris, ledges = geometry
+    cell_fid, wrld_fid, grid_x, grid_y, is_exterior = frame
+    return native_loader.native_core().pack_nvnm(
+        verts, tris, ledges, doors, water_z, wrld_fid, cell_fid,
+        grid_x, grid_y, is_exterior, navm_fid)
+
+
+def _navm_subrecords(rec, nvnm: bytes, base_objects: list) -> bytes:
+    """One NAVM's EDID, NVNM and ONAM subrecords, packed."""
+    subs = b''
+    edid = get_str(rec, 'EditorID')
+    if edid:
+        subs += pack_string_subrecord('EDID', f'TES4Navm{edid}')
+    subs += pack_subrecord('NVNM', nvnm)
+    if base_objects:
+        onam = b''.join(struct.pack('<I', b) for b in base_objects)
+        subs += pack_subrecord('ONAM', onam)
+    return subs
 
 
 def _collect_base_objects(refr_recs) -> list:

@@ -15,14 +15,18 @@ See: docs/commentary/tes5_import_quest.md#quest-conversion
 import re
 import struct
 
+from script_convert.constants import STAGE_PACKAGE_ALIAS_SCRIPT
+from script_convert.pipeline import build_vmad_quest_fragments
 from ..base.constants import ENGINE_GLOBAL_FORMIDS
 from ..base.conditions import (CTDA_OR, CTDA_RUN_ON_TARGET,
                                 convert_ctda,
                                 convert_ctda_list_with_strings,
                                 convert_script_var_ctda)
 from .objective_text import short_objective
+from ..packages.hosts import host_record
 from .quest_falloutnv import authored_objectives, has_authored_objectives
 from ..base.text_reader import get_formid_index_offset, remap_formid
+from ..base.vanilla_quests import engine_quest_edid
 from ..record_types.common import (
     get_formid,
     get_int,
@@ -195,19 +199,42 @@ _CTDA_OPS = {
 }
 
 
-def target_live_at_stage(raw_hexes: list, stage_idx: int) -> bool:
-    """Would Oblivion have shown this target's marker at `stage_idx`?
+def _stage_gate_value(raw: bytes, stage_idx: int, quest_fid: 'int | None'):
+    """True/False for a GetStage/GetStageDone on this quest at `stage_idx`, else None.
 
-    A target with no conditions is always live; a condition that
-    cannot be evaluated statically counts as passing.
+    `quest_fid` None treats every GetStage as this quest's.
+    """
+    func, param1, param2 = (struct.unpack_from('<H', raw, 8)[0],
+                            *struct.unpack_from('<II', raw, 12))
+    if func not in (_FUNC_GET_STAGE, _FUNC_GET_STAGE_DONE) or (
+            quest_fid is not None and param1 != quest_fid):
+        return None
+    op = _CTDA_OPS.get(raw[0] & 0xE0)
+    if op is None:
+        return True
+    value = (float(stage_idx) if func == _FUNC_GET_STAGE
+             else float(stage_idx >= param2))
+    return bool(op(value, struct.unpack_from('<f', raw, 4)[0]))
+
+
+def _or_chained(raws: list) -> list:
+    """`raws` as one OR group: OR flag on every entry but the last."""
+    return [(bytes([r[0] | CTDA_OR]) if k < len(raws) - 1
+             else bytes([r[0] & ~CTDA_OR])) + r[1:]
+            for k, r in enumerate(raws)]
+
+
+def target_runtime_conditions(raw_hexes: list, stage_idx: int,
+                              quest_fid: 'int | None' = None) -> 'list | None':
+    """The TES4 conditions this target still needs at runtime, or None if dead here.
+
+    The quest's own stage gates are settled against `stage_idx`: an OR group
+    one of them satisfies disappears, and a group left with nothing to test
+    kills the target. Every other condition survives as raw 24-byte CTDAs.
 
     See: docs/commentary/tes5_import_quest.md#resolving-target-markers-per-stage
     """
-    if not raw_hexes:
-        return True
-
-    groups = []
-    current = []
+    groups, current = [], []
     for raw_hex in raw_hexes:
         try:
             raw = bytes.fromhex(raw_hex)
@@ -215,29 +242,26 @@ def target_live_at_stage(raw_hexes: list, stage_idx: int) -> bool:
             continue
         if len(raw) < 20:
             continue
-        type_byte = raw[0]
-        comp = struct.unpack_from('<f', raw, 4)[0]
-        func = struct.unpack_from('<H', raw, 8)[0]
-
-        if func == _FUNC_GET_STAGE:
-            op = _CTDA_OPS.get(type_byte & 0xE0)
-            value = bool(op(float(stage_idx), comp)) if op else True
-        elif func == _FUNC_GET_STAGE_DONE:
-            target_stage = struct.unpack_from('<I', raw, 16)[0]
-            done = stage_idx >= target_stage
-            op = _CTDA_OPS.get(type_byte & 0xE0)
-            value = bool(op(1.0 if done else 0.0, comp)) if op else True
-        else:
-            value = True
-
-        current.append(value)
-        if not (type_byte & 0x01):
+        current.append((raw, _stage_gate_value(raw, stage_idx, quest_fid)))
+        if not raw[0] & CTDA_OR:
             groups.append(current)
             current = []
     if current:
         groups.append(current)
+    residue = []
+    for group in groups:
+        if any(value for _raw, value in group):
+            continue
+        runtime = [raw for raw, value in group if value is None]
+        if not runtime:
+            return None
+        residue += _or_chained(runtime)
+    return residue
 
-    return all(any(g) for g in groups)
+
+def target_live_at_stage(raw_hexes: list, stage_idx: int) -> bool:
+    """Could Oblivion have shown this target's marker at `stage_idx`?"""
+    return target_runtime_conditions(raw_hexes, stage_idx) is not None
 
 
 _QUEST_STATE_FUNCS = frozenset({56, 58, 59, 99})
@@ -245,6 +269,26 @@ _QUEST_STATE_FUNCS = frozenset({56, 58, 59, 99})
 _PLAYER_PROGRESS_FUNCS = frozenset({71, 73})
 
 _VAR_STATE_FUNCS = frozenset({53, 79})
+
+#: Conditions on WHERE THE SPEAKER IS (GetInCell): a greeting given only there offers its choices only there.
+_SPEAKER_PLACE_FUNCS = frozenset({67})
+
+
+def _inherited(func: int, on_target: bool, place: bool) -> bool:
+    """Whether a revealer's condition on `func` joins the gate its choice inherits."""
+    if func in _QUEST_STATE_FUNCS:
+        return True
+    if on_target:
+        return func in _PLAYER_PROGRESS_FUNCS
+    return place and func in _SPEAKER_PLACE_FUNCS
+
+
+def _timed_only(pairs: list) -> list:
+    """`pairs` with its last OR flag cleared, or [] when no condition is a timing one."""
+    if not any(struct.unpack_from('<H', ctda, 8)[0] not in _SPEAKER_PLACE_FUNCS for ctda, _ in pairs):
+        return []
+    last, cis2 = pairs[-1]
+    return pairs[:-1] + [(bytes([last[0] & ~CTDA_OR]) + last[1:], cis2)]
 
 
 def has_quest_state_condition(rec: dict) -> bool:
@@ -266,10 +310,10 @@ def has_quest_state_condition(rec: dict) -> bool:
             return True
 
 
-def quest_state_ctdas(rec: dict, offset: int, script_vars: dict = None) -> list:
+def quest_state_ctdas(rec: dict, offset: int, script_vars: dict = None, place: bool = False) -> list:
     """Converted [(32-byte CTDA, cis2-or-None)] for just the TIMING
     conditions on `rec` -- the gates a promoted choice target must
-    inherit. [] when the revealer has none.
+    inherit. [] when the revealer has none. `place` adds where the speaker is.
 
     See: docs/commentary/tes5_import_quest.md#timing-ctdas-a-promoted-target-inherits
     """
@@ -294,9 +338,7 @@ def quest_state_ctdas(rec: dict, offset: int, script_vars: dict = None) -> list:
             if pair is not None:
                 out.append(pair)
             continue
-        if func not in _QUEST_STATE_FUNCS and not (
-                func in _PLAYER_PROGRESS_FUNCS
-                and raw[0] & CTDA_RUN_ON_TARGET):
+        if not _inherited(func, bool(raw[0] & CTDA_RUN_ON_TARGET), place):
             continue
         try:
             ctda = convert_ctda(raw, offset)
@@ -304,10 +346,7 @@ def quest_state_ctdas(rec: dict, offset: int, script_vars: dict = None) -> list:
             continue
         if ctda is not None:
             out.append((ctda, None))
-    if out and (out[-1][0][0] & CTDA_OR):
-        out[-1] = (bytes([out[-1][0][0] & ~CTDA_OR]) + out[-1][0][1:],
-                   out[-1][1])
-    return out
+    return _timed_only(out) if out else out
 
 
 def _pack_gate_pair(pair) -> bytes:
@@ -662,7 +701,7 @@ def _quest_stages(rec: dict, stage_count: int,
     return subs
 
 
-def _quest_targets(rec: dict) -> tuple:
+def quest_targets(rec: dict) -> tuple:
     """(alias_by_fid, [(alias_id, tes4_flags, [raw ctda hex])]) from QSTA."""
     alias_by_fid, targets, t = {}, [], 0
     while f'Target[{t}].FormID' in rec:
@@ -679,15 +718,51 @@ def _quest_targets(rec: dict) -> tuple:
     return alias_by_fid, targets
 
 
-def _quest_objectives(rec: dict, stage_count: int, targets: list,
-                      script_vars: dict = None) -> bytes:
-    """One QOBJ per journal-bearing stage, carrying only its live targets.
+def _on_player(ctda: bytes) -> bytes:
+    """A subject-run CTDA retargeted onto PlayerRef."""
+    if struct.unpack_from('<I', ctda, 20)[0]:
+        return ctda
+    return ctda[:20] + struct.pack('<II', 2, _PLAYER_FORMID) + ctda[28:]
+
+
+def _target_ctdas(residue: list, script_vars: dict) -> bytes:
+    """CTDA [CIS2] run for one objective target's runtime conditions."""
+    cond = {f'Condition[{k}].Raw': raw.hex() for k, raw in enumerate(residue)}
+    subs = b''
+    for ctda, cis2 in convert_ctda_list_with_strings(cond, script_vars):
+        subs += pack_subrecord('CTDA', _on_player(ctda))
+        if cis2:
+            subs += pack_string_subrecord('CIS2', cis2)
+    return subs
+
+
+def _objective_targets(targets: list, stage_idx: int, quest_fid: int,
+                       script_vars: dict) -> bytes:
+    """QSTA [CTDA...] for every target live at `stage_idx`, once per distinct gate."""
+    subs = b''
+    seen, always = set(), set()
+    for alias_id, tflags, raws in targets:
+        residue = target_runtime_conditions(raws, stage_idx, quest_fid)
+        key = (alias_id, tuple(residue or ()))
+        if residue is None or alias_id in always or key in seen:
+            continue
+        seen.add(key)
+        if not residue:
+            always.add(alias_id)
+        subs += pack_subrecord('QSTA', struct.pack('<iB3x', alias_id, tflags))
+        subs += _target_ctdas(residue, script_vars)
+    return subs
+
+
+def quest_objectives(rec: dict, targets: list, script_vars: dict = None) -> bytes:
+    """One QOBJ per journal-bearing stage, carrying the targets live there.
 
     See: docs/commentary/tes5_import_quest.md#quest-targets-become-per-objective-aliases
     """
     subs = b''
     seen_stages = set()
-    for i in range(stage_count):
+    quest_fid = int(rec.get('FormID') or '0', 16)
+    for i in range(get_int(rec, 'StageCount')):
         stage_idx = get_int(rec, f'Stage[{i}].Index')
         if stage_idx in seen_stages:
             continue
@@ -698,14 +773,8 @@ def _quest_objectives(rec: dict, stage_count: int, targets: list,
         subs += pack_subrecord('QOBJ', struct.pack('<H', stage_idx))
         subs += pack_uint32_subrecord('FNAM', 0)
         subs += pack_string_subrecord('NNAM', short_objective(txt))
-        emitted = set()
-        for alias_id, tflags, raws in targets:
-            if alias_id in emitted or not target_live_at_stage(raws,
-                                                               stage_idx):
-                continue
-            emitted.add(alias_id)
-            subs += pack_subrecord('QSTA', struct.pack('<iB3x',
-                                                       alias_id, tflags))
+        subs += _objective_targets(targets, stage_idx, quest_fid,
+                                   script_vars or {})
     return subs
 
 
@@ -728,7 +797,7 @@ def _quest_alias_packages(pack_plan, qfid: int, alias_by_fid: dict) -> dict:
     return alias_packages
 
 
-def _quest_aliases(alias_by_fid: dict, alias_packages: dict,
+def quest_aliases(alias_by_fid: dict, alias_packages: dict,
                    fid_to_edid: dict) -> bytes:
     """Forced-reference aliases: ALST ALID FNAM ALFR [ALPC...] VTCK ALED.
 
@@ -748,6 +817,20 @@ def _quest_aliases(alias_by_fid: dict, alias_packages: dict,
     return subs
 
 
+def package_host(pack_plan, fid_to_edid: dict) -> bytes:
+    """The QUST hosting every actor's package alias.
+
+    See: docs/commentary/tes5_import_package.md#package-hosts
+    """
+    host_fid = pack_plan.hosts.host
+    alias_by_fid = {}
+    alias_packages = _quest_alias_packages(pack_plan, host_fid, alias_by_fid)
+    sources = {alias_id: sorted({pack_plan.source_quest[p] for p in pkgs if p in pack_plan.source_quest})
+               for alias_id, pkgs in alias_packages.items()}
+    return host_record(host_fid, sources, len(alias_by_fid),
+                       quest_aliases(alias_by_fid, alias_packages, fid_to_edid))
+
+
 def convert_QUST(rec: dict, fid_to_edid: dict = None,
                  well_known_props: dict = None,
                  unlock_plan: dict = None,
@@ -759,47 +842,54 @@ def convert_QUST(rec: dict, fid_to_edid: dict = None,
     Order: EDID [VMAD] FULL DNAM NEXT [stages] [objectives] ANAM [aliases].
     unlock_plan/unlock_globals bind the AddTopic unlock GLOB properties for
     stage result scripts that reveal topics; script_vars names the quest
-    variables authored objective targets are gated on.
+    variables authored objective targets are gated on. Objectives convert
+    first, so authored targets take their alias ids before packages do.
 
     See: docs/commentary/tes5_import_quest.md#quest-conversion
     """
-    subs = b''
     edid = get_str(rec, 'EditorID')
-    if edid:
-        subs += pack_string_subrecord('EDID', edid)
+    qfid = get_formid(rec, 'FormID')
+    alias_by_fid, targets = quest_targets(rec)
+    objectives = (authored_objectives(rec, alias_by_fid, script_vars or {},
+                                      get_formid_index_offset())
+                  if has_authored_objectives(rec)
+                  else quest_objectives(rec, targets, script_vars))
+    alias_packages = _quest_alias_packages(pack_plan, qfid, alias_by_fid)
 
-    stage_frags = quest_stage_fragments(rec)
-    from ..base.object_scripts import get_quest_script
-    attached = get_quest_script(get_formid(rec, 'FormID'))
-    if (stage_frags or attached) and edid:
-        from script_convert.pipeline import build_vmad_quest_fragments
-        prop_vals = _quest_vmad_properties(rec, edid, fid_to_edid,
-                                           well_known_props, unlock_plan,
-                                           unlock_globals, xref)
-        subs += pack_subrecord('VMAD', build_vmad_quest_fragments(
-            edid, stage_frags, property_values=prop_vals or None,
-            attached_script=attached))
-
+    subs = pack_string_subrecord('EDID', engine_quest_edid(edid)) if edid else b''
+    subs += _quest_vmad(rec, edid, alias_packages, (fid_to_edid, well_known_props, unlock_plan,
+                                                    unlock_globals, xref))
     full = get_str(rec, 'FULL')
     if full:
         subs += pack_string_subrecord('FULL', full)
     subs += pack_subrecord('DNAM', _quest_dnam(rec))
     subs += pack_subrecord('NEXT', b'')
-
-    stage_count = get_int(rec, 'StageCount')
-    subs += _quest_stages(rec, stage_count, script_vars)
-    alias_by_fid, targets = _quest_targets(rec)
-    subs += (authored_objectives(rec, alias_by_fid, script_vars or {},
-                                 get_formid_index_offset())
-             if has_authored_objectives(rec)
-             else _quest_objectives(rec, stage_count, targets,
-                                    script_vars))
-
-    qfid = get_formid(rec, 'FormID')
-    alias_packages = _quest_alias_packages(pack_plan, qfid, alias_by_fid)
+    subs += _quest_stages(rec, get_int(rec, 'StageCount'), script_vars)
+    subs += objectives
     subs += pack_uint32_subrecord('ANAM', len(alias_by_fid))
-    subs += _quest_aliases(alias_by_fid, alias_packages, fid_to_edid)
+    subs += quest_aliases(alias_by_fid, alias_packages, fid_to_edid)
     return pack_record('QUST', qfid, get_int(rec, 'RecordFlags'), subs)
+
+
+def _quest_vmad(rec: dict, edid: str, alias_packages: dict, prop_args: tuple) -> bytes:
+    """The VMAD subrecord: stage fragments, attached quest script, package-alias scripts; b'' if none.
+
+    `prop_args` is `_quest_vmad_properties`'s (fid_to_edid, well_known_props,
+    unlock_plan, unlock_globals, xref). Imports object_scripts here: it reaches
+    this module through overrides.builder.
+    See: docs/commentary/script_convert.md#setstage-re-evaluates-alias-packages
+    """
+    from ..base.object_scripts import get_quest_script
+    qfid = get_formid(rec, 'FormID')
+    stage_frags = quest_stage_fragments(rec)
+    attached = get_quest_script(qfid)
+    if not ((stage_frags or attached or alias_packages) and edid):
+        return b''
+    prop_vals = _quest_vmad_properties(rec, edid, *prop_args)
+    alias_scripts = [(alias_id, [(STAGE_PACKAGE_ALIAS_SCRIPT, {})]) for alias_id in sorted(alias_packages)]
+    return pack_subrecord('VMAD', build_vmad_quest_fragments(
+        edid, stage_frags, property_values=prop_vals or None, attached_script=attached,
+        alias_scripts=alias_scripts, quest_fid=qfid))
 
 
 def _alias_name(ref_fid: int, alias_id: int, fid_to_edid: dict) -> str:

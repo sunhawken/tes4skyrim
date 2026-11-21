@@ -1,0 +1,59 @@
+# The walk with the Emperor to the Sanctum. At each stop the NPCs walk ahead by themselves (the case waits for the
+# stage their package sets) and CharGenQuest only moves on once the PLAYER is near the Emperor: 52 -> 54 within 500 of
+# him at marker F; 56 -> 58 within 500 of him at marker G, both Baurus and the Emperor in ImperialDungeon03; 68 -> 70
+# within 300 of him at marker J. moveto to the Emperor's marker stands in for the player's walk behind him.
+# After the talk at J the Emperor force-greets (73) and hands over the Amulet of Kings (74).
+
+# Baurus first walks up with the torch ("You may as well make yourself useful...", his say-once greeting between
+# 40 and 80): a real conversation since the dialogue-gate fix, which the party waits out (run 5b: left open, 52
+# never came). The player hears him and leaves it.
+# Five assassins (CGGenericAssassin1-3, 0001774A, 00017734) attack on the road to F. The player finishes them
+# (kill stands in for the fight), once as they attack and once at 52 for any that came late: one left alive held up
+# 50 -> 52 (6c) or 52 -> 54 (13e).
+case walk_marker_f
+hear 900 BaurusRef stick close
+wait 30
+bye if open
+wait 60
+run
+CGGenericAssassin1.kill
+CGGenericAssassin2.kill
+CGGenericAssassin3.kill
+0001774A.kill
+00017734.kill
+until 3600 GetStage Charactergen >= 52
+run
+CGGenericAssassin1.kill
+CGGenericAssassin2.kill
+CGGenericAssassin3.kill
+0001774A.kill
+00017734.kill
+approach UrielSeptimRef
+until 900 GetStage Charactergen >= 54
+end
+
+# Marker G is in the next cell (ImperialDungeon03), and a player walks there with the party. Left behind at F,
+# the party arrives in a cell that is not loaded, where Glenroy's escort never reports its end (run 5g: both stood
+# at G with 54 still set; 56 and 58 came the moment the player was moved there). Sent ahead to G, the party never
+# sets out from the unloaded cell behind (5i). So the player waits at F until the Emperor is at G, then joins him.
+# The wait also takes 56: at test pace the party can pass G between two looks and go on to I (60a, 19th: 68).
+case walk_marker_g
+until 3600 UrielSeptimRef.GetDistance CGMarkerGEmperor < 400 || GetStage Charactergen >= 56
+run
+player.moveto CGMarkerGEmperor
+until 900 GetStage Charactergen >= 56
+until 900 GetStage Charactergen >= 58
+until 900 GetStage Charactergen >= 59
+end
+
+# Glenroy reaches H (60), the Emperor reaches H (62: CGEmperorScript OnPackageDone CGEmperorToMarkerH), Glenroy
+# reaches I and talks with Baurus about the locked gate (64, 65 by INFO 0000BF17, 66), Baurus reaches J (67).
+case walk_marker_h_i
+until 3600 GetStage Charactergen >= 60
+until 3600 GetStage Charactergen >= 62
+until 3600 GetStage Charactergen >= 64
+until 3600 GetStage Charactergen >= 65
+until 3600 GetStage Charactergen >= 66
+until 3600 GetStage Charactergen >= 67
+until 3600 GetStage Charactergen >= 68
+end

@@ -27,7 +27,55 @@ ground-model fallback changes there, change it here too.
 import os
 from pathlib import Path
 
+from asset_convert.character.morrowind_coverage import (SkinFill, covered_partitions, hidden_skin,
+                                                        part_slots, sided_slot)
 from asset_convert.character.wearable_plan_falloutnv import biped_bit_body_parts
+
+
+def _worn_models(rec: dict) -> list:
+    """The normalized worn model paths a wearable record names."""
+    return [norm_model_path(model) for key in ('Male.BipedModel.MODL', 'Female.BipedModel.MODL')
+            if (model := rec.get(key, '').strip())]
+
+
+def _wearables(export_dir):
+    """Every ARMO and CLOT record of the export."""
+    for name in ('ARMO.txt', 'CLOT.txt'):
+        yield from iter_records(Path(export_dir) / name)
+
+
+def build_skin_fill(export_dir) -> dict:
+    """Morrowind worn mesh path -> its SkinFill (partitions its ARMA hides, parts it covers).
+
+    The hidden partitions are every section of the skin files the ARMA hides:
+    the ARMO's own body slots (a one-sided piece's own slot) plus the
+    partitions its parts overlap, as `equipment._arma_bod2` writes them.
+    See: docs/commentary/asset_convert_armor.md#morrowind-skin-fill
+    """
+    out = {}
+    for rec in _wearables(export_dir):
+        slots = part_slots(rec)
+        if not slots:
+            continue
+        sided = sided_slot(rec)
+        own = {sided} if sided else body_parts_for_flags(int(rec.get('BMDT.BipedFlags', '0') or 0))
+        hidden = hidden_skin(covered_partitions(slots) | frozenset(own))
+        for model in _worn_models(rec) if hidden else ():
+            out[model] = SkinFill(hidden, frozenset(slots))
+    return out
+
+
+def build_sided_slots(export_dir) -> dict:
+    """Morrowind worn mesh path -> the Skyrim slot of the one-sided piece wearing it.
+
+    See: docs/commentary/asset_convert_armor.md#body-slot-layout
+    """
+    out = {}
+    for rec in _wearables(export_dir):
+        slot = sided_slot(rec)
+        for model in _worn_models(rec) if slot else ():
+            out[model] = slot
+    return out
 
 # TES4 BMDT biped bits 2=UpperBody 3=LowerBody 4=Hand 5=Foot — the gear the
 # vanilla weight slider applies to.  Mirrors _build_arma's `use_slider`.
@@ -55,7 +103,7 @@ MORROWIND_WEAPON_PRN = {0: 'WeaponDagger', 1: 'WeaponSword', 2: 'BackWeapon',
 # Bit 0 Head, 1 Hair, 2 UpperBody, 3 LowerBody, 4 Hand, 5 Foot.
 _SBP_131_HAIR = 131
 _SBP_32_BODY = 32
-_SBP_44_LOWERBODY = 44
+_SBP_49_LOWER_BODY = 49
 _SBP_33_HANDS = 33
 _SBP_37_FEET = 37
 _SBP_36_RING = 36
@@ -64,7 +112,7 @@ _BIPED_BIT_BODY_PART = [
     (0, _SBP_131_HAIR),        # Head  -> helmets ride Skyrim's hair slot
     (1, _SBP_131_HAIR),        # Hair
     (2, _SBP_32_BODY),
-    (3, _SBP_44_LOWERBODY),
+    (3, _SBP_49_LOWER_BODY),
     (4, _SBP_33_HANDS),
     (5, _SBP_37_FEET),
     # Jewellery.  Bit meanings per xEdit wbBipedFlags (wbDefinitionsTES4.pas):
@@ -91,7 +139,7 @@ def body_part_for_flags(biped_flags: int):
     return None
 
 
-def _norm(path: str) -> str:
+def norm_model_path(path: str) -> str:
     """Normalize an export model path to a lowercase mesh-relative key.
 
     The export escapes backslashes, so a model path arrives as
@@ -140,18 +188,25 @@ def build_biped_flags(export_dir) -> dict:
             for key in ('Male.BipedModel.MODL', 'Female.BipedModel.MODL'):
                 mp = rec.get(key, '').strip()
                 if mp:
-                    k = _norm(mp)
+                    k = norm_model_path(mp)
                     flags[k] = flags.get(k, 0) | bf
     return flags
 
 
-# Key under which build_plan stashes the biped-flag map inside the plan dict.
-# _norm() lowercases and strips leading '/', so it can never emit this string —
-# the sub-map cannot collide with a real mesh entry.
+#: Biped-flag sub-map key; norm_model_path never emits it, so it cannot collide with a mesh entry.
 BIPED_FLAGS_KEY = '*biped_flags*'
 
-#: Key under which build_plan stashes the weapon Prn map; `_norm` can never emit it either.
+#: Weapon Prn sub-map key; norm_model_path can never emit it either.
 WEAPON_PRN_KEY = '*weapon_prn*'
+
+#: Skin-fill sub-map key: a Morrowind worn mesh -> the body partitions its ARMA hides.
+SKIN_FILL_KEY = '*skin_fill*'
+
+#: Sided-slot sub-map key: a Morrowind one-sided piece's worn mesh -> its Skyrim slot.
+SIDED_SLOT_KEY = '*sided_slot*'
+
+#: Sub-maps a base's plan merges into instead of replacing.
+_NESTED_KEYS = (BIPED_FLAGS_KEY, WEAPON_PRN_KEY, SKIN_FILL_KEY, SIDED_SLOT_KEY)
 
 
 def biped_flags_for(plan: dict, src_path, meshes_root) -> int:
@@ -169,7 +224,7 @@ def biped_flags_for(plan: dict, src_path, meshes_root) -> int:
         rel = os.path.relpath(str(src_path), str(meshes_root))
     except (ValueError, TypeError):
         return 0
-    val = flags.get(_norm(rel), 0)
+    val = flags.get(norm_model_path(rel), 0)
     return val if isinstance(val, int) else 0
 
 
@@ -201,10 +256,10 @@ def build_weapon_prns(export_dir) -> dict:
         if not model or not kind.isdigit():
             continue
         prn = MORROWIND_WEAPON_PRN.get(int(kind))
-        if prn and 'staff' in os.path.basename(_norm(model)):
+        if prn and 'staff' in os.path.basename(norm_model_path(model)):
             prn = 'WeaponStaff'
         if prn:
-            out[_norm(model)] = prn
+            out[norm_model_path(model)] = prn
     return out
 
 
@@ -217,10 +272,19 @@ def _want_ammo(export_dir: Path, want):
 def _inherit(plan: dict, inherited: dict) -> None:
     """Lay a base's plan under `plan`; the nested maps merge instead of replacing."""
     for k, v in inherited.items():
-        if k in (BIPED_FLAGS_KEY, WEAPON_PRN_KEY):
+        if k in _NESTED_KEYS:
             plan.setdefault(k, {}).update(v)
         else:
             plan[k] = v
+
+
+def merge_sibling(plan: dict, sibling: dict) -> None:
+    """Add a plan sharing `plan`'s mesh tree: variant bits OR, nested maps merge."""
+    for k, v in sibling.items():
+        if k in _NESTED_KEYS:
+            plan.setdefault(k, {}).update(v)
+        else:
+            plan[k] = plan.get(k, 0) | v
 
 
 def build_plan(export_dir, _seen=None) -> dict:
@@ -257,7 +321,7 @@ def build_plan(export_dir, _seen=None) -> dict:
 
     def want(path: str, flags: int):
         if path:
-            key = _norm(path)
+            key = norm_model_path(path)
             plan[key] = plan.get(key, 0) | flags
 
     for name in ('ARMO.txt', 'CLOT.txt'):
@@ -296,6 +360,8 @@ def build_plan(export_dir, _seen=None) -> dict:
     # per entry rather than replacing the map wholesale.
     plan.setdefault(BIPED_FLAGS_KEY, {}).update(build_biped_flags(export_dir))
     plan.setdefault(WEAPON_PRN_KEY, {}).update(build_weapon_prns(export_dir))
+    plan.setdefault(SKIN_FILL_KEY, {}).update(build_skin_fill(export_dir))
+    plan.setdefault(SIDED_SLOT_KEY, {}).update(build_sided_slots(export_dir))
     return plan
 
 
@@ -309,16 +375,37 @@ def variants_for(plan: dict, src_path, meshes_root) -> int:
         rel = os.path.relpath(str(src_path), str(meshes_root))
     except ValueError:
         return BASE
-    return plan.get(_norm(rel), BASE)
+    return plan.get(norm_model_path(rel), BASE)
 
 
-_LATCH = [0, None]
+_LATCH = [0, None, None, None]
 
 
 def latch_variants(plan: dict, src_path, meshes_root):
-    """Record the plugin's variant flags and weapon Prn for the NIF about to convert."""
+    """Latch the plugin's variants, weapon Prn, skin fill and sided slot for the NIF to convert."""
     _LATCH[0] = variants_for(plan, src_path, meshes_root) if plan else 0
     _LATCH[1] = weapon_prn_for(plan, src_path, meshes_root) if plan else None
+    _LATCH[2] = _sub_map_entry(plan, SKIN_FILL_KEY, src_path, meshes_root, None)
+    _LATCH[3] = _sub_map_entry(plan, SIDED_SLOT_KEY, src_path, meshes_root, None)
+
+
+def _sub_map_entry(plan, key: str, src_path, meshes_root, default):
+    """`src_path`'s entry in the plan's `key` sub-map, or `default`."""
+    try:
+        rel = os.path.relpath(str(src_path), str(meshes_root))
+    except (ValueError, TypeError):
+        return default
+    return (plan or {}).get(key, {}).get(norm_model_path(rel), default)
+
+
+def mesh_skin_fill() -> SkinFill:
+    """Body partitions to fill with skin in the NIF being converted."""
+    return _LATCH[2]
+
+
+def mesh_sided_slot():
+    """The Skyrim slot of the one-sided Morrowind piece being converted, or None."""
+    return _LATCH[3]
 
 
 def weapon_prn_for(plan: dict, src_path, meshes_root):
@@ -327,7 +414,7 @@ def weapon_prn_for(plan: dict, src_path, meshes_root):
         rel = os.path.relpath(str(src_path), str(meshes_root))
     except ValueError:
         return None
-    return plan.get(WEAPON_PRN_KEY, {}).get(_norm(rel))
+    return plan.get(WEAPON_PRN_KEY, {}).get(norm_model_path(rel))
 
 
 def mesh_weapon_prn():
@@ -369,4 +456,4 @@ def is_worn(plan: dict, src_path, meshes_root) -> bool:
         rel = os.path.relpath(str(src_path), str(meshes_root))
     except (ValueError, TypeError):
         return False
-    return bool(plan.get(_norm(rel), 0) & WORN)
+    return bool(plan.get(norm_model_path(rel), 0) & WORN)

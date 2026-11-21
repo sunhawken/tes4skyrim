@@ -7,8 +7,8 @@ that).
 
 The pipeline STEPS/GLOBAL_ACTIONS tables live here because the runner, the
 checkbox list and the menu bar all read them and none of them owns them.
-`run_process` sits here rather than in `runner.py` for room: it is the only
-non-GUI thing the runner needs, and the runner has no headroom left.
+`run_process` (process_job's, run from REPO_ROOT) sits here rather than in
+`runner.py` for room: the runner has no headroom left.
 
 REPO_ROOT is derived once, here, from this file's three parents. No other GUI
 module may re-anchor on its own `__file__`: doing so silently repoints
@@ -17,28 +17,24 @@ module may re-anchor on its own `__file__`: doing so silently repoints
 _OFFICIAL_PLUGINS lists the base game and official Creation Club content in
 Bethesda's own load-order priority, independent of whatever plugins.txt says.
 
-`create_pool_job()` runs at import so the whole conversion is contained in a
-Job Object owned by this process: a GUI that dies without cleanup (crash, Task
-Manager, closed window) then takes convert.py and every pool worker with it.
-Cancel covers only a DELIBERATE stop; without the job, orphaned console-less
-pythonw workers survive invisibly, holding the export index in RAM and keeping
-handles open on output/ files.
+Importing this module has no process-level side effects beyond
+`configure_multiprocessing()`. The Job Object that ties convert.py and its
+workers to the window is created by `gui.gui_main`, in the process that shows
+the window, never at import: an importer that relaunches itself (gui.py under
+pythonw) would otherwise hand the job to its child and kill it on exit.
 
 See: docs/reference/pipeline.md#game-data-path-detection
 """
 
 import json
 import os
-import queue
-import subprocess
 import sys
-import threading
 from pathlib import Path
 
+from core import process_job
 from core.collision_options import default_for_plugin as _winding_default
-from core.process_job import create_pool_job
 from core.run_log import DEFAULT_RUNS_KEPT
-from core.subprocess_flags import POPEN_FLAGS, configure_multiprocessing
+from core.subprocess_flags import configure_multiprocessing
 from output_layout import asset_root
 
 #: The repo root: this file is `<root>/core/gui/config.py`.
@@ -130,6 +126,24 @@ WINDING_MODES = (WINDING_AUTO, WINDING_ON, WINDING_OFF)
 #: conversion_config.json key for the object-LOD detail preset index.
 LOD_DETAIL_CONFIG_KEY = "lodDetail"
 
+#: conversion_config.json key for the navmesh generator (core.navmesh_options.GENERATORS).
+NAVMESH_GENERATOR_CONFIG_KEY = "navmeshGenerator"
+
+#: conversion_config.json key for the folder the navmesh editor saves pins to.
+NAVMESH_PINS_CONFIG_KEY = "navmeshPinsDir"
+
+#: That folder until the user picks another: beside the app, so an update never replaces it.
+DEFAULT_NAVMESH_PINS_DIR = REPO_ROOT / "my_navmesh_pins"
+
+
+def navmesh_pins_dir(cfg=None) -> str:
+    """The navmesh pin save folder: the saved setting, else the default.
+
+    See: docs/commentary/tes5_import_navmesh.md#user-pin-folder
+    """
+    cfg = load_config() if cfg is None else cfg
+    return str(cfg.get(NAVMESH_PINS_CONFIG_KEY) or DEFAULT_NAVMESH_PINS_DIR)
+
 
 def lod_detail_labels() -> tuple:
     """One menu label per detail preset: its distant-LOD triangle multiplier.
@@ -150,7 +164,7 @@ def lod_detail_labels() -> tuple:
 #: Distant-LOD triangle multiplier per preset, measured against preset 0.
 LOD_DETAIL_STEPS = (1.00, 1.35, 2.60, 3.04, 3.48, 3.95, 4.74)
 
-#: (key, label, tooltip, short, row); `row` None means Tools menu, no button.
+#: (key, label, tooltip, short, row); `row` None means Build menu only, no button.
 GLOBAL_ACTIONS = [
     ("create_lod", "Create LOD",
      "Generate distant LOD for the whole load order in one pass, into the "
@@ -172,20 +186,20 @@ GLOBAL_ACTIONS = [
      "converted plugin. Needs Skyrim installed: the MQ101 override is "
      "spliced from its Skyrim.esm",
      "Pack Start Mod", 1),
-    ("modify_body_meshes", "Patch Skyrim",
+    ("modify_body_meshes", "Body Slot Patch",
      "Build the ARMA slot-44 body patch for your Skyrim load order",
-     "Patch Skyrim", 2),
+     "Body Slot Patch", 2),
     ("package_runtime_dll", "Package SKSE Mod",
-     "Zip the built TESRuntime.dll (the SKSE plugin that registers every "
-     "converted plugin's creature animations at load) into "
+     "Zip the built runtime DLLs (TESRuntime, CreatureRuntime, FalloutRuntime, "
+     "HavokWorldSize and MorrowindRuntime, from tes_runtime/dist) into "
      "output/Finished Mods, ready to install like any converted plugin",
      "Pack SKSE Mod", 2),
-    ("convert_ui", "Convert UI",
+    ("convert_ui", "Convert Oblivion UI",
      "Build the standalone Oblivion UI mod: Skyrim's message boxes and menu "
      "cursor reskinned with Oblivion's own art, read from your Oblivion "
      "install. Replaces two files "
      "(Interface\\messagebox.swf, Interface\\cursormenu.swf)",
-     "Convert UI", None),
+     "Convert Oblivion UI", None),
 ]
 
 
@@ -359,7 +373,7 @@ def scan_converted(output_path: str) -> list:
     """Plugins already converted into `output_path`, sorted.
 
     Keyed on the manifests `phase_import` writes, never on directory names:
-    `output/` also accumulates the standalone `Slot44 Patch.esp`, the
+    `output/` also accumulates the `Finished Mods` folder, the
     `TESGameSelect` folder and `<plugin>.zip` archives, none of which can be
     re-run.
     """
@@ -518,121 +532,9 @@ def parse_dropped_paths(data: str) -> list:
 # ---------------------------------------------------------------------------
 
 configure_multiprocessing()
-create_pool_job()
-
-#: Returned by `run_process` when the user cancelled the run.
-RC_CANCELLED = -2
-
-#: Returned when the process could not be started or streamed at all.
-RC_FAILED = -1
-
-
-def kill_process_tree(proc) -> None:
-    """Forcibly kill `proc` and every descendant it spawned.
-
-    `proc.terminate()` signals only convert.py; the conversion spawns
-    multiprocessing workers plus helper .exes (ffmpeg, hkxcmd, BSArch, LODGen)
-    that would keep running and hold the stdout pipe open, making cancellation
-    look like a hang. `taskkill /T` walks the tree by PID.
-    """
-    if sys.platform == "win32":
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True, timeout=15, **POPEN_FLAGS,
-            )
-            return
-        except (OSError, subprocess.TimeoutExpired):
-            pass
-    try:
-        proc.kill()
-    except OSError:
-        pass
-
-
-def _split_lines(buf: bytearray) -> list:
-    """Pop every complete line out of `buf`, decoded and newline-stripped."""
-    lines = []
-    while True:
-        nl = buf.find(b"\n")
-        if nl == -1:
-            return lines
-        line = bytes(buf[:nl + 1])
-        del buf[:nl + 1]
-        lines.append(line.decode("utf-8", errors="replace").rstrip("\r\n"))
-
-
-def _pipe_reader(out, line_q) -> None:
-    """Drain `out` into `line_q` a line at a time, then push a None sentinel."""
-    buf = bytearray()
-    try:
-        while True:
-            chunk = out.read(1024)
-            if not chunk:
-                break
-            buf.extend(chunk)
-            for line in _split_lines(buf):
-                line_q.put(line)
-    except (OSError, ValueError):
-        pass
-    finally:
-        text = bytes(buf).decode("utf-8", errors="replace").rstrip("\r\n")
-        if text:
-            line_q.put(text)
-        line_q.put(None)
-
-
-def _pump(line_q, log_cb, cancel_event, proc) -> bool:
-    """Feed queued lines to `log_cb` until the pipe closes; True if cancelled.
-
-    Polls on a short interval so Cancel takes effect even while the child is
-    silent or blocked deep inside a long step -- a blocking pipe read must
-    never be what stands between the click and the process dying.
-    """
-    while True:
-        if cancel_event is not None and cancel_event.is_set():
-            kill_process_tree(proc)
-            return True
-        try:
-            item = line_q.get(timeout=0.1)
-        except queue.Empty:
-            continue
-        if item is None:
-            return False
-        log_cb(item)
 
 
 def run_process(cmd, log_cb, env=None, cancel_event=None) -> int:
-    """Run `cmd`, streaming its output to `log_cb` as bytes arrive.
-
-    Returns the child's exit code, `RC_CANCELLED` if `cancel_event` fired, or
-    `RC_FAILED` if it could not be run at all.
-    """
-    try:
-        full_env = os.environ.copy()
-        full_env["PYTHONUNBUFFERED"] = "1"
-        if env:
-            full_env.update(env)
-
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            bufsize=0, cwd=str(REPO_ROOT), env=full_env, **POPEN_FLAGS,
-        )
-        line_q: queue.Queue = queue.Queue()
-        threading.Thread(target=_pipe_reader, args=(proc.stdout, line_q),
-                         daemon=True).start()
-
-        if _pump(line_q, log_cb, cancel_event, proc):
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
-            return RC_CANCELLED
-        proc.wait()
-        return proc.returncode
-    except Exception as exc:
-        try:
-            log_cb(f"ERROR: {exc}")
-        except Exception:
-            pass
-        return RC_FAILED
+    """`process_job.run_process`, run from the repo root."""
+    return process_job.run_process(cmd, log_cb, env=env, cancel_event=cancel_event,
+                                   cwd=str(REPO_ROOT))

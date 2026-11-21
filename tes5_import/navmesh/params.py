@@ -15,9 +15,6 @@ CS_EXTERIOR = 32.0
 CH = 8.0
 
 # --- Agent ---------------------------------------------------------------------
-# Radius to erode the walkable set by, so the mesh keeps a correct standoff from
-# every wall.  This replaces the old hand-tuned EXCLUSION_MARGIN fudge.
-AGENT_RADIUS = 24.0
 # Required headroom.  Kills crawlspaces under stairs and low shelves.
 AGENT_HEIGHT = 128.0
 # Step height.  THE key constant: it decides stairs (connected) vs ledges
@@ -45,6 +42,8 @@ MAX_SIMPLIFY_ERR = 12.0
 MIN_REGION_VOXELS = 8
 #: Hex-lattice spacing and outline densify step (u); 192 was measured and rejected, see #tri-target-edge-192.
 TRI_TARGET_EDGE = 128.0
+#: Target edge for TERRAIN sheets; relief keeps them finer where the land curves.
+LAND_TRI_TARGET_EDGE = 256.0
 # Triangle shape bound during simplification: longest_edge^2 / (4 * area).  An
 # equilateral triangle scores 0.58; slivers score high.  A collapse or a smooth
 # move may not create a triangle worse than this.  (The old bound of 6 let
@@ -92,13 +91,6 @@ PGRD_XY_REACH = 384.0
 # climb cliffs steeper than MAX_CLIMB per step or cross water gaps, and roofs
 # remain unreachable, so the wrong-surface protection is intact).
 PGRD_XY_REACH_EXTERIOR = 8192.0
-# Radius of the flood barrier stamped over each TELEPORT door of an interior
-# cell.  The reach flood may arrive at these columns (the doorstep keeps its
-# mesh, so the Door Triangle exists) but never expands from them, so the mesh
-# ends at the threshold — like vanilla — instead of escaping through the open
-# doorway onto the decorative street outside the shell.  Must comfortably
-# exceed a doorway's half-width so the flood cannot slip around the corners.
-DOOR_BARRIER_RADIUS = 64.0
 # Half-width of the band stamped along every pathgrid line (voxel.stamp_pathgrid).
 # This band is UNCONDITIONAL navmesh: the pathgrid is the only part of the input
 # we know to be correct, so a strip of this width around every pathgrid line is
@@ -127,25 +119,9 @@ PGRD_SNAP_Z = 48.0
 # loses a climbing cave passage and stamps the ribbon inside the hill.
 
 # --- Door threshold quads -----------------------------------------------------------
-# Every door REFR (teleport or interior) gets an exact oriented quad stamped
-DOOR_QUAD_HALF_WIDTH = 48.0
-DOOR_QUAD_HALF_DEPTH = 32.0
 # Z window for claiming mesh vertices into the quad — a door only restructures
 # the floor it stands on, never a storey above/below.
 DOOR_QUAD_ZTOL = 128.0
-
-# --- Boundary cleanup ---------------------------------------------------------------
-# A triangle on the outline with at most one neighbour (a protruding flap/ear)
-EAR_MIN_AREA = 192.0
-# A flap is exempt when any densified pathgrid sample lies within this XY
-# distance of it.  Containment-only exemption still let the cull eat ribbon
-# ends and narrow cave ledges the pathgrid walks (2 wrong-floor nodes in
-# XPGloomstonePassage02); a distance buffer protects the walked line and its
-# fringe while still cleaning wall corners elsewhere.
-EAR_PGRD_RADIUS = 64.0
-# Cull rounds.  Each round exposes new boundary edges; more rounds chain-eat
-# the outline (a cave boundary is legitimately jagged).
-EAR_ROUNDS = 2
 
 # --- Island pruning ---------------------------------------------------------------
 # A disconnected component smaller than this is noise (a scrap behind a shelf, a
@@ -342,15 +318,90 @@ DECIMATE_PIN_NODE_RADIUS = 24.0
 # a neighbour centerline is closer, so a corridor squeezed between two close
 # obstacles still carries a walkable strip (the Phase-1 width was unconditional).
 RIBBON_GROW_MIN_HALF = 16.0
-# Hard cap on grown half-width.  A corridor in open space (no wall, no neighbour)
-# stops here rather than ballooning across a whole exterior cell.  ~1.5 doorways;
-# wide enough for room coverage, bounded enough that a doorway leak is a nub.
+#: Grown half-width cap: over BUILT floor always, over LAND only past another centerline.
 RIBBON_GROW_MAX_HALF = 160.0
 
-# --- Limits ----------------------------------------------------------------------
-# Hard cap on grid dimension per cell; beyond this CS is coarsened.  Guards
-# memory on huge exterior cells.
-MAX_GRID_DIM = 512
-# Per-cell wall-clock budget.  On overrun the cell is abandoned (the caller
-# falls back), so one pathological cell can never stall the whole run.
-CELL_TIME_BUDGET = 20.0
+
+# ---------------------------------------------------------------------------
+# Native-only tunables
+# ---------------------------------------------------------------------------
+
+#: A concave outline notch is cut straight while its cut loses under this fraction of the area.
+CONCAVE_CUT_FRAC = 0.25
+
+#: Trim node-disc rays at stair nodes so the FLAT disc never rides out over a descending flight.
+DISC_RAY_TRIM = True
+#: A disc ray runs past its ribbons' reach only over ground this close to the node's level.
+DISC_LEVEL_TOL = 2.0
+#: Stations either side whose shortest rail bounds a rail past the cap (8u apart).
+FAR_WIDTH_WINDOW = 8
+#: March step when pushing a ledge lip out to the floor's edge.
+LIP_MARCH_STEP = 4.0
+
+#: Farthest a corridor edge may be from a door for the door to get a footprint.
+DOOR_BRIDGE_RADIUS = 384.0
+#: Fallback door half-width, used only when a door model has no measured panel width.
+DOOR_LINE_HALF = 45.0
+#: Widest door half-width; a city gate's base line is capped here, a measured width is otherwise exact.
+DOOR_LINE_HALF_MAX = 220.0
+#: Shallowest door triangle: the apex sits at half the base length, never nearer than this.
+DOOR_TRI_MIN_DEPTH = 64.0
+#: How far from each end the door-bridge collision walk is skipped (past the door panel itself).
+DOOR_SELF_CLEARANCE = 48.0
+#: Shallowest door footprint, so it genuinely overlaps the corridor it bridges to.
+DOOR_MIN_DEPTH = 64.0
+#: Extra footprint depth pushed past the corridor edge so the union merges them.
+DOOR_OVERLAP = 32.0
+#: A sheet claims a door only when it holds at least this fraction of the door triangle.
+DOOR_CLAIM_MIN_FRAC = 0.5
+#: How far off a door base line a corner may sit and still be snapped onto it.
+DOOR_SNAP_PERP = 4.0
+
+#: Grid spacing of a door route search; under the body column's 40u width so no wall slips between.
+ROUTE_STEP = 16.0
+#: Farthest a door route strays from its door, in plan.
+ROUTE_REACH = 1536.0
+
+#: Heights within this at one point are ONE walkable surface.
+SAME_SURFACE_Z = 36.0
+#: Two levels are different STOREYS only when at least this far apart.
+STOREY_GAP_Z = 120.0
+#: How far a corner's ground may be from a surface and still count as ON it.
+REACH_TOL = STOREY_GAP_Z
+#: Steepest triangle the mesh may carry, as cos(slope); cos(55 deg).
+WALL_SLOPE_COS = 0.574
+#: A free edge dropping this far is a silhouette over open space, not a join.
+FLAP_EDGE_DROP = 40.0
+
+#: Along-ribbon spacing of steep-ribbon (stair) seeds.
+RIBBON_SEED_STEP = 24.0
+#: Longest edge a steep (stair) triangle may keep before it is bisected.
+STEEP_REFINE_EDGE = 64.0
+#: A terrain triangle is split while the LAND leaves one of its edges by more than this...
+LAND_RELIEF_TOL = 16.0
+#: ...but never below this edge length.
+LAND_MIN_EDGE = 96.0
+#: A terrain sheet's triangle edges are bisected down to this many target edges.
+LAND_MAX_EDGE_RATIO = 2.5
+#: Half the widest gap between terrain ribbons that is closed up.
+LAND_SLIT_HALF = 16.0
+
+#: A notch mouth wider than this is a room corner, not a bite out of the mesh.
+NOTCH_MAX_MOUTH = 160.0
+#: A filled notch's side must be at least this many times its mouth (a slim V, not a shallow wedge).
+NOTCH_MIN_DEPTH_RATIO = 1.2
+#: How close a notch fill must be to a walked pathgrid line to be justified.
+NOTCH_NEAR_LINE = 192.0
+
+#: Plan radius for sealing a T-junction at an INTERIOR hanging vertex.
+TSPLIT_TOL = 2.0
+#: Plan radius for sealing a T-junction when the hit vertex is itself on the boundary.
+TSPLIT_CRACK_TOL = 6.0
+#: Z window for sealing a T-junction crack.
+TSPLIT_Z_TOL = 12.0
+#: Bucket size for the walked-pathgrid sample grid.
+PG_CELL = 128.0
+#: Radius within which two sheet vertices fuse.
+WELD_R = 16.0
+#: XY cap for fusing two vertices of the same emission.
+SAME_PART_WELD_XY = 4.0

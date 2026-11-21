@@ -42,9 +42,14 @@ silent.
 import struct
 
 from ..base.text_reader import get_float, get_formid, get_int
+from ..base.tes5_reader import subrecords
+from ..dialogue.quest import quest_objectives, quest_targets
+from ..actors.combat_style import actor_combat_style
 from ..actors.outfits import split_inventory
+from ..packages.actor_wiring import CSTY_DEFAULT
+from .vmad_swap import SCRIPT_SWAP_KEY, SCRIPTED_TYPES, swap_vmad_script
 
-from ..base.writer import RECORD_HEADER_SIZE
+from ..base.writer import RECORD_HEADER_SIZE, encode_string
 _COMPRESSED_FLAG = 0x00040000
 
 # Export key -> the output subrecord it writes, for keys whose value is a
@@ -127,7 +132,7 @@ _IGNORED_CHANGES = frozenset({
     'ParentDIAL',           # grouping metadata, not a field on the record
     'ParentCELL',
     'ParentWRLD',
-    'RecordFlags',          # the master's flags are authoritative for an override
+    'RecordFlags',
 })
 
 # (sig, key) — or ('*', key) for any signature — whose TES4 field the
@@ -137,7 +142,6 @@ _IGNORED_CHANGES = frozenset({
 # names why.
 _INEXPRESSIBLE = frozenset({
     ('*', 'Model.MODB'),          # TES4 bound radius; TES5 has no MODB
-    ('*', 'ZNAM.CombatStyle'),    # CSTY is a skipped type; ref would dangle
     ('*', 'LNAM.HairLength'),     # TES5 NPC_ has no hair length field
     ('*', 'ACBS.Fatigue'),        # TES5 derives stamina; converter drops it
     ('*', 'ACBS.SpellPoints'),    # TES5 derives magicka; converter drops it
@@ -201,10 +205,6 @@ def join_subrecords(header: bytes, subs: list) -> bytes:
             + header[8:RECORD_HEADER_SIZE] + body)
 
 
-def _encode_string(value: str) -> bytes:
-    return (value or '').encode('cp1252', errors='replace') + b'\x00'
-
-
 # --------------------------------------------------------------------------
 # Subrecord rebuilders
 #
@@ -252,6 +252,13 @@ def _build_xclw(rec):
 def _build_mnam(rec):
     from ..record_types.world import build_wrld_mnam
     return build_wrld_mnam(rec)
+
+
+def _build_xcmo(rec):
+    """CELL XCMO for an authored music type; KEEP when no MUSC resolves for it."""
+    from ..record_types.world import cell_music
+    packed = cell_music(rec)
+    return packed[6:] if packed else KEEP
 
 
 def _build_xown(rec):
@@ -336,11 +343,17 @@ _RB_CREA_ACBS = _Rebuild(b'ACBS', _build_crea_acbs)
 # TES5 NPC_ order; anchor off NAM5 so an override that ADDS the subrecord
 # puts it in the right place.
 _RB_CREA_NAM6 = _Rebuild(b'NAM6', _build_crea_nam6, (('after', b'NAM5'),))
+_RB_ZNAM = _Rebuild(b'ZNAM', lambda rec: struct.pack('<I', actor_combat_style(rec) or CSTY_DEFAULT),
+                    (('after', b'HCLF'), ('after', b'DNAM')))
 _RB_BOD2 = _Rebuild(b'BOD2', _build_bod2)
 _RB_XCLL = _Rebuild(b'XCLL', _build_xcll, (('before', b'LTMP'),))
 _RB_XCLW = _Rebuild(b'XCLW', _build_xclw,
                     (('after', b'XOWN'), ('after', b'LTMP')))
 _RB_XOWN = _Rebuild(b'XOWN', _build_xown, (('after', b'LTMP'),))
+_RB_XCMO = _Rebuild(b'XCMO', _build_xcmo,
+                    (('before', b'XCCM'), ('after', b'XCWT'), ('after', b'XEZN'),
+                     ('after', b'XLCN'), ('after', b'XCLR'), ('after', b'XNAM'),
+                     ('after', b'XCLW'), ('after', b'XOWN'), ('after', b'LTMP')))
 _RB_REFR_XOWN = _Rebuild(b'XOWN', _build_xown, (('after', b'XESP'),))
 _RB_MNAM = _Rebuild(b'MNAM', _build_mnam, (('after', b'DNAM'),))
 # WRLD world-object bounds. A plugin that ADDS land outside the master's
@@ -422,11 +435,14 @@ _reg('NPC_', ('DATA.Endurance', 'ACBS.Flags', 'ACBS.Level', 'ACBS.CalcMin',
 _reg('CREA', ('ACBS.Flags', 'ACBS.Level', 'ACBS.CalcMin', 'ACBS.CalcMax'),
      _RB_CREA_ACBS)
 _reg('CREA', 'BNAM.BaseScale', _RB_CREA_NAM6)
+_reg('NPC_', 'ZNAM.CombatStyle', _RB_ZNAM)
+_reg('CREA', 'ZNAM.CombatStyle', _RB_ZNAM)
 _reg('ARMO', ('BMDT.GeneralFlags', 'BMDT.BipedFlags'), _RB_BOD2)
 _reg('CLOT', ('BMDT.GeneralFlags', 'BMDT.BipedFlags'), _RB_BOD2)
 _reg('CELL', _XCLL_KEYS, _RB_XCLL)
 _reg('CELL', 'XCLW.WaterHeight', _RB_XCLW)
 _reg('CELL', 'XOWN.Owner', _RB_XOWN)
+_reg('CELL', 'XCMT.MusicType', _RB_XCMO)
 _reg('REFR', 'XOWN.Owner', _RB_REFR_XOWN)
 _reg('ACHR', 'XOWN.Owner', _RB_REFR_XOWN)
 _reg('ACRE', 'XOWN.Owner', _RB_REFR_XOWN)
@@ -443,25 +459,16 @@ _reg('LAND', 'VNML', _RB_LAND_VNML)
 _reg('LAND', 'VHGT', _RB_LAND_VHGT)
 _reg('LAND', 'VCLR', _RB_LAND_VCLR)
 _reg('LAND', 'DATA.Flags', _RB_LAND_DATA)
-# Every type whose converter attaches object scripts via get_object_vmad
-# (record_types/common._common_header_subs + NPC_/CREA/STAT paths).
-for _scripted in ('ACTI', 'ALCH', 'APPA', 'ARMO', 'BOOK', 'CLOT', 'CONT',
-                  'CREA', 'DOOR', 'FLOR', 'FURN', 'INGR', 'KEYM', 'LIGH',
-                  'MISC', 'NPC_', 'SGST', 'SLGM', 'STAT', 'WEAP'):
+for _scripted in SCRIPTED_TYPES:
     _reg(_scripted, 'SCRI', _RB_SCRI_VMAD)
 
-# Authored changes to a spell's EFFECT LIST cannot be spliced into the
-# master's converted bytes: effect conversion may synthesize aimed-MGEF clone
-# companions, which an override must not silently inherit or re-mint. The
-# author rewrote the record's magic payload, so the record is RECONVERTED
-# from the plugin's export through the normal path instead (its FormID still
-# lands on the master's, so it stays an override). The handful of clone
-# companions a reconversion mints are ordinary new records in the plugin.
+#: (signature, export key) whose authored change reconverts the whole record from the plugin's export.
+# See: docs/commentary/tes5_import_override.md#effect-lists-are-reconverted
 RECONVERT_KEYS = frozenset({
-    ('SPEL', 'Effect[]'),
-    ('SPEL', 'ScriptEffect[]'),
-    ('ENCH', 'Effect[]'),
-    ('ENCH', 'ScriptEffect[]'),
+    *((sig, key) for sig in ('SPEL', 'ENCH', 'ALCH', 'INGR', 'SGST')
+      for key in ('Effect[]', 'ScriptEffect[]')),
+    *((sig, f'{gender}.BipedModel.MODL') for sig in ('ARMO', 'CLOT')
+      for gender in ('Male', 'Female')),
 })
 
 
@@ -692,6 +699,8 @@ for _sig in ('REFR', 'ACHR', 'ACRE'):
         _PATCHERS[(_sig, _key)] = (_out.encode(), _fn)
 _PATCHERS[('SPEL', 'SPIT.Cost')] = (b'SPIT', _patch_spit_cost)
 _PATCHERS[('PACK', 'PKDT.Flags')] = (b'PKDT', _patch_pkdt_flags)
+for _sig in SCRIPTED_TYPES + ('INFO', 'REFR', 'ACHR', 'ACRE'):
+    _PATCHERS[(_sig, SCRIPT_SWAP_KEY)] = (b'VMAD', swap_vmad_script)
 
 
 # --------------------------------------------------------------------------
@@ -713,9 +722,8 @@ def _rebuild_inventory(plugin_rec, master_rec, old_subs):
     """New COCT+CNTO run for an authored Item[] change.
 
     Actors split wearables into the OTFT companion, so only the carried
-    part lives in CNTO.  That companion is the master's and is never
-    re-minted, so an authored change to a WORN item cannot be expressed;
-    the carried part still applies.
+    part lives in CNTO; a change to what an actor WEARS overrides the
+    master's OTFT instead (`OverrideContext.build_outfit_companion`).
     """
     sig = plugin_rec.get('Signature')
     if sig in ('NPC_', 'CREA'):
@@ -824,113 +832,51 @@ def _rebuild_land_layers(plugin_rec, master_rec, old_subs):
     master's for unchanged layers.
     """
     from ..record_types.world import build_land_layers
-    blob = build_land_layers(plugin_rec)
-    out = []
-    off = 0
-    while off + 6 <= len(blob):
-        sig = blob[off:off + 4]
-        size = struct.unpack_from('<H', blob, off + 4)[0]
-        out.append((sig, blob[off + 6:off + 6 + size]))
-        off += 6 + size
-    return out
+    return subrecords(build_land_layers(plugin_rec))
 
 
 def _rebuild_qust_targets(plugin_rec, master_rec, old_subs):
-    """New QOBJ/FNAM/NNAM/QSTA run for an authored QUST Target[] change.
+    """New objective run for an authored QUST Target[] change, via convert_QUST's own writer.
 
-    Oblivion's QSTA conditions are GetStage gates saying WHEN a marker is live;
-    convert_QUST resolves them at build time and hangs each target on the
-    objectives where the gate holds (see target_live_at_stage). Changing a
-    target's conditions therefore changes which objective carries which
-    marker — nothing a byte patch can express.
-
-    The whole objective run is regenerated from the plugin's export, and it is
-    deterministic to do so: an alias id is just the ordinal of the target's
-    first appearance in the Target list, a pure function of the export, and the
-    journal text comes from the same Stage[] entries. The reference ALIASes
-    those ids point at are the master's, and this rebuild does not touch them —
-    only which objective references which alias.
+    Alias ids stay the MASTER's ordinals, whose ALIAS records this rebuild
+    leaves alone; a target the master lacks has no alias and is dropped.
+    See: docs/commentary/tes5_import_quest.md#quest-targets-become-per-objective-aliases
     """
-    from ..dialogue.quest import target_live_at_stage, stage_objective_text
-    from ..dialogue.objective_text import short_objective
+    master_alias, _ = quest_targets(master_rec)
+    plugin_alias, targets = quest_targets(plugin_rec)
+    fid_of = {aid: fid for fid, aid in plugin_alias.items()}
+    remapped = [(master_alias[fid_of[aid]], tflags, raws)
+                for aid, tflags, raws in targets
+                if fid_of[aid] in master_alias]
+    return subrecords(quest_objectives(plugin_rec, remapped))
 
-    alias_by_fid = {}
-    targets = []
-    t = 0
-    while f'Target[{t}].FormID' in plugin_rec:
-        tfid = get_formid(plugin_rec, f'Target[{t}].FormID')
-        if tfid:
-            alias_id = alias_by_fid.setdefault(tfid, len(alias_by_fid))
-            tflags = get_int(plugin_rec, f'Target[{t}].Flags') & 0x01
-            raws = []
-            k = 0
-            while True:
-                raw = plugin_rec.get(f'Target[{t}].Condition[{k}].Raw')
-                if raw is None:
-                    break
-                raws.append(raw)
-                k += 1
-            targets.append((alias_id, tflags, raws))
-        t += 1
 
-    # The master's alias ids must stay authoritative: this plugin's target list
-    # may order refs differently, and the ALIAS records it points at are the
-    # master's. Re-map through the MASTER's ordering wherever the ref is known.
-    master_alias = {}
-    t = 0
-    while f'Target[{t}].FormID' in master_rec:
-        tfid = get_formid(master_rec, f'Target[{t}].FormID')
-        if tfid:
-            master_alias.setdefault(tfid, len(master_alias))
-        t += 1
-    plugin_fids = {aid: fid for fid, aid in alias_by_fid.items()}
-    remapped = []
-    for alias_id, tflags, raws in targets:
-        fid = plugin_fids.get(alias_id)
-        mapped = master_alias.get(fid)
-        if mapped is None:
-            # A target the master does not have has no alias to point at;
-            # emitting an out-of-range index would dangle.
-            continue
-        remapped.append((mapped, tflags, raws))
+_OBJECTIVE_RUN_SIGS = frozenset(
+    (b'QOBJ', b'FNAM', b'NNAM', b'QSTA', b'CTDA', b'CIS2'))
 
-    out = []
-    seen_stages = set()
-    i = 0
-    while f'Stage[{i}].Index' in plugin_rec:
-        stage_idx = get_int(plugin_rec, f'Stage[{i}].Index')
-        if stage_idx in seen_stages:
-            i += 1
-            continue
-        txt = stage_objective_text(plugin_rec, i)
-        if not txt:
-            i += 1
-            continue
-        seen_stages.add(stage_idx)
-        out.append((b'QOBJ', struct.pack('<H', stage_idx)))
-        out.append((b'FNAM', struct.pack('<I', 0)))
-        # The HUD objective is the SHORT line, not the long log entry — the
-        # same swap convert_QUST and quest_objective_texts make. This is the
-        # THIRD site deriving NNAM from Stage[].Log[].Text; all three must
-        # agree or a translation plugin's objectives diverge from its master's.
-        out.append((b'NNAM', _encode_string(short_objective(txt))))
-        emitted = set()
-        for alias_id, tflags, raws in remapped:
-            if alias_id in emitted:
-                continue
-            if not target_live_at_stage(raws, stage_idx):
-                continue
-            emitted.add(alias_id)
-            out.append((b'QSTA', struct.pack('<iB3x', alias_id, tflags)))
-        i += 1
-    return out
+
+def _objective_run_span(out: list):
+    """(start, end) of the QUST objective run: first QOBJ up to the alias block."""
+    start = next((i for i, (s, _p) in enumerate(out) if s == b'QOBJ'), None)
+    if start is None:
+        return None
+    end = next((i for i in range(start, len(out))
+                if out[i][0] not in _OBJECTIVE_RUN_SIGS), len(out))
+    return start, end
 
 
 class _RunRebuild:
-    def __init__(self, family: tuple, builder, anchors: tuple):
+    """A subrecord run rebuilt wholesale.
+
+    `span(out) -> (start, end) | None` locates the run by position, for a
+    family whose signatures also occur elsewhere in the record.
+    """
+
+    def __init__(self, family: tuple, builder, anchors: tuple, span=None):
         self.family = family        # sigs replaced as a unit
         self.builder = builder
         self.anchors = anchors
+        self.span = span
 
 
 _RUN_INVENTORY = _RunRebuild((b'COCT', b'CNTO'), _rebuild_inventory,
@@ -975,7 +921,7 @@ _RUN_LAND_LAYERS = _RunRebuild(
 # before the ALIAS block convert_QUST writes next.
 _RUN_QUST_TARGETS = _RunRebuild(
     (b'QOBJ', b'FNAM', b'NNAM', b'QSTA'), _rebuild_qust_targets,
-    (('after', b'CNAM'), ('after', b'DNAM')))
+    (('after', b'CNAM'), ('after', b'DNAM')), _objective_run_span)
 
 _RUN_REBUILDERS = {
     ('QUST', 'Target[]'): _RUN_QUST_TARGETS,
@@ -1162,7 +1108,7 @@ def _classify_changes(changes: dict, sig_name: str, plugin_export: dict,
         if sub_sig is None:
             buckets.generic.add(key)
             continue
-        buckets.pending[sub_sig] = _encode_string(value)
+        buckets.pending[sub_sig] = encode_string(value)
     return buckets
 
 
@@ -1182,7 +1128,7 @@ def _substitute_strings(subs: list, buckets: _Buckets) -> tuple:
             seen[sub_sig] = n + 1
             values = buckets.indexed[sub_sig]
             if n < len(values):
-                out.append((sub_sig, _encode_string(values[n])))
+                out.append((sub_sig, encode_string(values[n])))
             else:
                 out.append((sub_sig, payload))
             replaced.add(sub_sig)
@@ -1254,6 +1200,19 @@ def _apply_patchers(out: list, buckets: _Buckets, plugin_export: dict,
         applied.add(key)
 
 
+def _cut_run(out: list, run: _RunRebuild) -> tuple:
+    """(insert index or None, `out` without the run, the run removed)."""
+    span = run.span(out) if run.span else None
+    if span:
+        start, end = span
+        return start, out[:start] + out[end:], out[start:end]
+    if run.span:
+        return None, out, []
+    idx = next((i for i, (s, _p) in enumerate(out) if s in run.family), None)
+    return (idx, [(s, p) for s, p in out if s not in run.family],
+            [(s, p) for s, p in out if s in run.family])
+
+
 def _apply_runs(out: list, buckets: _Buckets, plugin_export: dict,
                 master_export: dict) -> list:
     """Replace each whole subrecord family with its regenerated run.
@@ -1262,11 +1221,8 @@ def _apply_runs(out: list, buckets: _Buckets, plugin_export: dict,
     spec's anchor when the master carried none. Returns the new list.
     """
     for run in buckets.runs:
-        old_run = [(s, p) for s, p in out if s in run.family]
+        idx, out, old_run = _cut_run(out, run)
         new_run = run.builder(plugin_export, master_export, old_run)
-        idx = next((i for i, (s, _p) in enumerate(out)
-                    if s in run.family), None)
-        out = [(s, p) for s, p in out if s not in run.family]
         if new_run:
             if idx is not None:
                 out[idx:idx] = new_run

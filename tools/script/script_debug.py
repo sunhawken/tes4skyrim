@@ -25,6 +25,12 @@ What it captures per script kind:
                 unloaded actor is silently dropped by the engine)
   FRAG          every INFO End fragment, i.e. the line actually PLAYED —
                 the ground truth for "did this dialogue reach the player"
+  FRAGMENT      (--fragment) entry to every Fragment_N of a fragment script,
+                static ones included, with its argument
+  OBJECT        (--object) every event an object script receives, with `Self`
+                and its state variables — which events reach an item at all
+  PLACE         (--place-calls) every PlaceAtMe(): the form, the spawner's and
+                the new ref's position, and the new ref again 2s later
 
 Instrumentation is idempotent (a second run is a no-op) and is wiped by any
 `convert.py --scripts-only`, which is also how you revert.
@@ -85,8 +91,7 @@ def _add_state(src, marker=MARKER):
                      src, count=1)
     if n:
         return new
-    # No doc comment (fragments, static scripts): insert after ScriptName.
-    return re.sub(r'(ScriptName[^\n]*\n)', r'\1' + decl, src, count=1)
+    return re.sub(r'(ScriptName[^\n]*\n(?:\{[^}]*\}\n)?)', r'\1' + decl, src, count=1)
 
 
 # --- Quest scripts ---------------------------------------------------------
@@ -212,6 +217,63 @@ def instrument_actor(path, log, tag):
     return True
 
 
+_EVENT_RE = re.compile(r'^Event (\w+)\([^)]*\)\n', re.M)
+
+#: Script-level converter state variables worth dumping next to the properties.
+_STATE_VAR_RE = re.compile(r'^(?:Bool|Int|Float|ObjectReference)\s+(TES4_\w+)',
+                           re.M)
+
+#: Globals a script reads: TES4 scripts sequence through them as often as through their own variables.
+_GLOBAL_PROP_RE = re.compile(r'^GlobalVariable Property (\w+)', re.M)
+
+
+def _object_block(log, tag, event, fields):
+    """Trace one event's arrival with `Self` and the script's state; OnUpdate only on change.
+
+    `Self` is converted to text, never called: a native on a carried item
+    can abort the event being diagnosed.
+    """
+    expr = ' + '.join([f'"{tag} {event} self=" + Self']
+                      + [f'" {f}=" + {f}' for f in fields])
+    trace = f'  Debug.TraceUser("{log}", _s)\n'
+    if event == 'OnUpdate':
+        trace = ('  _dbgTicks += 1\n'
+                 '  If _s != _dbgLast || _dbgTicks % 10 == 0\n'
+                 '    _dbgLast = _s\n'
+                 f'    Debug.TraceUser("{log}", _s + " tick=" + _dbgTicks)\n'
+                 '  EndIf\n')
+    return (f'  ; --- TEMP DIAGNOSTIC ({MARKER}) ---\n{_open_block(log)}'
+            f'  String _s = {expr}\n{trace}')
+
+
+#: Item events probed even when the script does not handle them.
+_ITEM_EVENTS = ('OnEquipped(Actor akActor)', 'OnUnequipped(Actor akActor)',
+                'OnRead()',
+                'OnContainerChanged(ObjectReference akNewContainer, '
+                'ObjectReference akOldContainer)')
+
+
+def instrument_object(path, log, tag):
+    """Trace every event an object script receives, with its state variables.
+
+    OnUpdate also logs a heartbeat every 10 ticks, so a poll that stops is
+    visible; item events the script lacks are added as probe-only events.
+    """
+    src = open(path, encoding='utf-8').read()
+    if MARKER in src:
+        return False
+    src = _add_state(src) + '\nInt _dbgTicks = 0\n'
+    if 'extends ObjectReference' in src.split('\n', 1)[0]:
+        src += ''.join(f'\nEvent {sig}\nEndEvent\n' for sig in _ITEM_EVENTS
+                       if f'Event {sig.split("(")[0]}(' not in src)
+    fields = (_conditional_props(src) + _STATE_VAR_RE.findall(src)
+              + [f'{g}.GetValue()' for g in _GLOBAL_PROP_RE.findall(src)])
+    src = _EVENT_RE.sub(lambda m: m.group(0) + _object_block(
+        log, tag, m.group(1), fields), src)
+    open(path, 'w', encoding='utf-8').write(src)
+    return True
+
+
 # --- Say() call sites ------------------------------------------------------
 
 # `(x as Actor).Say(Topic)` / `x.Say(Topic)` as emitted by script_convert.
@@ -271,6 +333,41 @@ def instrument_say_calls(path, log, tag):
     return True
 
 
+#: A bare `x.PlaceAtMe(Form, n)` statement as emitted by script_convert.
+_PLACE_RE = re.compile(
+    r'^(?P<indent>[ \t]*)(?P<call>(?P<obj>[\w.()]+)\.PlaceAtMe\((?P<form>\w+)[^\n]*\))[ \t]*$',
+    re.M)
+
+
+def _place_probe(m, log, tag, n):
+    """The statement rewritten to keep its result, trace it, and trace it again 2s later."""
+    ind, obj, form, r = m.group('indent'), m.group('obj'), m.group('form'), f'_dbgPlaced{n}'
+    where = (f'" at=" + {obj} + " z=" + {obj}.GetPositionZ() + " -> " + {r}'
+             f' + " z=" + {r}.GetPositionZ() + " 3d=" + {r}.Is3DLoaded()'
+             f' + " dead=" + ({r} as Actor).IsDead()')
+    return (f'{ind}ObjectReference {r} = {m.group("call")}\n'
+            f'{ind}Debug.TraceUser("{log}", "PLACE {tag} form={form}=" + {form} + {where})\n'
+            f'{ind}Utility.Wait(2.0)\n'
+            f'{ind}Debug.TraceUser("{log}", "PLACE+2s {tag} form={form}" + {where})')
+
+
+def instrument_place_calls(path, log, tag):
+    """Log every PlaceAtMe(): the form, where it went, and where the new ref is 2s later.
+
+    Separates "the spawn never ran" (no PLACE line) from "it ran but the
+    object landed somewhere unseen" (z below the floor, never 3D-loaded).
+    """
+    src = open(path, encoding='utf-8').read()
+    if f'"PLACE {tag} ' in src:
+        return False
+    count = iter(range(1_000_000))
+    new, hits = _PLACE_RE.subn(lambda m: _place_probe(m, log, tag, next(count)), src)
+    if not hits:
+        return False
+    open(path, 'w', encoding='utf-8').write(_add_state(new))
+    return True
+
+
 # --- INFO fragments --------------------------------------------------------
 
 def instrument_fragment(path, log, fid):
@@ -289,6 +386,24 @@ def instrument_fragment(path, log, fid):
         r'\1' + _open_block(log)
         + f'  Debug.TraceUser("{log}", "FRAG {fid} spk=" + akSpeakerRef)\n',
         src, count=1)
+    if not n:
+        return False
+    open(path, 'w', encoding='utf-8').write(src)
+    return True
+
+
+def instrument_all_fragments(path, log, tag):
+    """Log entry to EVERY Fragment_N of a fragment script (INFO, package or static), with its argument."""
+    src = open(path, encoding='utf-8').read()
+    if MARKER in src:
+        return False
+    src = _add_state(src)
+    src, n = re.subn(
+        r'(Function (Fragment_\d+)\((\w+) (\w+)\)\n)',
+        lambda m: (m.group(1) + _open_block(log)
+                   + f'  Debug.TraceUser("{log}", "FRAG {tag} {m.group(2)} '
+                   + f'{m.group(4)}=" + {m.group(4)})\n'),
+        src)
     if not n:
         return False
     open(path, 'w', encoding='utf-8').write(src)
@@ -466,7 +581,8 @@ def compile_one(plugin, stem, headers):
     return ok
 
 
-def main():
+def _parse_args():
+    """The command line."""
     ap = argparse.ArgumentParser(
         description='Add diagnostic logging to converted Papyrus scripts.')
     ap.add_argument('-f', '--file', required=True,
@@ -478,92 +594,88 @@ def main():
                     help='actor/object script stem to probe')
     ap.add_argument('--script', action='append', default=[],
                     help='any script stem: quest-style tick logging')
+    ap.add_argument('--object', action='append', default=[],
+                    help='object script stem: trace every event it receives')
+    ap.add_argument('--fragment', action='append', default=[],
+                    help='fragment script stem (INFO/package, static too): '
+                         'trace every Fragment_N it runs')
     ap.add_argument('--say-calls', action='store_true',
                     help='log every Actor.Say() in the touched scripts')
+    ap.add_argument('--place-calls', action='store_true',
+                    help='log every PlaceAtMe() in the touched scripts, and the '
+                         'placed ref 2s later')
     ap.add_argument('--log', default=None,
                     help='user-log name (default TES4Debug)')
     ap.add_argument('--no-compile', action='store_true')
     ap.add_argument('--revert', action='store_true',
                     help='re-run convert.py --scripts-only for clean output')
-    args = ap.parse_args()
+    return ap.parse_args()
 
-    plugin = args.file
-    log = args.log or 'TES4Debug'
 
-    if args.revert:
-        return subprocess.call([sys.executable, 'convert.py',
-                                '--scripts-only', '-f', plugin])
+def _tag(stem):
+    """The log tag for a script stem."""
+    return stem.replace('TES4_', '').upper()
 
-    d = src_dir(plugin)
-    if not os.path.isdir(d):
-        print(f'ERROR: no converted scripts at {d}')
-        return 1
-    if not (args.quest or args.actor or args.script):
-        print('ERROR: nothing selected — pass --quest/--actor/--script')
-        return 1
 
-    headers = find_headers()
-    if not headers and not args.no_compile:
-        print('ERROR: Skyrim Papyrus headers not found')
-        return 1
-
-    esm = os.path.join('output', plugin, plugin)
-    touched = []
-    say_targets = []
-
+def _instrument_quests(args, d, log, touched, say_targets):
+    """Instrument each --quest's scripts, stage fragments and INFO fragments."""
+    esm = os.path.join('output', args.file, args.file)
     for q in args.quest:
-        for kind, stem in quest_scripts(plugin, q):
-            path = os.path.join(d, stem + '.psc')
+        for kind, stem in quest_scripts(args.file, q):
             fn = instrument_quest_fragments if kind == 'qf' else instrument_quest
-            if fn(path, log):
+            if fn(os.path.join(d, stem + '.psc'), log):
                 touched.append(stem)
                 print(f'  instrumented {stem} [{kind}]')
             say_targets.append(stem)
-        frags = quest_info_fragments(plugin, q, esm)
-        n = 0
-        for stem, fid in frags:
-            if instrument_fragment(os.path.join(d, stem + '.psc'), log, fid):
-                touched.append(stem)
-                n += 1
+        frags = quest_info_fragments(args.file, q, esm)
+        done = [stem for stem, fid in frags
+                if instrument_fragment(os.path.join(d, stem + '.psc'), log, fid)]
+        touched.extend(done)
         if frags:
-            print(f'  instrumented {n} INFO fragment(s) for {q}')
+            print(f'  instrumented {len(done)} INFO fragment(s) for {q}')
 
-    for stem in args.actor:
-        path = os.path.join(d, stem + '.psc')
-        if not os.path.isfile(path):
-            print(f'  SKIP {stem} (not found)')
-            continue
-        tag = stem.replace('TES4_', '').upper()
-        if instrument_actor(path, log, tag):
-            touched.append(stem)
-            print(f'  instrumented {stem} [{tag}]')
-        say_targets.append(stem)
 
-    for stem in args.script:
-        path = os.path.join(d, stem + '.psc')
-        if not os.path.isfile(path):
-            print(f'  SKIP {stem} (not found)')
-            continue
-        if instrument_quest(path, log):
-            touched.append(stem)
-            print(f'  instrumented {stem}')
-        say_targets.append(stem)
-
-    if args.say_calls:
-        for stem in dict.fromkeys(say_targets):
+def _instrument_stems(args, d, log, touched, say_targets):
+    """Instrument the --actor, --script and --object stems, each with its probe."""
+    kinds = ((args.actor, lambda p, s: instrument_actor(p, log, _tag(s)), True),
+             (args.script, lambda p, s: instrument_quest(p, log), True),
+             (args.object, lambda p, s: instrument_object(p, log, _tag(s)), False),
+             (args.fragment, lambda p, s: instrument_all_fragments(p, log, _tag(s)), False))
+    for stems, probe, speaks in kinds:
+        for stem in stems:
             path = os.path.join(d, stem + '.psc')
             if not os.path.isfile(path):
+                print(f'  SKIP {stem} (not found)')
                 continue
-            tag = stem.replace('TES4_', '').upper()
-            if instrument_say_calls(path, log, tag):
-                if stem not in touched:
-                    touched.append(stem)
-                print(f'  say-probes in {stem}')
+            if probe(path, stem):
+                touched.append(stem)
+                print(f'  instrumented {stem}')
+            if speaks:
+                say_targets.append(stem)
 
-    print(f'\n{len(touched)} script(s) instrumented')
-    if args.no_compile:
-        return 0
 
+def _instrument_says(d, log, touched, say_targets):
+    """Add Say() probes to every script that can speak."""
+    for stem in dict.fromkeys(say_targets):
+        path = os.path.join(d, stem + '.psc')
+        if os.path.isfile(path) and instrument_say_calls(path, log, _tag(stem)):
+            if stem not in touched:
+                touched.append(stem)
+            print(f'  say-probes in {stem}')
+
+
+def _instrument_places(d, log, touched, stems):
+    """Add PlaceAtMe() probes to every selected script that spawns something."""
+    for stem in dict.fromkeys(stems):
+        path = os.path.join(d, stem + '.psc')
+        if os.path.isfile(path) and instrument_place_calls(path, log, _tag(stem)):
+            if stem not in touched:
+                touched.append(stem)
+            print(f'  place-probes in {stem}')
+
+
+def _compile_touched(plugin, touched, headers, log):
+    """Compile the instrumented scripts; 0 on success."""
     print('Compiling...')
     bad = [s for s in touched if not compile_one(plugin, s, headers)]
     print(f'  {len(touched) - len(bad)}/{len(touched)} compiled')
@@ -573,6 +685,37 @@ def main():
     print(f'\nLog: Documents/My Games/Skyrim Special Edition/'
           f'Logs/Script/User/{log}.log')
     return 0
+
+
+def main():
+    """Instrument the selected scripts and compile them."""
+    args = _parse_args()
+    log = args.log or 'TES4Debug'
+    if args.revert:
+        return subprocess.call([sys.executable, 'convert.py',
+                                '--scripts-only', '-f', args.file])
+    d = src_dir(args.file)
+    if not os.path.isdir(d):
+        print(f'ERROR: no converted scripts at {d}')
+        return 1
+    if not (args.quest or args.actor or args.script or args.object or args.fragment):
+        print('ERROR: nothing selected — pass --quest/--actor/--script/--object/--fragment')
+        return 1
+    headers = find_headers()
+    if not headers and not args.no_compile:
+        print('ERROR: Skyrim Papyrus headers not found')
+        return 1
+    touched, say_targets = [], []
+    _instrument_quests(args, d, log, touched, say_targets)
+    _instrument_stems(args, d, log, touched, say_targets)
+    if args.say_calls:
+        _instrument_says(d, log, touched, say_targets)
+    if args.place_calls:
+        _instrument_places(d, log, touched, say_targets + args.object)
+    print(f'\n{len(touched)} script(s) instrumented')
+    if args.no_compile:
+        return 0
+    return _compile_touched(args.file, touched, headers, log)
 
 
 if __name__ == '__main__':

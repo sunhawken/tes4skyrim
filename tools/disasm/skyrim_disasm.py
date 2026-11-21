@@ -119,7 +119,7 @@ class Binary:
         The name we match sits at descriptor+16.
         """
         out = []
-        for m in re.finditer(rb'\.\?AV[A-Za-z0-9_@]{2,120}?@@', self.data):
+        for m in re.finditer(rb'\.\?A[UV][A-Za-z0-9_@]{2,120}?@@', self.data):
             name = m.group(0).decode('latin1')
             if needle and needle.lower() not in name.lower():
                 continue
@@ -136,7 +136,7 @@ class Binary:
         x64 holds a *relative* pointer to the type descriptor at +12.
         """
         descs = [rva for nm, rva in self.find_rtti_names(class_name)
-                 if nm == f'.?AV{class_name}@@']
+                 if nm in (f'.?AV{class_name}@@', f'.?AU{class_name}@@')]
         if not descs:
             return []
         desc = descs[0]
@@ -452,6 +452,8 @@ def _parse_args():
     ap.add_argument('--find', help='list RTTI class names containing this')
     ap.add_argument('--vtable', help='show vtable(s) for this class name')
     ap.add_argument('--slot', type=int, help='with --vtable: disassemble this slot')
+    ap.add_argument('--slots', type=int, default=24,
+                    help='with --vtable: how many slots to list (default 24)')
     ap.add_argument('--disasm', help='disassemble at this RVA (hex ok)')
     ap.add_argument('--func',
                     help='disassemble the WHOLE function containing this RVA '
@@ -526,10 +528,10 @@ def _report_rtti(b: Binary, args):
           f'{", ".join(hex(v) for v in vts) or "none"}')
     for vt in vts:
         print(f'\n  vtable {vt:#x}:')
-        for slot, frva in b.vtable_slots(vt):
+        for slot, frva in b.vtable_slots(vt, args.slots):
             print(f'    [{slot:2d}] {frva:#010x}')
     if args.slot is not None and vts:
-        slots = dict(b.vtable_slots(vts[0]))
+        slots = dict(b.vtable_slots(vts[0], max(args.slots, args.slot + 1)))
         if args.slot in slots:
             rva = slots[args.slot]
             print(f'\n  disasm slot {args.slot} @ {rva:#x}:')

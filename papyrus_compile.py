@@ -17,9 +17,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from core.plugin_masters import master_chain
 from core.subprocess_flags import POPEN_FLAGS as _POPEN_FLAGS, windows_cmd
 from core.worker_budget import worker_count
 from output_layout import plugin_out_root, record_dir
+from script_convert.ownership import owner_key, read_owned, sibling_owned
+from script_convert.static_scripts import STATIC_DIR, static_script_files
 from source_paths import find_game_path
 
 #: TESConversion root, for the bundled compiler and as the compiler's cwd.
@@ -137,7 +140,8 @@ class _Compiler:
         self.script_src = script_src
         self.script_out = script_out
         self.master_src_dirs = master_src_dirs
-        self.psc_files = sorted(script_src.glob("*.psc"))
+        self.psc_files = _own_psc_files(file_name, script_src)
+        self.partial = len(self.psc_files) != len(list(script_src.glob("*.psc")))
 
     def _header_args(self) -> list:
         """`-h`: vanilla headers, SKSE's, this plugin's, then its masters'."""
@@ -161,7 +165,7 @@ class _Compiler:
         Built once and maintained incrementally.
         See: docs/commentary/script_convert.md#batch-compilation
         """
-        if not quarantine:
+        if not quarantine and not self.partial:
             return self.script_src
         stage = self.script_out / "_batch_src"
         if not stage.is_dir():
@@ -267,25 +271,17 @@ class _Compiler:
         return ok_count, errors
 
 
-def _master_chain(file_name: str, export_root: str) -> list:
-    """Every plugin `file_name` inherits from, nearest master first.
+def _own_psc_files(file_name: str, script_src: Path) -> list:
+    """The .psc files `file_name` wrote: all of them, unless the folder is shared.
 
-    The walk is transitive and cycle-safe. A master is resolved through
-    `record_dir`, never by joining its name onto the export root: plugins
-    imported from one mod archive share a folder named for the MOD, so a
-    plain join misses them.
-    See: docs/commentary/script_convert.md#vanilla-headers
+    See: docs/commentary/script_convert.md#wipe-output-dir
     """
-    from script_convert.cross_ref import master_names
-    ordered, seen, queue = [], {file_name.lower()}, [file_name]
-    while queue:
-        for name in master_names(record_dir(export_root, queue.pop(0))):
-            if not name or name.lower() in seen:
-                continue
-            seen.add(name.lower())
-            ordered.append(name)
-            queue.append(name)
-    return ordered
+    owner = owner_key(record_dir(str(SCRIPT_DIR / "export"), file_name))
+    every = sorted(script_src.glob("*.psc"))
+    if not sibling_owned(script_src, owner):
+        return every
+    own = {n.lower() for n in read_owned(script_src, owner)}
+    return [p for p in every if p.stem.lower() in own]
 
 
 def _master_source_dirs(file_name: str, out_root: Path) -> list:
@@ -298,7 +294,7 @@ def _master_source_dirs(file_name: str, out_root: Path) -> list:
     """
     export_root = str(SCRIPT_DIR / "export")
     dirs = []
-    for m in _master_chain(file_name, export_root):
+    for m in reversed(master_chain(record_dir(export_root, file_name))):
         d = plugin_out_root(out_root, m, export_root) / "scripts" / "source"
         if d.is_dir():
             dirs.append(d)
@@ -306,6 +302,28 @@ def _master_source_dirs(file_name: str, out_root: Path) -> list:
             print(f"[{file_name}] WARNING: master scripts not found ({d}); "
                   f"scripts referencing {m}'s script types will not compile")
     return dirs
+
+
+def _root_statics_current(file_name: str, out_root: Path) -> bool:
+    """False, after printing which master to reconvert, when the root's static scripts are stale.
+
+    See: docs/commentary/script_convert.md#stale-master-static-scripts
+    """
+    export_root = str(SCRIPT_DIR / "export")
+    chain = master_chain(record_dir(export_root, file_name))
+    if not chain:
+        return True
+    root_src = plugin_out_root(out_root, chain[0], export_root) / "scripts" / "source"
+    stale = [n for n in static_script_files()
+             if not (root_src / n).is_file()
+             or (root_src / n).read_bytes() != (Path(STATIC_DIR) / n).read_bytes()]
+    if not stale:
+        return True
+    print(f"[{file_name}] ERROR: {chain[0]}'s converted scripts are missing or "
+          f"older than this converter ({', '.join(stale)}).\n"
+          f"  Reconvert them first: python convert.py -f \"{chain[0]}\" "
+          f"--scripts-only")
+    return False
 
 
 def _write_error_log(script_out: Path, errors: list) -> None:
@@ -364,6 +382,9 @@ def _prepare(file_name: str, config: dict, output_dir):
         print("  Expected at: <Skyrim SE>\\Data\\Source\\Scripts\\")
         return None, False
 
+    if not _root_statics_current(file_name, out_root):
+        return None, False
+
     script_out.mkdir(parents=True, exist_ok=True)
     return _Compiler(file_name, compiler, headers, script_src, script_out,
                      _master_source_dirs(file_name, out_root),
@@ -405,4 +426,4 @@ def phase_compile(file_name: str, config: dict, output_dir: str = None):
         print(f"  Batch compile: {time.time() - started:.1f}s")
 
     _report(file_name, ok_count, total, errors, run.script_out)
-    return ok_count > 0
+    return total == 0 or ok_count > 0

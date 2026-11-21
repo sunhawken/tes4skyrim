@@ -1,18 +1,5 @@
 # TES4-to-TES5 Conversion Project — AI Context
 
-> # 🛑 READ BEFORE ENDING ANY TURN 🛑
->
-> **Asked a QUESTION? Answer it. Don't write code.** Me proposing an approach
-> is not permission to build it. Build only on "do it" / "implement" / "fix".
->
-> **Given a TASK? Finish it — fixed, built, verified.** No mid-task status,
-> no "want me to X?", no diagnosis without the fix. Low confidence and being
-> wrong repeatedly oblige you to keep going; they never earn a check-in.
-> A stop dressed as honesty is still a stop. Report uncertainty at the END.
-> Ask only if proceeding is unsafe or destructive — never "is my fix right?".
->
-> Details: [Working with the user](#no-stopping) · `feedback_never_stop_until_done`
-
 Convert TES4 (Oblivion) master/plugin files to TES5 (Skyrim) format.
 
 | Stage | Package | Responsibility |
@@ -34,248 +21,315 @@ caching, skipped record types, the export text format, and the directory layout.
 
 ---
 
-## Critical Rules
+## Safety rules
 
-### Process
+These protect things that are hard or impossible to get back.
 
-- **Do one bug at a time.** Make the edits before moving to the next. If you find
-  another bug while FIXING, fix it too — but if the task was a question, a plan,
-  an analysis, or a doc edit, REPORT it and do not write code.
-- **Work in the order the prompt presents.** Highest priority first.
-- **Never stop mid-task to report or ask.** Finish everything, verify, then reply.
-- **All fixes must be generic.** Never patch to satisfy a single record or file.
-  Oblivion and Nehrim are only the test files — we never know what plugin this
-  runs on.
-- 🛑 **FO3/FNV-SPECIFIC CODE GOES IN ITS OWN FILE.** Put it in `<stage>_<game>.py` beside the stage — `tes4_export/export_falloutnv.py` — and leave the main file a call site.
-- **The goal is COMPLETE conversion.** Don't strip things out because the
-  conversion would be complicated.
-- **If you don't see the problem described, the test data is not stale** — there
-  is always a REAL problem to find.
+- 🛑 <a id="safe-run"></a>**Run every shell command through
+  `python tools/validate/safe_run.py <command>`** (chains, loops, `$(...)` and
+  other programs go inside `safe_run.py -c '<command>'`); the hook says what may
+  run bare. It gates the `.py` files the command wrote.
+- 🛑 **Unlink every junction before removing a worktree.** Linking live
+  `export/`/`output/` into a worktree is fine; `git worktree remove --force` and
+  `rmtree` both follow junctions and delete the real tree, and both dirs are
+  gitignored so nothing restores them. Order: `os.rmdir()` each link, verify each
+  target still has its files, then remove. `is_junction()` misses them — track
+  links as you create them.
+- 🛑 **Never overwrite an artifact to set up an A/B or comparison.** Work on
+  scratchpad copies and point the tool at them — regenerating wastes the user's
+  time and destroys the baseline. Copy the whole `.esm`, not hashes.
+- 🛑 <a id="formid-drift"></a>**Never ship FormID drift without asking first.**
+  Moving even one existing id breaks the user's saves. Measure the count, stop, and
+  ask. FormIDs are hashed, not counted — `derive_formid(site, key)` — so allocation
+  order is irrelevant and generators can go anywhere, but:
+  - `key` must be **authored** data (source FormID, EditorID, TES4 model path),
+    never a value we compute.
+  - Changing the hash input, region, or `FORMID_SCHEME_VERSION` renumbers
+    everything.
+  Guarded by `tests/test_formid_determinism.py`; details:
+  [performance.md](docs/commentary/performance.md#formid-determinism--the-save-game-contract-rewritten-2026-08-17).
+- **Git: the user commits after in-game testing.** Never `git commit`, `git push`,
+  `git stash`/`stash pop`, `git add`, or `git rm` (use plain `rm`). Never
+  `git reset` — it destroys the user's own staging.
+  <a id="staging-is-single-use"></a>If the user authorizes staging, it covers that
+  one action only, not your next edit or turn. Stage hunks via
+  `git apply --cached`, never whole files (they carry the user's own work), and
+  never `git add -A` / `-u` / `.`. If unsure whether authorization still applies,
+  it does not.
+  `git mv` is fine. When staging: read each diff then and stage only your own
+  hunks (other sessions share the tree); say first if your work and theirs depend
+  on each other; never re-split the user's named set by author. A stage request
+  means confirmed in-game, so its test and doc go in the same stage. Never
+  mention staged files.
+- **Stay out of the live, heavily modded SSE install** except for its sanctioned
+  use. It is full of other mods' assets, so it tells you nothing about this
+  converter. Never inspect it to check whether your changes were deployed —
+  trust the user's deployment statements.
+
+  | Path | Use it for | Not for |
+  |---|---|---|
+  | `...\content\app_489830\depot_489833\` (unpacked exes) | exe decompilation | assets, deployment checks |
+  | Oblivion / Nehrim LE install | BSA files and NIFs | anything Skyrim-side |
+  | The modded SSE install | Papyrus logs, reading `Skyrim.esm`, and the vanilla `.psc` sources in `Data\Source\Scripts` | everything else, especially verifying deployment |
+
+## Working with the user
+
+- 🛑 **After a compaction or resume, `.claude/hooks/worklog_gate.py` blocks every
+  tool until the whole run worklog that session was using has been Read** (it tracks the lines covered):
+  [mwscript_full_runs.md](docs/audits/mwscript_full_runs.md) for Morrowind-format runs,
+  [oblivion_quest_runs.md](docs/audits/oblivion_quest_runs.md) for TES4 runs. A session that never read or
+  edited a worklog is not locked. Update a quest's entry in place. **Past ~1200
+  lines, compact it before adding more:** one ledger line per run, ~10 lines per
+  quest entry (status, proven cause, fix, failed attempts); move superseded detail
+  to the next `docs/audits/<worklog>_archive_<n>.md`, never delete it.
+
+- Spawn subagents only when it clearly saves cost: focused or repetitive work a
+  smaller model can do from a complete prompt. Rarely more than 3. Haiku for
+  mechanical work (search, reading files, simple bulk edits), Sonnet for anything
+  needing judgment; always medium effort, never inheriting the parent model.
+
+- 🛑 **A question asked mid-task: answer it directly, then end the turn.**
+- **"Diagnose" means report the cause and proposed fix, then wait.** Propose
+  unapproved design changes first; test-harness steps need no approval.
+- **Otherwise finish the whole task without stopping** — no option menus, "go
+  ahead?" or interim reports; never revert your own work unprompted.
+- The prompt is complete as written. A design question asked twice: stop and let
+  the user choose. An approved plan is a contract. "I need X anyway" = do X too.
+  An obvious gameplay bug found while testing gets fixed, not listed.
+- Read a file the user names before writing it.
+- **A fact the user states is ground truth — don't search to confirm it.** Search
+  only for what they didn't tell you. If the code later contradicts it, say so in
+  the final report.
+- **A mechanism the user names is the lead — build it to completion.** Never swap
+  in a cheaper substitute, and never drop it because it is "invasive" or "needs new
+  records". Cost is never a reason, only correctness. If it truly cannot work,
+  prove it with a measurement and say so.
+- Build the implementation idea the user describes, not your own preconception
+  of it.
+- **Do the task asked, at the size asked.** Size the work by the request, never by
+  what you don't know: a UI change is a UI change, not an investigation of the
+  subsystem behind it. Feeling a task is too big is the signal you've inflated it.
+- If the user gives multiple constraints for a bug, the fix must satisfy all of
+  them. Work in the order the prompt presents.
+- Measure the invariant the user asked for, not a proxy for it.
+- **Trust the user's in-game results.** Never question whether they tested
+  something or rebut a result with file timestamps. Reading Papyrus logs to
+  diagnose is encouraged; using them to dispute the user's report is not. A crash
+  they call yours is yours: diff your artifact against the last good one.
+- **A user report is about their build, not yours.** Diagnose from the log they
+  gave plus the source (`tes_runtime/`, `tes5_import/`, `external/`) — "absent
+  from my `export/`/`output/`" says nothing about their bug.
+- **Never ask the user to leave the game running, reproduce a bug, or replay
+  something.** Their game time is the [last resort](#attach-to-the-live-game). If
+  they offer the game with the bug already onscreen, use it right away.
+- **Report honestly.** Say what is untested or skipped and why. Never describe an
+  unverified change as working.
+- **Reply in plain, ordinary words** — "I keep my own list", not "the queue is
+  DLL-owned state". American spelling ("color", "center"). Say whitelist and
+  blacklist, not allowlist/blocklist. Reports stand alone (goal, status, changes,
+  open items); every image must actually open for the user: a markdown link
+  with a workspace-relative path to a file INSIDE the repo (copy scratchpad or
+  instance images into `temp/<task>/` first; AppData or absolute paths do not
+  open), or send the file itself. Use proper grammar. "They" is not a singular pronoun.
+- Other sessions' transcripts are files on disk — you can read them.
+
+## Approaching a bug
+
+- **Fix one bug at a time**, edits included, before moving on. A second bug found
+  while fixing gets fixed too.
+- **All fixes must be generic.** Oblivion and Nehrim are only test files — we
+  never know what plugin this runs on. Never patch for a single record or file.
+  Never scope a fix to one game.
+- **The goal is complete conversion.** Don't strip something out because
+  converting it is complicated, and never fix a crash by deleting data.
+- Find a quest, NPC or package the user names by reading `export/`, never from
+  memory of the game.
+- **Never guess a value**; copy it verbatim from source or say it's unavailable.
+- Never classify by filename; never touch or blame `unknown_*` NIF/Havok fields.
+- Never store state on a vanilla actor value. A ported mechanic keeps Skyrim's own
+  notices and UI.
+- Ask before adding a runtime-DLL requirement to a feature (MorrowindRuntime
+  excepted).
+- If you don't see the described problem, the test data is not stale — there is
+  always a real problem to find.
+- **Look for the authored indicator.** Everything in the original plugin works for
+  a reason; needing a heuristic usually means the approach is wrong.
 - **Census vanilla before calling something wrong.** If Skyrim.esm or the DLCs do
-  the same thing at scale, it is legal and is not your bug — several docs record
-  "verified vanilla-legal, don't fix this" for exactly the things that looked
-  broken. Conversely, "all 3,740 vanilla records write 0 here" is the strongest
-  possible evidence for what to write.
-- **Prefer the engine's own mechanism over a Papyrus/script approximation.** Force
-  greet is a package, not a function call; `SetAlert` is native, not
-  `DrawWeapon()`. Check for a real equivalent before declaring one absent — the
-  wikis under-document both games.
-- **A symptom's cause is often several layers from the symptom.** Frozen NPCs have
-  traced to navmesh, condition params, package data, and behavior graphs in turn.
-  Confirm the mechanism before fixing; a plausible story that explains the symptom
-  is not yet a diagnosis.
-- <a id="master-blindness"></a>**IF THE PLUGIN HAS MASTERS, SUSPECT MASTER-EXPORT
-  BLINDNESS FIRST.** Morrowind_ob and the ESPs depend on Oblivion.esm (Nehrim and
+  the same thing at scale, it is legal — several docs record "verified
+  vanilla-legal, don't fix this". Conversely, "all 3,740 vanilla records write 0
+  here" is the strongest evidence for what to write.
+- **Prefer the engine's own mechanism over a Papyrus approximation** (force greet
+  is a package; `SetAlert` is native, not `DrawWeapon()`). The wikis
+  under-document both games, so check for a real equivalent before declaring one
+  absent.
+- **A symptom's cause is often several layers away.** Frozen NPCs have traced to
+  navmesh, condition params, package data, and behavior graphs in turn. A
+  plausible story is not a diagnosis — confirm the mechanism before fixing.
+- <a id="master-blindness"></a>**If the plugin has masters, suspect master-export
+  blindness first.** Morrowind_ob and the ESPs depend on Oblivion.esm (Nehrim and
   Oblivion are standalone). The recurring defect: an import phase indexes only
-  `by_type` — the CURRENT plugin's export — and never consults
-  `ctx.master_export`, so an actor's master-owned packages, items, scripts or
-  refs resolve to nothing and the feature silently dies.
-- Don't preserve backwards compatibility. Delete code that is no longer used.
-- Keep files under ~1000 lines; split by responsibility when one grows.
-- <a id="tools-first"></a>**CHECK `tools/` BEFORE BUILDING ANYTHING BESPOKE.**
-  ~147 tools already exist and one probably answers your question — the full
-  catalogue is [docs/reference/python_tools.md](docs/reference/python_tools.md).
-  They live in `tools/<folder>/`: `generators` (code imports their output —
-  never delete blind), `release`, `validate`, `audit`, `live`, `disasm`, `nif`,
-  `creature`, `dialog`, `script`, `lod`, `esm`, `navmesh`, `misc`.
-  The order is:
-  1. **Use** the existing tool.
-  2. If it *almost* fits, **extend or fix it** — new flags, wider output. Never
-     write a parallel script that duplicates a tool's job, and never leave a
-     broken tool in place while working around it.
-  3. Only if nothing is close, write a new one — and **add its entry to
-     `python_tools.md` in the same pass**, before you report back. An
-     undocumented tool is one the next session will rebuild from scratch.
-- <a id="one-off-goes-in-temp"></a>**A SCRIPT THAT CHASES ONE BUG GOES IN
-  `temp/` or your scratchpad, NOT `tools/`.** A tool re-answers its question on NEW input; if
-  nothing new would change its output, it is a one-off. A/B and bisect
-  harnesses, censuses whose answer ships as a constant, and anything naming one
-  plugin/mesh/creature in code are one-offs — finding to `docs/`, script to
-  `temp/`. A good docstring does not make one reusable.
-- Put throwaway files in `temp/` or your scratchpad. Don't write one-off scripts with hardcoded
-  output — `tools/` scripts take arguments and produce general output, so they are
-  reusable next time.
-- **Always record new learnings** in this file or, more likely, the relevant `docs/` file.
-- **Findings go in `docs/`, NOT just memory.** Memory is per-machine; a doc is
-  the only copy another computer sees.
-- **KEEP THIS FILE EXTREMELY TERSE.** Every rule is the shortest sentence that
-  states it. No rationale, history, worked examples, or "rewritten on <date>"
-  notes — those go in `docs/`, linked. Editing a rule means it gets SHORTER.
-- Docs can be wrong: they sometimes describe fixes that were never implemented.
-  Grep the source before claiming a mechanism exists, and fix the doc.
-- Test scripts must print as they go, so a 120s timeout still yields output.
-- **LISTEN CAREFULLY to EXACTLY what the user's prompt says**. Seek to understand any implementation ideas instead of using your pre-conceived notions
-- **A MECHANISM THE USER NAMES IS THE LEAD. BUILD IT TO COMPLETION.**
-  Never abandon it for a cheaper substitute, and never because it is
-  "invasive" / "touches too much" / "needs new records" — **COST IS NEVER A
-  REASON, ONLY CORRECTNESS IS.** If it truly cannot work, PROVE it with a
-  measurement and say so; never silently swap in something smaller.
-- If you need to continue iterating on an idea with only marginal improvments in some areas and regressions in another, your idea is likely incorrect and you need to find another one
-- **Look for the AUTHORED indicator** If you need to resort to heuristics, your approach is most likely incorrect. Remember, everything in the original plugin works for a reason
-- **Pay close attention to performance** This needs to run quickly on a modest PC. If your new code makes a step run significantly slower than it did before you **MUST optimize**. Python first optimizations, and then native C++ if necessary.
-- If the user gives multiple constraints to a bug, your fix MUST satisfy ALL of them
-- If the user asks for a plan or analysis. DO NOT BUILD until you have the goahead. Overeager code development is the opposite of helpful
-- Deletion and Simplification is an IMPORTANT part of the process. A change that removes or only adds a few total lines of code is FAR SUPERIOR to one that adds many lines. More does not equal better. Strive to have as low of a cyclomatic complexity as possible
-- If the hook triggers for old debt, don't try to get around it as fast as possible or line golf. Take the time to examine the entire surrounding file and fix it properly. You have the time. If you need to separate out a file, pull out the RIGHT thing, not necessaryily the thing you are working on.
-- Docstrings should contain real and important function information. Story content only and always belongs in a see: tag. See tags should ALWAYS have an anchor.
-- Duplicated code is a big no-no. Check if something has been built first and if it has either point to that code instead or pull it out into a shared function
-- Avoid the chicken and egg problem when updating files. For example, adding an import without also adding its call in the same write will trigger the hook and prevent the write
+  `by_type` — the current plugin's export — and never consults
+  `ctx.master_export`, so master-owned packages, items, scripts or refs resolve to
+  nothing and the feature silently dies.
+- **Morrowind has two modes, and both must be tested:** authored masters
+  (Morrowind, Tribunal, Bloodmoon), and Morroblivion (Morrowind_ob.esm plus the
+  Morroblivion-Morrowind compat patch). The full OpenMW source is in `references/`.
+  - 🛑 **Morrowind.esm is always exported in authored mode, never Morroblivion
+    mode.** An export whose `_HEADER.txt` lists `Morrowind_ob.esm` or the compat
+    patch as masters is wrong — flag it; it is not the user's setup.
+  - Tamriel_Data and TR_Mainland are built in Morroblivion mode. Never convert
+    Tribunal.esm or Bloodmoon.esm; a TR export that demands them means the
+    wrong mode was picked.
 
-### <a id="regression-read-the-commits"></a>🛑 IF IT IS A REGRESSION, READ THE COMMITS
+### When an idea isn't working
 
-**"This used to work" means the cause is ON A `+` LINE IN A RECENT DIFF.**
+- **Two failed attempts on one theory means the theory is probably wrong.** Don't
+  re-apply a variant without new evidence. Go back to the sources below, find a
+  different mechanism, and say plainly that the earlier explanation was wrong.
+- **Marginal gains in one place with regressions in another mean the idea is
+  wrong** — it will not reach the goal with more iteration. Drop it and find
+  another one.
+- **While iterating on a repeated in-game failure, write no tests or docs** until
+  the fix is confirmed in game. Each round trip costs them a full
+  build-and-play cycle, and tests written against an unconfirmed theory encode the
+  wrong theory. Confirmed means the user's game OR your own before/after pass on
+  the headless test instance; either way, add the regression test and the doc
+  note at once, without waiting for the user.
+  Don't then delete prose written for a wrong theory; do revert regressing code.
+- A theory must predict what the user saw; a census deviation is not a diagnosis.
+- Never trade working behavior for an unproven fix of a lesser defect.
+- Settle it offline before asking the user for an in-game test; at most one
+  instrumented run per bug.
+
+### <a id="regression-read-the-commits"></a>Regressions: read the commits
+
+"This used to work" means the cause is on a `+` line in a recent diff.
 
 ```bash
 git log --oneline --since=3.days                 # candidates
-git show <sha> -- script_convert/ tes5_import/   # READ THE + LINES
+git show <sha> -- script_convert/ tes5_import/   # read the + lines
 ```
 
-Read every candidate diff BEFORE rebuilding at an old commit, writing a probe
-script, or re-examining the same record again — those all waste the cycle and
-the probe is usually wrong. "Nothing changed in this window" is a broken tool,
-not proof.
+Read every candidate diff before rebuilding at an old commit, writing a probe, or
+re-examining the same record. "Nothing changed in this window" means the tool is
+broken, not that nothing changed. Generated `.psc`/`.pex` are artifacts too:
+`--import-only` does not regenerate scripts, so a behavioral regression means
+reading `script_convert/` diffs and running `--scripts-only`. Still unfound:
+`git log -S'<symbol>'`, then byte-diff one asset built in a detached worktree at
+`<sha>^`. Changing a call's emitted shape: grep post-pass regexes for the old one.
 
-A generated `.psc`/`.pex` is an artifact too: `--import-only` does NOT
-regenerate scripts, so a behavioural regression means reading
-`script_convert/` diffs and running `--scripts-only`.
+## <a id="verifying-your-work"></a>Verifying your work
 
-### Verifying your work
+Work down this list and confirm every finding against a second source. The order
+comes from what actually solved 46 recent bugs
+([diagnosis_sources.md](docs/audits/diagnosis_sources.md)).
 
-**Always check theories against several of these** before acting:
+1. **The authored data against ours.** Read the source record, script or mesh in
+   `export/`, what we wrote in `output/`, and the code between them. Put a
+   working case beside the broken one and diff them: another creature, mesh or
+   record of the same kind that works, or vanilla's version of the feature. This
+   solved more bugs than any other source.
+2. **The user's logs and words.** Papyrus, crash and runtime logs from their run,
+   and what they saw; their observations cracked as many bugs as disassembly.
+   For "this used to work", [read the commits](#regression-read-the-commits).
+3. **Code that has already done the work.**
+   - `references/skse64-master`: engine class layouts and addresses.
+   - `references/openmw`: how Morrowind behaves.
+   - `references/xOBSE-master`: what an Oblivion or OBSE function really does.
+   - `references/fnv_decomp`: byte-matching C++ decomp of FalloutNV.exe
+     1.4.0.525. Oblivion's engine lineage, so read it before disassembling
+     either source game (packages, conditions, script functions).
+   - `references/xEdit`: `Core/` has every record type's binary layout, so it's
+     the first stop for a layout lookup.
+   - For meshes: `references/nif*.xml` and the NifSkope source.
+   - For behavior graphs: Haviour, Pandora and `skyrim-behavior-modding-guide.txt`.
+4. **Disassembly, for why an engine does something.** A theory from disassembly
+   is still a theory; confirm it against data before building on it.
+   - **Unpacked Skyrim exes** in
+     `C:\Program Files (x86)\Steam\steamapps\content\app_489830\depot_489833`:
+     `SkyrimSE.<version>.unpacked.exe` (1.5.97, 1.6.659, 1.6.1170, 1.7.104) and
+     `SkyrimVR.exe.unpacked.exe` (1.4.15). All disassemble statically (a retail
+     Steam copy is encrypted); crash logs map across via the Address Library.
+     **Start with 1.6.1170, the build the user plays**; use the others to
+     confirm. See
+     [address_library_formats.md](docs/reference/address_library_formats.md#two-id-generations).
+   - **`Oblivion.exe`** in the Nehrim install, for how the source game really
+     behaved.
+   - <a id="ck-is-a-source"></a>**`CreationKit.exe` (Steam)**: not DRM-packed, and
+     the best source for why a record is rejected. Asserts carry file+line; it
+     keeps 1,114 Bethesda source paths, 17k diagnostic strings, and 433 record
+     editor dialogs the game strips. Tools: `tools/disasm/ck_srcpaths.py`,
+     `ck_strref.py`, `skyrim_disasm.py --exe <ck>`. Runtime behavior still comes
+     from the game exe; the CK can disagree with the game
+     ([ck_vs_game_missing_objects.md](docs/commentary/ck_vs_game_missing_objects.md)).
+     Details: [ck_exe_disassembly.md](docs/commentary/ck_exe_disassembly.md).
+5. **A vanilla census** of the Skyrim.esm dump at `references/Skyrim.esm`, the
+   real Skyrim.esm, and `references/Skyrim Meshes`. It picks the value or pattern
+   to write; it shows what, not why. **Verify binary layout against both the
+   xEdit definition and a real Skyrim.esm dump.**
+6. The Oblivion/Nehrim install at `D:\Other Games\Nehrim At Fate's Edge\Data`.
+7. **Wikis, then the web.** The offline CK wiki (`references/SkyrimCKWiki_210522`)
+   and CS wiki (`references/cs_wiki`), then UESP via
+   `python tools/misc/uesp_lookup.py`. Never WebSearch or WebFetch UESP or the CK
+   wiki (they 403); an empty result means fix the query. Wikis describe; they are
+   sometimes wrong. Last, a web search for other authoritative sources.
+8. **Project docs and memory are leads, not evidence.** In the census they were
+   wrong about twice as often as they helped. Check a claim against code or data
+   before repeating it, and fix the doc when it's wrong.
+9. <a id="attach-to-the-live-game"></a>**Last resort, only in extreme need: the
+   user's live game or added logging.** Both spend the user's own time (the
+   headless test instance does not). Use the live
+   game only when the user offers it with the bug already onscreen. The live
+   Steam process disassembles (decrypted in memory) with RVAs matching the
+   running build; recipe: [REFR angle hang](docs/commentary/tes5_import_world.md#refr-angle-normalize-hang). Added logging
+   costs the user a full build-and-play cycle, so do it rarely and thoroughly.
 
-1. The Skyrim exe at `D:\Other Games\Skyrim Anniversary Edition\SkyrimSE.exe`
-   — GOG/AE, **not DRM-packed**, so it disassembles statically (the *Steam*
-   copy is encrypted). Crash logs map across via the Address Library.
-   Disassembly is a first resort, not a last one.
-   The SkyrimVR exe is at `D:\SteamLibrary\steamapps\common\SkyrimVR\SkyrimVR.exe.unpacked.exe`
-2. <a id="ck-is-a-source"></a>**`CreationKit.exe` (Steam) — NOT DRM-packed, and
-   the BEST source for why a record is REJECTED.** Asserts carry file+line, and
-   it keeps 1,114 Bethesda source paths, 17k diagnostic strings, and 433 record
-   editor dialogs the game strips. `tools/disasm/ck_srcpaths.py`, `ck_strref.py`,
-   `skyrim_disasm.py --exe <ck>`. Runtime behavior still comes from item 1;
-   the CK can disagree with the game ([ck_vs_game_missing_objects.md](docs/commentary/ck_vs_game_missing_objects.md)).
-   Details: [ck_exe_as_a_source.md](docs/commentary/ck_exe_disassembly.md).
-3. The Oblivion/Nehrim install at `D:\Other Games\Nehrim At Fate's Edge\Data`.
-4. xEdit source at `references/xEdit` — `Core/` documents the binary structure of
-   every record type. This is the first stop for any format question. Or if working with meshes, go to the Nifskope source at `references/Nifskope`
-5. The Skyrim.esm dump at `references/Skyrim.esm`, real Skyrim.esm, and
-   `references/Skyrim Meshes`. **Verify binary layout against BOTH the xEdit
-   definition AND a real Skyrim.esm dump — never skip either.**
-6. UESP / CK wiki via `python tools/misc/uesp_lookup.py`. **Never WebSearch or
-   WebFetch for these** (they 403). An empty result means fix the query.
-7. A web search for other authoritative sources.
-8. The Papyrus logs from the last in-game run — read them to diagnose a runtime
-   symptom (see the directory-purpose table under Hard prohibitions).
-9. <a id="attach-to-the-live-game"></a>**The LIVE game process — for any hang,
-   ask the user to leave it running and attach.** Beats everything above when
-   there is no crash log; the live Steam process disassembles (decrypted in
-   memory) with RVAs matching the running build. Recipe:
-   `project_refr_angle_normalize_hang`.
-10. Failing all the above, add thorough logging for the user's next run — one
-   wasted round trip costs them a full build-and-play cycle.
+- Never blame a bug on LE-vs-SSE mesh format differences — verify engine theories
+  externally first.
+- **A clean audit is not an alibi.** If every check passes and the symptom is
+  real, suspect a value the engine chokes on, not a structure it rejects.
+- 🛑 **Reproduce an in-game bug on the headless test instance, rerun after the
+  fix, and show before/after screenshots as links.** Untested = say so. Load
+  the `test-instances` skill first and use its tools (`questtest --fast` with a
+  `.tes4test`/`.mwtest` case, `shot`). Check out an instance first
+  (`test_instance checkout`) and check it back in when done.
+- Verify every case a change touches, not one; never fit a constant to one cell.
+- **The user's live game:** probe at once when offered; for steps they must do,
+  end the turn and start on their "go". Never freeze it (no cdb sampling, `help`
+  or FormID scans, `GetGraphVariable*`, hot-function hooks) or steal focus.
 
-Never attribute a bug to LE-vs-SSE mesh format differences — verify engine
-theories externally first.
+## Testing and building
 
-**A "CLEAN" audit is not an alibi** — if every check passes and the symptom is
-real, suspect a VALUE the engine chokes on, not a STRUCTURE it rejects.
-
-### <a id="code-review"></a>🛑 Code review: RUN THE CLAIM, DON'T READ IT
-
-**An unexecuted finding is a GUESS. Delete it — never soften it** to "possible
-issue" / "may not handle". Ship it only with a reproduction, a query against
-real data, or a failing-then-passing test.
-
-- **Every number is measured or absent.** Never write a count you did not
-  compute this session.
-- **Read the code, don't infer** Otherwise you will produce confident nonsense.
-- Mark verified vs suspected differently
-- **Don't nitpick** = no theoretical edge cases, style, or naming.
-
-### Hard prohibitions
-
-- 🛑 **NEVER RUN A BARE SHELL COMMAND.** Every one goes through
-  `python tools/validate/safe_run.py <command>`, which gates the `.py` files
-  the command wrote. The hook refuses anything else. See [the wrapper](#safe-run).
-- 🛑 **UNLINK EVERY JUNCTION BEFORE REMOVING A WORKTREE.** Linking live
-  `export/`/`output/` into one is fine; the TEARDOWN is what kills — both
-  `git worktree remove --force` and `rmtree` FOLLOW junctions and delete the
-  real tree. Order: `os.rmdir()` each link, verify each target still has its
-  files, then remove. `is_junction()` misses them — track links as you create
-  them. Both dirs are gitignored, so nothing restores them.
-- 🛑 **NEVER OVERWRITE AN ARTIFACT TO SET UP AN A/B OR COMPARISON.** Work on
-  scratchpad copies and point the tool at them. Regenerating wastes the user's
-  time, and it destroys the baseline the comparison needed.
-- **NEVER `git stash` / `git stash pop`** in this repository.
-- **NEVER `git commit` or `git push`.** The user commits after in-game testing.
-- **NEVER `git add` / `git rm`** (staging, including staged deletions). Use plain
-  `rm`. `git reset` destroys the user's own staging.
-
-  <a id="staging-is-single-use"></a>**Authorization to stage is SINGLE-USE and
-  CHUNK-SCOPED** — it covers that one action, not your next edit or turn. Stage
-  HUNKS via `git apply --cached`, never whole files (they carry the user's own
-  work). **NEVER `git add -A` / `-u` / `.`** If unsure whether authorization
-  still applies, it does not.
-- **NEVER go snooping in the live, heavily-modded SSE install.** It is full of
-  other mods' assets, so nothing you find there tells you anything about this
-  converter. In particular: **never inspect it to check whether your changes were
-  deployed or installed correctly** — trust the user's deployment statements, and
-  never argue with an in-game result by reading their setup.
-  Each external directory has ONE sanctioned purpose:
-  | Path | Use it for | Not for |
-  |---|---|---|
-  | `D:\Other Games\Skyrim Anniversary Edition\` (GOG/AE) | exe decompilation | assets, deployment checks |
-  | Oblivion / Nehrim LE install | BSA files and NIFs | anything Skyrim-side |
-  | The modded SSE install | **Papyrus logs, and reading `Skyrim.esm`** | everything else, especially verifying deployment |
-- **Never run the full pytest suite** — only the tests for files you changed.
-- **KEEP EVERY TEST COMMAND / SCRIPT UNDER 120 SECONDS. Never set a long
-  timeout.** Narrow the scope instead: one cell, not a worldspace; 2-3 NIFs,
-  not a tree; one record type, not the whole plugin. Most tools take `--cell` /
-  `--max N` / `--workers` for exactly this. If something genuinely cannot be
-  scoped down, say so instead of waiting on it. **Does NOT apply to real
-  pipeline runs** (`convert.py --import-only` etc.), which take as long as they
-  take — see [BUILD EVERY FILE](#build-every-file).
-  **Write each result as you compute it; on timeout use what it wrote. Never
-  re-run the same sweep at a smaller scope.**
-- **NEVER stop mid-task for a status update** — see [no stopping](#no-stopping).
-
-### Working with the user
-
-- **NEVER STOP TO GIVE A MID-SESSION STATUS REPORT.** Not "here's where I am",
-  not "should I continue?", not a summary of progress so far. Finish the whole task, then report once. A status update mid-task is a failure, not politeness. If something the user has asked for remains unsolved, YOU ARE NOT DONE!
-
-  <a id="no-stopping"></a>**Low confidence is NOT an exception.** The tradeoff
-  is already decided: **the user would rather you finish and be wrong than stop
-  and ask.** Being wrong repeatedly obligates you to keep going — go back to
-  "Verifying your work", find a DIFFERENT mechanism, and build it.
-
-  All stops, however phrased: "which do you want?" (pick one), "want me to X?"
-  (do X), findings + a question instead of findings + a fix, "I found the cause
-  but haven't built it" (build it), and <a id="honesty-costume"></a>**confessing
-  a bad track record as the reason to stop — a stop in the costume of honesty
-  is still a stop.**
-
-  **Uncertainty is reported, never resolved by asking.** State the assumption in
-  the FINAL REPORT, having done the work under it. Finish every unblocked part
-  and say what was blocked. A question is only ever permitted when proceeding
-  would be UNSAFE or DESTRUCTIVE (deleting data, force-pushing,
-  [causing FormID drift](#formid-drift)) — never because you are unsure
-  whether your fix is right. Asking the user to DO something is a request, not
-  a stop — but **only when they are the ONLY one who can do it** (leave the
-  game running, play a build). Anything you could do yourself, DO. The user's
-  time is worth far more than yours.
-- **Measure the invariant the user asked for, not a proxy for it.**
-- **Trust the user's in-game test results as ground truth.** Never question
-  whether they tested something, and never rebut a reported result with file
-  timestamps or a reconstructed timeline. (Reading Papyrus logs to *diagnose* is
-  encouraged — using them to dispute the user's report is not.)
-- **On a hang, ask EARLY for the game to be left running with the bug onscreen**
-  ("don't close it, I can attach to it") — nearly free for the user, and it pins
-  the exact faulting state. See [the live game process](#attach-to-the-live-game).
-- <a id="build-every-file"></a>**BUILD EVERY FILE YOUR CHANGES TOUCH, before reporting back.** The user should
-  be able to launch the game and verify immediately — never leave them to work out
-  which stage to re-run, and never hand back a change that only compiles in
-  theory. Map the files you edited to stages and run each one into `output/`:
+- **Targeted tests only** — the tests for files you changed, never the full suite;
+  don't re-run an unchanged result.
+- **Keep every test command or script under 120 seconds** (background steps
+  too); never set a long
+  timeout. Narrow the scope instead: one cell, 2–3 NIFs, one record type (most
+  tools take `--cell` / `--max N` / `--workers`). If something can't be scoped
+  down, say so. Test scripts print as they go and write each result as computed;
+  on timeout, use what was written — never re-run the same sweep smaller. This
+  limit does not apply to real pipeline runs.
+- 🛑 **Never start a test run or long background job without a fallback timer**
+  (a Monitor or wakeup at ~2x its expected time, plus `--stop-on-fail` for case
+  runs) that checks progress and stops a stalled run. Never sit waiting on one.
+  How: the **test-instances** skill.
+- **Builds queue themselves; launch them without checking the load.** `convert.py`
+  and `create_lod.py` take a machine-wide lock
+  ([heavy_lock](docs/commentary/performance.md#one-heavy-job-at-a-time)), so a
+  build that prints "Waiting for the running heavy job" is queued, not hung.
+  Targeted tests first, then builds. While yours runs, wait for its completion
+  notification and don't fill the wait with busywork. A lock held by the same
+  plugin+stage means yours is a duplicate. An empty log is not a dead job.
+- **Build only the plugin under test**; ask, with the cost, before any build the
+  change doesn't need. Nehrim scripts also rebuild `Translation.esp`'s.
+  Morrowind-format plugins have no scripts stage. Morrowind changes are tested via
+  the compat patch, `Tamriel_Data.esm` and `TR_Mainland.esm`, always with
+  `--morrowind-source morroblivion`.
+- 🛑 **Never pack a BSA**: the user tests loose files.
+- **Don't start a build until you're sure the fix is correct:** edits finished,
+  targeted tests passed, your own diff re-read.
+- <a id="build-every-file"></a>**Build every stage your changes touch before
+  reporting back**, into `output/`, so the user can launch the game immediately:
 
   | Changed | Run |
   |---|---|
@@ -283,115 +337,234 @@ real data, or a failing-then-passing test.
   | `tes5_import/` (records, navmesh, packages, dialogue) | `--import-only` |
   | `script_convert/` | `--scripts-only` (compiles .psc → .pex) |
   | `asset_convert/nif/nif_converter.py`, collision, skin | `--meshes-only` |
+  | `asset_convert/havok/` (creature skeleton, behavior, ragdoll, mesh) | `--creatures-only --only <folder>...` (folders under `meshes/creatures/`; drop `--only` for a change every creature or FNV gun needs) |
   | `spt_*` | `--speedtrees-only` |
   | sound conversion | `--sounds-only` |
-  | LOD | `tools/release/create_lod.py --worldspaces <EDID>`, NEVER `--lod-only` |
-  | BSA packing | `--pack-only` |
+  | LOD | `tools/release/create_lod.py --worldspaces <EDID>` |
 
-  Touching several areas means running several stages — import *and* scripts if
-  you changed both. Other flags: `--creatures-only`, `--extract-only`,
-  `--prune-textures-only`, `--pack-zip-only`. Report what you built and any
-  failures verbatim; if a stage genuinely cannot be run, say which and why rather
-  than staying silent.
+  🛑 <a id="static-scripts-rebuild-all"></a>**A change to
+  `script_convert/static_scripts/` rebuilds `--scripts-only` for EVERY
+  masterless plugin with an `output/` folder (Oblivion.esm, Nehrim.esm,
+  FalloutNV.esm)**
+  Each ships the same-named `TES4Polyfill.pex`; installed together, one game's
+  copy overrides the other's, so a stale copy breaks every game's newer calls.
 
-  **An asset-only mod (no ESP/ESM) is still a `-f` target.** `--import-mod`
-  registers a pseudo-plugin for it, so its asset stages run exactly like any
-  other plugin's: `python convert.py -f "Tamriel Landscape Pack"
-  --speedtrees-only`. Only the record stages (export/import/scripts/creatures)
-  are skipped. `python convert.py --list-mods` shows them.
-- **NEVER START A BUILD UNTIL YOU ARE SURE THE FIX IS CORRECT.** Finish every
-  edit, run the targeted tests, and re-read your own diff FIRST.
-- **A FULL `--meshes-only` REBUILD IS LONG AND EXPENSIVE (~20,000 meshes, many
-  minutes at 100% CPU). Never launch one lightly.** Rebuild ONLY the meshes your
-  change affects. Reserve the full stage for changes that genuinely touch every
-  mesh, and say so when you run one.
-- **Build the mesh the user named, in the PLUGIN the user named** If they say a mesh is a Nehrim issue, rebuild it under `Nehrim.esm` even if there is a same-named mesh under `Oblivion.esm`
-- 🛑 **A `--*-only` FLAG IS A STAGE, NOT A SCOPE** — `--lod-only` bakes every
+  Several areas means several stages. Other flags:
+  `--extract-only`, `--prune-textures-only`. Report what you
+  built and any failures verbatim; if a stage can't be run, say which and why.
+- <a id="blast-radius"></a>**After the build, measure the change's blast radius
+  and read it for regressions before reporting.** Count every site the change
+  touches in at least the file you are working on (or its master if examples are few) and read each one that now behaves differently. A fix that is right for the bug's script is often wrong elsewhere. Report the counts and any regression, and fix it.
+- 🛑 **`-f` takes the plugin's filename, never the mod or folder name:**
+  `-f TR_Mainland.esm`, not `-f "Tamriel Rebuilt 25.08.12"`. A wrong name
+  builds a phantom plugin whose sidecar breaks the real one in game
+  ([pipeline.md](docs/reference/pipeline.md#-f-takes-the-plugin)).
+  `--list-mods` shows each mod's plugins.
+- An asset-only mod (no ESP/ESM) is the one exception and is still a `-f` target: `--import-mod` registers
+  a pseudo-plugin, so its asset stages run normally (`python convert.py -f
+  "Tamriel Landscape Pack" --speedtrees-only`); only record stages are skipped.
+  `--list-mods` shows them.
+- **A `--*-only` flag is a stage, not a scope** — `--lod-only` bakes every
   qualifying worldspace, masters' included. Confirm the target from the first
-  output lines before calling a build running; a banner is not progress.
-- 🛑 **LOD BUILDS ONLY VIA `tools/release/create_lod.py --worldspaces <EDID>`,
-  NEVER `--lod-only`** — a worldspace bakes once from its owner plus every
-  plugin as an overlay. `--dry-run` first; the plan names owner and overlays.
-- **Never run two CPU-saturating jobs at once.** The order is **targeted tests
-  first, then builds, one at a time.** While one runs, do not start pytest, a
-  mesh sweep, or a second build — wait for the completion notification, then
-  run the next. While waiting, WAIT — don't burn tokens on filler work.
-- **While iterating on a repeated failure, don't write tests, update docs, or ANYTHING until
-  the fix is CONFIRMED in-game.** Each round trip costs the user a full
-  build-and-play cycle, so spend it on the diagnosis and the candidate fix only.
-  Tests and docs written against an unconfirmed theory usually just encode the
-  wrong theory and have to be rewritten. Once the user confirms, then add the
-  regression test and the doc note.
-- **When a fix doesn't work, don't continue to re-apply a variant of the same theory without new evidence.** Two
-  failed attempts on one theory likely means the theory is wrong — go back to the
-  sources in "Verifying your work" and find a *different* mechanism. Say plainly
-  that the previous explanation was wrong rather than layering another guess on
-  top of it.
-- **Report honestly.** If something is untested, say so; if you skipped part of
-  the scope, say which part and why. Never describe an unverified change as
-  working.
-- We aren't British. No "colour", "centre" or the like
-- No allowlist or blocklist, it's whitelist and blacklist
-- Never tell the user you can't look another session's transcript. They are files on disc. Yes you can.
+  output lines; a banner is not progress. Scope with `--only <names>` where a
+  stage honors it (today: `--creatures-only --only rat`); for a stage that
+  doesn't, add the scope before running the whole stage for one unit.
+- **LOD builds only via `create_lod.py --worldspaces <EDID>`, never
+  `--lod-only`.** A worldspace bakes once from its owner plus every plugin as an
+  overlay. Run `--dry-run` first; the plan names owner and overlays.
+- **A full `--meshes-only` rebuild is expensive** (~20,000 meshes, many minutes at
+  100% CPU). Rebuild only the meshes your change affects; if a change genuinely
+  touches every mesh, say so when you run the full stage.
+- **Build the mesh in the plugin the user named.** A Nehrim issue rebuilds under
+  `Nehrim.esm` even if a same-named mesh exists under `Oblivion.esm`.
+- **Never batch-test many NIFs** — test 2–3 specific to the bug. If a batch is
+  genuinely required, use `cpu_count() - 1` workers (single-threaded runs cap at 10
+  NIFs). Compare the `output/` mesh against the `export/` mesh and a few similar
+  Skyrim meshes.
+- If a change makes a cache (e.g. the collision cache) generate differently, bump
+  its version.
 
-### Assets and references
+## Writing code
 
-- **`references/` is for comparison/analysis ONLY — the pipeline must NEVER
-  resolve runtime assets through it.** Vanilla Skyrim files are fetched via
-  `asset_convert/sources/skyrim_assets.py` (cache in `export/skyrim_assets/`, else
-  auto-extracted from the SSE BSAs via registry-detected install).
-- `references/` subfolders (`NIFConverter/`, `xEdit/`, `UESP/`, `nifskope`) are
-  other projects — reference only. Note that these are not the ONLY references in that folder. Check before guessing
-- <a id="ck-wiki-offline"></a>**What a Papyrus native DOES: `references/SkyrimCKWiki_210522/skyrim/<Func>_-_<Script>.html`.
-  Grep it before describing one — never invent semantics.** Oblivion:
-  `references/cs_wiki/` (.txt).
-- **LE assets are SSE-compatible.** Never dig through SSE-format assets/BSAs.
-  BSA meshes are SSE-format; read them with `asset_convert/nif/sse_nif.py`
-  (`read_nif` converts BSTriShape graphs to LE NiTriShape graphs in-memory;
-  pyffi Patch 8 supplies the SSE read layouts). Output is always written LE
-  (uv2=83), which SSE loads natively.
-- **The LE-compatibility rule above does NOT extend to `.hkx`: every hkx we ship
-  is 64-bit.** `convert_hkx_to_amd64()` is the mandatory final step
-- Use `references/nif [version].xml` for valid Skyrim NIF behavior — newer and
-  more correct than pyffi 2.2.3's bundled version. Use pyffi with the clock
-  monkey patch when analyzing.
-- **Never batch-test many NIFs.** Test 2-3 specific to the bug. If a batch is
-  genuinely required, use full workers (`cpu_count() - 1`) — single-threaded runs
-  cap at 10 NIFs. Compare an `output/` mesh against the `export/` mesh and a few
-  similar Skyrim meshes.
+- **Simpler is better.** Deletion and simplification are core to the work: a
+  change that removes lines, or adds only a few, beats one that adds many. Keep
+  cyclomatic complexity low.
+- **No duplicated code.** Check whether it's already built; point to it or pull
+  it into a shared function. **De-duplicating code that can drift is a
+  priority:** when a fix touches one of several copies of the same rule (path
+  resolution, header parsing, naming), fold them into one function in the same
+  change — the unfixed copy is the next silent bug.
+- **Use the vendored OpenMW (`external/openmw`) instead of hand-rolling what it
+  already does** (e.g. `ESM::InfoOrder` for dialogue order), so our behavior
+  can't drift from OpenMW's. Hand-roll only when calling it would make the code
+  more complex; vendor a missing header from `references/openmw` first.
+- Don't preserve backwards compatibility in code — delete what is no longer used.
+  (Save-game compatibility is different: see [FormID drift](#formid-drift).)
+- <a id="end-user-state"></a>**Except what end users already have installed.**
+  This ships to users whose converted output, sidecars, patched UI movies,
+  inis and saves can come from ANY older build. When a runtime path, file or
+  name moves, the runtime keeps reading the old one (current wins, logged as
+  `DEPRECATED`, marked for removal) and the converter deletes the old copy on
+  its next rebuild. Cleaning up the developer's own `output/` by hand is a fine
+  one-off during development, but it never counts as the fix.
+  ([legacy paths](docs/reference/tes_runtime_fragments.md#legacy-sidecar-paths))
+- **Performance matters** — this must run quickly on a modest PC. If your change
+  makes a step significantly slower, optimize: Python first, then native C++ if
+  needed. Judge speed by a cold build: end users convert any mod, with no cache.
+- FO3/FNV-specific code goes in its own `<stage>_<game>.py` beside the stage
+  (e.g. `tes4_export/export_falloutnv.py`); the main file stays a call site.
+- Keep files under ~1200 lines; split by responsibility when one grows.
+- <a id="tools-first"></a>**Check `tools/` before building anything bespoke.**
+  ~147 tools exist — catalogue in
+  [docs/reference/python_tools.md](docs/reference/python_tools.md). Folders:
+  `generators` (code imports their output — never delete blind), `release`,
+  `validate`, `audit`, `live`, `disasm`, `nif`, `creature`, `dialog`, `script`,
+  `lod`, `esm`, `navmesh`, `misc`. Order:
+  1. Use the existing tool.
+  2. If it almost fits, extend or fix it. Never write a parallel script, and never
+     work around a broken tool while leaving it broken.
+  3. Only if nothing is close, write a new one — and add it to `python_tools.md`
+     in the same pass, or the next session will rebuild it.
+- <a id="one-off-goes-in-temp"></a>**A script that chases one bug goes in `temp/`
+  or your scratchpad, not `tools/`.** A tool re-answers its question on new input;
+  if nothing new would change its output, it's a one-off. A/B and bisect harnesses,
+  censuses whose answer ships as a constant, and anything naming one
+  plugin/mesh/creature are one-offs — finding to `docs/`, script to `temp/`.
+  `tools/` scripts take arguments and produce general output.
 
 ### Performance and memory
 
-- Use multiprocessing, not threads, for pure-Python work; **ThreadPoolExecutor is
-  only for I/O and subprocesses.** The output ESM must stay byte-reproducible.
-  Rules and measured results: [docs/commentary/performance.md](docs/commentary/performance.md).
-- 🛑 **EVERY `subprocess` CALL IN THE PIPELINE PASSES `**POPEN_FLAGS`**
-  (`subprocess_flags.py`). Without it a per-file stage opens one console window
-  per file under `pythonw`. Loose assets in a shared Data folder belong to the
-  MASTERLESS plugin only — gate on `_is_masterless`, or every expansion
-  re-copies and re-transcodes its master's tree.
-- **Never exhaust memory**: some pool tools load the ~2.1 GB export index per
-  worker. Cap `--workers` or run single-process.
-- **<a id="formid-drift"></a>FORMIDS ARE HASHED, NOT COUNTED.**
-  `derive_formid(site, key)`. Allocation order is irrelevant — add generators
-  anywhere.
-  - **`key` must be AUTHORED data** (source FormID, EditorID, TES4 model path),
-    never a value we compute — that moves ids and breaks saves.
-  - 🛑 **NEVER SHIP DRIFT WITHOUT ASKING FIRST.** Moving even one existing id
-    breaks saves. Measure the count, STOP, and ask — this is the unsafe-action
-    exception to [never stopping](#no-stopping), not a report-it-afterwards.
-    Changing the hash input, region, or `FORMID_SCHEME_VERSION` renumbers
-    everything.
-  Guarded by `tests/test_formid_determinism.py`; details:
-  [performance_notes.md](docs/commentary/performance.md#formid-determinism--the-save-game-contract-rewritten-2026-08-17).
+- **Do each piece of work once per run.** Read a file, parse a binary, scan
+  the masters' records or build an index once, and share the result with
+  every step that needs it; never re-derive what an earlier step already
+  computed. Keep it in memory for that run only. A cache between runs is
+  justified only by a huge win (the navmesh cache).
+  ([shared readers](docs/commentary/performance.md#import-once-per-run))
+- Multiprocessing, not threads, for pure-Python work; `ThreadPoolExecutor` only for
+  I/O and subprocesses. The output ESM must stay byte-reproducible. Rules and
+  measurements: [docs/commentary/performance.md](docs/commentary/performance.md).
+- Every `subprocess` call in the pipeline passes `**POPEN_FLAGS`
+  (`subprocess_flags.py`) — otherwise a per-file stage opens a console window per
+  file under `pythonw`.
+- Loose assets in a shared Data folder belong to the masterless plugin only — gate
+  on `_is_masterless`, or every expansion re-copies and re-transcodes its master's
+  tree.
+- 🛑 **Never limit workers** (`cpu_count() - 1`); on WinError 1450/ENOMEM, wait
+  and retry alone at full count. Never put a pool over the ~2.1 GB export index
+  (each worker copies it): run single-process or use the project's runners.
+- Probe scripts with a pool need a `__main__` guard; probe subprocesses pass
+  `**POPEN_FLAGS`.
 
-### Output paths
+### <a id="doc-rules"></a>Code rules (every `.py`) — enforced by a hook
 
-`output/Oblivion.esm` is a **FOLDER**, not a file — the .esm goes in
-`output/Oblivion.esm/Oblivion.esm`. A write failure there means you are trying to
-overwrite a folder with a file, not that a file is locked.
+`.claude/hooks/doc_rules_gate.py` runs `--gate-diff` before an Edit lands and
+refuses it, charging the lines you changed plus the comments above them.
+`--gate-file` scores a whole file including old debt; use it only to audit before
+refactoring.
 
-### <a id="shared-navmesh-cache"></a>The shared navmesh cache
+- A hook report naming a file and line: fix it in the next tool call.
+- **When the hook fires on old debt, fix it properly** — examine the whole file,
+  no line golf. If a file needs splitting, pull out the right thing, not
+  necessarily the thing you're working on.
+- **Check before you edit a big function.** Run `code_rules.py --gate-file
+  <path>` first: a function already over a limit, or a comment above the lines
+  you change, is charged to your edit. Plan the split as part of the change.
+- `oversized-files` is a ratchet: it fires only when your edit raises the count.
+  It counts code lines, so trimming comments can't clear it — remove or relocate
+  code.
+- An import and its use may land in separate edits. Unused imports and undefined
+  names are checked when the turn ends, not per edit.
+- **Prose:** only a docstring, a one-line 120-char `#:` attribute doc, or a
+  `# ----` heading. A docstring states the contract, never the story; rationale
+  and measurements go in `docs/`, cited by `See: docs/<file>.md#anchor` (the gate
+  checks path and anchor — always include the anchor).
+- **Docstring budget:** at most 480 chars, and at most **80** when the body is
+  one or two code lines; a `See:` line doesn't count. Every function over two
+  statements needs one, tests included.
+- A comment is prose wherever it sits — the scanner tokenizes, so end-of-line
+  placement hides nothing, and `# noqa`/`# pragma`/`# type:` count too. An inline
+  comment means the code can't state its intent — fix the code.
+- **Shape:** per function ≤35 statements (not lines), complexity ≤25, nesting ≤4,
+  ≤10 returns; ≤1200 lines per file; no class-level `dict`/`list`/`set`.
+- **No dead code:** no unused import or variable, no undefined name, nothing
+  unreachable. `code_rules.py --dead-code` is the whole-program sweep.
+- **Imports go at module scope.** Keep one inside a function only to break a real
+  import cycle, and name the cycle in the docstring. Never import another
+  module's `_name`; drop the underscore to make it public.
+- **A file with `# ----` section headings keeps every `def` under one.**
+- When compressing text, keep every measured count, script name and mechanism;
+  drop the narration and dates.
+
+### Shell and search gotchas
+
+- **Search with the Grep tool, never `grep -r`.** It honors `.gitignore`, so it
+  skips `export/`/`output/`/`references/` (tens of GB) and covers the repo in ~1s.
+  Never grep whole data directories — scope it.
+- `grep "a\|b"` silently finds nothing (bash eats the backslash). Use
+  `grep -E "a|b"` or `-e a -e b`. Zero matches is a broken query, not evidence.
+- A bash heredoc eats backslashes (`\a`, `\1`, `\_`). Never write a Windows path,
+  regex or doc text through `cat <<'EOF'` / `python - <<'EOF'` — use the Write
+  tool, and build paths with `chr(92)` or forward slashes.
+
+### Scripts
+
+When restructuring `script_convert/` (new modules, moving logic between layers),
+run the decision procedure in
+[script_convert_architecture.md](docs/reference/script_convert_architecture.md) §3
+and score it with `python tools/script/arch_fitness.py --fail-on-regression`. For
+ordinary fixes the edit gate is enough.
+
+## Assets and references
+
+- **`references/` is for comparison only — the pipeline must never resolve
+  runtime assets through it.** Vanilla Skyrim files come via
+  `asset_convert/sources/skyrim_assets.py` (cache in `export/skyrim_assets/`, else
+  auto-extracted from the SSE BSAs via the registry-detected install).
+- `references/` holds other projects (`NIFConverter/`, `xEdit/`, `UESP/`,
+  `nifskope`, `openmw`, and more) — look before assuming a reference doesn't exist.
+- <a id="ck-wiki-offline"></a>**What a Papyrus native does:**
+  `references/SkyrimCKWiki_210522/skyrim/<Func>_-_<Script>.html`. Grep it before
+  describing one — never invent semantics. Oblivion: `references/cs_wiki/` (.txt).
+- **How vanilla scripts use it:** the game's own `.psc` sources, at
+  `<SSE>\Data\Source\Scripts` — the directory `find_skyrim_source_scripts()`
+  (`papyrus_compile.py`) resolves and the script stage compiles against. Other
+  mods' sources sit beside vanilla's there, so check a file is Bethesda's
+  before calling a pattern vanilla.
+- **LE assets are SSE-compatible** — never dig through SSE-format assets. BSA
+  meshes are SSE-format; read them with `asset_convert/nif/sse_nif.py` (`read_nif`
+  converts BSTriShape to LE NiTriShape in memory; pyffi Patch 8 supplies the SSE
+  read layouts). Output is always written LE (uv2=83), which SSE loads natively.
+- **Except `.hkx`: every hkx we ship is 64-bit.** `convert_hkx_to_amd64()` is the
+  mandatory final step.
+- Use `references/nif [version].xml` for valid Skyrim NIF behavior — newer and more
+  correct than pyffi 2.2.3's bundled version. Use pyffi with the clock monkey patch
+  when analyzing.
+- `output/Oblivion.esm` is a folder; the .esm goes in
+  `output/Oblivion.esm/Oblivion.esm`. A write failure there means you're
+  overwriting a folder with a file, not that a file is locked.
+
+## <a id="navmesh-changes"></a>Navmesh changes
+
+- 🛑 **Protected cells never change without explicit consent:** Oblivion
+  `ImperialDungeon*` and Nehrim `SchattenrufMine*`, nothing else (Morrowind has
+  none). Check them on every change (`tools/navmesh/navmesh_ab.py build` +
+  `protected`); one differs → stop and ask.
+- 🛑 **Pinned cells are a separate by-name check, not protected cells.** Never edit
+  the user's pins. Your own pins must be clean (no overlaps, holes, slivers),
+  proven by the walk, and shipped via `tools.cellview.bake.mesh_to_esm`, never a
+  reimport.
+- **Be mindful of whole-plugin navmesh rebuilds:** run one when the work needs
+  it, never several in a row. The one build is cellview's (`world.plugin_meshes`).
+- A navmesh regression gets the smallest fix in the step that regressed.
+- Navmesh logic is C++ only (`native/src/navgrow/`), in the per-cell build
+  cellview runs. Changes touch only the cells that need them and keep speed.
+- Every comparison reports every health trait (topology, width, connectivity,
+  coverage, height, slope, doors, `engine_check`), per plugin, interiors and
+  exteriors apart, with protected and pinned cells by name.
+- Look first (`render.py --collision`, cellview, a screenshot); a walk stall
+  goes through `pathfind_calibrate.py` first.
+
+## <a id="shared-navmesh-cache"></a>The shared navmesh cache
 
 Navmesh generation is the slowest import stage; per-cell results are cached and
 published as a GitHub Release asset.
@@ -403,89 +576,59 @@ python tools/navmesh/navmesh_cache_hook.py --install                  # gate pus
 python tools/navmesh/navmesh_cache_hook.py --run                      # publish manually
 ```
 
-- **NEVER ship `collision_cache.bin`** — it holds Bethesda's Havok triangles
-  keyed by asset path. Only our own `navmesh_geom_cache` pickles go in.
-- **Never put mtime, absolute paths, or worker counts in a cache key** — they
-  are machine-local, so every downloader misses.
-- **The cache tag is a SHA-1 over the BYTES of every `tes5_import/navmesh/*.py`**
-  (`navmesh/pool.py:navmesh_geom_cache`). Any edit there — whitespace included —
-  invalidates every downloader's cache, so republish when you touch it.
+- **Never ship `collision_cache.bin`** — it holds Bethesda's Havok triangles keyed
+  by asset path. Only our own `navmesh_geom_cache` pickles go in.
+- Never put mtime, absolute paths, or worker counts in a cache key — they're
+  machine-local, so every downloader misses.
+- **The cache tag is a SHA-1 over the bytes of every `tes5_import/navmesh/*.py`**
+  (`navmesh/pool.py:navmesh_geom_cache`). The experimental `lattice/` package
+  feeds only its own local `navmesh_geom_cache_lattice/` and never gates a push.
+  Any edit to a top-level navmesh file, whitespace included,
+  invalidates everyone's cache — republish when you touch it.
   `NAVMESH_PATHS`/`NAVMESH_FUNCS` in `navmesh_cache_hook.py` gate the push; a
-  function added directly below a gated one reads as a navmesh change because
-  git's `-U0` hunk header names the function ABOVE an insertion. Check with
+  function added directly below a gated one reads as a navmesh change (git's `-U0`
+  hunk header names the function above an insertion). Check with
   `navmesh_cache_hook.py --check`.
 
-Why, and the invalidation/tag contracts:
-[world_land_navmesh_notes.md](docs/commentary/tes5_import_navmesh.md#the-shared-navmesh-cache--design-rationale).
+Rationale and contracts:
+[tes5_import_navmesh.md](docs/commentary/tes5_import_navmesh.md#the-shared-navmesh-cache--design-rationale).
 
----
+## Documentation
 
-## Documentation Map
+- **Findings go in `docs/`, not just memory** — memory is per-machine; a doc is
+  the only copy another computer sees. Record new learnings once confirmed (see
+  [When an idea isn't working](#when-an-idea-isnt-working) for in-game fixes).
+- **Before writing a memory, search memory for the topic** and strengthen the
+  existing file instead of adding a copy.
+- Keep this file short: each rule in one place, with at most a one-clause reason.
+  Worked examples, history and measurements go in `docs/`, linked.
 
-Deep reference material lives in `docs/`, sorted by KIND.
-**[docs/README.md](docs/README.md) is the index and says where a NEW document goes.**
+**[docs/README.md](docs/README.md) is the index and says where a new document goes.**
 
 | Folder | Holds |
 |---|---|
 | [reference/](docs/reference/) | What a format or contract IS — stable, no dates |
-| [commentary/](docs/commentary/) | Why the SHIPPED code is the way it is — named `<package>_<subsystem>.md` after the code it explains, opens with `**Code:**`. Measurements, engine behaviour, reverted attempts. The DEFAULT |
-| [plans/](docs/plans/) | Designed, NOT yet built |
+| [commentary/](docs/commentary/) | Why the SHIPPED code is the way it is — named `<package>_<subsystem>.md` after the code it explains, opens with `**Code:**`. Measurements, engine behavior, reverted attempts. The default |
+| [plans/](docs/plans/) | Designed, not yet built |
 | [audits/](docs/audits/) | A dated sweep over a corpus, with counts |
-| [assets/](docs/assets/) | Images and icons; `banner.png`/`favicon.ico` load at RUNTIME |
+| [assets/](docs/assets/) | Images and icons; `banner.png`/`favicon.ico` load at runtime |
 
-### Code rules — EVERY `.py` in the repo
+## <a id="code-review"></a>Code review: run the claim, don't read it
 
-🛑 <a id="safe-run"></a>**RUN EVERY SHELL COMMAND THROUGH THE WRAPPER** —
-`python tools/validate/safe_run.py <command>`. It runs in your shell, streams
-live, returns the child's exit code, and gates the `.py` files the command
-WROTE. A bare command is refused: a heredoc writes a `.py` no gate ever sees.
+An unexecuted finding is a guess — delete it; never soften it to "possible issue".
+Ship a finding only with a reproduction, a query against real data, or a
+failing-then-passing test.
 
-**`grep "a\|b"` silently finds NOTHING** — bash eats the backslash, so grep
-gets a literal `|` and still exits 0. Use `grep -E "a|b"` or `-e a -e b`. Zero
-matches is a broken query, never evidence about the tree.
-
-🛑 **A BASH HEREDOC EATS BACKSLASHES** — `\a`, `\1`, `\_` become bell, byte 1,
-`_`. Never write a Windows path, regex or doc text through `cat <<'EOF'` /
-`python - <<'EOF'`. Use the Write tool for the file, and build paths with
-`chr(92)` or forward slashes. Applies to the doc-gate hook too.
-
-🛑 <a id="doc-rules"></a>**THE CODE RULES ARE A REQUIREMENT, NOT A GUIDELINE.**
-`.claude/hooks/doc_rules_gate.py` runs `--gate-diff` BEFORE an Edit lands and
-REFUSES it, charging the lines you changed plus the comments above them.
-`--gate-file` scores a WHOLE file, including debt you did not write; use it only
-to audit a file before refactoring it. `oversized-files` is a RATCHET: it fires
-only when your edit RAISES the count, never for merely being over. **It counts
-CODE lines — trimming docstrings or comments CANNOT clear it.** Clear it by
-removing or relocating CODE.
-
-- **Prose:** only a docstring, a ONE-line 120-char `#:` attribute doc, or a
-  `# ----` heading. A docstring states the CONTRACT, never the why; rationale
-  and measurements go in `docs/`, cited by `See: docs/<file>.md#anchor` (the
-  gate checks path and anchor).
-- **A comment is prose wherever it sits** — the scanner tokenizes, so moving it
-  to the end of a line hides nothing, and `# noqa`/`# pragma`/`# type:` score
-  like any other comment.
-- **Shape:** per function ≤35 statements (NOT lines — reflow moves nothing),
-  complexity ≤25, nesting ≤4, ≤10 returns; ≤1000 lines per file; no
-  class-level `dict`/`list`/`set`.
-- **No dead code:** no unused import or variable, no undefined name, nothing
-  unreachable. `code_rules.py --dead-code` is the whole-program sweep.
-- 🛑 **IMPORTS GO AT MODULE SCOPE.** A function-local import is a code smell —
-  hoist it. Keep one inside a function ONLY to break a real import cycle, and
-  say which one in the docstring.
-- **Compress, never delete:** keep every measured count, script name and
-  mechanism; drop the narration. **No dates.**
-- An inline comment means the code cannot state its own intent — fix the code.
-
-### Scripts
-
-🛑 **Before writing ANY `script_convert/` code, run the decision procedure in [script_convert_architecture.md](docs/reference/script_convert_architecture.md) §3** and score the change with `python tools/script/arch_fitness.py --fail-on-regression`.
-
-### World, meshes & navmesh
-
-### Skills
-| Skill | Covers |
-|---|---|
-| `oblivion-dialog-system` | Vanilla TES4 dialogue/voice/quest records |
-| `skyrim-dialog-system` | Vanilla TES5 dialogue/voice/quest records |
-| `oblivion-to-skyrim-dialog` | TES4→TES5 dialogue/quest/voice mapping |
+- Every number is measured this session or absent.
+- Read the code; don't infer — inference produces confident nonsense.
+- Mark verified and suspected findings differently.
+- Don't nitpick: no theoretical edge cases, style, or naming.
+- **Judge whether each change is right, not whether it runs**: authored value vs
+  constant, settled decisions, and what it changes in Oblivion/Nehrim output.
+- 🛑 **Fork PRs: check the Commits and Files tabs before merging.** History was
+  rewritten on 2026-09-26 to purge Bethesda art (`morrowind_dialogue.swf`); a
+  branch older than that carries the old commits, and any merge style, squash
+  included, brings the file back. Flag a PR that contains commit `88fe78ac`,
+  shows commits already on master, or lists that `.swf`: the author must rebase
+  onto the new master. Also flag any added binary (`.swf`, `.dds`, `.nif`,
+  `.bsa`, `.dll`), since a file-type test cannot see art embedded inside one.

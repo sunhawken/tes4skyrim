@@ -9,7 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from asset_convert.nif.nif_batch import batch_convert
+from asset_convert.nif import sequences
+from asset_convert.nif.nif_batch import _collect_nifs, batch_convert
 from asset_convert.nif.nif_converter import (
     OUTPUT_USER_VERSION as _SKY_UV,
     OUTPUT_USER_VERSION_2 as _SKY_UV2,
@@ -17,6 +18,8 @@ from asset_convert.nif.nif_converter import (
     rewrite_tex_path,
     convert_nif,
 )
+from asset_convert.nif.particles import skyrimize_billboard
+from asset_convert.nif.shaders import resolve_texture
 from asset_convert.character import wearable_plan, wearable_plan_falloutnv
 from asset_convert.character.head_gear import remap_bone_names
 from asset_convert.collision import collision_falloutnv
@@ -39,9 +42,10 @@ class TestTexturePathRewriting:
         result = rewrite_tex_path(b'textures\\armor\\iron\\cuirass.dds')
         assert result == 'Textures\\tes4\\armor\\iron\\cuirass.dds'
 
-    def test_already_prefixed_unchanged(self):
+    def test_folder_named_like_namespace_is_prefixed(self):
+        """Nehrim authors a `Nehrim\\` folder; the asset copy always prefixes it."""
         result = rewrite_tex_path(b'textures\\tes4\\armor\\iron\\cuirass.dds')
-        assert result == 'Textures\\tes4\\armor\\iron\\cuirass.dds'
+        assert result == 'Textures\\tes4\\tes4\\armor\\iron\\cuirass.dds'
 
     def test_empty_path_gets_prefix(self):
         assert rewrite_tex_path(b'') == 'Textures\\tes4\\'
@@ -68,6 +72,41 @@ class TestTexturePathRewriting:
     def test_data_prefix_with_forward_slashes(self):
         result = rewrite_tex_path(b'Data/Textures/dwarven/rock01.dds')
         assert result == 'Textures\\tes4\\dwarven\\rock01.dds'
+
+    def test_lowres_segment_is_kept(self):
+        """A mod may ship a _far texture ONLY under lowres\\."""
+        result = rewrite_tex_path(b'textures\\LowRes\\xullc\\Rockbeach05.dds')
+        assert result == 'Textures\\tes4\\LowRes\\xullc\\Rockbeach05.dds'
+
+    def test_lowres_falls_back_to_full_res_twin(self, tmp_path):
+        """A missing lowres copy resolves to the full-res texture instead."""
+        (tmp_path / 'meshes').mkdir()
+        full = tmp_path / 'textures' / 'rocks' / 'rock01.dds'
+        full.parent.mkdir(parents=True)
+        full.write_bytes(b'')
+        stats = {'_src_path': str(tmp_path / 'meshes' / 'rock_far.nif')}
+        tex = rewrite_tex_path(b'textures\\lowres\\rocks\\rock01.dds')
+        assert resolve_texture(tex, stats) == 'Textures\\tes4\\rocks\\rock01.dds'
+        lowres = tmp_path / 'textures' / 'lowres' / 'rocks' / 'rock01.dds'
+        lowres.parent.mkdir(parents=True)
+        lowres.write_bytes(b'')
+        assert resolve_texture(tex, stats) == tex
+
+    def test_textures_folder_mid_path_is_the_cut(self):
+        """Relative and absolute authoring paths cut at their textures folder."""
+        assert rewrite_tex_path(b'\\..\\Textures\\Tx_wood.tga') == 'Textures\\tes4\\Tx_wood.dds'
+        assert (rewrite_tex_path(b'c:\\programme\\oblivion\\data\\textures\\dwarven\\rock01.dds')
+                == 'Textures\\tes4\\dwarven\\rock01.dds')
+
+    def test_missing_texture_falls_back_to_top_level_file(self, tmp_path):
+        """A texture absent from its folder resolves to the same file name under textures\\."""
+        (tmp_path / 'meshes').mkdir()
+        stats = {'_src_path': str(tmp_path / 'meshes' / 'chain.nif')}
+        tex = rewrite_tex_path(b'Textures\\RN\\CM\\Chainmail3.dds')
+        assert resolve_texture(tex, stats) == tex
+        (tmp_path / 'textures').mkdir()
+        (tmp_path / 'textures' / 'Chainmail3.dds').write_bytes(b'')
+        assert resolve_texture(tex, stats) == 'Textures\\tes4\\Chainmail3.dds'
 
 
 class TestBoneMapping:
@@ -374,6 +413,16 @@ class TestBsaPack:
     def test_empty_input_yields_no_bins(self):
         from asset_convert.sources.bsa_pack import bin_files
         assert bin_files([], limit=1000) == []
+
+    def test_os_junk_files_are_not_packed(self, tmp_path):
+        """Thumbs.db/desktop.ini are skipped; every other file still packs."""
+        from asset_convert.sources.bsa_pack import _collect_files
+        meshes = tmp_path / 'meshes' / 'sub'
+        meshes.mkdir(parents=True)
+        for name in ('a.nif', 'Thumbs.db', 'desktop.ini', 'notes.txt'):
+            (meshes / name).write_bytes(b'x')
+        packed = {rel.name for _, rel, _ in _collect_files(tmp_path, ['meshes'])}
+        assert packed == {'a.nif', 'notes.txt'}
 
     def test_loader_stem_naming(self):
         """Overflow loaders are <stem>_loader, <stem>_loader_1, ..."""
@@ -696,6 +745,22 @@ class TestSkyrimLEReferenceValidation:
         assert hdr['user_version_2'] == 83
         errors = _verify_block_structure(data, hdr)
         assert errors == [], f"Structural errors in reference: {errors}"
+
+
+NIGHTMARE_TROLL_NIF = Path('export/Nehrim.esm/meshes/ptcreatures/nightmaretroll/nightmaretroll.nif')
+
+
+class TestSharedShapeConvertsOnce:
+    """A shape listed under two parents keeps its texture (Nehrim's black troll)."""
+
+    @pytest.mark.skipif(not NIGHTMARE_TROLL_NIF.exists(), reason='Nehrim export not available')
+    def test_doubly_listed_body_keeps_its_diffuse(self, tmp_path):
+        """The body the root lists twice still names troll.dds, never white.dds."""
+        dst = tmp_path / 'out.nif'
+        assert convert_nif(str(NIGHTMARE_TROLL_NIF), str(dst))['converted']
+        raw = dst.read_bytes().lower()
+        assert b'troll.dds' in raw
+        assert b'white.dds' not in raw
 
 
 class TestConvertedNifStructure:
@@ -1249,6 +1314,85 @@ class TestParticleSystemConversion:
             su, sv = _struct.unpack_from('<2f', raw, q)
             assert su > 0 and sv > 0, \
                 f'effect shader block[{i}] UV Scale ({su},{sv}) — zero = invisible'
+
+
+def _rotation_rows(node):
+    """A node's rotation as rounded row tuples."""
+    r = node.rotation
+    return tuple(round(v, 3) + 0.0 for v in (r.m_11, r.m_12, r.m_13, r.m_21, r.m_22,
+                                             r.m_23, r.m_31, r.m_32, r.m_33))
+
+
+class TestSunbeamBillboard:
+    """sky/sunbeam*.nif: a placed FX billboard, not sky geometry.
+
+    See: docs/commentary/asset_convert_nif.md#billboard-axis-fix
+    """
+
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_sunbeam_keeps_authored_frame_and_fx_shader(self, tmp_path):
+        """The authored billboard rotation survives and the beam takes the FX shader.
+
+        Both engines spin a mode-1 billboard about its own local +Y, so the
+        authored -90°X is what hangs the beam vertically; the sky shader made
+        it show through walls.
+        """
+        src = EXPORT_MESHES / 'sky' / 'sunbeam01.nif'
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'meshes' / 'sky' / 'sunbeam01.nif'
+        dst.parent.mkdir(parents=True)
+        assert convert_nif(str(src), str(dst)).get('converted')
+
+        def billboard(blocks):
+            return next(b for b in blocks if isinstance(b, NifFormat.NiBillboardNode))
+        out_blocks = read_nif(dst)[1].blocks
+        assert (_rotation_rows(billboard(out_blocks))
+                == _rotation_rows(billboard(read_nif(src)[1].blocks)))
+        types = {type(b).__name__ for b in out_blocks}
+        assert 'BSSkyShaderProperty' not in types
+        shader = next(b for b in out_blocks
+                      if isinstance(b, NifFormat.BSEffectShaderProperty))
+        assert shader.shader_flags_1.slsf_1_z_buffer_test
+        assert not shader.shader_flags_2.slsf_2_z_buffer_write
+        assert shader.shader_flags_2.slsf_2_double_sided
+        assert 'NiAlphaProperty' in types
+
+
+def _particle_billboard(mode):
+    """A -90°X billboard over a flame quad and a particle system."""
+    bb = NifFormat.NiBillboardNode()
+    bb.billboard_mode = mode
+    r = bb.rotation
+    r.m_11, r.m_12, r.m_13 = 1.0, 0.0, 0.0
+    r.m_21, r.m_22, r.m_23 = 0.0, 0.0, 1.0
+    r.m_31, r.m_32, r.m_33 = 0.0, -1.0, 0.0
+    bb.num_children = 2
+    bb.children.update_size()
+    bb.children[0] = NifFormat.NiTriShape()
+    bb.children[1] = NifFormat.NiParticleSystem()
+    return bb
+
+
+class TestBillboardDemotion:
+    """A demoted billboard keeps its rotation only where the engine reads it.
+
+    See: docs/commentary/asset_convert_nif.md#billboard-demotion
+    """
+
+    def test_mode1_keeps_the_stand_up_rotation(self):
+        """Mode 1's rotation picks the spin axis, so demotion must keep it."""
+        bb = _particle_billboard(1)
+        authored = _rotation_rows(bb)
+        plain = skyrimize_billboard(bb)
+        assert not isinstance(plain, NifFormat.NiBillboardNode)
+        assert _rotation_rows(plain) == authored
+
+    def test_face_camera_mode_drops_the_rotation(self):
+        """Mode 0 cancels a billboard's own rotation, so demotion gives identity."""
+        plain = skyrimize_billboard(_particle_billboard(0))
+        assert _rotation_rows(plain) == (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+
 
 class TestFlameNodeConversion:
     """FlameNode markers → grafted CONVERTED Oblivion flame subtree.
@@ -2964,6 +3108,55 @@ class TestTextureTransformControllerConversion:
         assert all(c.interpolator is not None and c.interpolator.data is not None
                    for c in ctrls), 'controller lost its curve'
 
+    def _centered_map(self, operation, keys, tiling, translation):
+        """A strip whose base map carries a MAX-method transform centered on (0.5, 0.5)."""
+        shape, NF = self._build_textured_strip(operation, keys)
+        texprop = shape.properties[0]
+        texprop.controller.target = texprop
+        bt = texprop.base_texture
+        bt.has_texture_transform = True
+        bt.transform_type = 1
+        bt.clamp_mode = 1
+        bt.tiling.u, bt.tiling.v = tiling
+        bt.translation.u, bt.translation.v = translation
+        bt.center_offset.u = bt.center_offset.v = 0.5
+        return shape, NF
+
+    @staticmethod
+    def _curves(shader):
+        """{controlled variable: [key values]} along the shader's controller chain."""
+        out = {}
+        c = shader.controller
+        while c is not None:
+            out[c.type_of_controlled_variable] = [
+                round(k.value, 3) for k in c.interpolator.data.data.keys]
+            c = c.next_controller
+        return out
+
+    def test_center_scaled_map_carries_static_uv_and_clamp(self):
+        """se01waitingroomwalls butterflies: one sprite is cropped from the sheet
+        by a static transform and the wing flap scales U about the center, so the
+        U offset must move with the scale.
+
+        See: docs/commentary/asset_convert_shader.md#texture-transform
+        """
+        shape, _ = self._centered_map(3, [(0.0, 0.876), (0.1, 3.7)],
+                                      (0.876, 0.27), (0.0, -1.3))
+        shader = self._convert(shape).bs_properties[0]
+        assert (round(shader.uv_scale.u, 3), round(shader.uv_scale.v, 3)) == (0.876, 0.27)
+        assert (round(shader.uv_offset.u, 3), round(shader.uv_offset.v, 3)) == (0.062, 0.014)
+        assert int(shader.texture_clamp_mode) & 0xFF == 1, 'authored clamp S must survive'
+        curves = self._curves(shader)
+        assert curves[21] == [0.876, 3.7], 'U scale keys change'
+        assert curves[20] == [0.062, -1.35], 'U offset must follow the centered scale'
+
+    def test_translate_scrolls_through_a_centered_scale(self):
+        """An animated translate under a static scale of 3 lands on offset 3*(t-0.5)+0.5."""
+        shape, _ = self._centered_map(1, [(0.0, -0.01), (1.0, 0.0)],
+                                      (1.0, 3.0), (0.0, -0.01))
+        curves = self._curves(self._convert(shape).bs_properties[0])
+        assert curves == {22: [-1.03, -1.0]}
+
 
 
 # ---------------------------------------------------------------------------
@@ -3269,6 +3462,219 @@ class TestAmbientSequences:
                 f'{rel}: {name} plays at {got[name]:.2f} deg, '
                 f'TES4 plays it at {want[name]:.2f} deg')
 
+    @pytest.mark.parametrize('rel', [
+        'dungeons/caves/cplog01.nif',
+        'dungeons/ayleidruins/interior/traps/artrapswingblade01.nif',
+        'oblivion/fire column/oblivioncitadelfirecolumn01.nif',
+        'architecture/lowerclass/doorfulllower02.nif',
+    ])
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_rest_world_rotation_matches_tes4(self, tmp_path, rel):
+        """A mesh whose sequence never plays at load keeps the root's authored rotation at rest.
+
+        Oblivion honours the root rotation; Skyrim ignores it, so it must survive below the root.
+        See: docs/commentary/asset_convert_nif.md#accum-root-classification
+        """
+        src = EXPORT_MESHES / rel
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+        _, sd = read_nif(src)
+        _, dd = read_nif(dst)
+        sroot, droot = sd.roots[0], dd.roots[0]
+        want = {bytes(b.name): (b.get_transform(sroot) * sroot.get_transform()).get_matrix_33()
+                for b in sroot.tree() if isinstance(b, NifFormat.NiTriBasedGeom)}
+        got = {bytes(b.name): b.get_transform(droot).get_matrix_33()
+               for b in droot.tree() if isinstance(b, NifFormat.NiTriBasedGeom)}
+        assert set(want) & set(got), 'no comparable geometry'
+        for name in set(want) & set(got):
+            diff = max(abs(getattr(want[name], f'm_{i}{j}') - getattr(got[name], f'm_{i}{j}'))
+                       for i in (1, 2, 3) for j in (1, 2, 3))
+            assert diff < 1e-3, f'{rel}: {name!r} rests {diff:.3f} off its TES4 rotation'
+
+
+_FIRE_COLUMN = 'oblivion/fire column/oblivioncitadelfirecolumn01.nif'
+_LOWER_DOOR = 'architecture/lowerclass/doorfulllower02.nif'
+
+
+def _quat_rows(w, x, y, z):
+    """A unit quaternion as a rotation matrix in pyffi's row-vector layout."""
+    import numpy as np
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w)],
+        [2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w)],
+        [2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y)]])
+
+
+def _first_frame_rotation(interp):
+    """The rotation a transform interpolator holds at its first key; None when it holds none.
+
+    Euler keys are composed X, then Y, then Z, as quaternions.  Without a
+    rotation key the pose plays, and a sentinel pose means no value.
+    """
+    data = interp.data
+    if data is not None and any(g.num_keys for g in data.xyz_rotations):
+        q = (1.0, 0.0, 0.0, 0.0)
+        for axis, group in enumerate(data.xyz_rotations):
+            half = (group.keys[0].value if group.num_keys else 0.0) / 2
+            turn = [math.cos(half), 0.0, 0.0, 0.0]
+            turn[axis + 1] = math.sin(half)
+            q = (q[0] * turn[0] - q[1] * turn[1] - q[2] * turn[2] - q[3] * turn[3],
+                 q[0] * turn[1] + q[1] * turn[0] + q[2] * turn[3] - q[3] * turn[2],
+                 q[0] * turn[2] - q[1] * turn[3] + q[2] * turn[0] + q[3] * turn[1],
+                 q[0] * turn[3] + q[1] * turn[2] - q[2] * turn[1] + q[3] * turn[0])
+        return _quat_rows(*q)
+    if data is not None and data.num_rotation_keys:
+        k = data.quaternion_keys[0].value
+        return _quat_rows(k.w, k.x, k.y, k.z)
+    q = interp.rotation
+    return _quat_rows(q.w, q.x, q.y, q.z) if q.w > -3.0e38 else None
+
+
+def _first_frame_world_rotations(path, sequence):
+    """{shape name: world rotation} at the first frame of the sequence called `sequence`.
+
+    Each node the sequence drives takes its entry's first-frame rotation, keyed
+    or posed; every other node keeps its bind rotation.
+    """
+    import numpy as np
+    NF, d = read_nif(path)
+    root = d.roots[0]
+    seqs = {bytes(b.name): b for b in root.tree() if isinstance(b, NF.NiControllerSequence)}
+    assert sequence in seqs, f'{path}: no sequence {sequence!r} among {sorted(seqs)}'
+    seq = seqs[sequence]
+    played = {}
+    for cb in seq.controlled_blocks:
+        if isinstance(cb.interpolator, NF.NiTransformInterpolator):
+            name = cb.get_node_name()
+            name = name if isinstance(name, bytes) else name.encode('latin-1')
+            played[name] = _first_frame_rotation(cb.interpolator)
+    out = {}
+
+    def walk(node, above):
+        """Carry the world rotation down the tree, row-vector order."""
+        mine = played.get(bytes(node.name))
+        if mine is None:
+            mine = np.array(node.rotation.as_list())
+        world = mine @ above
+        if isinstance(node, NF.NiTriBasedGeom):
+            out[bytes(node.name)] = world
+        for child in (getattr(node, 'children', None) or ()):
+            if child is not None and isinstance(child, NF.NiAVObject):
+                walk(child, world)
+    walk(root, np.eye(3))
+    return out
+
+
+def _accum_root_entry(*, pose=(1.0, 0.0, 0.0, 0.0), data=True, scale_keys=0,
+                      translation_keys=0, quat_keys=0, euler_keys=0, euler_axis=0):
+    """(root, manager) of a one-sequence mesh whose entry names the file root."""
+    root = NifFormat.NiNode()
+    root.name = b'Top'
+    interp = NifFormat.NiTransformInterpolator()
+    (interp.rotation.w, interp.rotation.x,
+     interp.rotation.y, interp.rotation.z) = pose
+    if data:
+        interp.data = NifFormat.NiTransformData()
+        interp.data.scales.num_keys = scale_keys
+        interp.data.translations.num_keys = translation_keys
+        interp.data.num_rotation_keys = quat_keys
+        if euler_keys:
+            interp.data.rotation_type = 4
+            interp.data.xyz_rotations[euler_axis].num_keys = euler_keys
+    seq = NifFormat.NiControllerSequence()
+    seq.name = b'Idle'
+    seq.target_name = b'Top'
+    seq.num_controlled_blocks = 1
+    seq.controlled_blocks.update_size()
+    seq.controlled_blocks[0].interpolator = interp
+    seq.controlled_blocks[0].node_name = b'Top'
+    mgr = NifFormat.NiControllerManager()
+    mgr.num_controller_sequences = 1
+    mgr.controller_sequences.update_size()
+    mgr.controller_sequences[0] = seq
+    return root, mgr
+
+
+class TestDroppedAccumRootPose:
+    """The file root's sequence entry is dropped; its pose must reach the node
+    whenever the pose is what would have played."""
+
+    def _pose(self, **entry):
+        """The pose the converter takes off the dropped entry, or None."""
+        root, mgr = _accum_root_entry(**entry)
+        return sequences._dropped_accum_root_pose(
+            root, mgr, sequences._seq_name_resolver(None))
+
+    def test_dataless_entry_gives_its_pose(self):
+        assert self._pose(data=False) == (1.0, 0.0, 0.0, 0.0)
+
+    @pytest.mark.parametrize('keys', [
+        {'scale_keys': 2}, {'translation_keys': 2}, {},
+    ])
+    def test_entry_keyed_on_another_channel_gives_its_pose(self, keys):
+        """Two constant scale keys do not stop the identity rotation from playing.
+
+        See: docs/commentary/asset_convert_nif.md#accum-root-classification
+        """
+        assert self._pose(**keys) == (1.0, 0.0, 0.0, 0.0)
+
+    @pytest.mark.parametrize('pose', [
+        (math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)),      # a quarter turn about Z
+        (0.0, 0.0, 0.0, 1.0),                            # half a turn: w is zero
+        (-math.sqrt(0.5), 0.0, -math.sqrt(0.5), 0.0),    # a quarter turn about Y, w negative
+    ])
+    def test_the_pose_given_is_the_entry_s_own(self, pose):
+        """The entry's pose comes back as written, not as identity and not dropped."""
+        assert self._pose(pose=pose, scale_keys=2) == pytest.approx(pose)
+
+    @pytest.mark.parametrize('keys', [
+        {'quat_keys': 2},
+        {'quat_keys': 1},                     # a single key is still a key
+        {'euler_keys': 2},                    # counted in the Euler groups only
+        {'euler_keys': 1, 'euler_axis': 1},   # one key, on Y
+        {'euler_keys': 2, 'euler_axis': 2},   # on Z
+        {'quat_keys': 1, 'euler_keys': 2},    # the layout Oblivion's files use
+        {'quat_keys': 2, 'scale_keys': 2},
+    ])
+    def test_entry_with_a_rotation_key_gives_no_pose(self, keys):
+        assert self._pose(**keys) is None
+
+    @pytest.mark.parametrize('keys', [{'data': False}, {'scale_keys': 2}])
+    def test_sentinel_rotation_gives_no_pose(self, keys):
+        """-FLT_MAX in the pose means the channel has no value to bake."""
+        none = -3.4028234663852886e+38
+        assert self._pose(pose=(none, none, none, none), **keys) is None
+
+    @pytest.mark.parametrize('rel, played, converted', [
+        (_FIRE_COLUMN, b'Idle', b'AutoLoop'),   # stood a quarter turn off while Idle played
+        (_FIRE_COLUMN, b'Idle', b'AutoPlay'),
+        (_LOWER_DOOR, b'Open', b'Open'),        # root at 180 deg, the same two scale keys
+        (_LOWER_DOOR, b'Close', b'Close'),
+        (_CLAW_STAND, b'Idle', b'AutoLoop'),    # a data-less entry: must not regress
+    ])
+    @pytest.mark.skipif(not EXPORT_MESHES.exists(), reason='Export meshes not available')
+    def test_first_frame_world_rotation_matches_tes4(self, tmp_path, rel, played, converted):
+        """While a sequence plays, each shape faces as it does in TES4.
+
+        The root entry's pose and NonAccum's first key are one transform split
+        over two entries; keeping the root's bind rotation applies it twice.
+        See: docs/commentary/asset_convert_nif.md#accum-root-classification
+        """
+        src = EXPORT_MESHES / rel
+        if not src.exists():
+            pytest.skip(f'{src} not found')
+        dst = tmp_path / 'out.nif'
+        convert_nif(str(src), str(dst))
+        want = _first_frame_world_rotations(src, played)
+        got = _first_frame_world_rotations(dst, converted)
+        shared = set(want) & set(got)
+        assert shared, 'no comparable geometry'
+        for name in sorted(shared):
+            off = abs(want[name] - got[name]).max()
+            assert off < 1e-3, f'{rel}: {name!r} plays {off:.3f} off its TES4 rotation'
+
 
 _PALACE_FONT = 'architecture/palace/interior/palacefont01.nif'
 
@@ -3330,96 +3736,98 @@ class TestShaderControllerTarget:
     @pytest.mark.skipif(not _MW_EXPORT_MESHES.exists(),
                         reason='Morrowind export meshes not available')
     def test_stale_palette_entry_does_not_emit_null_target(self, tmp_path):
-        import time
-        if not hasattr(time, '_original_clock'):
-            time.clock = time.perf_counter
-        from pyffi.formats.nif import NifFormat as NF
-
+        """The chandelier's dangling colour entry converts to a live controller with its curve intact."""
         src = _MW_EXPORT_MESHES / _STALE_PALETTE_SAMPLE
         if not src.exists():
             pytest.skip(f'{src} not found')
-
-        # The source must actually exhibit the defect, or the test proves
-        # nothing: its sequence must name a node the mesh does not contain.
-        src_data = NF.Data()
-        with open(str(src), 'rb') as f:
-            src_data.read(f)
-        node_names = {bytes(getattr(b, 'name', b'') or b'')
-                      for b in src_data.blocks}
-        palettes = [b.string_palette for b in src_data.blocks
-                    if isinstance(b, NF.NiControllerSequence)
-                    and b.string_palette is not None]
-        assert palettes, 'sample has no string palette — test is stale'
-        pal = bytes(palettes[0].palette.palette)
-        # The color controller targets "CandleSkinny01:0", which — unlike the
-        # bare "CandleSkinny01" NiNode carrying the transform tracks — is not a
-        # node in this mesh at all, so no shader can ever be found for it.
-        assert b'CandleSkinny01:0' in pal, \
-            'sample palette changed — test is stale'
-        assert b'CandleSkinny01:0' not in node_names, \
-            'sample no longer has a dangling palette name — test is stale'
-
+        src_data = _read_nif_data(src)
+        _assert_dangling_palette(src_data)
         dst = tmp_path / 'out.nif'
         convert_nif(str(src), str(dst))
-
-        dst_data = NF.Data()
-        with open(str(dst), 'rb') as f:
-            dst_data.read(f)
+        dst_data = _read_nif_data(dst)
 
         ctrls = self._shader_ctrls(dst_data)
         nulls = [type(c).__name__ for c in ctrls if c.target is None]
         assert not nulls, f'NULL-target shader controllers emitted: {nulls}'
-
-        # FAITHFUL CONVERSION: the emissive flicker must SURVIVE.  Deleting the
-        # entry was the earlier (wrong) fix -- it cost the chandelier its
-        # animation and stranded the manager with 0 sequences, which the engine
-        # dereferences just the same (vanilla ships no 0-sequence manager).
         assert ctrls, 'emissive animation was dropped instead of retargeted'
-
-        empty = [bytes(b.name) for b in dst_data.blocks
-                 if isinstance(b, NF.NiControllerSequence)
-                 and b.num_controlled_blocks == 0]
-        assert not empty, f'empty sequences left in file: {empty}'
-        for mgr in dst_data.blocks:
-            if isinstance(mgr, NF.NiControllerManager):
-                assert mgr.num_controller_sequences > 0, \
-                    'NiControllerManager left with 0 sequences (engine derefs it)'
-                assert all(s is not None for s in mgr.controller_sequences), \
-                    'manager references a dropped sequence'
-
-        # The curve itself must come across unchanged (5 keys, 0 -> 3s loop).
-        src_keys = []
-        for b in src_data.blocks:
-            if isinstance(b, NF.NiControllerSequence):
-                for cb in b.controlled_blocks:
-                    it = cb.interpolator
-                    if it is not None and type(it).__name__ == 'NiPoint3Interpolator':
-                        src_keys = [(round(k.time, 4),
-                                     (round(k.value.x, 4), round(k.value.y, 4),
-                                      round(k.value.z, 4)))
-                                    for k in it.data.data.keys]
+        _assert_sequences_kept(dst_data)
+        src_keys = _point3_entry_curve(src_data)
         assert src_keys, 'source has no color curve — test is stale'
-        got_keys = []
-        for c in ctrls:
-            it = c.interpolator
-            if it is not None and getattr(it, 'data', None) is not None:
-                got_keys = [(round(k.time, 4),
-                             (round(k.value.x, 4), round(k.value.y, 4),
-                              round(k.value.z, 4)))
-                            for k in it.data.data.keys]
-        assert got_keys == src_keys, \
-            f'color curve changed: {src_keys} -> {got_keys}'
+        assert _point3_entry_curve(dst_data, ctrls) == src_keys, 'color curve changed'
+        _assert_entries_name_nodes(dst_data)
 
-        # The entry must name a block that exists, or the engine cannot bind it.
-        names = {bytes(getattr(b, 'name', b'') or b'') for b in dst_data.blocks}
-        for b in dst_data.blocks:
-            if not isinstance(b, NF.NiControllerSequence):
+
+def _read_nif_data(path):
+    """A pyffi NifFormat.Data read from `path`."""
+    import time
+    if not hasattr(time, 'clock'):
+        time.clock = time.perf_counter
+    from pyffi.formats.nif import NifFormat
+    data = NifFormat.Data()
+    with open(str(path), 'rb') as f:
+        data.read(f)
+    return data
+
+
+def _sequences(data):
+    """The NiControllerSequence blocks of `data`."""
+    return [b for b in data.blocks if type(b).__name__ == 'NiControllerSequence']
+
+
+def _assert_dangling_palette(src_data):
+    """The sample's colour entry names "CandleSkinny01:0", a node the mesh lacks, or the test proves nothing."""
+    node_names = {bytes(getattr(b, 'name', b'') or b'') for b in src_data.blocks}
+    palettes = [s.string_palette for s in _sequences(src_data) if s.string_palette is not None]
+    assert palettes, 'sample has no string palette — test is stale'
+    assert b'CandleSkinny01:0' in bytes(palettes[0].palette.palette), 'sample palette changed — test is stale'
+    assert b'CandleSkinny01:0' not in node_names, 'sample no longer has a dangling palette name — test is stale'
+
+
+def _assert_sequences_kept(dst_data):
+    """No empty sequence, and every manager keeps its sequences (the engine derefs a 0-sequence manager)."""
+    empty = [bytes(s.name) for s in _sequences(dst_data) if s.num_controlled_blocks == 0]
+    assert not empty, f'empty sequences left in file: {empty}'
+    for mgr in dst_data.blocks:
+        if type(mgr).__name__ == 'NiControllerManager':
+            assert mgr.num_controller_sequences > 0, 'NiControllerManager left with 0 sequences'
+            assert all(s is not None for s in mgr.controller_sequences), 'manager references a dropped sequence'
+
+
+def _point3_entry_curve(data, ctrls=None):
+    """Keys of the colour entry's NiPoint3Interpolator; with `ctrls`, its controller must hold its own blend.
+
+    See: docs/commentary/asset_convert_nif.md#controller-owns-its-interpolator
+    """
+    keys = []
+    for seq in _sequences(data):
+        for cb in seq.controlled_blocks:
+            it = cb.interpolator
+            if type(it).__name__ != 'NiPoint3Interpolator' or (ctrls is not None and cb.controller not in ctrls):
                 continue
-            for cb in b.controlled_blocks:
-                nm = bytes(cb.node_name or b'')
-                if nm:
-                    assert nm in names, \
-                        f'sequence entry names a missing node: {nm!r}'
+            if ctrls is not None:
+                assert type(cb.controller.interpolator).__name__ == 'NiBlendPoint3Interpolator'
+            keys = [(round(k.time, 4), (round(k.value.x, 4), round(k.value.y, 4), round(k.value.z, 4)))
+                    for k in it.data.data.keys]
+    return keys
+
+
+def _assert_entries_name_nodes(dst_data):
+    """Every sequence entry names a block that exists, or the engine cannot bind it."""
+    names = {bytes(getattr(b, 'name', b'') or b'') for b in dst_data.blocks}
+    for seq in _sequences(dst_data):
+        for cb in seq.controlled_blocks:
+            nm = bytes(cb.node_name or b'')
+            assert not nm or nm in names, f'sequence entry names a missing node: {nm!r}'
+
+
+class TestShaderControllerTargetSamples:
+    """Further shader-controller samples (split from TestShaderControllerTarget when its first test was split)."""
+
+    def _shader_ctrls(self, data):
+        """The shader-property controllers of `data`."""
+        return [b for b in data.blocks
+                if 'ShaderProperty' in type(b).__name__
+                and 'Controller' in type(b).__name__]
 
     @pytest.mark.skipif(not _MW_EXPORT_MESHES.exists(),
                         reason='Morrowind export meshes not available')
@@ -3902,6 +4310,55 @@ class TestAnimObjectBehaviorGraph:
                 assert transitions.strip() != 'null',                     (f'[{n} seq] state {name!r} has no transitions — it is a '
                      f'dead end and can never be re-entered')
 
+    def test_starts_on_specialidle_when_present(self):
+        """An object with SpecialIdle loads playing it; one without starts at Rest.
+
+        See: docs/commentary/asset_convert_nif.md#specialidle-is-the-load-state
+        """
+        from asset_convert.havok.hkx_animobject import behavior_xml
+
+        cases = [(['SpecialIdle', 'Forward'], 0), (['Left', 'SpecialIdle'], 1),
+                 (['Forward', 'Backward'], 2)]
+        for seqs, start in cases:
+            xml = behavior_xml('obj', seqs)
+            assert f'<hkparam name="startStateId">{start}</hkparam>' in xml, seqs
+
+    def test_graph_declares_soundplay_after_sequences(self):
+        """A `SoundPlay.<SNDR>` key raises the bare `SoundPlay` event; a graph
+        without it stays silent.  Sequence event ids must stay first.
+
+        See: docs/commentary/asset_convert_animation.md#sound-text-keys-are-native
+        """
+        import re
+        from asset_convert.havok.hkx_animobject import SOUND_EVENT, behavior_xml
+
+        xml = behavior_xml('wire', ['Forward'])
+        names = re.search(r'<hkparam name="eventNames"[^>]*>(.*?)</hkparam>',
+                          xml, re.S).group(1)
+        assert re.findall(r'<hkcstring>(.*?)</hkcstring>', names) == [
+            'Forward', SOUND_EVENT]
+
+    def test_graph_sound_keys_become_soundplay(self):
+        """`sound: X` on a graph-driven mesh becomes `SoundPlay.TES4_X_SNDR`."""
+        import time
+        if not hasattr(time, 'clock'):
+            time.clock = time.perf_counter
+        from pyffi.formats.nif import NifFormat as NF
+        from asset_convert.nif.nif_passes import graph_sound_text_keys
+
+        tk = NF.NiTextKeyExtraData()
+        tk.num_text_keys = 2
+        tk.text_keys.update_size()
+        tk.text_keys[0].value = b'start'
+        tk.text_keys[1].value = b'sound: TRPTripwireSnap'
+        root = NF.NiNode()
+        root.add_extra_data(tk)
+        data = NF.Data()
+        data.roots = [root]
+        assert graph_sound_text_keys(data) == 1
+        assert [bytes(k.value) for k in tk.text_keys] == [
+            b'start', b'SoundPlay.TES4_TRPTripwireSnap_SNDR']
+
     def test_skeleton_has_one_pose_per_bone(self):
         """1 bone + 0 reference poses = null deref when a sequence binds.
 
@@ -3987,46 +4444,35 @@ class TestAnimationBlockLayout:
         # idempotent -- a second pass must find nothing left to fix
         assert normalize_blend_interpolators(root) == 0
 
-    @pytest.mark.skip(reason=
-        'The wrapper-node SCALE morph swap was REVERTED 2026-08-10: it hard-'
-        'freezes Skyrim on the ImperialDungeon05 tripwire (no crash, no log, '
-        'process alive but never renders again), while the SAME mesh works in '
-        'Vilverin.  morphs.emulate_morphs is back to the pre-90d04a3 '
-        'NiVisController version, so this test asserts a design that is no '
-        'longer shipped.  Re-enable it together with a real fix - see '
-        'docs/commentary/asset_convert_nif.md "NiGeomMorpherController does not exist '
-        'in Skyrim" for the bisection, the four failed fixes, the verified exe '
-        'field offsets, and the one unchased lead (the ref persistent flag).')
-    def test_morph_emulation_never_targets_geometry(self):
-        """The morph swap must not synthesize NiVisController entries: across
-        every vanilla Skyrim mesh, sequence-driven NiVisController entries
-        target only NiNode / NiBillboardNode / particle systems (1852/1852),
-        never a NiTriShape, and trishape-targeted vis swaps never produced a
-        visible swap in-game.  The swap is a wrapper-NODE scale animation
-        driven by NiTransformController -- the machinery confirmed working
-        in-game (CharacterGen secret wall)."""
-        from asset_convert.nif.morphs import BLEND_INTERP_FLAGS_ARRAYSIZE
-        import inspect
-        from asset_convert.nif import morphs
-        src = inspect.getsource(morphs.emulate_morphs)
-        assert 'NiVisController()' not in src, \
-            'morph emulation must not construct NiVisController blocks'
-        assert "b'NiVisController'" not in src, \
-            'morph emulation must not emit NiVisController sequence entries'
-        assert "controller_type = b'NiTransformController'" in src, \
-            'morph swap entries must be transform (scale) entries'
-        assert BLEND_INTERP_FLAGS_ARRAYSIZE == 0x0201
+    def test_palette_gains_every_sequence_target(self):
+        """A target missing from the palette (Oblivion's claw stand: Box02:2) is added once; listed ones stay."""
+        from asset_convert.nif.morphs import complete_object_palette
+        NF = self._nif()
+        root, mgr, pal, seq = NF.NiNode(), NF.NiControllerManager(), NF.NiDefaultAVObjectPalette(), \
+            NF.NiControllerSequence()
+        shapes = [NF.NiTriShape(), NF.NiTriShape()]
+        root.num_children = 2
+        root.children.update_size()
+        seq.num_controlled_blocks = 2
+        seq.controlled_blocks.update_size()
+        for i, (shape, name) in enumerate(zip(shapes, (b'Box01:2', b'Box02:2'))):
+            shape.name = name
+            root.children[i] = shape
+            seq.controlled_blocks[i].node_name = name
+        pal.num_objs = 1
+        pal.objs.update_size()
+        pal.objs[0].name, pal.objs[0].av_object = b'Box01:2', shapes[0]
+        mgr.object_palette = pal
+        mgr.num_controller_sequences = 1
+        mgr.controller_sequences.update_size()
+        mgr.controller_sequences[0] = seq
+        root.controller = mgr
+        assert complete_object_palette(root) == 1
+        assert [(bytes(o.name), o.av_object) for o in pal.objs] == [(b'Box01:2', shapes[0]), (b'Box02:2', shapes[1])]
+        assert complete_object_palette(root) == 0
 
-    @pytest.mark.skip(reason=
-        'Same revert as test_morph_emulation_never_targets_geometry: the '
-        'SCALE swap freezes the game, so ctrigtripwire01 no longer ships '
-        'wrapper "<shape> Swap" nodes or inverse scale curves.  See '
-        'docs/commentary/asset_convert_nif.md before re-enabling.')
-    def test_tripwire_morph_ships_a_scale_swap(self):
-        """End-to-end on the mesh the bug was reported against: converting
-        ctrigtripwire01 must produce paired wrapper NiNodes whose scale curves
-        are INVERSE (base 1->0 as the snapped clone goes 0->1), with the clone
-        wrapper resting at 0 so the un-tripped wire looks intact."""
+    def _tripwire_root_and_vis(self):
+        """(converted ctrigtripwire01 root, its NiVisController entries); skips if unexported."""
         src = Path('export/Oblivion.esm/meshes/dungeons/caves/triggers/'
                    'ctrigtripwire01.nif')
         if not src.exists():
@@ -4038,74 +4484,87 @@ class TestAnimationBlockLayout:
             result = convert_nif(str(src), dst)
             if result.get('error'):
                 pytest.skip(f'Conversion failed: {result["error"]}')
-
             data = NF.Data()
             with open(dst, 'rb') as f:
-                data.inspect(f)
-                f.seek(0)
                 data.read(f)
-            root = data.roots[0]
+        root = data.roots[0]
+        vis = [cb for seq in root.controller.controller_sequences
+               for cb in seq.controlled_blocks
+               if bytes(cb.controller_type or b'') == b'NiVisController']
+        assert vis, 'the morph must still animate'
+        return root, vis
 
-            mgr = root.controller
-            assert isinstance(mgr, NF.NiControllerManager)
-            curves = {}
-            for seq in mgr.controller_sequences:
-                for cb in seq.controlled_blocks:
-                    name = bytes(cb.node_name).decode('latin-1')
-                    if not name.endswith(' Swap'):
-                        continue
-                    ctype = bytes(cb.controller_type or b'').decode('latin-1')
-                    assert ctype == 'NiTransformController', \
-                        f'{name} must swap via transform, got {ctype!r}'
-                    keys = cb.interpolator.data.scales.keys
-                    curves[name] = [(k.time, k.value) for k in keys]
+    def test_tripwire_morph_swaps_wrapper_nodes_with_own_shaders(self):
+        """ctrigtripwire01's morph must convert to NiVisController entries on
+        "<shape> Swap" NiNodes only, every baked shape must own its shader
+        property and texture set, and only the base wrapper may rest visible.
 
-            assert len(curves) == 2, f'expected a base/clone pair, got {curves}'
-            base = [c for n, c in curves.items() if 'Mrph' not in n][0]
-            clone = [c for n, c in curves.items() if 'Mrph' in n][0]
-            assert base[0][1] == 1.0 and base[-1][1] == 0.0, \
-                'the intact wire must start visible and scale away'
-            assert clone[0][1] == 0.0 and clone[-1][1] == 1.0, \
-                'the snapped wire must start hidden and scale in'
-            assert abs(base[-1][0] - clone[-1][0]) < 1e-3, \
-                'both halves of the cut must happen at the same instant'
+        See: docs/commentary/asset_convert_animation.md#morph-emulation
+        """
+        NF = self._nif()
+        root, vis = self._tripwire_root_and_vis()
+        nodes = {bytes(b.name): b for b in root.tree()
+                 if isinstance(b, NF.NiAVObject)}
+        for cb in vis:
+            node = nodes[bytes(cb.node_name)]
+            assert type(node) is NF.NiNode and node.name.endswith(b' Swap')
+            assert cb.controller.target is node
 
-            # Wrappers must exist as real nodes, rest at the right scale, and
-            # be reachable by the manager (extra_targets + object palette) --
-            # a CB naming a node the manager cannot resolve drives nothing.
-            wrappers = {}
-            stack = [root]
-            while stack:
-                blk = stack.pop()
-                nm = bytes(getattr(blk, 'name', b'') or b'').decode('latin-1')
-                if nm.endswith(' Swap'):
-                    wrappers[nm] = blk
-                stack.extend(getattr(blk, 'children', []) or [])
-            assert set(wrappers) == set(curves)
-            for nm, node in wrappers.items():
-                want = 0.0 if 'Mrph' in nm else 1.0
-                assert node.scale == want, \
-                    f'{nm} must rest at scale {want}, got {node.scale}'
-                assert not int(node.flags) & 0x01, f'{nm} must not be hidden'
+        ropes = [b for b in root.tree() if isinstance(b, NF.NiTriShape)
+                 and bytes(b.name).startswith(b'Rope')]
+        assert len(ropes) >= 2
+        shaders = [r.bs_properties[0] for r in ropes]
+        assert len({id(s) for s in shaders}) == len(ropes)
+        assert len({id(s.texture_set) for s in shaders}) == len(ropes)
 
-            mtc = mgr.next_controller
-            while mtc is not None and not isinstance(
-                    mtc, NF.NiMultiTargetTransformController):
-                mtc = mtc.next_controller
-            assert mtc is not None, 'scale CBs need an MTC to bind through'
-            targets = {bytes(t.name).decode('latin-1')
-                       for t in mtc.extra_targets if t is not None}
-            assert set(curves) <= targets, \
-                'every animated wrapper must be an MTC extra target'
-            palette = {bytes(o.name).decode('latin-1')
-                       for o in mgr.object_palette.objs}
-            assert set(curves) <= palette, \
-                'every animated wrapper must be in the object palette'
+        for name, node in nodes.items():
+            if name.endswith(b' Swap'):
+                assert bool(int(node.flags) & 1) == (b'Mrph' in name), name
 
-            # The failed approach must not creep back in via any other pass.
-            assert not any(isinstance(b, NF.NiVisController)
-                           for b in root.tree()), \
-                'no NiVisController may survive on a morph-swap mesh'
+    def test_tripwire_morph_is_a_30fps_flipbook(self):
+        """The snap bakes many poses, each shown for exactly one 1/30 s frame
+        except the last, which holds.
+
+        See: docs/commentary/asset_convert_animation.md#morph-emulation
+        """
+        _, vis = self._tripwire_root_and_vis()
+        poses = [cb for cb in vis if b'Mrph' in bytes(cb.node_name)]
+        assert len(poses) >= 10, 'the snap is a flipbook, not a single cut'
+        for cb in poses:
+            keys = [(k.time, k.value) for k in cb.interpolator.data.data.keys]
+            on = [t for t, v in keys if v]
+            off = [t for t, v in keys[1:] if not v]
+            if off:
+                assert abs(off[0] - on[0] - 1.0 / 30) < 1e-3, keys
+
+    def test_waiting_room_beams_rest_dark_and_every_frame_fades(self):
+        """se01waitingroomwalls' LightBeams author emissive black plus a fade
+        curve, so they must rest dark before Forward plays, and every baked
+        morph frame must carry the fade or the last frame stays lit forever.
+
+        See: docs/commentary/asset_convert_shader.md#rest-emissive
+        """
+        src = Path('export/Oblivion.esm/meshes/architecture/quests/'
+                   'se01waitingroomwalls.nif')
+        if not src.exists():
+            pytest.skip('waiting room source NIF not exported')
+        NF = self._nif()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dst = os.path.join(tmpdir, 'meshes', 'se01waitingroomwalls.nif')
+            os.makedirs(os.path.dirname(dst))
+            assert not convert_nif(str(src), dst).get('error')
+            data = NF.Data()
+            with open(dst, 'rb') as f:
+                data.read(f)
+        beams = [b for b in data.roots[0].tree() if isinstance(b, NF.NiTriShape)
+                 and bytes(b.name).startswith(b'LightBeam')]
+        assert len(beams) > 3, 'the beam morph must bake frames'
+        for beam in beams:
+            shader = beam.bs_properties[0]
+            e = shader.emissive_color
+            assert (e.r, e.g, e.b) == (0.0, 0.0, 0.0), beam.name
+            assert isinstance(shader.controller,
+                              NF.BSEffectShaderPropertyColorController), beam.name
 
 
 class TestVoiceFilePrune:
@@ -4470,9 +4929,93 @@ class TestCollisionWindingRepair:
                 normals = C._shape_tri_normals(inner)
                 if normals is None:
                     continue
-                assert len(normals) == len(soup[0])
+                assert len(normals) == len(soup[0]) == len(soup[1])
                 checked += 1
         assert checked, 'expected a mesh collision shape in seisland.nif'
+
+
+class TestWindingRepairNeverRemovesFloor:
+    r"""A mesh solid at source must stay solid: the repair may add standable
+    surface, never take it away.
+
+    User report (2026-09-20): "I just fell through 0inuaru08".  The arch
+    raycasts 0 fall-through at source and 152 after conversion, because the
+    rule could not ABSTAIN -- its two nearest render candidates sat within one
+    unit of each other pointing opposite ways, and it guessed 30 times.  Only
+    3 of the mesh's 48 horizontal faces are decidable at all.
+    See: docs/commentary/asset_convert_collision.md#round-4b-the-rule-must-abstain
+    """
+
+    MORRO = Path('export/Morrowind_ob.esm/meshes/morro/i')
+
+    def _standable(self, tris, n=12):
+        """Cells with an UP-facing face under them; down-faces pass through."""
+        from asset_convert.collision import collision_winding as W
+        xs = [v[0] for t in tris for v in t]
+        ys = [v[1] for t in tris for v in t]
+        out = set()
+        for i in range(n):
+            for j in range(n):
+                ox = min(xs) + (max(xs) - min(xs)) * (i + 0.5) / n
+                oy = min(ys) + (max(ys) - min(ys)) * (j + 0.5) / n
+                for t in tris:
+                    if W.face_normal(t)[2] <= 0:
+                        continue
+                    (ax, ay, _az), (bx, by, _bz), (cx, cy, _cz) = t
+                    d1 = (bx-ax)*(oy-ay) - (by-ay)*(ox-ax)
+                    d2 = (cx-bx)*(oy-by) - (cy-by)*(ox-bx)
+                    d3 = (ax-cx)*(oy-cy) - (ay-cy)*(ox-cx)
+                    neg = d1 < -1e-9 or d2 < -1e-9 or d3 < -1e-9
+                    pos = d1 > 1e-9 or d2 > 1e-9 or d3 > 1e-9
+                    if not (neg and pos):
+                        out.add((i, j))
+                        break
+        return out
+
+    def _soups(self, path):
+        """`(collision, render)` triangles, both in Oblivion havok units."""
+        from asset_convert.nif import sse_nif
+        data = sse_nif.read_nif(str(path))
+        root = data.blocks[0] if data.blocks else None
+        coll, vis = [], []
+        for b in data.blocks:
+            if b.__class__.__name__ == 'hkPackedNiTriStripsData':
+                v = [(x.x, x.y, x.z) for x in b.vertices]
+                coll += [(v[t.triangle.v_1], v[t.triangle.v_2],
+                          v[t.triangle.v_3]) for t in b.triangles]
+        for b in data.blocks:
+            if b.__class__.__name__ != 'NiTriShape':
+                continue
+            d = getattr(b, 'data', None)
+            if d is None:
+                continue
+            m = b.get_transform(root)
+            v = [((p.x*m.m_11 + p.y*m.m_21 + p.z*m.m_31 + m.m_41) / 7.0,
+                  (p.x*m.m_12 + p.y*m.m_22 + p.z*m.m_32 + m.m_42) / 7.0,
+                  (p.x*m.m_13 + p.y*m.m_23 + p.z*m.m_33 + m.m_43) / 7.0)
+                 for p in d.vertices]
+            vis += [(v[t.v_1], v[t.v_2], v[t.v_3]) for t in d.triangles]
+        return coll, vis
+
+    @pytest.mark.parametrize('name', ['inuaru03', 'inuaru04', 'inuaru05',
+                                      'inuaru07', 'inuaru08', 'inuaru09',
+                                      'inuaru10'])
+    def test_solid_source_stays_solid(self, name, monkeypatch):
+        """No cell standable at source may lose its surface to the repair."""
+        from asset_convert.collision import collision_winding as W
+        src = self.MORRO / f'{name}.nif'
+        if not src.exists():
+            pytest.skip(f'{name}.nif not exported')
+        monkeypatch.setenv('TESCONV_COLLISION_WINDING_FIX', '1')
+        coll, vis = self._soups(src)
+        assert coll and vis, 'fixture must have both collision and render'
+        before = self._standable(coll)
+        repaired, _n = W.repair_inverted_floors(list(coll), vis, None, None)
+        after = self._standable(repaired)
+        lost = before - after
+        assert not lost, (
+            f'{name}: repair removed {len(lost)} standable cells of '
+            f'{len(before)} -- a hole in a floor that was solid at source')
 
 
 class TestLuminanceGlowMapsBecomeRGB:
@@ -4535,6 +5078,25 @@ class TestLuminanceGlowMapsBecomeRGB:
             ww, hh = max(1, ww // 2), max(1, hh // 2)
         assert len(blob) - 128 == total, (
             f'mip chain truncated: body {len(blob)-128} != expected {total}')
+
+    @pytest.mark.skipif(not Path(SRC).exists(),
+                        reason='Oblivion candle glow map not available')
+    def test_hard_linked_copy_receives_the_fix(self, tmp_path):
+        """A deployed hard link to the output file must see the grey glow map.
+
+        See: docs/commentary/asset_convert_texture.md#texture-repairs-write-in-place
+        """
+        import shutil as _sh
+        from asset_convert.texture import luminance_textures as lt
+
+        out = tmp_path / 'candle_g.dds'
+        deployed = tmp_path / 'deployed_candle_g.dds'
+        _sh.copy2(self.SRC, str(out))
+        os.link(str(out), str(deployed))
+        assert lt.convert_file(str(out)) is True
+        assert not lt.is_luminance(str(deployed)), (
+            'the deployed link still holds the L8 original -- it renders red')
+        assert os.stat(str(out)).st_nlink == 2, 'the conversion cut the link'
 
 
 class TestFallbackWhiteIsNotAFlame:
@@ -4824,7 +5386,7 @@ class TestFalloutMeshSideSlots:
         assert wearable_plan.body_part_for_flags(1 << 10) == 131
         assert not wearable_plan_falloutnv.shield_flags(1 << 13)
         collision_falloutnv._SOURCE[0] = False
-        assert wearable_plan.body_part_for_flags(1 << 3) == 44
+        assert wearable_plan.body_part_for_flags(1 << 3) == 49
         assert wearable_plan_falloutnv.shield_flags(1 << 13)
 
     def test_fallout_only_bones_are_renamed(self):
@@ -4895,4 +5457,83 @@ class TestFalloutBipedSlotsAreNotOblivions:
         """FNV bit 5 is Weapon, which no ARMO may occupy."""
         world_falloutnv.register_fallout_source({'TERM': [1]})
         assert _convert_biped_flags(1 << 5) == 0
+
+
+class TestMorrowindParticlesRender:
+    """A legacy Morrowind emitter must come out simulating and visible, not just loadable.
+
+    See: docs/commentary/asset_convert_nif.md#morrowind-particles-invisible
+    """
+
+    def _upgraded(self, color_extra=None):
+        """The NiParticleSystem one synthetic legacy emitter upgrades to."""
+        from asset_convert.nif.particles_morrowind import upgrade_legacy_particles
+        root, frame = NifFormat.NiNode(), NifFormat.NiNode()
+        legacy = NifFormat.NiRotatingParticles()
+        legacy.data = NifFormat.NiRotatingParticlesData()
+        ctrl = NifFormat.NiParticleSystemController()
+        ctrl.frequency = 1.0
+        ctrl.emitter = frame
+        ctrl.particle_extra = color_extra
+        legacy.controller = ctrl
+        root.num_children = 2
+        root.children.update_size()
+        root.children[0], root.children[1] = frame, legacy
+        data = NifFormat.Data()
+        data.roots = [root]
+        data.blocks = [root, frame, legacy, ctrl] + ([color_extra] if color_extra else [])
+        assert upgrade_legacy_particles(data) == 1
+        return root.children[1]
+
+    def test_clock_runs_and_particles_are_born_visible(self):
+        """The update clock runs at the authored rate and particles are born opaque."""
+        psys = self._upgraded()
+        update = psys.controller.next_controller
+        assert isinstance(update, NifFormat.NiPSysUpdateCtlr)
+        assert update.frequency == 1.0
+        emitter = next(m for m in psys.modifiers if isinstance(m, NifFormat.NiPSysEmitter))
+        assert emitter.initial_color.a == 1.0
+
+    def test_every_system_carries_a_color_modifier(self):
+        mods = self._upgraded().modifiers
+        assert any(isinstance(m, NifFormat.NiPSysColorModifier) for m in mods)
+
+    def test_authored_color_curve_is_kept(self):
+        """Morrowind's own color curve rides through instead of being dropped."""
+        curve = NifFormat.NiColorData()
+        legacy = NifFormat.NiParticleColorModifier()
+        legacy.color_data = curve
+        mods = self._upgraded(legacy).modifiers
+        colors = [m for m in mods if isinstance(m, NifFormat.NiPSysColorModifier)]
+        assert len(colors) == 1 and colors[0].data is curve
+
+
+class TestMeshSubdirFilter:
+    """`--mesh-subdirs` entries are path prefixes: a root folder, a nested one or one mesh."""
+
+    def _tree(self, root):
+        """Four empty meshes across two root folders."""
+        for rel in ('tr/l/candle.nif', 'tr/f/bed.nif', 'pc/l/lamp.nif', 'td/vfx.nif'):
+            path = root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'')
+
+    def _kept(self, root, subdirs):
+        """The meshes the filter keeps, as sorted posix paths under `root`."""
+        kept, _skipped = _collect_nifs(root, subdirs)
+        return sorted(p.relative_to(root).as_posix() for p in kept)
+
+    def test_root_folder_keeps_its_whole_tree(self, tmp_path):
+        self._tree(tmp_path)
+        assert self._kept(tmp_path, ['tr']) == ['tr/f/bed.nif', 'tr/l/candle.nif']
+
+    def test_nested_folder_and_single_mesh(self, tmp_path):
+        self._tree(tmp_path)
+        assert self._kept(tmp_path, ['TR\\l', 'td/vfx.nif']) == ['td/vfx.nif', 'tr/l/candle.nif']
+
+    def test_an_uppercase_extension_is_a_mesh_too(self, tmp_path):
+        """A loose mod's `Tower.NIF` is collected on any filesystem."""
+        self._tree(tmp_path)
+        (tmp_path / 'td' / 'Tower.NIF').write_bytes(b'')
+        assert self._kept(tmp_path, ['td']) == ['td/Tower.NIF', 'td/vfx.nif']
 

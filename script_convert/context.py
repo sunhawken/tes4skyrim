@@ -30,6 +30,8 @@ class ScriptContext:
     var_types: dict = field(default_factory=dict)
     #: Original lowercased name -> Papyrus-safe name, where they differ.
     var_renames: dict = field(default_factory=dict)
+    #: Lowercased `ref` variable -> the ONE traceable command it is assigned (symbols.assignment_sources).
+    ref_sources: dict = field(default_factory=dict)
     #: OBSE `array_var` declarations; a read of one is inert.
     obse_arrays: set = field(default_factory=set)
     #: Lowercased OBSE user-function parameter names.
@@ -46,9 +48,23 @@ class ScriptContext:
     uses_hour_window: bool = False
     uses_timer: bool = False
     uses_say: bool = False
+    #: The script calls MessageBox, which a GameMode pass must not raise over an open dialogue.
+    shows_box: bool = False
+    #: A standalone script, which declares the halted flag; a fragment only returns.
+    can_halt: bool = False
+    #: A statement emitted the halt, so every event checks the halted flag.
+    halts: bool = False
     uses_say_timer: bool = False
+    #: An event without an action ref read the last activator; OnActivate records it.
+    uses_last_activator: bool = False
+    #: A poll block calls SetPos/SetAngle: TES4 per-frame motion.
+    moves_in_poll: bool = False
+    #: Poll SetPos/SetAngle calls stepping from their own axis read -> (axis, step, sign) (poll_motion.relative_sets).
+    relative_sets: dict = field(default_factory=dict)
     #: Authored quest-script delay in seconds (FO3/FNV DATA.Delay); 0 = none.
     quest_delay: float = 0.0
+    #: Every record the script is attached to is a BOOK, so its OnActivate means "read".
+    on_book: bool = False
 
     # --- Emission bookkeeping ----------------------------------------------
     #: Quest -> latch variable, for stage timers.  Per-script: a latch
@@ -56,6 +72,8 @@ class ScriptContext:
     stage_latches: dict = field(default_factory=dict)
     #: The arm a TES4 `return` must emit before `Return` inside a poll body.
     poll_return_prefix: str = ''
+    #: Glide duration expression while a moving poll body is emitted; SetPos/SetAngle there glide over it.
+    glide_secs: str = ''
     #: GetInCell family helpers this script needs.
     cell_families: dict = field(default_factory=dict)
     #: SCRO alias map, scoped to ONE fragment.
@@ -66,13 +84,15 @@ class ScriptContext:
     #: script-managed flag rather than the engine's sleep state.
     in_sleep_menumode: bool = False
 
-    in_foreach: int = 0
     refwalk_var: str = ''
     refwalk_labels: set = field(default_factory=set)
     block_depth: int = 0
 
     udf_returns: bool = False
-    udf_return_value: str = ''
+    #: Set while a user function's body converts: its `Self` is the calling reference.
+    in_udf: bool = False
+    #: Papyrus type of the first `SetFunctionValue`, the UDF's return type.
+    udf_return_type: str = 'Int'
     #: Parameter types of this script's OBSE user function, in order; None
     #: when it declares no TES4Call at all.
     udf_signature: list = None
@@ -89,6 +109,12 @@ class ScriptContext:
     #: this script, and whether the helpers are due.
     msgbox_used: set = field(default_factory=set)
     uses_msg_buttons: bool = False
+    #: The script's source as parsed, so a MessageBoxEX resolves its `%z` strings the way the plan did.
+    source: str = ''
+    #: A `Message` converted to TES4_Notify, so the helper is due.
+    uses_notify: bool = False
+    #: A StartConversation walk runs inside the poll, so the poll's overlap guard is due.
+    uses_conv_walk: bool = False
 
     #: Chargen-menu call sites converted here, and whether the re-entrancy
     #: latch declaration is due.

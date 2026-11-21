@@ -24,11 +24,19 @@ override system. This pipeline is for everything CREA.
 from asset_convert.game_paths import current_namespace
 import json
 import os
+from asset_convert.havok.animation_data import (fragment_path,
+                                                remove_legacy_fragment)
 from asset_convert.havok.behavior_vocabulary import movement_type_names
 import re
 import shutil
 
-from asset_convert.havok.creature_split_morrowind import split_creatures
+from asset_convert.havok.creature_sounds import sound_data_by_folder
+from asset_convert.havok.creature_split_morrowind import (source_dirs,
+                                                          split_creatures)
+from asset_convert.havok.npc_anim_morrowind import convert_npc_anims
+from asset_convert.havok.npc_graph_morrowind import (build_npc_graphs,
+                                                     remove_npc_graphs)
+from asset_convert.paths import EXPORT
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
@@ -86,6 +94,39 @@ def _clear_stale_nifs(proj_dir):
             pass
 
 
+def _convert_parts(creature_dir, proj_dir, parts_dir, tex_fallback,
+                   converted, attachments, nif_failures, named_parts):
+    """Convert every source NIF: skeletons in place, parts into staging.
+
+    A `skeleton*` NIF is a skeleton unless a CREA names it in NIFZ
+    (`named_parts`): Morrowind's skeleton creature ships `skeleton_body.nif`.
+    Attachment nodes are read from the SOURCE first, because convert_nif
+    strips the `Prn` extra data the merge needs.
+    """
+    from asset_convert.nif.nif_converter import convert_nif
+    from asset_convert.havok.creature_mesh import source_attachment_node
+
+    for fn in sorted(os.listdir(creature_dir)):
+        if not fn.lower().endswith('.nif'):
+            continue
+        src = os.path.join(creature_dir, fn)
+        if fn.lower().startswith('skeleton') and fn.lower() not in named_parts:
+            dst = os.path.join(proj_dir, 'character assets', fn.lower())
+            convert_nif(src, dst, creature=True, tex_fallback=tex_fallback)
+            continue
+        dst = os.path.join(parts_dir, fn.lower())
+        try:
+            attachments[dst] = source_attachment_node(src)
+        except Exception:
+            pass
+        res = convert_nif(src, dst, creature=True,
+                          tex_fallback=tex_fallback)
+        if res.get('error'):
+            nif_failures.append((fn, res['error']))
+            continue
+        converted[fn.lower()] = dst
+
+
 def _convert_creature(creature_dir: str, name: str, out_meshes_dir: str,
                       part_sets: list = None, fps: float = 30.0,
                       sound_slots: dict = None,
@@ -103,6 +144,7 @@ def _convert_creature(creature_dir: str, name: str, out_meshes_dir: str,
     from asset_convert.havok.hkx_behavior import generate_creature_project
     from asset_convert.havok.hkx_xml import convert_hkx_to_amd64
     from asset_convert.nif.nif_converter import convert_nif
+    from asset_convert.nif.shaders import master_texture_roots
     from asset_convert.havok.creature_mesh import (
         extract_death_pile, merge_creature_body, source_attachment_node,
         source_hidden_attachment_nodes)
@@ -113,6 +155,7 @@ def _convert_creature(creature_dir: str, name: str, out_meshes_dir: str,
                                          attr_speed=attr_speed,
                                          namespace=namespace)
     proj_dir = os.path.join(out_meshes_dir, manifest['dir'])
+    tex_fallback = master_texture_roots(creature_dir)
 
     _widen_hkx_to_amd64(proj_dir, convert_hkx_to_amd64)
     _clear_stale_nifs(proj_dir)
@@ -160,7 +203,8 @@ def _convert_creature(creature_dir: str, name: str, out_meshes_dir: str,
                     holder_offsets=manifest.get('death_offsets')):
                 res = convert_nif(raw_pile,
                                   os.path.join(proj_dir, pile_name),
-                                  creature=True)
+                                  creature=True,
+                                  tex_fallback=tex_fallback)
                 if os.path.exists(os.path.join(proj_dir, pile_name)):
                     death_pile = pile_name
                 else:
@@ -170,28 +214,9 @@ def _convert_creature(creature_dir: str, name: str, out_meshes_dir: str,
         except Exception as e:
             nif_failures.append((pile_name, f'{type(e).__name__}: {e}'))
     manifest['death_pile'] = death_pile
-    for fn in sorted(os.listdir(creature_dir)):
-        if not fn.lower().endswith('.nif'):
-            continue
-        if fn.lower().startswith('skeleton'):
-            dst = os.path.join(proj_dir, 'character assets', fn.lower())
-            convert_nif(os.path.join(creature_dir, fn), dst, creature=True)
-            continue
-        dst = os.path.join(parts_dir, fn.lower())
-        # Read the part's attachment node from the SOURCE, before
-        # convert_nif strips the `Prn` extra data.  The death animation
-        # hides these nodes (kf_decode NiVisController -> bone scale), so
-        # the merge has to hang each shape off the right one.
-        try:
-            attachments[dst] = source_attachment_node(
-                os.path.join(creature_dir, fn))
-        except Exception:
-            pass
-        res = convert_nif(os.path.join(creature_dir, fn), dst, creature=True)
-        if res.get('error'):
-            nif_failures.append((fn, res['error']))
-            continue
-        converted[fn.lower()] = dst
+    _convert_parts(creature_dir, proj_dir, parts_dir, tex_fallback,
+                   converted, attachments, nif_failures,
+                   {p for pset in part_sets or () for p in pset})
 
     # A single Oblivion creature folder holds several DISTINCT creatures (dog,
     # wolf, skeletal-hound) each with its own NIFZ part set.  Merge EACH set
@@ -315,80 +340,6 @@ def foot_enum_map(slots: dict) -> dict:
                 'backleft': 'FootLeft', 'backright': 'FootRight'}
     return {'left': 'FootFront', 'right': 'FootFront',
             'backleft': 'FootBack', 'backright': 'FootBack'}
-
-
-def _sound_data_by_folder(export_dir: str) -> dict:
-    """folder(lower) -> {csdt_type: (SOUN EditorID, chance)}, from the CREA
-    export.
-
-    Resolves CSCR inheritance (817 of Oblivion's 909 CREA records inherit their
-    sounds from another creature rather than defining their own), and takes the
-    richest slot set in a folder: one behavior project serves every creature
-    sharing that mesh folder, so the annotations have to be the union.
-
-    chance is the authored CSDC play-chance (0-100); 100 when the export
-    predates the field.
-    """
-    from tes5_import.base.text_reader import parse_export_file
-
-    crea_path = os.path.join(export_dir, 'CREA.txt')
-    soun_path = os.path.join(export_dir, 'SOUN.txt')
-    if not os.path.exists(crea_path):
-        return {}
-
-    soun_edid = {}
-    if os.path.exists(soun_path):
-        for rec in parse_export_file(soun_path):
-            fid = (rec.get('FormID') or '').upper()
-            edid = rec.get('EditorID')
-            if fid and edid:
-                soun_edid[fid] = edid
-
-    recs = list(parse_export_file(crea_path))
-    by_fid = {(r.get('FormID') or '').upper(): r for r in recs}
-
-    def slots_of(rec, depth=0):
-        """{type: (SOUN fid, chance)} for a CREA, following CSCR
-        inheritance."""
-        n = int(rec.get('SoundTypeCount', 0) or 0)
-        if n:
-            out = {}
-            for i in range(n):
-                t = rec.get(f'SoundType[{i}].Type')
-                s = rec.get(f'SoundType[{i}].Sound')
-                c = rec.get(f'SoundType[{i}].Sound.Chance')
-                if t is not None and s:
-                    out[int(t)] = (s.upper(),
-                                   int(c) if c is not None else 100)
-            return out
-        if depth < 4:
-            src = (rec.get('CSCR.InheritSound') or '').upper()
-            if src and src in by_fid:
-                return slots_of(by_fid[src], depth + 1)
-        return {}
-
-    out = {}
-    for rec in recs:
-        model = (rec.get('Model.MODL') or '').replace('/', '\\')
-        parts = [p for p in model.lower().split('\\') if p]
-        folder = parts[-2] if len(parts) >= 2 else ''
-        if not folder:
-            continue
-        slots = {t: (soun_edid[s], c) for t, (s, c) in slots_of(rec).items()
-                 if s in soun_edid}
-        if not slots:
-            continue
-        # Richest set wins — the project is shared across the whole folder.
-        if len(slots) > len(out.get(folder, {})):
-            out[folder] = slots
-    return out
-
-
-def sound_slots_by_folder(export_dir: str) -> dict:
-    """folder(lower) -> {csdt_type: SOUN EditorID} (see
-    _sound_data_by_folder; this is the chance-less view most callers use)."""
-    return {folder: {t: edid for t, (edid, _c) in slots.items()}
-            for folder, slots in _sound_data_by_folder(export_dir).items()}
 
 
 def _speed_attr_by_folder(export_dir: str) -> dict:
@@ -539,15 +490,42 @@ def convert_guns(export_dir: str, out_meshes_dir: str, workers: int = None,
         return {}
     work = os.path.join(str(paths.EXPORT), 'skyrim_assets', 'humanoid_graph')
     return build_gun_graphs(manifest, out_meshes_dir, work, log)
+
+
+#: Whether a Morrowind plugin's NPC animation files are converted; off, their earlier outputs are deleted.
+NPC_ANIMS = False
+
+
+def humanoid_appends(export_dir: str, out_meshes_dir: str, workers: int = None,
+                     log=print) -> dict:
+    """The fragment appends of what a plugin adds to the humanoid project.
+
+    FO3/FNV guns, else (with `NPC_ANIMS`) the animation files a Morrowind
+    plugin's NPCs name; {} for a plugin with neither.
+    See: docs/commentary/asset_convert_animation.md#morrowind-npc-animation-files
+    """
+    guns = convert_guns(export_dir, out_meshes_dir, workers, log)
+    if guns:
+        return guns
+    if not NPC_ANIMS:
+        remove_npc_graphs(out_meshes_dir, log)
+        return {}
+    work = os.path.join(str(EXPORT), 'skyrim_assets', 'humanoid_graph_tes3')
+    manifest = convert_npc_anims(export_dir, out_meshes_dir, work, workers, log)
+    return build_npc_graphs(manifest, out_meshes_dir, work, log)
+
+
 def _creature_folders(export_dir: str, meshes_root: str, names, log) -> list:
     """(folder, leaf name, referenced by a CREA) for every animated creature folder.
 
     A creature is ANY folder holding a skeleton.nif plus .kf animations, at
     any depth: Morrowind_ob nests 67 such folders where Oblivion keeps them
-    flat, and a depth-1 scan found 16 of them.
+    flat, and a depth-1 scan found 16 of them. A folder of Morrowind source
+    models no CREA points at is skipped: its `skeleton.nif` is a model.
     See: docs/commentary/tes4_export_morrowind.md#creatures
     """
     referenced = _crea_model_dirs(export_dir)
+    sources = source_dirs(export_dir) - referenced
     wanted = {n.lower() for n in names} if names else None
     candidates = []
     for cdir, _subdirs, files in os.walk(meshes_root):
@@ -564,6 +542,8 @@ def _creature_folders(export_dir: str, meshes_root: str, names, log) -> list:
             log(f'  [skip] {name}: no animations')
             continue
         rel = os.path.relpath(cdir, meshes_root).lower().replace('/', '\\')
+        if rel in sources:
+            continue
         candidates.append((cdir, name, rel in referenced))
     return candidates
 
@@ -600,7 +580,7 @@ def _convert_pool(dirs, export_dir, out_meshes_dir, workers, namespace,
     sound slots are replayed as annotations and vocal idle states.
     """
     part_sets = _part_sets_by_folder(export_dir)
-    sound_data = _sound_data_by_folder(export_dir)
+    sound_data = sound_data_by_folder(export_dir)
     sound_slots = {f: {t: e for t, (e, _c) in s.items()}
                    for f, s in sound_data.items()}
     sound_chances = {f: {t: c for t, (_e, c) in s.items()}
@@ -661,13 +641,41 @@ def _project_summary(all_manifests) -> dict:
     } for name, m in all_manifests.items()}
 
 
+#: A fragment's own keys; every other key is an append a full run registered.
+_FRAGMENT_OWN_KEYS = frozenset({'version', 'source', 'animdata', 'animsetdata'})
+
+
+def _kept_appends(plugin_out: str) -> dict:
+    """The vanilla-project appends (guns) the plugin's fragment already holds,
+    so a run scoped to some creatures keeps them without rebuilding them."""
+    try:
+        with open(fragment_path(plugin_out, os.path.basename(plugin_out)),
+                  encoding='utf-8') as handle:
+            frag = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return {key: value for key, value in frag.items() if key not in _FRAGMENT_OWN_KEYS}
+
+
+def _remove_stale_fragment(plugin_out: str, log=print) -> None:
+    """Delete the fragment an earlier build left for a plugin that now
+    registers nothing, so CreatureRuntime stops composing it."""
+    path = fragment_path(plugin_out, os.path.basename(plugin_out))
+    if os.path.isfile(path):
+        os.remove(path)
+        log(f'  Removed stale {os.path.relpath(path, plugin_out)}')
+    if remove_legacy_fragment(plugin_out, os.path.basename(plugin_out)):
+        log('  Removed stale pre-split creature fragment')
+
+
 def convert_creatures(export_dir: str, out_meshes_dir: str,
                       names: list = None, workers: int = None,
                       log=print) -> dict:
     """Convert every creature folder; {'projects': {name: manifest}, 'errors': {name: str}}.
 
     Writes the projects, meshes, the animation cache fragment (from ALL
-    projects on disk, so a subset run keeps the rest registered) and
+    projects on disk, so a subset run keeps the rest registered, and the
+    gun appends it already holds, which only a full run rebuilds) and
     <export_dir>/creature_projects.json. Morrowind creatures are split first,
     which creates the tree for a plugin that ships no meshes.
     See: docs/reference/tes_runtime_fragments.md#the-runtime-composer
@@ -676,7 +684,7 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
     from tes5_import.base.artifact_schema import write_artifact
 
     meshes_root = str(assets_for(export_dir) / 'meshes')
-    split_creatures(export_dir, meshes_root, log)
+    split_creatures(export_dir, meshes_root, log, workers, names=names)
     if not os.path.isdir(meshes_root):
         log(f'  No meshes folder at {meshes_root}')
         return {'projects': {}, 'errors': {}}
@@ -693,14 +701,16 @@ def convert_creatures(export_dir: str, out_meshes_dir: str,
     for m in manifests_under(out_meshes_dir).values():
         if m.get('namespace') == namespace:
             all_manifests.setdefault(m['name'], m)
-    appends = {} if names else convert_guns(export_dir, out_meshes_dir,
-                                            workers, log)
+    plugin_out = os.path.dirname(os.path.normpath(out_meshes_dir))
+    appends = (_kept_appends(plugin_out) if names
+               else humanoid_appends(export_dir, out_meshes_dir, workers, log))
     if all_manifests or appends:
-        plugin_out = os.path.dirname(os.path.normpath(out_meshes_dir))
         path = write_fragment(list(all_manifests.values()), out_meshes_dir,
                               os.path.basename(plugin_out), appends, plugin_out)
         log(f'  Registered {len(all_manifests)} projects in '
             f'{os.path.relpath(path, plugin_out)}')
+    elif not names:
+        _remove_stale_fragment(plugin_out, log)
     write_artifact(os.path.join(export_dir, 'creature_projects.json'),
                    os.path.basename(os.path.normpath(export_dir)),
                    _project_summary(all_manifests))

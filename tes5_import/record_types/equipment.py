@@ -5,7 +5,6 @@ import re
 import struct
 
 from ..base.constants import ENCH_CAST_TYPE_MAP, ENCH_TYPE_MAP, WEAPON_TYPE_MAP, ARMA_BODY_COVERAGE_EXTRA
-from ..actors.magic_effects import aimed_variant, has_projectile
 from ..base.equivalents import (
     ARMA_ADDITIONAL_RACES,
     ARMA_ADDITIONAL_RACES_NONBEAST,
@@ -28,9 +27,19 @@ from ..base.equivalents import (
     WEAPON_ANIM_MULT,
     WEAPON_ANIM_NAM8,
     WEAPON_ANIM_NAM9,
-    WEAPON_ANIM_STAGGER,
     WEAPON_ANIM_VNAM,
+    weapon_skill_stagger,
 )
+from .magic_variants import (DELIVERY_CONTACT, MGEF_CAST_FOR_OWNER, RANGE_DELIVERY,
+                             UNCASTABLE_SPELL_TYPES, ability_variant,
+                             bound_assoc_is_armor,
+                             bound_item_assoc, bound_script_variant,
+                             delivery_variant, get_mgef_formid,
+                             get_seff_variant, menu_object, owner_delivery,
+                             written_once)
+from ..actors.disease_contact import contact_effect
+from ..actors.vampirism_morrowind import vampire_disease_effects
+from .world_falloutnv import is_fallout_source
 from .equipment_falloutnv import ammo_flags, gun_speed
 from .equipment_falloutnv import refine_anim_type as refine_fallout_anim_type
 from .projectile_falloutnv import (ammo_projectile, gun_sheathe_sounds,
@@ -54,7 +63,106 @@ from .common import (
 )
 
 
-from output_layout import assets_for
+from asset_convert.character.morrowind_coverage import (BODY_PARTITIONS,
+                                                        coverage_bits,
+                                                        part_slots, sided_slot)
+from asset_convert.ui.book_inam import (find_source_mesh, inv_basename,
+                                        inv_basename_map, reads_as_book)
+
+#: Biped slot of BOD2 bit 0.
+_FIRST_SLOT = 30
+#: Vanilla note reading rig (Clutter\Books\Note01\Note02.nif), the INAM of 77 vanilla notes.
+HIGH_POLY_NOTE02 = 0x0001541B
+#: Vanilla bound-book reading rig (BookSkyrim01.nif).
+HIGH_POLY_SKYRIM_BOOK = 0x000E894C
+
+
+# ---------------------------------------------------------------------------
+# Book inventory art
+# ---------------------------------------------------------------------------
+
+def _book_inventory_art(writer, model: str) -> int:
+    """INAM FormID (never 0: BookMenu null-derefs) for a BOOK with world model `model`.
+
+    A bound book: its generated rig (asset_convert/ui/book_inam.py), one STAT
+    per model keyed on the authored model path, named by the asset side's
+    collision-aware basename.  A note, parchment or scroll: vanilla
+    HighPolyNote02's clean paper.  A model no asset tree ships, or none: the
+    vanilla book.  A writer without `book_roots` takes every model to be a
+    book.  Cached per writer.
+    """
+    if writer is None or not model:
+        return HIGH_POLY_SKYRIM_BOOK
+    cache = getattr(writer, '_book_inam_fids', None)
+    if cache is None:
+        cache = writer._book_inam_fids = {}
+    key = model.lower()
+    if key not in cache:
+        cache[key] = _resolve_book_inventory_art(writer, model)
+    return cache[key]
+
+
+def _resolve_book_inventory_art(writer, model: str) -> int:
+    """Uncached body of _book_inventory_art."""
+    roots = getattr(writer, 'book_roots', None)
+    if roots is not None:
+        src = find_source_mesh(roots, model)
+        if src is None:
+            return HIGH_POLY_SKYRIM_BOOK
+        if not reads_as_book(src):
+            return HIGH_POLY_NOTE02
+    bmap = getattr(writer, '_book_inam_names', None)
+    if bmap is None:
+        models = sorted(getattr(writer, 'book_models', None) or [], key=str.lower)
+        bmap = writer._book_inam_names = inv_basename_map(models)
+    base = bmap.get(model) or inv_basename(model)
+    fid = writer.derive_formid('BOOK_INVART', model.lower())
+    writer.add_record('STAT', _build_model_stat(
+        'InvArt_' + base, prefix_path('clutter\\books\\inv\\' + base + '.nif'), fid))
+    return fid
+
+
+# ---------------------------------------------------------------------------
+# Shared record helpers
+# ---------------------------------------------------------------------------
+
+def armo_slots(rec: dict) -> int:
+    """The ARMO's BOD2 slots: a one-sided Morrowind piece's own, else the converted flags.
+
+    See: docs/commentary/asset_convert_armor.md#body-slot-layout
+    """
+    sided = sided_slot(rec)
+    if sided:
+        return 1 << (sided - _FIRST_SLOT)
+    return _convert_biped_flags(get_int(rec, 'BMDT.BipedFlags'))
+
+
+def _arma_bod2(rec: dict, tes5_biped: int, armor_type: int) -> int:
+    """The ARMA's BOD2: the ARMO's slots plus the body regions its mesh covers.
+
+    A Morrowind wearable states its body coverage in its part list; every
+    other record takes `ARMA_BODY_COVERAGE_EXTRA`, less forearms for clothing
+    and calves for shoes. Head extras apply to both.
+    See: docs/commentary/asset_convert_armor.md#morrowind-skin-fill
+    """
+    slots = part_slots(rec)
+    arma_biped = tes5_biped | coverage_bits(slots)
+    is_clothing = (armor_type == 2)
+    is_boot = ('boot' in (get_str(rec, 'Male.BipedModel.MODL', '')
+                          or get_str(rec, 'Female.BipedModel.MODL', '')).lower())
+    for bit, extras in ARMA_BODY_COVERAGE_EXTRA.items():
+        if not arma_biped & (1 << bit):
+            continue
+        for extra_bit in extras:
+            if slots and extra_bit + _FIRST_SLOT in BODY_PARTITIONS:
+                continue
+            if is_clothing and extra_bit == 4:
+                continue
+            if extra_bit == 8 and bit == 7 and not is_boot and is_clothing:
+                continue
+            arma_biped |= (1 << extra_bit)
+    return arma_biped
+
 
 def _resolve_mgef(code: str, actor_value: int = -1, script_fid: str = '',
                   effect_type: str = '') -> int:
@@ -75,8 +183,6 @@ def _resolve_mgef(code: str, actor_value: int = -1, script_fid: str = '',
     records were not exported (an override plugin that redefines no effects),
     where there is no record of ours to point at.
     """
-    from .magic import get_mgef_formid, get_seff_variant
-
     if code == 'SEFF' and script_fid:
         fid = get_seff_variant(script_fid, effect_type)
         if fid:
@@ -115,8 +221,6 @@ def _bound_script_for(mgef_fid: int, writer, uncastable: bool) -> int:
     resolved to an output WEAP/ARMO by the MGEF pass — reusing it means the
     script and the native archetype always agree on what gets equipped.
     """
-    from .magic import bound_assoc_is_armor, bound_item_assoc, bound_script_variant
-
     assoc = bound_item_assoc(mgef_fid)
     if not assoc:
         return 0
@@ -148,104 +252,97 @@ def set_ench_index(ench_records) -> None:
 _FILLER_EFFECTS = (0x0003EB15, 0x0003EB17, 0x0003EB16, 0x0003EAF3)  # AlchRestore{Health,Magicka,Stamina}, AlchFortifyHealth
 
 
+#: Effect owner rule for potions, poisons and ingredients: Fire and Forget on Self, 803 of 803 vanilla slots.
+OWNER_CONSUMED = (1, 0)
+#: TES5 spell type -> (casting type, delivery): abilities Constant on Self, diseases Constant on Contact.
+SPELL_TYPE_CAST = {4: (0, 0), 1: (0, DELIVERY_CONTACT)}
+#: TES4 ENCH type -> the delivery its effects are fixed to: a weapon strikes (Contact), apparel is worn (Self).
+ENCH_FIXED_DELIVERY = {2: DELIVERY_CONTACT, 3: 0}
+#: The spell type both games number 1.
+SPELL_TYPE_DISEASE = 1
+#: The spell type both games number 4.
+SPELL_TYPE_ABILITY = 4
+#: A subrecord's type and size precede its data: 6 bytes.
+_SUBRECORD_HEADER = 6
+#: (TES4 SPIT flag, TES5 SPIT flag) pairs with one meaning in both games (xEdit SPIT definitions).
+SPELL_FLAG_MAP = ((0x01, 0x000001), (0x04, 0x020000), (0x10, 0x080000),
+                  (0x20, 0x100000), (0x40, 0x200000))
+
+
+def _slot_mgef(rec: dict, i: int, code: str, writer, spell_type: int,
+               owner: tuple) -> int:
+    """The MGEF effect slot ``i`` references, 0 when its code has none.
+
+    ``owner`` is (the casting type the owner's effects carry, its fixed
+    delivery or None for each effect's own TES4 range); the effect is
+    re-pointed at a clone carrying that pair.  ``spell_type`` is the owning
+    TES5 spell type, -1 for any other owner.  An Oblivion Ability's effect
+    drops the hit visuals Oblivion never drew (magic_variants.ability_variant).
+    """
+    mgef_fid = _resolve_mgef(code, get_int(rec, f'Effect[{i}].ActorValue', -1),
+                             get_str(rec, f'ScriptEffect[{i}].FormID'),
+                             get_str(rec, f'Effect[{i}].Type'))
+    if not mgef_fid:
+        return 0
+    mgef_fid = _bound_script_for(mgef_fid, writer,
+                                 spell_type in UNCASTABLE_SPELL_TYPES) or mgef_fid
+    delivery = owner[1]
+    if delivery is None:
+        delivery = RANGE_DELIVERY.get(get_str(rec, f'Effect[{i}].Type'), 0)
+    mgef_fid = delivery_variant(mgef_fid, owner[0], delivery, writer,
+                                area=get_int(rec, f'Effect[{i}].Area') > 0)
+    if (spell_type != SPELL_TYPE_ABILITY or is_fallout_source()
+            or get_str(rec, f'Effect[{i}].MorrowindIndex')):
+        return mgef_fid
+    return ability_variant(mgef_fid, code, get_int(rec, f'Effect[{i}].Magnitude'), writer)
+
+
 def _pack_effects(rec: dict, count_key: str = 'EffectCount', pad_to: int = 0,
-                  delivery: int = 0, writer=None, uncastable: bool = False) -> bytes:
-    """Pack EFID/EFIT pairs for all effects on a record.
+                  delivery: int = 0, writer=None, spell_type: int = -1,
+                  owner: tuple = OWNER_CONSUMED, self_only: bool = False,
+                  disease: str = '') -> bytes:
+    """EFID/EFIT pairs for every effect on a record that has a TES5 MGEF.
 
-    Effects with no TES5 equivalent are dropped — an EFID of 0 (null MGEF)
-    crashes the game as soon as the item's card is shown in a menu. If all
-    effects are dropped, or pad_to demands more (e.g. 4 for INGR), real
-    zero-magnitude filler effects are used.
-
-    ``delivery`` is the owning record's delivery (2 = Aimed): an aimed magic
-    item fires the projectile of its effects' MGEFs, so if none of them has
-    one the item casts NOTHING in game.  In that case the first effect is
-    swapped for a synthesized aimed clone (see magic_effects.aimed_variant).
-
-    Bound-item effects are re-pointed at a scripted stand-in whenever the
-    engine's own archetype 17 cannot serve them — always for bound ARMOR
-    (Skyrim implements bound weapons only), and for any bound item on a
-    never-cast spell.  ``uncastable`` marks that second case: a spell the
-    engine APPLIES rather than casts (an Ability or Lesser Power).  See
-    _bound_script_for and magic.bound_script_variant.
+    A null EFID crashes the menu, so an empty list (or one short of
+    ``pad_to``) takes zero-magnitude fillers.  Every slot is fitted to
+    ``owner`` and ``spell_type`` (see _slot_mgef); a filler takes
+    ``delivery`` when the owner fixes none, and carries no hit visuals on an
+    Ability.  ``self_only`` keeps only Self-range effects.  The effects of
+    the disease named ``disease`` carry its contraction (contact_effect).
+    See: docs/commentary/tes5_import_magic.md#aimed-ench-null-projectile
     """
     effects = []
-    effect_count = get_int(rec, count_key)
-    dropped_dur = 0
-    for i in range(effect_count):
+    for i in range(get_int(rec, count_key)):
         if pad_to and len(effects) >= pad_to:
             break
-        code = get_str(rec, f'Effect[{i}].EFID')
-        av = get_int(rec, f'Effect[{i}].ActorValue', -1)
-        mgef_fid = _resolve_mgef(
-            code, av,
-            get_str(rec, f'ScriptEffect[{i}].FormID'),
-            get_str(rec, f'Effect[{i}].Type')) if code else 0
-        if not mgef_fid:
-            dropped_dur = max(dropped_dur, get_int(rec, f'Effect[{i}].Duration'))
+        if self_only and get_str(rec, f'Effect[{i}].Type') not in ('', 'Self'):
             continue
-        # Bound armor has no engine implementation at all, and any bound item
-        # on a never-cast spell is equally dead — either way the scripted
-        # stand-in takes over.  A bound weapon on a castable spell is left on
-        # the native archetype.
-        scripted = _bound_script_for(mgef_fid, writer, uncastable)
-        if scripted:
-            mgef_fid = scripted
-        mag = get_int(rec, f'Effect[{i}].Magnitude')
-        area = get_int(rec, f'Effect[{i}].Area')
-        dur = get_int(rec, f'Effect[{i}].Duration')
-        effects.append((mgef_fid, float(mag), area, dur, code))
+        code = get_str(rec, f'Effect[{i}].EFID')
+        mgef_fid = _slot_mgef(rec, i, code, writer, spell_type, owner) if code else 0
+        if mgef_fid and disease:
+            mgef_fid = contact_effect(mgef_fid, disease, len(effects),
+                                      effects[0][0] if effects else 0, writer)
+        if mgef_fid:
+            effects.append((mgef_fid, float(get_int(rec, f'Effect[{i}].Magnitude')),
+                            get_int(rec, f'Effect[{i}].Area'),
+                            get_int(rec, f'Effect[{i}].Duration')))
 
-    # Every effect-bearing record needs at least one real effect; INGR needs
-    # exactly pad_to. Fill with distinct harmless zero-magnitude effects.
-    # When EVERY effect dropped (pure script-effect spells), the first filler
-    # keeps the longest dropped duration: the spell then still registers as an
-    # active magic effect for as long as the TES4 spell did, which is what the
-    # converted IsSpellTarget checks (TES4Polyfill.HasMagicEffectByID) look for.
-    want = max(pad_to, 1)
-    used = {fid for fid, _, _, _, _ in effects}
+    used = {fid for fid, *_ in effects}
     fillers = iter(fid for fid in _FILLER_EFFECTS if fid not in used)
-    filler_dur = dropped_dur if not effects else 0
-    while len(effects) < want:
-        effects.append((next(fillers, _FILLER_EFFECTS[0]), 0.0, 0, filler_dur, ''))
-        filler_dur = 0
-
-    if delivery == 2 and not any(has_projectile(fid) for fid, *_ in effects):
-        for idx, (fid, mag, area, dur, code) in enumerate(effects):
-            variant = aimed_variant(fid, code, writer)
-            if variant:
-                effects[idx] = (variant, mag, area, dur, code)
-                break
+    filler_delivery = delivery if owner[1] is None else owner[1]
+    while len(effects) < max(pad_to, 1):
+        filler = delivery_variant(next(fillers, _FILLER_EFFECTS[0]), owner[0],
+                                  filler_delivery, writer)
+        if spell_type == SPELL_TYPE_ABILITY:
+            filler = ability_variant(filler, '', 0, writer)
+        effects.append((filler, 0.0, 0, 0))
 
     subs = b''
-    for mgef_fid, mag, area, dur, _code in effects:
+    for mgef_fid, mag, area, dur in effects:
         subs += pack_formid_subrecord('EFID', mgef_fid)
         subs += pack_subrecord('EFIT', struct.pack('<fII', mag, area, dur))
     return subs
 
-
-def _book_source_mesh_missing(writer, model: str) -> bool:
-    """True when the plugin's BOOK MODL has no source mesh in the export.
-
-    asset_convert/ui/book_inam.py skips those models ("source mesh missing"), so
-    the INAM STAT must not point at a mesh that will never be generated.
-    Cached per writer; unknown export dir → assume present (old behaviour).
-    """
-    import os
-    export_dir = getattr(writer, 'export_dir', None)
-    if not export_dir or not model:
-        return False
-    cache = getattr(writer, '_book_src_missing', None)
-    if cache is None:
-        cache = writer._book_src_missing = {}
-    key = model.lower()
-    hit = cache.get(key)
-    if hit is None:
-        parts = model.replace('/', '\\').split('\\')
-        hit = not os.path.isfile(
-        os.path.join(str(assets_for(export_dir)), 'meshes', *parts))
-        cache[key] = hit
-    return hit
 
 
 def _build_model_stat(edid: str, model_path: str, stat_fid: int) -> bytes:
@@ -392,7 +489,9 @@ def convert_WEAP(rec: dict, writer=None) -> bytes:
     struct.pack_into('<I', dnam, 12, WEAPON_ANIM_FLAGS.get(anim_type, 0))
     struct.pack_into('<B', dnam, 26, max(1, get_int(rec, 'DNAM.ProjectileCount', 1)))
     struct.pack_into('<f', dnam, 44, speed)
-    struct.pack_into('<B', dnam, 76, WEAPON_ANIM_STAGGER.get(anim_type, 0)) # Stagger
+    skill, stagger = weapon_skill_stagger(anim_type)
+    struct.pack_into('<i', dnam, 76, skill)
+    struct.pack_into('<f', dnam, 96, stagger)
     subs += pack_subrecord('DNAM', bytes(dnam))
 
     # CRDT — Critical data (24 bytes for SSE, form version 44)
@@ -421,8 +520,7 @@ def build_armo_bod2(rec: dict, is_clothing: bool) -> bytes:
     (The ARMA companion's BOD2 stays the master's — companions are never
     re-minted by an override.)
     """
-    tes5_biped = _convert_biped_flags(get_int(rec, 'BMDT.BipedFlags'))
-    return struct.pack('<II', tes5_biped, _armo_armor_type(rec, is_clothing))
+    return struct.pack('<II', armo_slots(rec), _armo_armor_type(rec, is_clothing))
 
 
 def convert_ARMO(rec: dict, is_clothing: bool = False, writer=None) -> bytes:
@@ -461,7 +559,7 @@ def convert_ARMO(rec: dict, is_clothing: bool = False, writer=None) -> bytes:
 
     # BOD2 (Biped Object Data) replaces BMDT — shared with the override path
     tes4_biped = get_int(rec, 'BMDT.BipedFlags')
-    tes5_biped = _convert_biped_flags(tes4_biped)
+    tes5_biped = armo_slots(rec)
     armor_type = _armo_armor_type(rec, is_clothing)
     subs += pack_subrecord('BOD2', struct.pack('<II', tes5_biped, armor_type))
 
@@ -556,126 +654,91 @@ def _beast_arma_races(rec: dict) -> tuple:
     return tuple(ARMA_BEAST_RACES)
 
 
-def _build_arma(rec: dict, arma_fid: int, tes5_biped: int, armor_type: int,
-                is_shield: bool = False, beast_race=None,
-                exclude_beast_races: bool = False) -> bytes:
-    """Build an ARMA (Armor Addon) companion record for an ARMO.
+#: BOD2 bits of slots 32 and 49, the body and lower body.
+_BODY_SLOTS = (1 << 2) | (1 << 19)
 
-    ARMA holds the actual worn mesh models.
-    Order: EDID BOD2 RNAM DNAM MOD2 MOD3 [SNDD] MODL[]
+#: TES4 biped bits of the body, hand and foot slots, whose gear is weight-morphed; bit 5 is the foot.
+_TES4_BODY_BITS, _TES4_FOOT = 0b111100, 1 << 5
 
-    `beast_race` builds the KHAJIIT or ARGONIAN armature instead of the
-    default one: its RNAM is that race, its MODL[] that race's vampire
-    variant, and its meshes are the per-race NIFs asset_convert fitted to
-    that race's own skull.  `exclude_beast_races` drops the beast races
-    from the DEFAULT armature's additional-race list, so the engine cannot
-    satisfy a khajiit with the human-fitted mesh and skip the beast one.
-    Both mirror vanilla -- see skyrim_overrides.ARMA_BEAST_RACES.
+#: ARMA DNAM priority of body and lower-body armor. See: docs/commentary/asset_convert_armor.md#biped-slot-conversion
+_BODY_PRIORITY = 5
+
+#: ARMA DNAM priority of every other armor addon (vanilla gauntlets, boots, helmets).
+_ITEM_PRIORITY = 10
+
+#: Armor type (0 light, 1 heavy, 2 clothing) -> the footstep set its boots use.
+_FOOTSTEP_SETS = {0: LIGHT_ARMOR_FOOTSTEP_SET, 1: HEAVY_ARMOR_FOOTSTEP_SET, 2: CLOTHING_FOOTSTEP_SET}
+
+
+def _arma_dnam(use_slider: bool, tes5_biped: int) -> bytes:
+    """ARMA DNAM: both priorities, both weight sliders (2 = enabled), zero padding and sound.
+
+    Body and lower-body armor draw at 5 so gloves win 34 and boots 38, as in vanilla.
+    See: docs/commentary/asset_convert_armor.md#biped-slot-conversion
     """
-    subs = b''
-    edid = get_str(rec, 'EditorID', '')
-    if beast_race:
-        subs += pack_string_subrecord(
-            'EDID', edid + '_' + beast_race.capitalize() + 'AA')
-    else:
-        subs += pack_string_subrecord('EDID', edid + '_AA')
-
-    # BOD2 — body coverage flags (may be wider than the ARMO's equipment slot).
-    # ARMA declares which body regions the mesh covers, e.g. a cuirass mesh
-    # covers Body + ForeArms + Calves even though the ARMO only claims "Body".
-    arma_biped = tes5_biped
-    # Clothing shirts should NOT claim ForeArms — their sleeves are SBP_32_BODY
-    # geometry that should remain visible when gloves are equipped.
-    # Shoes should NOT claim Calves — only boots (armor foot items) should.
-    is_clothing = (armor_type == 2)
-    # Either gender's path — a female-only boot is still a boot.
-    is_boot = ('boot' in (get_str(rec, 'Male.BipedModel.MODL', '')
-                          or get_str(rec, 'Female.BipedModel.MODL', '')).lower())
-    for bit, extras in ARMA_BODY_COVERAGE_EXTRA.items():
-        if arma_biped & (1 << bit):
-            for extra_bit in extras:
-                # Skip ForeArms(4) for clothing — sleeves stay visible with gloves
-                if is_clothing and extra_bit == 4:
-                    continue
-                # Skip Calves(8) for shoes (foot items without 'boot' in path)
-                if extra_bit == 8 and bit == 7 and not is_boot and is_clothing:
-                    continue
-                arma_biped |= (1 << extra_bit)
-    subs += pack_subrecord('BOD2', struct.pack('<II', arma_biped, armor_type))
-
-    # RNAM — Race (must match parent ARMO)
-    if beast_race:
-        subs += pack_formid_subrecord(
-            'RNAM', ARMA_BEAST_RACES[beast_race][0])
-    else:
-        subs += pack_formid_subrecord('RNAM', 0x00000019)
-
-    # Weight-slider morphing follows the vanilla convention: ONLY gear
-    # covering body/hands/feet uses it (ARMA path <name>_1.nif + slider
-    # enabled; engine lerps the _0/_1 pair by actor weight).  Vanilla
-    # helmets and shields have the slider DISABLED and a plain path
-    # (IronShieldAA / IronHelmetAA), and rigid PRN pieces must never be
-    # weight-morphed.  TES4 biped bits: 2=UpperBody 3=LowerBody 4=Hand 5=Foot.
-    tes4_biped_flags = get_int(rec, 'BMDT.BipedFlags')
-    use_slider = bool(tes4_biped_flags & 0b111100)
-
-    # DNAM — ARMA-specific data (12 bytes)
-    # Priority M(U8) + Priority F(U8) + WeightSlider M(U8) + WeightSlider F(U8)
-    # + pad(2) + DetectionSoundValue(U8) + pad(U8) + WeaponAdjust(float)
-    # Weight slider: 0x02=enabled (vanilla convention)
-    # Priority: 10 matches vanilla Skyrim iron armor
     slider = 2 if use_slider else 0
-    dnam = struct.pack('<BBBBHBBf', 10, 10, slider, slider, 0, 0, 0, 0.0)
-    subs += pack_subrecord('DNAM', dnam)
+    priority = _BODY_PRIORITY if tes5_biped & _BODY_SLOTS else _ITEM_PRIORITY
+    return pack_subrecord('DNAM', struct.pack('<BBBBHBBf', priority, priority, slider, slider,
+                                              0, 0, 0, 0.0))
 
+
+def _arma_models(rec: dict, beast_race, use_slider: bool) -> bytes:
+    """MOD2/MOD3: the worn meshes, female falling back to male.
+
+    A beast armature wears the per-race mesh fitted to its skull; weight-morphed
+    gear names its `_1` variant.
+    """
     def _weighted(path: str) -> str:
         p = prefix_path(path)
         if not p.lower().endswith('.nif'):
             return p
         if beast_race:
-            # The per-race mesh asset_convert fitted to THIS race's skull.
-            # Head gear never sets the weight slider (vanilla helmets ship a
-            # plain path), so the two suffixes can never both apply.
             return p[:-4] + ARMA_BEAST_RACES[beast_race][2] + '.nif'
-        if use_slider:
-            return p[:-4] + '_1.nif'
-        return p
+        return p[:-4] + '_1.nif' if use_slider else p
 
-    # MOD2 — Male biped model (the actual worn mesh)
     male_model = get_str(rec, 'Male.BipedModel.MODL')
-    if male_model:
-        subs += pack_string_subrecord('MOD2', _weighted(male_model))
-
-    # MOD3 — Female biped model
-    female_model = get_str(rec, 'Female.BipedModel.MODL')
+    female_model = get_str(rec, 'Female.BipedModel.MODL') or male_model
+    subs = pack_string_subrecord('MOD2', _weighted(male_model)) if male_model else b''
     if female_model:
         subs += pack_string_subrecord('MOD3', _weighted(female_model))
-    elif male_model:
-        # Fall back to male model for female
-        subs += pack_string_subrecord('MOD3', _weighted(male_model))
+    return subs
 
-    # MODL[] — Additional Races that can equip this armor addon.
-    # Per TES5 record definition: MODL (Additional Races) comes BEFORE SNDD.
+
+def _arma_races(beast_race, exclude_beast_races: bool) -> bytes:
+    """MODL[]: the additional races that can wear the armature."""
     if beast_race:
         race_list = ARMA_BEAST_RACES[beast_race][1]
     elif exclude_beast_races:
         race_list = ARMA_ADDITIONAL_RACES_NONBEAST
     else:
         race_list = ARMA_ADDITIONAL_RACES
-    for race_fid in race_list:
-        subs += pack_formid_subrecord('MODL', race_fid)
+    return b''.join(pack_formid_subrecord('MODL', race_fid) for race_fid in race_list)
 
-    # SNDD — Footstep sound (boots need footstep set)
+
+def _build_arma(rec: dict, arma_fid: int, tes5_biped: int, armor_type: int,
+                is_shield: bool = False, beast_race=None,
+                exclude_beast_races: bool = False) -> bytes:
+    """An ARMO's companion ARMA: EDID BOD2 RNAM DNAM MOD2 MOD3 MODL[] [SNDD].
+
+    `beast_race` builds that race's armature (its RNAM, vampire variant and
+    skull-fitted meshes); `exclude_beast_races` drops the beast races from
+    the default one's list, as vanilla does (skyrim_overrides.ARMA_BEAST_RACES).
+    Only body, hand and foot gear is weight-morphed; boots get a footstep set.
+    """
+    edid = get_str(rec, 'EditorID', '')
+    suffix = '_' + beast_race.capitalize() + 'AA' if beast_race else '_AA'
+    subs = pack_string_subrecord('EDID', edid + suffix)
+    subs += pack_subrecord('BOD2', struct.pack(
+        '<II', _arma_bod2(rec, tes5_biped, armor_type), armor_type))
+    subs += pack_formid_subrecord(
+        'RNAM', ARMA_BEAST_RACES[beast_race][0] if beast_race else 0x00000019)
     tes4_biped = get_int(rec, 'BMDT.BipedFlags')
-    is_feet = bool(tes4_biped & (1 << 5))   # TES4 bit 5 = Foot
-    if is_feet:
-        if armor_type == 1:  # Heavy
-            subs += pack_formid_subrecord('SNDD', HEAVY_ARMOR_FOOTSTEP_SET)
-        elif armor_type == 0:  # Light
-            subs += pack_formid_subrecord('SNDD', LIGHT_ARMOR_FOOTSTEP_SET)
-        else:  # Clothing
-            subs += pack_formid_subrecord('SNDD', CLOTHING_FOOTSTEP_SET)
-
+    use_slider = bool(tes4_biped & _TES4_BODY_BITS)
+    subs += _arma_dnam(use_slider, tes5_biped)
+    subs += _arma_models(rec, beast_race, use_slider)
+    subs += _arma_races(beast_race, exclude_beast_races)
+    if tes4_biped & _TES4_FOOT:
+        subs += pack_formid_subrecord('SNDD', _FOOTSTEP_SETS.get(armor_type, CLOTHING_FOOTSTEP_SET))
     return pack_record('ARMA', arma_fid, 0, subs)
 
 
@@ -871,54 +934,7 @@ def convert_BOOK(rec: dict, writer=None) -> bytes:
     data = struct.pack('<BBHiIf', tes5_flags, book_type, 0, teaches_tes5, value, weight)
     subs += pack_subrecord('DATA', data)
 
-    # INAM — Inventory Art (STAT).  BookMenu null-derefs without it (in-game
-    # crash on reading any book), so it must always be present.  It also must
-    # point at one of the rigged Skyrim reading meshes: the open animation and
-    # page text come from the template's behavior graph + skinned page bones +
-    # PageText quad, so a static mesh here opens invisible with no text.
-    # asset_convert/ui/book_inam.py bakes each distinct TES4 book model's cover
-    # textures onto the vanilla book/note rig and writes it to
-    # meshes\tes4\clutter\books\inv\<inv_basename(model)>.nif; one STAT per
-    # model is synthesised here (cached on the writer — BOOKs convert
-    # serially).  The basename rule is imported from book_inam so the STAT
-    # target and the generated mesh cannot drift apart.
-    inam_fid = 0x000E894C  # HighPolySkyrimBook — fallback for model-less books
-    if writer is not None and model:
-        # Resolve through the plugin-wide collision-aware map, exactly as the
-        # asset side does: two BOOK models can share a leaf filename across
-        # different directories, and only the map knows which one keeps the
-        # bare name.  Built once per writer (BOOKs convert serially).
-        from asset_convert.ui.book_inam import inv_basename, inv_basename_map
-        bmap = getattr(writer, '_book_inam_names', None)
-        if bmap is None:
-            models = sorted(getattr(writer, 'book_models', None) or [],
-                            key=lambda m: m.lower())
-            bmap = writer._book_inam_names = inv_basename_map(models)
-        base = bmap.get(model) or inv_basename(model)
-        # The asset stage skips models whose source mesh the plugin never
-        # ships, so pointing a STAT at the mesh it would have generated
-        # leaves BookMenu loading a file that does not exist.  Fall back to
-        # the vanilla reading rig for those, same as a model-less book.
-        if _book_source_mesh_missing(writer, model):
-            base = None
-        if base is not None:
-            cache = getattr(writer, '_book_inam_stats', None)
-            if cache is None:
-                cache = writer._book_inam_stats = {}
-            inam_fid = cache.get(base)
-            if inam_fid is None:
-                # SHARED across every book using this mesh, so it cannot key
-                # off one book's FormID. `base` is derived (inv_basename_map
-                # resolves collisions against the whole model list), so key on
-                # the authored source model path instead — that is TES4 data
-                # and does not move when our naming logic changes.
-                inam_fid = writer.derive_formid('BOOK_INVART', model.lower())
-                inv_model = 'clutter\\books\\inv\\' + base + '.nif'
-                stat_bytes = _build_model_stat('InvArt_' + base,
-                                               prefix_path(inv_model), inam_fid)
-                writer.add_record('STAT', stat_bytes)
-                cache[base] = inam_fid
-    subs += pack_formid_subrecord('INAM', inam_fid)
+    subs += pack_formid_subrecord('INAM', _book_inventory_art(writer, model))
 
     # CNAM — Description (string, empty like vanilla non-descriptive books).
     subs += pack_string_subrecord('CNAM', '')
@@ -945,13 +961,8 @@ def convert_ENCH(rec: dict, writer=None) -> bytes:
 
     tes5_type = ENCH_TYPE_MAP.get(tes4_type, 6)
     cast_type = ENCH_CAST_TYPE_MAP.get(tes4_type, 2)
-    # Target type from first effect
-    target_type = 0  # Self
-    first_effect_type = get_str(rec, 'Effect[0].Type')
-    if first_effect_type == 'Touch':
-        target_type = 1
-    elif first_effect_type == 'Target':
-        target_type = 2
+    fixed = ENCH_FIXED_DELIVERY.get(tes4_type, 0 if cast_type == 0 else None)
+    target_type = owner_delivery(rec) if fixed is None else fixed
 
     tes5_flags = 0
     if tes4_flags & 0x08:  # No Auto-Calc
@@ -969,84 +980,76 @@ def convert_ENCH(rec: dict, writer=None) -> bytes:
     # WornRestrictions at 32 = 0
     subs += pack_subrecord('ENIT', bytes(enit))
 
-    # Effects — TES5 uses EFID(FormID) + EFIT(Magnitude/Area/Duration)
-    subs += _pack_effects(rec, delivery=target_type, writer=writer)
+    subs += _pack_effects(rec, delivery=target_type, writer=writer,
+                          owner=(MGEF_CAST_FOR_OWNER.get(cast_type, 1), fixed),
+                          self_only=cast_type == 0)
 
     return pack_record('ENCH', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
 
 def convert_SPEL(rec: dict, writer=None) -> bytes:
-    """SPEL — Spell. SPIT restructured for TES5.
+    """SPEL — Spell, under its own FormID and EditorID."""
+    return pack_record('SPEL', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'),
+                       _spell_subrecords(rec, get_str(rec, 'EditorID'), writer))
 
-    TES5 order: EDID OBND FULL KWDA MDOB ETYP DESC SPIT EFID/EFIT*
+
+def attack_spell(fid: int, rec: dict, writer) -> int:
+    """A creature's ATKD Attack Spell: a Contact copy of spell ``rec``, else ``fid``.
+
+    See: docs/commentary/tes5_import_magic.md#creature-attack-spells
     """
-    subs = b''
-    edid = get_str(rec, 'EditorID')
-    if edid:
-        subs += pack_string_subrecord('EDID', edid)
+    edid = get_str(rec, 'EditorID') if rec else ''
+    if writer is None or not edid:
+        return fid
+    return written_once('SPEL_ATTACK', edid, writer, lambda new: writer.add_record(
+        'SPEL', pack_record('SPEL', new, 0, _spell_subrecords(
+            rec, f'{edid}Attack', writer, DELIVERY_CONTACT))))
+
+
+def _spell_subrecords(rec: dict, edid: str, writer, delivery: int = None) -> bytes:
+    """A SPEL's subrecords, SPIT restructured for TES5.
+
+    TES5 order: EDID OBND FULL KWDA MDOB ETYP DESC SPIT EFID/EFIT*.  The
+    spell types 0-4 mean the same in both games.  ETYP is mandatory: a spell
+    without one never appears in the magic menu (827/827 vanilla carry it).  MDOB is the
+    vanilla menu art the first effect calls for, on every type but Disease.
+    ``delivery`` fixes a castable spell's delivery, else its effects pick it.
+    See: docs/commentary/tes5_import_magic.md#menu-display-object
+    """
+    subs = pack_string_subrecord('EDID', edid) if edid else b''
     subs += pack_obnd()
     full = get_str(rec, 'FULL')
     if full:
         subs += pack_string_subrecord('FULL', full)
 
-    # SPIT (36 bytes in TES5)
-    cost = get_int(rec, 'SPIT.Cost')
     tes4_flags = get_int(rec, 'SPIT.Flags')
     tes4_type = get_int(rec, 'SPIT.Type')
-
-    # TES5 spell types: 0=Spell, 1=Disease, 2=Power, 3=Lesser Power, 4=Ability, 10=Addiction, 11=Voice
-    # TES4: 0=Spell, 1=Disease, 2=Power, 3=Lesser Power, 4=Ability
     tes5_type = tes4_type if tes4_type <= 4 else 0
+    cast_type, target_type = SPELL_TYPE_CAST.get(tes5_type, (1, None))
+    if target_type is None:
+        target_type = owner_delivery(rec) if delivery is None else delivery
+    effects = vampire_disease_effects(rec) or _pack_effects(
+        rec, delivery=target_type, writer=writer, spell_type=tes5_type,
+        owner=(cast_type, target_type if cast_type == 0 else delivery),
+        disease=get_str(rec, 'EditorID') if tes5_type == SPELL_TYPE_DISEASE else '')
 
-    # ETYP — Equip Type.  MANDATORY: it names the slot the magic menu files the
-    # spell under, and a spell without one never appears in the menu at all
-    # (converted Bound Dagger/Mace were addable by console but invisible and
-    # uncastable).  Oblivion has no equivalent field, so it is derived from the
-    # spell type exactly as vanilla does.  Census: 827/827 vanilla spells carry
-    # ETYP, no exceptions.
+    if tes5_type != SPELL_TYPE_DISEASE:
+        first_effect = struct.unpack_from('<I', effects, _SUBRECORD_HEADER)[0]
+        subs += pack_formid_subrecord('MDOB', menu_object(first_effect))
     subs += pack_formid_subrecord(
         'ETYP', SPELL_TYPE_EQUIP_TYPE.get(tes5_type, SPELL_EQUIP_EITHER_HAND))
 
-    # Target from first effect
-    target_type = 0
-    first_effect_type = get_str(rec, 'Effect[0].Type')
-    if first_effect_type == 'Touch':
-        target_type = 1
-    elif first_effect_type == 'Target':
-        target_type = 2
-
     tes5_flags = 0
-    if tes4_flags & 0x10:
-        tes5_flags |= 0x80000    # No Absorb/Reflect
-    if tes4_flags & 0x20:
-        tes5_flags |= 0x100000   # No Dual Cast
-    if tes4_flags & 0x40:
-        tes5_flags |= 0x200000
-
-    spit = bytearray(36)
-    struct.pack_into('<I', spit, 0, cost)          # Cost
-    struct.pack_into('<I', spit, 4, tes5_flags)    # Flags
-    struct.pack_into('<I', spit, 8, tes5_type)     # Type
-    struct.pack_into('<f', spit, 12, 0.0)          # Charge Time
-    # Cast Type 1 = Fire and Forget (wbCastEnum; 2 would be Concentration —
-    # verified against vanilla Firebolt: SPIT.CastType=1).
-    struct.pack_into('<I', spit, 16, 1)
-    struct.pack_into('<I', spit, 20, target_type)  # Delivery
-    struct.pack_into('<f', spit, 24, 0.0)          # Cast Duration
-    struct.pack_into('<f', spit, 28, 0.0)          # Range
-    # Half-cost Perk FormID at 32 = 0
-    subs += pack_subrecord('SPIT', bytes(spit))
-
-    # Effects.  An Ability (4) or Lesser Power (3) is applied, never cast, so
-    # any bound-item effect it carries needs the scripted stand-in.
-    from .magic import UNCASTABLE_SPELL_TYPES
-    subs += _pack_effects(rec, delivery=target_type, writer=writer,
-                          uncastable=tes5_type in UNCASTABLE_SPELL_TYPES)
-
-    return pack_record('SPEL', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
+    for tes4_bit, tes5_bit in SPELL_FLAG_MAP:
+        if tes4_flags & tes4_bit:
+            tes5_flags |= tes5_bit
+    subs += pack_subrecord('SPIT', struct.pack(
+        '<IIIfII12x', get_int(rec, 'SPIT.Cost'), tes5_flags, tes5_type, 0.0,
+        cast_type, target_type))
+    return subs + effects
 
 
-def convert_ALCH(rec: dict) -> bytes:
+def convert_ALCH(rec: dict, writer=None) -> bytes:
     subs = _common_header_subs(rec, obnd_sig='ALCH')
 
     tes4_flags = get_int(rec, 'ENIT.Flags')
@@ -1078,13 +1081,12 @@ def convert_ALCH(rec: dict) -> bytes:
     enit = struct.pack('<IIIII', value, tes5_flags, 0, 0, 0)
     subs += pack_subrecord('ENIT', enit)
 
-    # Effects
-    subs += _pack_effects(rec)
+    subs += _pack_effects(rec, writer=writer)
 
     return pack_record('ALCH', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
 
-def convert_INGR(rec: dict) -> bytes:
+def convert_INGR(rec: dict, writer=None) -> bytes:
     subs = _common_header_subs(rec, obnd_sig='INGR')
 
     # KSIZ/KWDA — vendor keyword (TES4 food is sold by ingredient vendors)
@@ -1103,8 +1105,7 @@ def convert_INGR(rec: dict) -> bytes:
     enit_flags = get_int(rec, 'ENIT.Flags') & 0x03
     subs += pack_subrecord('ENIT', struct.pack('<iI', value, enit_flags))
 
-    # Effects (TES5 ingredients have exactly 4)
-    subs += _pack_effects(rec, pad_to=4)
+    subs += _pack_effects(rec, pad_to=4, writer=writer)
 
     return pack_record('INGR', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
@@ -1119,7 +1120,8 @@ def _build_scrl(rec: dict, effect_src: dict, cost: int = 0,
 
     ``rec`` supplies the item (name, model, value, weight); ``effect_src`` the
     magic payload.  They are the SAME record for a sigil stone but differ for
-    an enchanted book, whose effects live on the ENCH its ENAM names.
+    an enchanted book, whose effects live on the ENCH its ENAM names: SCRL
+    carries its effects directly, and one without any is a dead item.
     """
     subs = _common_header_subs(rec, obnd_sig='SCRL')
 
@@ -1143,22 +1145,11 @@ def _build_scrl(rec: dict, effect_src: dict, cost: int = 0,
     weight = get_float(rec, 'DATA.Weight')
     subs += pack_subrecord('DATA', struct.pack('<If', value, weight))
 
-    # SPIT — same 36-byte layout as SPEL. CastType 3 = Scroll (matches every
-    # vanilla SCRL); Delivery from the first effect like SPEL.
-    target_type = 0
-    first_effect_type = get_str(effect_src, 'Effect[0].Type')
-    if first_effect_type == 'Touch':
-        target_type = 1
-    elif first_effect_type == 'Target':
-        target_type = 2
+    target_type = owner_delivery(effect_src)
     spit = struct.pack('<IIIfIIff4x', cost, 0, 0, 0.0, 3, target_type, 0.0, 0.0)
     subs += pack_subrecord('SPIT', spit)
-
-    # A scroll carries its effects DIRECTLY — SCRL has no field for an object
-    # effect, so an enchanted book's ENCH payload is copied in here.  Without
-    # them the record is a dead item (CK: "Magic Item ... has no effects
-    # defined").
-    subs += _pack_effects(effect_src, delivery=target_type, writer=writer)
+    subs += _pack_effects(effect_src, delivery=target_type, writer=writer,
+                          owner=(1, None))
     return subs
 
 

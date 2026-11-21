@@ -40,7 +40,7 @@ see the `oblivion-to-skyrim-dialog` skill.
 | CLOT | ARMO | Clothing → ARMO with ArmorType=Clothing in BOD2. Same ARMA requirement. |
 | CONT | CONT | Add OBND. Minor changes. |
 | CREA | NPC_ | **No CREA in TES5**. Must convert to NPC_. TES4 creature stats (attributes, skills) must map to TES5 DNAM. Needs race assignment. |
-| CSTY | CSTY | **Completely restructured**: TES4 CSTD/CSAD → TES5 CSGD/CSMD/CSME. |
+| CSTY | CSTY | **Completely restructured**: TES4 CSTD/CSAD chances → TES5 CSGD/CSME/CSCR/CSLR multipliers ([why](../commentary/tes5_import_actors.md#combat-styles)). FO3/FNV styles are not converted. |
 | DIAL | DIAL | Categories restructured. TES5 adds DLBR (Dialog Branch) and DLVW (Dialog View). |
 | DOOR | DOOR | Add OBND. Minor changes. |
 | EFSH | EFSH | DATA structure differs. |
@@ -193,31 +193,18 @@ because it runs too early or in the wrong order:
   (00021E81). Skipped CSTY refs are likewise replaced: ZNAM = `csWolf` (00057BE8) for animal/horse CREA,
   `DefaultCombatstyle` (0000003D) otherwise. TES4 aggression >5 now maps to TES5 tier 1 (the old >=40
   threshold left e.g. dogs at Unaggressive, which never initiates combat).
+  **Superseded:** TES4 CSTY records are now converted and ZNAM points at them; the csWolf /
+  DefaultCombatstyle fallback remains only for FO3/FNV and Morrowind sources.
+  **Superseded:** PACK records are now converted, so NPC_ and CREA keep their own packages in TES4 order
+  (quest packages excluded); creatures add `DefaultMasterPackageCreature` last as the fallback.
 - **QUST** — Alias system, objectives, and VMAD fragments are all new. Only basic stage data can be transferred.
 - **INFO** — Dialog response structure changed significantly. VMAD fragments replace result scripts.
 - **NPC_/CREA** — Attribute system removed, skill system changed, many new subsystems (templates, outfits, perks, keywords).
 - **Outfit split (`tes5_import/actors/outfits.py`)** — TES4's single CNTO inventory (engine picks what to wear at
-  spawn) → TES5 DOFT/OTFT (worn) + CNTO (carried), disjoint. Per-biped-slot conflict resolution keeps
-  one winner per slot (armor > clothing > value). **ChanceNone contract:** only a *guaranteed* winner
-  (plain ARMO/CLOT, or an LVLI with `LVLD.ChanceNone==0` down to slot-filling leaves) may EVICT a
-  lower-priority item from its slot. A probabilistic list (e.g. `LL0NPCArmorLightGreaves25`, ChanceNone
-  75) must NOT evict a guaranteed clothing base under it (`LL0NPCClothingPantsLower`, ChanceNone 0) —
-  Skyrim resolves the outfit once and has no equivalent of Oblivion's per-spawn re-scoring, so evicting
-  the guaranteed pants left ~75% of bandits bare-legged. Keep both; engine wears greaves when rolled,
-  pants otherwise. The `NN` in Bethesda's list names (`...Greaves25`, `...Cuirass100`) is the equip
-  probability. Trace any actor with `python -m tools.audit.trace_outfit export/Oblivion.esm <EditorID>`.
-  **A plugin WITH MASTERS must index its masters' items too** (`load_item_index(by_type,
-  ctx.master_export)`): a dependent plugin dresses its actors out of its MASTER's wardrobe, so most
-  inventory entries name a record the plugin does not contain. DLCBattlehornCastle draws 155 of its 165
-  NPC inventory entries from Oblivion.esm; indexing only its own 45 records left every one of them
-  unclassifiable, so they fell to the non-wearable default, stayed in CNTO, and all 22 NPCs — knights,
-  captain, maid, cook — spawned with NO outfit at all (index 45 items/9 wearable → 8,501/1,609; 20/22
-  now dressed, the 2 without being a dog and a lich). Only the item signatures are indexed, never the
-  master's whole export: at ~1.17M records that is the difference between ~30k dicts and all of them
-  (and the navmesh phase then forks workers off this process — see the memory note in `load_item_index`).
-  The index keys on the low 24 bits, so the plugin's own records are loaded LAST and win. An override
-  plugin that only retitles NPCs is unaffected and must stay so: Translation.esp's 1,284 NPC overrides
-  keep the master's DOFT byte-identically, 0 lost.
+  spawn) → TES5 DOFT/OTFT (worn) + CNTO (carried), disjoint, one winner per slot with the upper-body
+  piece chosen first. Rules and measurements:
+  [tes5_import_actors.md](../commentary/tes5_import_actors.md#outfit-split). An override plugin that only
+  retitles NPCs keeps the master's DOFT byte-identically (Translation.esp's 1,284 NPC overrides, 0 lost).
 - **RACE** — Almost entirely restructured. Only basic data (height/weight/skill boosts/spells) can transfer.
 - **ENCH/SPEL** — ENIT/SPIT completely restructured. Effects need MGEF FormID resolution.
 - **ARMO/CLOT** — Missing ARMA records means armor won't render in-game.
@@ -519,9 +506,9 @@ FormID drift and breaks saves.
 |---------------------|---------------------|-------|
 | Armorer (12) | Smithing (10) | |
 | Athletics (13) | *(none)* | Removed in TES5 |
-| Blade (14) | One-Handed (6) | |
+| Blade (14) | One-Handed (6) and Two-Handed (7) | NPC skills feed both; reads take the higher; writes, trainers and books use One-Handed |
 | Block (15) | Block (9) | |
-| Blunt (16) | One-Handed (6) | Merged with Blade |
+| Blunt (16) | One-Handed (6) and Two-Handed (7) | As Blade; Fortify Blunt is Two-Handed |
 | Hand to Hand (17) | One-Handed (6) | Merged with Blade |
 | Heavy Armor (18) | Heavy Armor (11) | |
 | Alchemy (19) | Alchemy (16) | |
@@ -529,14 +516,14 @@ FormID drift and breaks saves.
 | Conjuration (21) | Conjuration (19) | |
 | Destruction (22) | Destruction (20) | |
 | Illusion (23) | Illusion (21) | |
-| Mysticism (24) | Illusion (21) | Merged with Illusion |
+| Mysticism (24) | Alteration (18) | Where its spells' school converts |
 | Restoration (25) | Restoration (22) | |
 | Acrobatics (26) | *(none)* | Removed in TES5 |
 | Light Armor (27) | Light Armor (12) | |
 | Marksman (28) | Archery (8) | |
-| Mercantile (29) | Pickpocket (13) | Approximate |
+| Mercantile (29) | Speech (17) | Speech trains from trading and sets prices |
 | Security (30) | Lockpicking (14) | |
-| Sneak (31) | Sneak (15) | |
+| Sneak (31) | Sneak (15), and Pickpocket (13) for NPC skills | Oblivion's Sneak covered pickpocketing ("Pick pockets and move unseen") |
 | Speechcraft (32) | Speech (17) | |
 
 TES4 Attributes (Strength, Intelligence, etc.) have no TES5 equivalent. Health/Magicka/Stamina are derived from TES4 attributes for NPC conversion.
@@ -608,10 +595,13 @@ Playable Oblivion races map directly to Skyrim equivalents by EditorID:
   real code in `_npc_acbs`; it doubled every NPC's level range and disagreed with
   the creature path, which never doubled.)
 - **Health / Magicka / Stamina — the authored control is `ACBS.*Offset`, not DNAM.**
-  The engine computes an actor's pool as
-  `RACE.StartingHealth + ACBS.HealthOffset + (Level-1) * fNPCHealthLevelBonus`,
-  with `fNPCHealthLevelBonus = 5.0` (Skyrim.esm GMST) and all 11 mapped playable
-  /Dremora races at `StartingHealth = 50.0`.
+  The engine computes a manual NPC's pool as
+  `RACE.StartingHealth + ACBS.HealthOffset`; only an Auto-calc-stats (ACBS 0x10)
+  NPC adds `(Level-1) * fNPCHealthLevelBonus` (5.0) plus a class-weighted share
+  of `(Level-1) * iAVDhmsLevelUp` (10). Converted classes write zero HMS weights,
+  so the share is 0. All 11 mapped playable/Dremora races have
+  `StartingHealth = 50.0`. Details:
+  [tes5_import_actors.md](../commentary/tes5_import_actors.md#health-offset).
   `DNAM.Health/Magicka/Stamina` (offsets 36/38/40) are only the engine's
   *calculated cache* — vanilla proves they are not a function of the record at
   all: 52 groups of NPCs with identical race/class/level/offset carry different
@@ -769,12 +759,11 @@ must stay in step. CNAM.CrimeGold carries across as the Steal Multiplier.
 - **AIMED magic needs a projectile effect**: an aimed ENCH/SPEL/SCRL whose
   effects all resolve to projectile-less Alch* MGEFs casts NOTHING in game
   (CK: "is AIMED but has no Magic Effects with Projectiles assigned", 369x).
-  Skyrim ships no aimed variants of plain value modifiers, so
-  `tes5_import/actors/magic_effects.py` synthesizes a companion MGEF per (vanilla
-  effect, TES4 code): clone of the vanilla 152-byte DATA (baked in
-  `vanilla_mgef_data.py`, regen with `tools/generators/gen_vanilla_mgef_table.py`),
-  patched to CastType=FF(1)/Delivery=Aimed(2) + a projectile (spectral arrow
-  for hostile, sunfire for beneficial), swapped in for the first effect.
+  Every effect slot is now cloned onto its owner's casting type and delivery
+  (`magic_variants.delivery_variant`), and `magic.fit_delivery` gives an Aimed
+  clone a projectile; a vanilla effect clones from its 152-byte DATA baked in
+  `vanilla_mgef_data.py` (regen with `tools/generators/gen_vanilla_mgef_table.py`).
+  See [tes5_import_magic.md](../commentary/tes5_import_magic.md#owner-casting-type).
   MGEF DATA offsets: archetype 0x40, AV 0x44, projectile 0x48, cast 0x50,
   delivery 0x54, counter-count 0x14 (zero it — clones carry no ESCE).
 - **SPEL/SCRL SPIT CastType**: wbCastEnum 0=Constant, **1=Fire and Forget**,

@@ -46,7 +46,7 @@ old algorithm with no visible symptom.  Three independent guards:
      REFRs, the LAND heights, the collision of the meshes THAT CELL places, and
      the navmesh source tag.  A mismatch makes that entry miss -- the loader
      falls back to generating.  This is enforced by the importer itself
-     (pgrd_to_navm._geom_cache_load), not by this tool.
+     (from_pgrd.geom_cache_load), not by this tool.
   2. `verify` checks the cache against the CURRENT navmesh sources before any
      publish, so an out-of-date cache cannot be released.
   3. The manifest records the source tag, the collision content hash and the
@@ -82,11 +82,10 @@ from core.subprocess_flags import POPEN_FLAGS
 MANIFEST_NAME = 'navmesh_cache_manifest.json'
 CACHE_DIRNAME = 'navmesh_geom_cache'
 
-# Set to 1/true to skip the automatic download (metered connections, or a user
-# who would rather generate locally).  Defined here so the GUI menu item and
-# convert.py agree on the name instead of repeating the literal -- the same
-# reason worker_budget exports WORKERS_ENV_VAR.
+#: Env var: 1/true skips the automatic cache download for this run.
 NO_DOWNLOAD_ENV_VAR = 'TESCONV_NO_CACHE_DOWNLOAD'
+#: conversion_config.json key for Settings > Download navmesh cache. Absent reads as ON.
+DOWNLOAD_CONFIG_KEY = 'navmeshCacheDownload'
 
 
 # ---------------------------------------------------------------------------
@@ -270,26 +269,17 @@ def archive(plugin: str, out_dir: str, tag: str, quiet: bool = False) -> str | N
 # publish
 # ---------------------------------------------------------------------------
 
-# The repo the caches are published from.  Used when the origin remote cannot
-# be read, which is the NORMAL case for an end user: the README tells people to
-# "paste a new download over your existing folder", so most installs are an
-# unzipped source archive with no .git directory at all.  There `git remote
-# get-url origin` fails, gh_repo() returns [], api_repo() returned '' and
-# _api_releases() gave back [] -- the download silently did nothing and every
-# such user regenerated navmesh from scratch believing the feature was on.
-# A constant is correct here: the release assets genuinely live at this repo,
-# and a fork that republishes its own caches still wins via the remote.
-FALLBACK_REPO = 'bryantmh/tes4skyrim'
+#: Repo the caches are published from. See: docs/commentary/tes5_import_navmesh.md#the-download-path-never-runs-git
+CACHE_REPO = 'bryantmh/tes4skyrim'
 
 
 def api_repo() -> str:
-    """'owner/name' for the GitHub API, from the origin remote.
+    """'owner/name' for the GitHub API.
 
-    Falls back to FALLBACK_REPO for a non-git install (see that constant) so
-    downloading works from an unzipped source archive, not just a clone.
+    A CONSTANT: git must not be reachable from any end-user path.
+    See: docs/commentary/tes5_import_navmesh.md#the-download-path-never-runs-git
     """
-    got = gh_repo()
-    return got[1] if len(got) == 2 else FALLBACK_REPO
+    return CACHE_REPO
 
 
 def _api_releases(timeout: int = 20) -> list:
@@ -362,11 +352,10 @@ def _download(url: str, dest: str, quiet: bool = False,
 def gh_repo() -> list:
     """['--repo', 'owner/name'] for gh, or [] if it cannot be determined.
 
-    Every gh call names the repo explicitly instead of relying on the process
-    CWD.  `install` is the reason: it is the one command a downloader may run
-    from outside a checkout (or against a redirected repo root), and a bare
-    `gh release list` there reports "no releases found" rather than failing
-    loudly -- which is exactly how a working publish looked broken.
+    Names the repo explicitly rather than relying on the process CWD.  CALLERS
+    MUST ALREADY REQUIRE gh: this spawns git, which an end user need not have.
+    The automatic download uses api_repo() instead.
+    See: docs/commentary/tes5_import_navmesh.md#the-download-path-never-runs-git
     """
     out = subprocess.run(['git', 'remote', 'get-url', 'origin'],
                          capture_output=True, text=True, cwd=repo_root(),
@@ -1125,6 +1114,12 @@ def _local_version_key() -> tuple | None:
     return None if key is None or key == (0, 0) else key
 
 
+def download_allowed(config: dict) -> bool:
+    """False when the saved setting or NO_DOWNLOAD_ENV_VAR turns the download off."""
+    opted_out = os.environ.get(NO_DOWNLOAD_ENV_VAR, '').strip().lower() in ('1', 'true')
+    return not opted_out and config.get(DOWNLOAD_CONFIG_KEY) is not False
+
+
 def auto_install(plugin: str, quiet: bool = False,
                  allow_download: bool = True) -> bool:
     """Get this plugin's navmesh cache in place, with nothing for the user to do.
@@ -1198,8 +1193,9 @@ def auto_install(plugin: str, quiet: bool = False,
             # happened -- otherwise this looks identical to the feature being
             # broken, which is the whole class of report this path caused.
             if not quiet:
-                print('  Navmesh cache: download disabled '
-                      '(TESCONV_NO_CACHE_DOWNLOAD); generating normally.')
+                print('  Navmesh cache: download disabled (%s setting or %s); '
+                      'generating normally.'
+                      % (DOWNLOAD_CONFIG_KEY, NO_DOWNLOAD_ENV_VAR))
                 print('    To use one offline, download %s from '
                       'https://github.com/%s/releases and drop it in %s/'
                       % (asset_name(plugin), api_repo(), DROPIN_DIRNAME))

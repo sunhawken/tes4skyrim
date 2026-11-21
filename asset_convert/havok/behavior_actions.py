@@ -71,8 +71,11 @@ def _modifier_generator(gb, name, modifier_ref, generator_ref):
 # Swimming
 # ---------------------------------------------------------------------------
 
-def _swim_states(gb, sw, clips, speeds):
-    """The SwimBehavior sub-machine's own states, in state-id order."""
+def _swim_states(gb, sw, clips, speeds, attack_entries):
+    """The SwimBehavior sub-machine's own states, in state-id order.
+
+    Each one carries `attack_entries`, the way into the swim attacks.
+    """
     eid = gb.eid
     idle_trans = [(eid['moveStart'], 1, F_LOCAL)]
     if sw.get('left'):
@@ -82,7 +85,7 @@ def _swim_states(gb, sw, clips, speeds):
     states = [gb.state(
         0, 'SwimIdleState',
         gb.clip('SwimIdle', sw.get('idle') or sw['forward'], True).ref,
-        transitions=idle_trans)]
+        transitions=idle_trans + attack_entries)]
 
     splan = swim_blend_plan(clips, speeds)
     move_gen = (gb.parametric_blend('SwimSpeedBlend', splan) if splan
@@ -91,36 +94,39 @@ def _swim_states(gb, sw, clips, speeds):
     if sw.get('backward'):
         move_trans.append((eid['moveBackward'], 2, F_LOCAL))
     states.append(gb.state(1, 'SwimMoveState', move_gen.ref,
-                           transitions=move_trans))
+                           transitions=move_trans + attack_entries))
 
     if sw.get('backward'):
         states.append(gb.state(
             2, 'SwimBackState',
             gb.clip('SwimBack', sw['backward'], True).ref,
             transitions=[(eid['moveForward'], 1, F_LOCAL),
-                         (eid['moveStop'], 0, F_LOCAL)]))
+                         (eid['moveStop'], 0, F_LOCAL)] + attack_entries))
     for sid, role, name in ((3, 'left', 'SwimTurnLeft'),
                             (4, 'right', 'SwimTurnRight')):
         if sw.get(role):
             states.append(gb.state(
                 sid, f'{name}State', gb.clip(name, sw[role], True).ref,
-                transitions=[(eid['turnStop'], 0, F_LOCAL)]))
+                transitions=[(eid['turnStop'], 0, F_LOCAL)] + attack_entries))
     return states
 
 
-def build_swim(gb, clips, speeds, state_id):
+def build_swim(gb, clips, speeds, state_id, attacks=((), ())):
     """SwimState: a sub-machine mirroring the land standing/locomotion split.
 
     Driven by the same engine locomotion events.  Vanilla sabrecat ships a
     single looping SwimForward; the richer Oblivion gait sets
-    (slaughterfish: idle/turns/fast) wire in when authored.
+    (slaughterfish: idle/turns/fast) wire in when authored.  `attacks` is
+    `swim_attack_states`' result: the attack states join the sub-machine.
     """
     sw = clips.get('swim', {})
     if not sw.get('forward'):
         return [], []
-    sm = gb.state_machine('SwimBehavior', _swim_states(gb, sw, clips, speeds))
+    attack_states, entries = attacks
+    sm = gb.state_machine('SwimBehavior', _swim_states(
+        gb, sw, clips, speeds, list(entries)) + list(attack_states))
     state = gb.state(state_id, 'SwimState', sm.ref,
-                     transitions=[(gb.eid['swimStop'], 0, F_LOCAL)])
+                     transitions=[(gb.eid['swimStop'], 0, F_LOCAL)], root=True)
     return [state], [(gb.eid['swimStart'], state_id, F_WILD)]
 
 
@@ -223,7 +229,8 @@ def build_cast(gb, cast_defs, clips, hit_times, state_id):
     state = gb.state(state_id, 'FireForgetState', mg.ref,
                      transitions=[(eid['Spell_Stop'], 0, F_LOCAL),
                                   (eid['Spell_Interrupt'], 0, F_LOCAL),
-                                  (eid['InterruptCast'], 0, F_LOCAL)])
+                                  (eid['InterruptCast'], 0, F_LOCAL)],
+                     root=True)
     return [state], _cast_entry_wilds(eid, state_id)
 
 
@@ -247,7 +254,7 @@ def _block_hit_state(gb, blk, ml, hit_id, block_id):
         hit_id, 'BlockHitState',
         _modifier_generator(gb, 'BlockHit_MG', ml.ref, clip.ref).ref,
         transitions=[(eid['blockHitStop'], block_id, F_LOCAL),
-                     (eid['blockStop'], 0, F_LOCAL)])
+                     (eid['blockStop'], 0, F_LOCAL)], root=True)
 
 
 def build_block(gb, clips, state_id):
@@ -274,7 +281,7 @@ def build_block(gb, clips, state_id):
     states = [gb.state(
         block_id, 'BlockState',
         _modifier_generator(gb, 'Block_MG', ml.ref, guard.ref).ref,
-        transitions=trans)]
+        transitions=trans, root=True)]
     wilds = [(eid['blockStart'], block_id, F_WILD)]
     if hit_id is not None:
         states.append(_block_hit_state(gb, blk, ml, hit_id, block_id))

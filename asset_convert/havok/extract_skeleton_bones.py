@@ -14,15 +14,20 @@ Usage:
 Output:
     asset_convert/generated/skeleton_bones_oblivion.json
     asset_convert/generated/skeleton_bones_falloutnv.json
+    asset_convert/generated/skeleton_bones_morrowind.json
+    asset_convert/generated/skeleton_bones_morrowind_female.json
     asset_convert/generated/skeleton_bones_skyrim_male.json
     asset_convert/generated/skeleton_bones_skyrim_female.json
 """
 import json
 import os
 
+import numpy as np
+
 from asset_convert.nif.pyffi_monkey_patch import apply_patches
 apply_patches()
 from asset_convert import paths
+from asset_convert.character.morrowind_body import bind_skeleton
 
 from pyffi.formats.nif import NifFormat
 
@@ -35,11 +40,26 @@ def source_skeleton(plugin: str) -> str:
 
 OBLIVION_SKELETON = source_skeleton('Oblivion.esm')
 FALLOUT_SKELETON = source_skeleton('FalloutNV.esm')
-# Vanilla Skyrim skeletons: auto-extracted from the SSE BSAs (skyrim_assets)
+#: Vanilla Skyrim male skeleton, data-relative (auto-extracted from the SSE BSAs).
 SKYRIM_SKELETON_MALE = ('meshes\\actors\\character\\character assets\\'
                         'skeleton.nif')
+#: Vanilla Skyrim female skeleton, data-relative.
 SKYRIM_SKELETON_FEMALE = ('meshes\\actors\\character\\'
                           'character assets female\\skeleton_female.nif')
+#: Beast skeletons whose tail bones are added to the matching human table.
+SKYRIM_BEAST_SKELETONS = {
+    SKYRIM_SKELETON_MALE: 'meshes\\actors\\character\\character assets\\skeletonbeast.nif',
+    SKYRIM_SKELETON_FEMALE: ('meshes\\actors\\character\\'
+                             'character assets female\\skeletonbeast_female.nif'),
+}
+#: Prefix of the beast skeleton's tail bones.
+_TAIL_PREFIX = 'TailBone'
+#: The bone the beast tail hangs from in both skeletons.
+_PELVIS = 'NPC Pelvis [Pelv]'
+
+#: female -> the JSON the Morrowind bind skeleton is saved as.
+MORROWIND_SKELETONS = ((False, 'skeleton_bones_morrowind.json'),
+                       (True, 'skeleton_bones_morrowind_female.json'))
 
 
 def _m44_to_list(m):
@@ -53,14 +73,17 @@ def _m44_to_list(m):
 
 
 def _walk_bones(root, node, result):
-    """Recursively walk NiNode tree using get_transform(root) for world transforms."""
+    """Recursively walk NiNode tree using get_transform(root) for world transforms.
+
+    A bone get_transform cannot reach from the root is left out.
+    """
     name = bytes(node.name).rstrip(b'\x00').decode('latin-1', errors='replace')
     if name and node is not root:
         try:
             W = node.get_transform(root)
             result[name] = _m44_to_list(W)
         except (ValueError, RuntimeError):
-            pass  # bone not reachable from root
+            pass
 
     if hasattr(node, 'children'):
         for child in node.children:
@@ -111,10 +134,26 @@ def _translation_from_m44(m):
     return m[3][0], m[3][1], m[3][2]
 
 
+def with_beast_tail(bones: dict, beast: dict) -> dict:
+    """`bones` plus the beast skeleton's tail bones, kept at their offset from the pelvis.
+
+    Morrowind skins (a beast-race robe) bind to the tail, which only the beast
+    skeleton carries; the human table needs it to place those bones.
+    See: docs/commentary/asset_convert_armor.md#morrowind-armor-assembly
+    """
+    pelvis_in = np.linalg.inv(np.array(beast[_PELVIS]))
+    pelvis = np.array(bones[_PELVIS])
+    tail = {name: (np.array(m) @ pelvis_in @ pelvis).tolist()
+            for name, m in beast.items() if name.startswith(_TAIL_PREFIX)}
+    return {**bones, **tail}
+
+
 def _emit(out_dir, label, source, out_name, samples=()):
-    """Extract one skeleton, save its JSON and print a few sample bones."""
+    """Extract one skeleton (with its beast tail, for Skyrim), save its JSON and print sample bones."""
     print(f"{label}: {source}")
     bones = extract_skeleton(source)
+    if source in SKYRIM_BEAST_SKELETONS:
+        bones = with_beast_tail(bones, extract_skeleton(SKYRIM_BEAST_SKELETONS[source]))
     save_json(bones, os.path.join(out_dir, out_name))
     for name in samples:
         if name in bones:
@@ -148,7 +187,25 @@ def _print_comparison(ob_bones, sk_male):
             print(f"  {ob_name:30s} -> {sk_name:30s}  ** MISSING in Skyrim **")
 
 
+def _emit_morrowind(out_dir):
+    """Save both Morrowind bind skeletons, when the Morrowind install is registered.
+
+    The skinned rest is the T-posed bind skeleton every vanilla skinned part
+    shares, read from the reference body's chest part.
+    See: docs/commentary/asset_convert_armor.md#morrowind-pose-cache
+    """
+    for female, out_name in MORROWIND_SKELETONS:
+        try:
+            bones = bind_skeleton(female)
+        except FileNotFoundError:
+            return
+        if bones:
+            save_json({n: m.tolist() for n, m in bones.items()},
+                      os.path.join(out_dir, out_name))
+
+
 def main():
+    """Write every skeleton bone table under asset_convert/generated."""
     out_dir = os.path.join(str(paths.REPO), 'asset_convert', 'generated')
     os.makedirs(out_dir, exist_ok=True)
 
@@ -157,6 +214,7 @@ def main():
     if os.path.isfile(FALLOUT_SKELETON):
         _emit(out_dir, 'Reading FO3/FNV skeleton', FALLOUT_SKELETON,
               'skeleton_bones_falloutnv.json', _OB_SAMPLES)
+    _emit_morrowind(out_dir)
     sk_male = _emit(out_dir, 'Reading Skyrim male skeleton',
                     SKYRIM_SKELETON_MALE, 'skeleton_bones_skyrim_male.json',
                     _SK_SAMPLES)

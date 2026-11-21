@@ -40,8 +40,7 @@ T_OBJECTLIST = 'ObjectList'      # payload subrecord: CNAM (u32 formid, 0 = none
 T_BOOL = 'Bool'                  # payload subrecord: CNAM (1 byte)
 T_INT = 'Int'                    # payload subrecord: CNAM (u32)
 T_FLOAT = 'Float'                # payload subrecord: CNAM (f32)
-# payload subrecord: PDTO (u32 type, u32 formid); type 0 = a DIAL topic.
-# This is what makes a ForceGreet package OPEN DIALOGUE — see FORCE_GREET.
+#: PDTO (u32 type, u32 value): 0 = a DIAL FormID, 1 = a subtype code (b'HELO'); opens a ForceGreet's dialogue.
 T_TOPIC = 'Topic'
 
 # PKDT.Type
@@ -198,6 +197,16 @@ FOLLOW = Template(
            'ride_horse': 4, 'need_los': 5},
 )
 
+#: FollowTo (00025E6D, 6 vanilla instances): trail the target, stop following at the destination.
+FOLLOW_TO = Template(
+    formid=0x00025E6D, edid='FollowTo', xnam=13, version=9,
+    index_list=(2, 4, 5, 8, 6),
+    inputs=(T_SINGLEREF, T_FLOAT, T_FLOAT, T_LOCATION, T_BOOL),
+    defaults={1: 128.0, 2: 256.0, 4: 0},
+    slots={'target': 0, 'min_radius': 1, 'max_radius': 2, 'location': 3,
+           'accompany': 4},
+)
+
 # --- Escort (00023B73) — 44 instances ------------------------------------
 # procedures: Escort.  Preferred over EscortPlayerWhenNear (which additionally
 # waits/travels); TES4 Escort is a plain "walk the target to the destination".
@@ -258,7 +267,7 @@ FORCE_GREET = Template(
                                                         T_BOOL),
     defaults={1: _PLDT_HERE_1000, 2: _PLDT_HERE_1000, 3: _PLDT_PLAYER_350,
               4: 0, 5: 1, 7: _PLDT_PLAYER_5000, 17: 50.0},
-    slots={'topic': 0, 'trigger_location': 1, 'greet_location': 2,
+    slots={'topic': 0, 'wait_location': 1, 'trigger_location': 2,
            'forcegreet_distance': 3, 'target': 6, 'leash_location': 7},
 )
 
@@ -270,6 +279,15 @@ HOLD_POSITION = Template(
     defaults={},
     slots={'location': 0},
 )
+
+#: HoldPositionWithTravel<N>: Travel while farther than N from slot 3, then HoldPosition; slot 3 repeats slot 0's ref.
+_HOLD_WITH_TRAVEL = dict(xnam=13, version=7, index_list=(0, 9, 11, 12),
+                         inputs=(T_LOCATION, T_BOOL, T_BOOL, T_SINGLEREF),
+                         defaults={1: 0, 2: 1}, slots={'location': 0, 'center': 3})
+#: HoldPositionWithTravel512 (0002A85F).
+HOLD_POSITION_TRAVEL_512 = Template(formid=0x0002A85F, edid='HoldPositionWithTravel512', **_HOLD_WITH_TRAVEL)
+#: HoldPositionWithTravel1024 (0010FAAF).
+HOLD_POSITION_TRAVEL_1024 = Template(formid=0x0010FAAF, edid='HoldPositionWithTravel1024', **_HOLD_WITH_TRAVEL)
 
 # --- Activate (00019B2D) -------------------------------------------------
 # "Walk to this reference and ACTIVATE it" — pulling a lever, opening a door,
@@ -307,6 +325,14 @@ USE_IDLE_MARKER = Template(
     slots={'target': 0},
 )
 
+#: DoNothing (000654E2): a lone Wait, no Travel; ActualSeconds 0, StopMovement 1 as vanilla MQ105DoNothing.
+DO_NOTHING = Template(
+    formid=0x000654E2, edid='DoNothing', xnam=5, version=0,
+    index_list=(3, 4),
+    inputs=(T_FLOAT, T_BOOL),
+    defaults={0: 0.0, 1: 1},
+)
+
 # --- FleeTo (000C7039) — flee to a location ------------------------------
 FLEE_TO = Template(
     formid=0x000C7039, edid='FleeTo', xnam=17, version=8,
@@ -314,6 +340,17 @@ FLEE_TO = Template(
     inputs=(T_LOCATION, T_OBJECTLIST, T_FLOAT, T_BOOL, T_FLOAT, T_BOOL, T_BOOL),
     defaults={1: 0, 2: 1000.0, 3: 0, 4: 128.0, 5: 0, 6: 1},
     slots={'location': 0, 'flee_distance': 2},
+)
+
+#: FleeFrom (000197F1, Find -> Flee): flee the actor's threats; defaults are the root's own values.
+FLEE_FROM = Template(
+    formid=0x000197F1, edid='FleeFrom', xnam=20, version=7,
+    index_list=(7, 6, 1, 0, 3, 4, 10, 13, 15, 17, 19),
+    inputs=(T_TARGETSEL, T_OBJECTLIST, T_FLOAT, T_BOOL, T_LOCATION, T_FLOAT,
+            T_LOCATION, T_BOOL, T_BOOL, T_BOOL, T_BOOL),
+    defaults={0: (2, 0, 0), 1: 0, 2: 0.0, 3: 1, 4: (2, 0, 0), 5: 200.0,
+              6: (12, 0, 1000), 7: 0, 8: 0, 9: 0, 10: 0},
+    slots={'flee_distance': 2},
 )
 
 # --- UseMagic (000504F5) — 46 instances ----------------------------------

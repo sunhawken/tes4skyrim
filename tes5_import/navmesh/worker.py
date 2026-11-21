@@ -16,7 +16,20 @@ once from disk in the pool initializer.  Without this, every cell would voxelize
 an empty world and emit no navmesh at all.
 """
 
-from .from_pgrd import cached_geometry, convert_PGRD, geom_equal
+import math
+import os
+
+from asset_convert.collision.collision_extract import get_collision
+
+from .door_reach import flood_graph, join_missing_doors
+from .edge_links import CELL_SIZE
+from .from_pgrd import (cell_pins, collect_doors, convert_PGRD, geom_cache_path, geom_equal,
+                        record_graph)
+from .lattice.build import set_activators
+from .seeding import regrow_unchanged, seeded_graph
+
+#: A landing this close in plan to a door with no Door Triangle seeds that door's flood and stands in for it.
+DOOR_LANDING_REACH = 512.0
 
 # Per-worker read-only carving context, populated by _init in each child.
 _BASE_MODEL_BY_FID: dict = {}
@@ -27,7 +40,7 @@ _GEOM_CACHE: tuple = None
 def init_worker(base_model_by_fid: dict, door_fids: set, collision_cache: str,
                 formid_offset: int = 0, geom_cache: tuple = None,
                 injected_formids: dict = None, disable_gc: bool = True,
-                door_centers_cache: str = None):
+                door_centers_cache: str = None, activator_fids: frozenset = None):
     """ProcessPool initializer: stash context; load the collision cache.
 
     Runs once per worker process.  A spawned child inherits no module-global
@@ -53,6 +66,8 @@ def init_worker(base_model_by_fid: dict, door_fids: set, collision_cache: str,
     if door_centers_cache:
         from .from_pgrd import load_door_centroids
         load_door_centroids(door_centers_cache, quiet=True)
+    if activator_fids is not None:
+        set_activators(activator_fids)
 
     # Generational GC is pure overhead in this worker and costs ~2x wall-clock.
     #
@@ -88,20 +103,10 @@ def _verify_against_cache(job: dict, result: tuple) -> tuple:
     See: docs/commentary/tes5_import_navmesh.md#verifying-a-cache-against-fresh-geometry
     """
     navm_bytes, meta = result
-    stored = cached_geometry(_GEOM_CACHE, *job['key'])
+    stored = meta.get('geometry')
     if stored is None:
         return result
-    fresh_bytes, fresh_meta = convert_PGRD(
-        job['pgrd_rec'],
-        land_rec=job['land_rec'],
-        cell_rec=job['cell_rec'],
-        refr_recs=job['refr_recs'],
-        base_model_by_fid=_BASE_MODEL_BY_FID,
-        door_fids=_DOOR_FIDS,
-        navm_fid=job['navm_fid'],
-        geom_cache=None,
-        extra_door_refrs=job.get('extra_door_refrs'),
-    )
+    fresh_bytes, fresh_meta = _convert(job, None)
     meta['verified'] = True
     fresh = fresh_meta.get('geometry') if fresh_meta else None
     if fresh is None or geom_equal(stored, fresh):
@@ -111,33 +116,182 @@ def _verify_against_cache(job: dict, result: tuple) -> tuple:
     return fresh_bytes, fresh_meta
 
 
+def convert_job(job: dict, base_model_by_fid: dict, door_fids, geom_cache=None):
+    """(navm_bytes, meta) for one gathered job; a seeded job floods its pathgrid first.
+
+    An interior's door seeds join walkable paths from its doors into the graph.  A regrown pathgrid
+    cell whose new seeds change no flood keeps its last result.
+    See: docs/commentary/tes5_import_navmesh.md#seeded-cells
+    See: docs/commentary/tes5_import_navmesh.md#door-reach
+    """
+    if job.get('previous') and regrow_unchanged(job, base_model_by_fid, door_fids, get_collision):
+        return job['previous']
+    known = ((job.get('previous') or (None, None))[1] or {}).get('flood_opens') or {}
+    opens = (known, {})
+    result = _convert_flow(job, base_model_by_fid, door_fids, geom_cache, opens)
+    if result[1]:
+        result[1]['flood_opens'] = opens[1]
+        result[1]['edge_seeds'] = job.get('edge_seeds')
+    return result
+
+
+def _convert_flow(job, base_model_by_fid, door_fids, geom_cache, opens):
+    """convert_job's builds over `opens`, (known, out) open lattices (from_pgrd._cell_geometry)."""
+    graph = None
+    if job.get('seeds'):
+        graph = seeded_graph(job, base_model_by_fid, door_fids, get_collision)
+        if graph is None:
+            return None, None
+    if job.get('door_seeds'):
+        graph = flood_graph(job, base_model_by_fid, door_fids, get_collision)
+        if not graph[1]:
+            return None, None
+    args = (job, base_model_by_fid, door_fids, (geom_cache, opens))
+    if not cell_pins(job['pgrd_rec'], job['cell_rec'])[1]:
+        return _door_choices(args, graph, True)[0]
+    _built, graph, spots = _door_choices(args, graph, False)
+    return _build(*args, graph, spots)
+
+
+def _door_choices(args, graph, pins):
+    """(build, graph, door spots): the cell built over `graph`, rebuilt with paths from doors that got no
+    Door Triangle, then at their landings, each kept when it links more doors.  A pinned cell decides
+    these unpinned (`pins` false) and is built once more with its pins over the result.
+    See: docs/commentary/tes5_import_navmesh.md#door-reach
+    """
+    job, base_model_by_fid, door_fids = args[:3]
+    built = _build(*args, graph, pins=pins)
+    missing = _doors_without_triangle(job, built[1], door_fids)
+    base = graph or record_graph(job['pgrd_rec'])
+    joined = (join_missing_doors(job, base, missing, base_model_by_fid, door_fids, get_collision)
+              if missing and base[0] is not None else None)
+    if joined:
+        rebuilt = _build(*args, joined, pins=pins)
+        if _linked(rebuilt) > _linked(built):
+            built, graph = rebuilt, joined
+    built, spots = _at_landings(args, built, graph, pins)
+    return built, graph, spots
+
+
+def _at_landings(args, built, graph, pins=True):
+    """(`built`, None), or its rebuild with each door still lacking a Door Triangle linked at its nearest
+    landing, with those spots, when that links more doors: the landing is where the game puts an actor.
+    See: docs/commentary/tes5_import_navmesh.md#door-reach
+    """
+    spots = {}
+    for x, y, _z, fid in _unlinked_doors(args[0], built[1], args[2]):
+        near = [p for p in args[0].get('landings') or () if math.dist(p[:2], (x, y)) <= DOOR_LANDING_REACH]
+        if near:
+            spots[fid] = tuple(min(near, key=lambda p: math.dist(p[:2], (x, y))))
+    if not spots:
+        return built, None
+    moved = _build(*args, graph, spots, pins=pins)
+    return (moved, spots) if _linked(moved) > _linked(built) else (built, None)
+
+
+def _linked(result) -> int:
+    """How many doors a build gave a Door Triangle."""
+    return len((result[1] or {}).get('door_refs') or ()) if result else 0
+
+
+def _build(job, base_model_by_fid, door_fids, cache_opens, graph, door_spots=None, pins=True):
+    """(navm_bytes, meta) for one job over `graph` (None: its pathgrid record's own graph).
+
+    `cache_opens` is (geometry cache, convert_PGRD's `opens`).
+    """
+    geom_cache, opens = cache_opens
+    return convert_PGRD(
+        job['pgrd_rec'],
+        land_rec=job['land_rec'],
+        cell_rec=job['cell_rec'],
+        refr_recs=job['refr_recs'],
+        base_model_by_fid=base_model_by_fid,
+        door_fids=door_fids,
+        navm_fid=job['navm_fid'],
+        geom_cache=geom_cache,
+        extra_door_refrs=job.get('extra_door_refrs'),
+        spawns=job.get('spawns'),
+        obstacles=job.get('obstacles'),
+        graph=graph,
+        door_spots=door_spots,
+        door_landings=job.get('door_landings'),
+        seeded=bool(job.get('seeds')),
+        edge_seeds=job.get('edge_seeds'),
+        pins=pins,
+        opens=opens,
+    )
+
+
+def _doors_without_triangle(job, meta, door_fids) -> list:
+    """Seeds for the job's teleport doors, standing in its own cell, that the built mesh gave no Door Triangle:
+    each door's point, and per landing within DOOR_LANDING_REACH of it (authored on the floor) the landing
+    and the door at the landing's height, since a flipped or hung door's origin stands far above its floor.
+    """
+    doors = [d[:3] for d in _unlinked_doors(job, meta, door_fids)]
+    seeds = list(doors)
+    for d in doors:
+        for p in job.get('landings') or ():
+            if math.dist(p[:2], d[:2]) <= DOOR_LANDING_REACH:
+                seeds += [tuple(p), (d[0], d[1], p[2])]
+    return seeds
+
+
+def _unlinked_doors(job, meta, door_fids) -> list:
+    """(x, y, z, ref) of the job's teleport doors, standing in its own cell, that `meta` gave no Door Triangle."""
+    have = set((meta or {}).get('door_refs') or ())
+    cell = job['cell_rec']
+    gx, gy = cell.get('XCLC.X'), cell.get('XCLC.Y')
+    rows = collect_doors((job['refr_recs'] or []) + (job.get('extra_door_refrs') or []), door_fids)
+    return [(x, y, z, fid) for (x, y, z, _r, fid, teleport, _w) in rows
+            if teleport and fid not in have
+            and (gx in (None, '') or (int(x // CELL_SIZE), int(y // CELL_SIZE)) == (int(gx), int(gy)))]
+
+
+def _convert(job: dict, geom_cache):
+    """(navm_bytes, meta) for one job, built against `geom_cache` (None: no cache)."""
+    return convert_job(job, _BASE_MODEL_BY_FID, _DOOR_FIDS, geom_cache)
+
+
+def _attempt(job: dict, geom_cache) -> tuple:
+    """(navm_bytes, meta) for one job; an exception comes back as meta['error']."""
+    try:
+        navm_bytes, meta = _convert(job, geom_cache)
+        if job.get('verify') and meta and meta.get('geom_cached'):
+            return _verify_against_cache(job, (navm_bytes, meta))
+        return navm_bytes, meta
+    except Exception as e:
+        import traceback
+        return None, {'error': f'{type(e).__name__}: {e}',
+                      'traceback': traceback.format_exc()}
+
+
+def _failed(result: tuple) -> bool:
+    """True when an attempt raised rather than built (or found nothing to build)."""
+    return result[0] is None and bool((result[1] or {}).get('error'))
+
+
+def _drop_entry(job: dict, geom_cache) -> None:
+    """Delete this cell's cache entry, so geometry that failed is never served or adopted."""
+    try:
+        os.remove(geom_cache_path(geom_cache, *job['key']))
+    except OSError:
+        pass
+
+
 def run_job(job: dict):
     """ProcessPool task: convert one PGRD to (navm_bytes, meta).
 
-    A failing cell must not abort the whole ex.map batch, so exceptions are
-    caught -- but the message is RETURNED, not printed: workers run under
-    pythonw.exe, where stdout goes nowhere. The parent prints what comes back
-    (see import_main._precompute_navmeshes).
-
-    job['verify'] asks this cell to double-build and compare; the PARENT picks
-    which cells carry it.
+    Exceptions are RETURNED in meta['error'], never printed: workers run under
+    pythonw.exe.  A failed cell drops its cache entry and is built once more,
+    so a bad entry never outlives the run.  job['verify'] double-builds and
+    compares (the PARENT picks which cells); job['prove'] builds with NO cache.
+    See: docs/commentary/tes5_import_navmesh.md#a-failed-cell-keeps-no-cache-entry
     """
-    try:
-        navm_bytes, meta = convert_PGRD(
-            job['pgrd_rec'],
-            land_rec=job['land_rec'],
-            cell_rec=job['cell_rec'],
-            refr_recs=job['refr_recs'],
-            base_model_by_fid=_BASE_MODEL_BY_FID,
-            door_fids=_DOOR_FIDS,
-            navm_fid=job['navm_fid'],
-            geom_cache=_GEOM_CACHE,
-            extra_door_refrs=job.get('extra_door_refrs'),
-        )
-        if job.get('verify') and meta and meta.get('geom_cached'):
-            return job['key'], _verify_against_cache(job, (navm_bytes, meta))
-        return job['key'], (navm_bytes, meta)
-    except Exception as e:
-        import traceback
-        return job['key'], (None, {'error': f'{type(e).__name__}: {e}',
-                                   'traceback': traceback.format_exc()})
+    cache = None if job.get('prove') else _GEOM_CACHE
+    result = _attempt(job, cache)
+    if cache and _failed(result):
+        _drop_entry(job, cache)
+        result = _attempt(job, cache)
+        if _failed(result):
+            _drop_entry(job, cache)
+    return job['key'], result

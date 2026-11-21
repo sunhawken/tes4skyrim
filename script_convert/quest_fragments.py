@@ -8,8 +8,12 @@ See: docs/commentary/script_convert.md#quest-fragments
 """
 
 from script_convert.constants import papyrus_script_name, script_prefix
+from script_convert.context_setup import add_topic_call
+from script_convert.conversation_sequence import hold_runs
 from script_convert.converter import ScriptConverter
 from script_convert.cross_ref import CrossRefGraph
+from script_convert.movie_last import movie_last
+from script_convert.redress import armor_names, redress_runs
 from script_convert.objective_completion import (
     objective_lines,
     superseded_stages,
@@ -64,11 +68,15 @@ def _fragment_lines(conv, rec: dict, xref, edid: str, frag: tuple,
     if completes:
         out += ['  CompleteAllObjectives()', '  CompleteQuest()']
     for gname in stage_reveals.get((edid.lower(), stage_idx), []):
-        out.append(f'  {gname}.SetValue(1)')
+        out.append(f'  {add_topic_call(ScriptConverter.topic_reveals, gname)}')
     if script_src.strip():
-        out.extend(conv.convert_fragment(script_src, 'Quest'))
+        body = conv.convert_fragment(script_src, 'Quest')
+        out.extend(hold_runs(redress_runs(body, armor_names(conv.sc.property_refs)), xref.holds))
+    settler = xref.settling_script(edid)
+    if settler:
+        out.append(f'  ((Self as Quest) as {settler}).TES4StageRan({stage_idx})')
     out += ['EndFunction', '']
-    return out
+    return movie_last(out)
 
 
 def _merge_property_types(prop_refs: dict) -> dict:

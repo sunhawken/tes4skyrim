@@ -5,29 +5,8 @@ of the way to the Skyrim rest pose and is locally SMOOTH (it is ordinary
 skinning), but it lands near — not on — the Skyrim body: armor floats or
 sinks by 0.5-2.5 units, which is exactly the clipping seen in game.
 
-This module measures that FK error EXACTLY and cancels it:
-
-BUILD (offline, `python -m asset_convert.character.body_wrap`):
-  1. Load the Oblivion body part meshes (upperbody/lowerbody/hand/foot AND
-     head+ears) in T-pose — the surfaces all Oblivion armor was modelled
-     around.  The HEAD group (2026-08-23) is what lets helmets, hoods and
-     converted hair be fitted by measurement instead of the hand-tuned
-     ARMOR_PIECE_OFFSETS constants they used to fall back to; its fit is the
-     tightest of any group (surface residual 0.013 vs the body's 0.020) and it
-     corrects a real FK error of mean 4.4 / max 10.4 units.  Its ICP is seeded
-     from the OB<->SK head UV correspondence, without which the fit cannot
-     reach the Skyrim crown at all (see _uv_head_seed).
-  2. FK-pose a copy with the very same retarget the armor gets (fkp).
-  3. Fit the posed body EXACTLY onto the real Skyrim body surfaces — BOTH
-     weight-slider targets (malebody_0 AND malebody_1, hands, feet):
-     iterative closest-point projection with
-     normal-agreement filtering, the per-step displacement smoothed over the
-     welded mesh graph (topology-aware — never bleeds between the legs), plus
-     limb-segment length rescaling so wrists/ankles land right (dst).
-  4. Save src (T-pose), fkp, dst0/dst1, triangles, and per-vertex
-     skin-weight bone centroids to generated/body_wrap_{gender}.npz.  The
-     dual dst targets give converted armor true _0/_1 weight-morph variants
-     (vanilla ARMA weight-slider convention).
+This module measures that FK error EXACTLY and cancels it. The fields it
+reads are built offline by `body_wrap_build` (one per gender and source game).
 
 APPLY (runtime, called from skin_retarget.retarget_skin_to_skyrim):
   1. Run the normal FK deform (unchanged — provides the smooth base).
@@ -47,12 +26,11 @@ keeps FK's local mesh quality (no crumpling, no vertex explosions, UV-seam
 twins move identically), while the residual body clipping is cancelled.
 """
 
-import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
-# Apply all PyFFI patches (time.clock fix, nif.xml condition fixes) before import
 from asset_convert.nif.pyffi_monkey_patch import apply_patches
 apply_patches()
 from asset_convert import paths
@@ -65,68 +43,7 @@ try:
 except ImportError:
     _PYFFI = False
 
-from asset_convert.character.skyrim_overrides import OBLIVION_TO_SKYRIM_BONE_MAP
-
-_REPO = paths.REPO
 _GEN_DIR = paths.GENERATED
-_OB_BODY_DIR = paths.EXPORT / 'Oblivion.esm' / 'meshes' / 'characters' / '_male'
-
-# The HEAD group.  Oblivion files the head outside _male\ (it is shared between
-# genders -- there is no femalehead), so these are named relative to the
-# characters\ root and resolved separately from the body parts.
-#
-# Ears are a SEPARATE mesh in Oblivion and are exactly the kind of detail a
-# bounding-box scale gets wrong, so they are fitted alongside the head rather
-# than left to whatever the skull transform happens to do to them.
-_OB_CHAR_DIR = _OB_BODY_DIR.parent
-_OB_HEAD_PARTS = (
-    Path('imperial') / 'headhuman.nif',
-    Path('imperial') / 'earshuman.nif',
-)
-
-# Oblivion body parts per gender, grouped by which Skyrim target surface they
-# fit onto.  src tag makes retarget_skin_to_skyrim pick the right skeleton.
-_OB_BODY_SETS = {
-    'male': ({'body':  ['upperbody.nif', 'lowerbody.nif'],
-              'hands': ['hand.nif'],
-              'feet':  ['foot.nif'],
-              'head':  list(_OB_HEAD_PARTS)}, 'armor/m/'),
-    'female': ({'body':  ['femaleupperbody.nif', 'femalelowerbody.nif'],
-                'hands': ['femalehand.nif'],
-                'feet':  ['femalefoot.nif'],
-                'head':  list(_OB_HEAD_PARTS)}, 'armor/f/'),
-}
-# Skyrim target bodies exist as _0 (thin) / _1 (heavy) weight-slider pairs;
-# a field is fitted against each so armor gets true _0/_1 morph variants.
-_SK_BODY_SETS = {
-    'male':   {'body': 'malebody', 'hands': 'malehands', 'feet': 'malefeet'},
-    'female': {'body': 'femalebody', 'hands': 'femalehands',
-               'feet': 'femalefeet'},
-}
-# The Skyrim head target.  Unlike the body/hands/feet there are no _0/_1
-# weight variants -- one head per gender, morphed through chargen instead.
-SK_HEAD_SETS = {'male': 'malehead.nif', 'female': 'femalehead.nif'}
-
-# ---- build parameters ------------------------------------------------------
-_FIT_PHASES = ((30, 8, 0.5), (20, 2, 0.7))  # (iterations, smooth passes, step)
-_PROJ_K = 8              # candidate triangles per projection query
-_NORMAL_DOT_MIN = 0.1    # reject target tris facing away during projection
-_WELD_TOL = 1e-3         # coincident-vertex weld tolerance (UV seam twins)
-
-# Long-bone segments rescaled along their axis before surface fitting so that
-# wrist/ankle rings land near the Skyrim wrist/ankle (fixes the bone-length
-# residual FK cannot express).  Twist bones ride their parent segment.
-# Fit-initialisation only — armor never gets axis-scaled.
-_SCALE_SEGMENTS = [
-    ('Bip01 L UpperArm', 'Bip01 L Forearm', ('Bip01 L UpperArmTwist',)),
-    ('Bip01 R UpperArm', 'Bip01 R Forearm', ('Bip01 R UpperArmTwist',)),
-    ('Bip01 L Forearm', 'Bip01 L Hand', ('Bip01 L ForearmTwist',)),
-    ('Bip01 R Forearm', 'Bip01 R Hand', ('Bip01 R ForearmTwist',)),
-    ('Bip01 L Thigh', 'Bip01 L Calf', ()),
-    ('Bip01 R Thigh', 'Bip01 R Calf', ()),
-    ('Bip01 L Calf', 'Bip01 L Foot', ()),
-    ('Bip01 R Calf', 'Bip01 R Foot', ()),
-]
 
 # ---- apply parameters ------------------------------------------------------
 K_CAND = 40              # body triangles blended per armor vertex (large so
@@ -215,625 +132,14 @@ DELTA_SMOOTH_PASSES = 12
 _FIELD_CACHE: dict = {}
 
 
-# ---------------------------------------------------------------------------
-# Shared geometry helpers
-# ---------------------------------------------------------------------------
-
-def closest_point_on_triangles(p, a, b, c):
-    """Vectorised closest point on triangle (Ericson).  All args (..., 3)."""
-    ab = b - a
-    ac = c - a
-    ap = p - a
-    d1 = np.einsum('...i,...i->...', ab, ap)
-    d2 = np.einsum('...i,...i->...', ac, ap)
-    bp = p - b
-    d3 = np.einsum('...i,...i->...', ab, bp)
-    d4 = np.einsum('...i,...i->...', ac, bp)
-    cp = p - c
-    d5 = np.einsum('...i,...i->...', ab, cp)
-    d6 = np.einsum('...i,...i->...', ac, cp)
-    va = d3 * d6 - d5 * d4
-    vb = d5 * d2 - d1 * d6
-    vc = d1 * d4 - d3 * d2
-
-    denom = va + vb + vc
-    denom = np.where(np.abs(denom) < 1e-12, 1.0, denom)
-    v = (vb / denom)[..., None]
-    w = (vc / denom)[..., None]
-    res = a + v * ab + w * ac                                    # interior
-
-    m = (va <= 0) & ((d4 - d3) >= 0) & ((d5 - d6) >= 0)          # edge BC
-    div = (d4 - d3) + (d5 - d6)
-    t = ((d4 - d3) / np.where(np.abs(div) < 1e-12, 1.0, div))[..., None]
-    res = np.where(m[..., None], b + t * (c - b), res)
-
-    m = (vb <= 0) & (d2 >= 0) & (d6 <= 0)                        # edge AC
-    div = d2 - d6
-    t = (d2 / np.where(np.abs(div) < 1e-12, 1.0, div))[..., None]
-    res = np.where(m[..., None], a + t * ac, res)
-
-    m = (vc <= 0) & (d1 >= 0) & (d3 <= 0)                        # edge AB
-    div = d1 - d3
-    t = (d1 / np.where(np.abs(div) < 1e-12, 1.0, div))[..., None]
-    res = np.where(m[..., None], a + t * ab, res)
-
-    res = np.where(((d6 >= 0) & (d5 <= d6))[..., None], c, res)  # vertex C
-    res = np.where(((d3 >= 0) & (d4 <= d3))[..., None], b, res)  # vertex B
-    res = np.where(((d1 <= 0) & (d2 <= 0))[..., None], a, res)   # vertex A
-    return res
-
-
-def weld_groups(verts: np.ndarray, tol: float = _WELD_TOL) -> np.ndarray:
-    """Group coincident vertices (UV-seam twins). Returns group id per vertex.
-
-    True distance-based welding (KDTree pairs + union-find), not grid
-    rounding: seam twins that land on opposite sides of a rounding boundary
-    (e.g. after per-block world transforms differing by float error) must
-    still weld, or the two copies receive different corrections and the seam
-    visibly splits."""
-    from scipy.spatial import cKDTree
-    n = len(verts)
-    parent = np.arange(n)
-
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-
-    pairs = cKDTree(verts).query_pairs(tol, output_type='ndarray')
-    for i, j in pairs:
-        ri, rj = find(i), find(j)
-        if ri != rj:
-            parent[rj] = ri
-    roots = np.fromiter((find(i) for i in range(n)), dtype=np.int64, count=n)
-    _, inv = np.unique(roots, return_inverse=True)
-    return inv
-
-
-def _group_mean(values: np.ndarray, group: np.ndarray, n_groups: int):
-    """Mean of `values` (N, D) per weld group -> (G, D)."""
-    sums = np.zeros((n_groups, values.shape[1]), dtype=np.float64)
-    np.add.at(sums, group, values)
-    counts = np.bincount(group, minlength=n_groups).astype(np.float64)
-    return sums / np.maximum(counts, 1.0)[:, None]
-
-
-def _vertex_normals(verts, tris, group, n_groups):
-    """Area-weighted vertex normals accumulated over weld groups."""
-    fn = np.cross(verts[tris[:, 1]] - verts[tris[:, 0]],
-                  verts[tris[:, 2]] - verts[tris[:, 0]])
-    acc = np.zeros((n_groups, 3), dtype=np.float64)
-    for k in range(3):
-        np.add.at(acc, group[tris[:, k]], fn)
-    ln = np.linalg.norm(acc, axis=1, keepdims=True)
-    acc /= np.maximum(ln, 1e-12)
-    return acc[group]
-
-
-def _build_adjacency(tris, group, n_groups):
-    """Weld-group adjacency as (nbr_idx, nbr_ptr) CSR arrays."""
-    e = np.vstack([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [0, 2]]])
-    ge = group[e]
-    ge = ge[ge[:, 0] != ge[:, 1]]
-    ge = np.vstack([ge, ge[:, ::-1]])
-    ge = np.unique(ge, axis=0)
-    nbr_idx = ge[:, 1]
-    nbr_ptr = np.zeros(n_groups + 1, dtype=np.int64)
-    counts = np.bincount(ge[:, 0], minlength=n_groups)
-    nbr_ptr[1:] = np.cumsum(counts)
-    return nbr_idx, nbr_ptr
-
-
-def _smooth_group_field(field_g, nbr_idx, nbr_ptr, iters, lam=0.5):
-    """Jacobi smoothing of a per-group vector field over the mesh graph."""
-    counts = np.maximum(np.diff(nbr_ptr), 1).astype(np.float64)
-    src_of_edge = np.repeat(np.arange(len(counts)), np.diff(nbr_ptr))
-    for _ in range(iters):
-        nbr_sum = np.zeros_like(field_g)
-        np.add.at(nbr_sum, src_of_edge, field_g[nbr_idx])
-        nbr_mean = nbr_sum / counts[:, None]
-        field_g = (1.0 - lam) * field_g + lam * nbr_mean
-    return field_g
-
-
-# ---------------------------------------------------------------------------
-# NIF reading helpers (build side)
-# ---------------------------------------------------------------------------
-
-def read_nif(source):
-    # sse_nif accepts a path or bytes and converts SSE geometry to LE blocks.
-    from asset_convert.nif.sse_nif import read_nif
-    return read_nif(source)
-
-
-def block_name(block) -> str:
-    return bytes(block.name).rstrip(b'\x00').decode('latin-1', errors='replace')
-
-
-def iter_skinned_geoms(data):
-    """Yield (block, skel_root) for every skinned NiTriShape/Strips."""
-    for root in data.roots:
-        if root is None:
-            continue
-        skel_root = None
-        for block in root.tree():
-            skin = getattr(block, 'skin_instance', None)
-            if skin is not None and skin.skeleton_root is not None:
-                skel_root = skin.skeleton_root
-                break
-        if skel_root is None:
-            skel_root = root
-        for block in root.tree():
-            if not isinstance(block, (NifFormat.NiTriShape, NifFormat.NiTriStrips)):
-                continue
-            skin = getattr(block, 'skin_instance', None)
-            if skin is None or skin.data is None:
-                continue
-            if block.data is None or block.data.num_vertices == 0:
-                continue
-            yield block, skel_root
-
-
-def geom_world(block, skel_root):
-    from asset_convert.character.skin_retarget import m44_to_np
-    try:
-        G = m44_to_np(block.get_transform(skel_root))
-    except (ValueError, RuntimeError):
-        G = np.eye(4)
-    verts = np.array([[v.x, v.y, v.z] for v in block.data.vertices],
-                     dtype=np.float64)
-    if not np.allclose(G, np.eye(4), atol=1e-6):
-        verts = verts @ G[:3, :3] + G[3, :3]
-    return verts, G
-
-
-def geom_triangles(block) -> np.ndarray:
-    d = block.data
-    if hasattr(d, 'triangles') and d.num_triangles:
-        return np.array([[t.v_1, t.v_2, t.v_3] for t in d.triangles],
-                        dtype=np.int64)
-    if hasattr(d, 'get_triangles'):  # NiTriStrips
-        return np.array(d.get_triangles(), dtype=np.int64)
-    return np.zeros((0, 3), dtype=np.int64)
-
-
-def _geom_bone_weights(block, alias: dict = None) -> dict:
-    """{bone_name: (indices, weights)} from NiSkinData, names passed through `alias`."""
-    skin = block.skin_instance
-    sd = skin.data
-    out: dict = {}
-    alias = alias or {}
-    for bi in range(min(skin.num_bones, sd.num_bones)):
-        bone = skin.bones[bi]
-        if bone is None:
-            continue
-        name = alias.get(block_name(bone), block_name(bone))
-        be = sd.bone_list[bi]
-        idx = np.fromiter((vw.index for vw in be.vertex_weights),
-                          dtype=np.int64, count=be.num_vertices)
-        w = np.fromiter((vw.weight for vw in be.vertex_weights),
-                        dtype=np.float64, count=be.num_vertices)
-        if name in out:
-            pi, pw = out[name]
-            idx = np.concatenate([pi, idx])
-            w = np.concatenate([pw, w])
-        out[name] = (idx, w)
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Field construction (offline)
-# ---------------------------------------------------------------------------
-
-def load_ob_group(gender: str):
-    """Read OB body parts.  Returns per-group dict:
-       {group: {'v0': (N,3) T-pose verts, 'tris': (M,3), 'bones': {name:(idx,w)}}}"""
-    sets, _tag = _OB_BODY_SETS[gender]
-    groups: dict = {}
-    for group, names in sets.items():
-        v_parts, t_parts, bone_acc = [], [], {}
-        offset = 0
-        for name in names:
-            # Body parts live in the _male folder; the head parts are named
-            # relative to the characters root (one head serves both genders).
-            path = (_OB_CHAR_DIR / name if group == 'head'
-                    else _OB_BODY_DIR / name)
-            if not path.exists():
-                print(f'  [{gender}] missing OB body mesh: {path}')
-                continue
-            data = read_nif(path)
-            for block, skel_root in iter_skinned_geoms(data):
-                verts, _G = geom_world(block, skel_root)
-                tris = geom_triangles(block)
-                v_parts.append(verts)
-                t_parts.append(tris + offset)
-                for bone, (idx, w) in _geom_bone_weights(block).items():
-                    bone_acc.setdefault(bone, []).append((idx + offset, w))
-                offset += len(verts)
-        if v_parts:
-            groups[group] = {
-                'v0': np.vstack(v_parts),
-                'tris': np.vstack(t_parts),
-                'bones': {b: (np.concatenate([c[0] for c in ch]),
-                              np.concatenate([c[1] for c in ch]))
-                          for b, ch in bone_acc.items()},
-            }
-    return groups
-
-
-def _fk_pose_group(gender: str):
-    """FK-retarget the OB body parts (exactly what armor gets); return
-    {group: (N,3) posed verts} in load_ob_group's concatenation order."""
-    from asset_convert.character.skin_retarget import retarget_skin_to_skyrim
-    sets, tag = _OB_BODY_SETS[gender]
-    posed: dict = {}
-    for group, names in sets.items():
-        v_parts = []
-        for name in names:
-            # Body parts live in the _male folder; the head parts are named
-            # relative to the characters root (one head serves both genders).
-            path = (_OB_CHAR_DIR / name if group == 'head'
-                    else _OB_BODY_DIR / name)
-            if not path.exists():
-                continue
-            data = read_nif(path)
-            retarget_skin_to_skyrim(data, src_path=tag + os.path.basename(str(name)),
-                                    allow_wrap=False)
-            for block, skel_root in iter_skinned_geoms(data):
-                verts, _G = geom_world(block, skel_root)
-                v_parts.append(verts)
-        if v_parts:
-            posed[group] = np.vstack(v_parts)
-    return posed
-
-
-def load_sk_surface(gender: str, group: str, weight: int):
-    """Skyrim target surface for a group+weight: (verts (N,3), tris (M,3))."""
-    from asset_convert.sources.skyrim_assets import get_body_nif_bytes
-    if group == 'head':
-        # The head has NO weight-slider variants -- Skyrim ships one
-        # malehead.nif / femalehead.nif and morphs the face through chargen
-        # instead.  The same surface is therefore the target for both weights,
-        # which is correct: a helmet does not change size with body weight.
-        raw = get_body_nif_bytes(SK_HEAD_SETS[gender])
-    else:
-        raw = get_body_nif_bytes(f'{_SK_BODY_SETS[gender][group]}_{weight}.nif')
-    if raw is None:
-        return None
-    data = read_nif(raw)
-    v_parts, t_parts = [], []
-    offset = 0
-    for block, skel_root in iter_skinned_geoms(data):
-        verts, _G = geom_world(block, skel_root)
-        v_parts.append(verts)
-        t_parts.append(geom_triangles(block) + offset)
-        offset += len(verts)
-    if not v_parts:
-        return None
-    return np.vstack(v_parts), np.vstack(t_parts)
-
-
-def _uv_head_seed(gender: str, v0):
-    """UV-correspondence positions for the OB head verts, as an ICP seed.
-
-    Both heads share the FaceGen UV layout landmark for landmark (crown OB
-    (0.499,0.053) <-> SK (0.502,0.044); back (0.499,0.506) <-> (0.502,0.464);
-    nose tip (0.400,0.003) <-> (0.437,0.010)), so sampling the Skyrim head at
-    each Oblivion head vertex's UV lands the crown and upper-back skull that
-    nearest-point fitting alone cannot reach.  Returns None (leaving the FK
-    seed in place) if either head or its UVs are unavailable."""
-    try:
-        from asset_convert.sources.skyrim_assets import get_body_nif_bytes
-        ob_path = _OB_CHAR_DIR / _OB_HEAD_PARTS[0]
-        raw = get_body_nif_bytes(SK_HEAD_SETS[gender])
-        if not ob_path.exists() or raw is None:
-            return None
-        ob = head_uv_geometry(ob_path)
-        sk = head_uv_geometry(raw)
-        if ob is None or sk is None:
-            return None
-        ob_v, _ob_t, ob_u = ob
-        sk_v, sk_t, sk_u = sk
-        if len(ob_v) != len(v0):
-            # the head group may concatenate more than the head mesh
-            return None
-        return _uv_sample(ob_u, sk_u, sk_t, sk_v)
-    except Exception as e:
-        print(f'  [{gender}/head] UV seed unavailable: {e}')
-        return None
-
-
-def _segment_scale(verts, bones, ob_skel, sk_skel):
-    """Longitudinally rescale limb segments (FK-posed space) so segment
-    lengths match the Skyrim skeleton.  Blended by skin weights."""
-    nv = len(verts)
-    acc = np.zeros_like(verts)
-    wsum = np.zeros(nv)
-    for parent, child, riders in _SCALE_SEGMENTS:
-        sk_p = OBLIVION_TO_SKYRIM_BONE_MAP.get(parent)
-        sk_c = OBLIVION_TO_SKYRIM_BONE_MAP.get(child)
-        if (parent not in ob_skel or child not in ob_skel
-                or sk_p not in sk_skel or sk_c not in sk_skel):
-            continue
-        ob_len = np.linalg.norm(ob_skel[child][3, :3] - ob_skel[parent][3, :3])
-        sk_head = sk_skel[sk_p][3, :3]
-        sk_vec = sk_skel[sk_c][3, :3] - sk_head
-        sk_len = np.linalg.norm(sk_vec)
-        if ob_len < 1e-3 or sk_len < 1e-3:
-            continue
-        axis = sk_vec / sk_len
-        s = sk_len / ob_len
-        idx_list, w_list = [], []
-        for bn in (parent,) + riders:
-            if bn in bones:
-                bi, bw = bones[bn]
-                idx_list.append(bi)
-                w_list.append(bw)
-        if not idx_list:
-            continue
-        idx = np.concatenate(idx_list)
-        w = np.concatenate(w_list)
-        rel = verts[idx] - sk_head
-        along = rel @ axis
-        moved = verts[idx] + np.outer(along * (s - 1.0), axis)
-        np.add.at(acc, idx, w[:, None] * moved)
-        np.add.at(wsum, idx, w)
-    has = wsum > 1e-6
-    out = verts.copy()
-    frac = np.minimum(wsum[has], 1.0)[:, None]
-    out[has] = (acc[has] / wsum[has][:, None]) * frac + verts[has] * (1.0 - frac)
-    return out
-
-
-def _project_points(points, normals, sk_verts, sk_tris, sk_tree, sk_tri_n):
-    """Closest point on the SK surface for each input point.
-    Normal-agreement filtered; falls back to plain nearest.  Returns (P,3)."""
-    k = min(_PROJ_K, len(sk_tris))
-    _, cand = sk_tree.query(points, k=k)
-    if k == 1:
-        cand = cand[:, None]
-    a = sk_verts[sk_tris[cand, 0]]
-    b = sk_verts[sk_tris[cand, 1]]
-    c = sk_verts[sk_tris[cand, 2]]
-    cp = closest_point_on_triangles(points[:, None, :], a, b, c)
-    d = np.linalg.norm(cp - points[:, None, :], axis=2)
-    agree = np.einsum('pki,pi->pk', sk_tri_n[cand], normals) > _NORMAL_DOT_MIN
-    d_f = np.where(agree, d, np.inf)
-    no_valid = ~np.isfinite(d_f).any(axis=1)
-    if no_valid.any():
-        d_f[no_valid] = d[no_valid]
-    best = np.argmin(d_f, axis=1)
-    return cp[np.arange(len(points)), best]
-
-
-def build_field(gender: str, verbose: bool = True) -> bool:
-    """Build + save the wrap field for one gender.  Returns success."""
-    from scipy.spatial import cKDTree
-    from asset_convert.character.skin_retarget import (load_skeleton, SKEL_OBLIVION,
-                                SKEL_SKYRIM_MALE, SKEL_SKYRIM_FEMALE)
-
-    ob_skel = load_skeleton(SKEL_OBLIVION)
-    sk_skel = load_skeleton(
-        SKEL_SKYRIM_FEMALE if gender == 'female' else SKEL_SKYRIM_MALE)
-    if not ob_skel or not sk_skel:
-        print(f'  [{gender}] skeleton JSONs missing — cannot build')
-        return False
-
-    groups = load_ob_group(gender)
-    posed = _fk_pose_group(gender)
-    if not groups or set(groups) != set(posed):
-        print(f'  [{gender}] OB body meshes missing — cannot build')
-        return False
-
-    all_src, all_fkp, all_tris, all_bc, all_part = [], [], [], [], []
-    all_dst = {0: [], 1: []}
-    offset = 0
-    head_pack = None      # (v0, tris, fitted, (sk_v, sk_t)) for head_fit
-    head_dst_slot = None  # index of the head group in the all_dst lists
-
-    for group, gd in groups.items():
-        v0 = gd['v0']
-        tris = gd['tris']
-        fk_raw = posed[group]
-        if len(fk_raw) != len(v0):
-            print(f'  [{gender}/{group}] vert count mismatch T-pose vs FK')
-            return False
-
-        # segment scaling is fit INITIALISATION only; the stored FK-posed
-        # verts (fkp) stay raw — they must match what armor FK produces.
-        seed = _segment_scale(fk_raw.copy(), gd['bones'], ob_skel, sk_skel)
-
-        wg = weld_groups(v0)
-        n_g = int(wg.max()) + 1
-        nbr_idx, nbr_ptr = _build_adjacency(tris, wg, n_g)
-
-        for wt in (0, 1):
-            sk = load_sk_surface(gender, group, wt)
-            if sk is None:
-                print(f'  [{gender}/{group}] missing SK target surface _{wt}')
-                return False
-            sk_v, sk_t = sk
-            sk_cent = sk_v[sk_t].mean(axis=1)
-            sk_tri_n = np.cross(sk_v[sk_t[:, 1]] - sk_v[sk_t[:, 0]],
-                                sk_v[sk_t[:, 2]] - sk_v[sk_t[:, 0]])
-            sk_tri_n /= np.maximum(
-                np.linalg.norm(sk_tri_n, axis=1, keepdims=True), 1e-12)
-            sk_tree = cKDTree(sk_cent)
-
-            cur = seed.copy()
-            if group == 'head':
-                # Seed the HEAD fit from the UV correspondence instead of the
-                # FK pose.  The Oblivion skull is 19.2 units tall against the
-                # Skyrim skull's 22.5, so from the FK pose ICP has nothing to
-                # project onto the extra height: it converged with the crown
-                # at z 130.8 (real: 131.85) and the upper-back skull up to 5.2
-                # units inside -- exactly where hair and helmets sit, which is
-                # what let the back of the head poke through them.
-                #
-                # The UV seed is used ONLY as a starting point; ICP still runs
-                # and still smooths, so the resulting correction field stays
-                # the smooth slowly-varying translation field armor depends on.
-                # (The raw UV map must NEVER be applied to geometry directly:
-                # it stretches the head's own edges by up to 2045%, and any
-                # field built from it mangles whatever rides it.)
-                uv_seed = _uv_head_seed(gender, v0)
-                if uv_seed is not None:
-                    cur = uv_seed
-            for iters, smooth_n, step in _FIT_PHASES:
-                for _ in range(iters):
-                    vn = _vertex_normals(cur, tris, wg, n_g)
-                    tgt = _project_points(cur, vn, sk_v, sk_t, sk_tree,
-                                          sk_tri_n)
-                    delta_g = _group_mean(tgt - cur, wg, n_g)
-                    delta_g = _smooth_group_field(delta_g, nbr_idx, nbr_ptr,
-                                                  smooth_n)
-                    cur = cur + step * delta_g[wg]
-
-            # residual: how exactly the fitted body sits on the SK surface
-            vn = _vertex_normals(cur, tris, wg, n_g)
-            proj = _project_points(cur, vn, sk_v, sk_t, sk_tree, sk_tri_n)
-            res = np.linalg.norm(proj - cur, axis=1)
-            corr = np.linalg.norm(cur - fk_raw, axis=1)
-            if verbose:
-                print(f'  [{gender}/{group}/_{wt}] {len(v0)} verts: surface '
-                      f'residual mean={res.mean():.3f} '
-                      f'p95={np.percentile(res, 95):.3f}; '
-                      f'FK correction mean={corr.mean():.2f} '
-                      f'p95={np.percentile(corr, 95):.2f} max={corr.max():.2f}')
-            all_dst[wt].append(cur)
-            if group == 'head' and wt == 0:
-                # captured for the head-gear fit (asset_convert.character.head_fit):
-                # the authored OB head, its fitted counterpart, and the REAL
-                # Skyrim head surface the runtime snap measures against.
-                head_pack = (v0, tris, cur.copy(), (sk_v, sk_t))
-                head_dst_slot = len(all_dst[wt]) - 1
-
-        # per-vertex bone centroid (region gate for candidate matching)
-        bc = np.zeros_like(v0)
-        bw_sum = np.zeros(len(v0))
-        for bone, (idx, w) in gd['bones'].items():
-            if bone not in ob_skel:
-                continue
-            head = ob_skel[bone][3, :3]
-            np.add.at(bc, idx, np.outer(w, head))
-            np.add.at(bw_sum, idx, w)
-        has = bw_sum > 1e-6
-        bc[has] /= bw_sum[has][:, None]
-        bc[~has] = v0[~has]
-
-        all_src.append(v0)
-        all_fkp.append(fk_raw)
-        all_tris.append(tris + offset)
-        all_bc.append(bc)
-        # part id per vertex: clearance is only ENFORCED against the body
-        # part — gauntlets/boots replace the body's hands/feet in Skyrim, and
-        # the fitted hand/foot surfaces are the least reliable (bunched
-        # fingers/toes).  EXCEPTION: the wrist/ankle seam region of the
-        # hand/foot fits (within 3 units of the body surface) is smooth and
-        # is exactly where clothing shoe tops and shirt cuffs clip — those
-        # verts count as body so enforcement can rescue them.
-        # The HEAD counts as body for this purpose: unlike hands/feet, no worn
-        # piece REPLACES the head, so a helmet or hairstyle sinking into the
-        # skull is exactly the clipping enforcement exists to stop (this is the
-        # "back of the head pokes through the helmet" case).
-        # THE HEAD IS ITS OWN PART (2), NOT BODY.  Labelling it 0 made every
-        # head triangle a valid correction source for ORDINARY ARMOR: the
-        # head group spans z 107.2-126.0, and in the collar band (z 110-116)
-        # 610 of 662 field verts are head verts carrying a mean delta of
-        # 7.33.  A cuirass collar sits exactly there, so it inherited the
-        # HEAD's correction and was lifted with it -- the iron cuirass
-        # shipped reaching z 121.6, above the head bone at 120.3, and the
-        # mythic dawn robe rode up the same way.  Armor did not do this
-        # before the head group existed, because there were no head verts to
-        # sample.  Head gear and hair are fitted by asset_convert.character.head_fit in
-        # the head's own frame, so nothing needs the head inside the BODY
-        # wrap's correction domain.
-        if group == 'head':
-            part = np.full(len(v0), 2, dtype=np.int32)
-        elif group == 'body':
-            part = np.zeros(len(v0), dtype=np.int32)
-        else:
-            part = np.ones(len(v0), dtype=np.int32)
-            if 'body' in groups:
-                from scipy.spatial import cKDTree as _KD
-                d_body, _ = _KD(groups['body']['v0']).query(v0)
-                part[d_body < 3.0] = 0
-        all_part.append(part)
-        offset += len(v0)
-
-    # Head-gear fit data (asset_convert.character.head_fit): the affine OB->SK head
-    # carrier plus both heads' clearance surfaces.  Hair and Prn helmets are
-    # fitted with these, NOT with the wrap field (their verts are bone-local,
-    # not world, so the field cannot even be queried for them).
-    hf_arrays = {}
-    if head_pack is not None:
-        try:
-            from asset_convert.character import head_fit
-            hv0, htris, _hdst, sk_surface = head_pack
-            hf_arrays = head_fit.build_arrays(
-                hv0, htris, sk_surface, _OB_CHAR_DIR,
-                o_ob=ob_skel['Bip01 Head'][3, :3],
-                o_sk=sk_skel['NPC Head [Head]'][3, :3],
-                gender=gender)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f'  [{gender}] head-fit arrays failed: {e}')
-            hf_arrays = {}
-
-    # THE WRAP'S HEAD SURFACE IS THE FIELD-MAPPED HEAD, NOT THE ICP FIT.
-    # The ICP head fit is a world-frame carrier and oversizes exactly as the
-    # v1 head_fit affine did (measured: the townguardcho skinned helmet
-    # shipped 20.54 units wide against its authored 16.45 — "comically
-    # large" in game).  head_fit's displacement field maps every OB head
-    # vertex EXACTLY onto the earless Skyrim skin, so replacing the head
-    # rows of dst gives skinned head gear (guard helmets, hoods) the
-    # identical mapping rigid PRN gear and hair take.
-    if head_dst_slot is not None and 'hf_dv' in hf_arrays:
-        hv0 = head_pack[0]
-        # hf arrays may be neck-extended; the head group rows come first
-        dv = hf_arrays['hf_dv'].astype(np.float64)[:len(hv0)]
-        carrier = (sk_skel['NPC Head [Head]'][3, :3]
-                   - ob_skel['Bip01 Head'][3, :3])
-        head_dst = hv0 + carrier + dv
-        for wt in (0, 1):
-            all_dst[wt][head_dst_slot] = head_dst
-        if verbose:
-            corr = np.linalg.norm(head_dst - hv0, axis=1)
-            print(f'  [{gender}/head] dst replaced by head-fit field: '
-                  f'correction mean={corr.mean():.2f} max={corr.max():.2f}')
-
-    _GEN_DIR.mkdir(parents=True, exist_ok=True)
-    out = _GEN_DIR / f'body_wrap_{gender}.npz'
-    np.savez_compressed(
-        out,
-        src=np.vstack(all_src).astype(np.float32),
-        fkp=np.vstack(all_fkp).astype(np.float32),
-        dst0=np.vstack(all_dst[0]).astype(np.float32),
-        dst1=np.vstack(all_dst[1]).astype(np.float32),
-        tris=np.vstack(all_tris).astype(np.int32),
-        vert_bc=np.vstack(all_bc).astype(np.float32),
-        part=np.concatenate(all_part),
-        has_head=np.array([1 if 'head' in groups else 0], dtype=np.int8),
-        **hf_arrays)
-    if verbose:
-        print(f'  [{gender}] saved {out.name}: {offset} verts, '
-              f'{sum(len(t) for t in all_tris)} tris')
-    return True
-
-
-def build_all_fields(verbose: bool = True) -> int:
-    n = 0
-    for gender in ('male', 'female'):
-        try:
-            if build_field(gender, verbose=verbose):
-                n += 1
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f'  [{gender}] wrap field build failed: {e}')
-    return n
+from asset_convert.character.wrap_mesh import (
+    build_adjacency as _build_adjacency, closest_point_on_triangles,
+    geom_bone_weights as _geom_bone_weights, geom_triangles,
+    group_mean as _group_mean, smooth_group_field as _smooth_group_field,
+    weld_groups)
+from asset_convert.character.skin_retarget import (
+    SKEL_OBLIVION, deform_vertices_animation_fk, load_animation_deltas, load_skeleton, m44_to_np)
+from asset_convert.character import head_fit
 
 
 # ---------------------------------------------------------------------------
@@ -932,82 +238,25 @@ class WrapField:
 
 
 # ---------------------------------------------------------------------------
-# Head map: exact UV correspondence between the OB and SK heads
+# Field files
+# ---------------------------------------------------------------------------
 
-_HEADMAP_CACHE: dict = {}
+def field_path(female: bool, morrowind: bool = False) -> Path:
+    """The field npz for a gender, fitted from Morrowind's reference body on request.
 
-
-def head_uv_geometry(source):
-    """(verts_world, tris, uvs) for a head NIF given a path or bytes."""
-    data = read_nif(source)
-    v_parts, t_parts, u_parts = [], [], []
-    offset = 0
-    for block, skel_root in iter_skinned_geoms(data):
-        uv = block.data.uv_sets[0] if len(block.data.uv_sets) else None
-        if uv is None:
-            continue
-        verts, _G = geom_world(block, skel_root)
-        v_parts.append(verts)
-        t_parts.append(geom_triangles(block) + offset)
-        u_parts.append(np.array([[p.u, p.v] for p in uv], dtype=np.float64))
-        offset += len(verts)
-    if not v_parts:
-        return None
-    return np.vstack(v_parts), np.vstack(t_parts), np.vstack(u_parts)
+    See: docs/commentary/asset_convert_armor.md#morrowind-wrap-field
+    """
+    return _GEN_DIR / ('body_wrap_%s%s.npz' % ('morrowind_' if morrowind else '',
+                                               'female' if female else 'male'))
 
 
-def _uv_sample(q_uv, uv, tris, verts, k=24):
-    """Sample `verts` at uv coordinates `q_uv` over the (uv, tris) uv mesh.
-
-    Barycentric inside a uv triangle where one contains the query, else the
-    triangle whose barycentrics are least negative (nearest in uv space), so
-    the few vertices on a uv island boundary still map continuously."""
-    from scipy.spatial import cKDTree
-    k = min(k, len(tris))
-    _, cand = cKDTree(uv[tris].mean(axis=1)).query(q_uv, k=k)
-    if k == 1:
-        cand = cand[:, None]
-    a = uv[tris[cand, 0]]
-    b = uv[tris[cand, 1]]
-    c = uv[tris[cand, 2]]
-    v0 = b - a
-    v1 = c - a
-    v2 = q_uv[:, None, :] - a
-    d00 = (v0 * v0).sum(axis=2)
-    d01 = (v0 * v1).sum(axis=2)
-    d11 = (v1 * v1).sum(axis=2)
-    d20 = (v2 * v0).sum(axis=2)
-    d21 = (v2 * v1).sum(axis=2)
-    den = d00 * d11 - d01 * d01
-    den = np.where(np.abs(den) < 1e-16, 1.0, den)
-    bv = (d11 * d20 - d01 * d21) / den
-    bw = (d00 * d21 - d01 * d20) / den
-    bu = 1.0 - bv - bw
-    inside = (bu >= -1e-6) & (bv >= -1e-6) & (bw >= -1e-6)
-    pen = np.minimum(np.minimum(bu, bv), bw)
-    best = np.argmax(np.where(inside, 1e6, pen), axis=1)
-    r = np.arange(len(q_uv))
-    bu_, bv_, bw_ = bu[r, best], bv[r, best], bw[r, best]
-    tot = bu_ + bv_ + bw_
-    tot = np.where(np.abs(tot) < 1e-12, 1.0, tot)
-    bu_, bv_, bw_ = bu_ / tot, bv_ / tot, bw_ / tot
-    t = tris[cand[r, best]]
-    return (bu_[:, None] * verts[t[:, 0]]
-            + bv_[:, None] * verts[t[:, 1]]
-            + bw_[:, None] * verts[t[:, 2]])
-
-
-def _field_path(female: bool) -> Path:
-    return _GEN_DIR / f'body_wrap_{"female" if female else "male"}.npz'
-
-
-def get_field(female: bool):
-    """Load (and cache) the wrap field for a gender, or None."""
-    key = 'female' if female else 'male'
+def get_field(female: bool, morrowind: bool = False):
+    """Load (and cache) the wrap field for a gender and source, or None."""
+    key = (female, morrowind)
     if key in _FIELD_CACHE:
         return _FIELD_CACHE[key]
     field = None
-    path = _field_path(female)
+    path = field_path(female, morrowind)
     if path.exists() and _PYFFI:
         try:
             with np.load(path, allow_pickle=False) as z:
@@ -1186,252 +435,192 @@ def _blended_clearance(field, pts, verts_surf, tri_normals, tree,
     return c_out, n_out, rel_out
 
 
-def deform_geoms_wrap(skinned_geoms, skel_root, field, female: bool,
-                      weight: int = 0, race=None, src_skel: dict = None) -> int:
-    """FK deform + exact body-fit correction for all non-PRN skinned geoms.
+def _shape_world(block, skel_root):
+    """(world transform, whether it is the identity) of a shape under `skel_root`."""
+    try:
+        world = m44_to_np(block.get_transform(skel_root))
+    except (ValueError, RuntimeError):
+        world = np.eye(4)
+    return world, np.allclose(world, np.eye(4), atol=1e-6)
 
-    Drop-in replacement for skin_retarget's FK Phase B: runs the standard FK
-    animation deform first (smooth base), then cancels its measured error
-    against the Skyrim body via the wrap correction field.  `weight` selects
-    the _0 (thin) or _1 (heavy) Skyrim body target.  `race` selects a beast
-    head pack for the head-gear correction (head_fit.BEAST_RACES).
-    `src_skel`, the source rest skeleton, selects the pose-delta cache.
-    See: docs/commentary/asset_convert_falloutnv.md#fnv-body-fitting
 
-    ALL blocks are solved as ONE system — a single cross-block weld, one
-    correction query, one deficit diffusion graph.  Per-block solving split
-    armor seams (cuirass/pauldron boundary verts got different corrections
-    and visibly came apart).  Returns the number of geometries corrected
-    (0 = caller should run plain FK)."""
-    from asset_convert.character.skin_retarget import (deform_vertices_animation_fk,
-                                load_animation_deltas, load_skeleton,
-                                SKEL_OBLIVION, m44_to_np)
-    bone_deltas, alias = load_animation_deltas(src_skel), oblivion_alias_map(src_skel)
-    if not bone_deltas:
-        return 0    # wrap needs the FK base; fall back entirely
+def _world_verts(block, skel_root) -> np.ndarray:
+    """A shape's vertices in skeleton (world) space."""
+    world, is_id = _shape_world(block, skel_root)
+    v = np.array([[p.x, p.y, p.z] for p in block.data.vertices], dtype=np.float64)
+    return v if is_id else v @ world[:3, :3] + world[3, :3]
 
-    # capture pre-FK (authored T-pose) world verts for clearance enforcement
-    # PRN-attached rigid pieces are EXCLUDED: their verts are BONE-LOCAL
-    # (near the origin — _add_prn_skin's contract), not skeleton-space, so a
-    # field query for them lands nowhere meaningful.  Rigid head gear is
-    # fitted by asset_convert.character.head_fit in its own frame instead.
-    pre_fk: dict = {}
-    for block, is_prn, _pb in skinned_geoms:
-        if is_prn or block.data is None or block.data.num_vertices == 0:
-            continue
-        try:
-            G = m44_to_np(block.get_transform(skel_root))
-        except (ValueError, RuntimeError):
-            G = np.eye(4)
-        v = np.array([[p.x, p.y, p.z] for p in block.data.vertices],
-                     dtype=np.float64)
-        if not np.allclose(G, np.eye(4), atol=1e-6):
-            v = v @ G[:3, :3] + G[3, :3]
-        pre_fk[id(block)] = v
 
-    deform_vertices_animation_fk(skinned_geoms, skel_root, bone_deltas)
+def _pre_fk_world(skinned_geoms, skel_root) -> dict:
+    """id(shape) -> authored world verts of each non-PRN shape with verts.
 
-    ob_skel = load_skeleton(SKEL_OBLIVION)
-    # ---- gather every eligible block into one concatenated system --------
-    metas = []          # (block, G_id, G, start, nv)
-    vw_parts, pre_parts, abc_parts, hf_parts, tri_parts = [], [], [], [], []
-    hwf_parts = []
-    hg_parts = []
-    off = 0
-    for block, is_prn, _prn_bone in skinned_geoms:
-        if is_prn:
-            continue
-        geom_data = block.data
-        skin = block.skin_instance
-        if (geom_data is None or skin is None or skin.data is None
-                or geom_data.num_vertices == 0):
-            continue
-        v0 = pre_fk.get(id(block))
-        nv = geom_data.num_vertices
-        if v0 is None or len(v0) != nv:
-            continue
+    See: docs/commentary/asset_convert_armor.md#body-wrap-armor-fitting
+    """
+    return {id(block): _world_verts(block, skel_root) for block, is_prn, _pb in skinned_geoms
+            if not is_prn and block.data is not None and block.data.num_vertices}
 
-        try:
-            G = m44_to_np(block.get_transform(skel_root))
-        except (ValueError, RuntimeError):
-            G = np.eye(4)
-        G_id = np.allclose(G, np.eye(4), atol=1e-6)
 
-        verts = np.array([[v.x, v.y, v.z] for v in geom_data.vertices],
-                         dtype=np.float64)
-        vw = verts if G_id else verts @ G[:3, :3] + G[3, :3]
+def _head_weights(bones_w, nv, ob_skel, vw):
+    """(bone-centroid anchor per vertex, head-weight fraction per vertex, whether the shape is head gear).
 
-        bones_w = _geom_bone_weights(block, alias)
-        abc = np.zeros((nv, 3), dtype=np.float64)
-        absum = np.zeros(nv)
-        head_w = np.zeros(nv)
-        tot_w = np.zeros(nv)
-        for bone, (idx, w) in bones_w.items():
-            valid = (idx < nv) & (w > 1e-6)
-            np.add.at(tot_w, idx[valid], w[valid])
-            if bone in HEAD_BONES:
-                np.add.at(head_w, idx[valid], w[valid])
-            if bone not in ob_skel:
-                continue
-            head = ob_skel[bone][3, :3]
-            np.add.at(abc, idx[valid], np.outer(w[valid], head))
+    A shape is head gear when over half its total skin weight is on HEAD_BONES; a vertex
+    with no bone in `ob_skel` anchors on itself.
+    See: docs/commentary/asset_convert_armor.md#body-wrap-armor-fitting
+    """
+    abc, absum, head_w, tot_w = np.zeros((nv, 3)), np.zeros(nv), np.zeros(nv), np.zeros(nv)
+    for bone, (idx, w) in bones_w.items():
+        valid = (idx < nv) & (w > 1e-6)
+        np.add.at(tot_w, idx[valid], w[valid])
+        if bone in HEAD_BONES:
+            np.add.at(head_w, idx[valid], w[valid])
+        if bone in ob_skel:
+            np.add.at(abc, idx[valid], np.outer(w[valid], ob_skel[bone][3, :3]))
             np.add.at(absum, idx[valid], w[valid])
-        has = absum > 1e-6
-        abc[has] /= absum[has][:, None]
-        abc[~has] = vw[~has]
-        hwf = head_w / np.maximum(tot_w, 1e-6)   # head-weight fraction
-        # head-gear gating is a PER-GEOMETRY decision: a helmet (majority
-        # head-weighted) keeps plain FK everywhere, but a shirt whose collar
-        # verts carry partial head weights (authored for neck-turn deform)
-        # must NOT lose correction/enforcement exactly at the collar
-        # HEAD GATING IS OFF once the field carries a head surface.
-        #
-        # This used to force head-weighted geometry back to the plain FK result
-        # (hf=1 suppresses both the correction and the clearance enforcement),
-        # because the field was built from body/hands/feet only and corrections
-        # interpolated from neck and shoulder triangles dragged helmets into
-        # the middle of the skull.  That left EVERY head-attached piece --
-        # helmets, hoods, and converted hair -- fitted by the hand-tuned
-        # ARMOR_PIECE_OFFSETS constants instead of a measurement, which is why
-        # helmets let the back of the head poke through and why hair needed a
-        # guessed scale factor.
-        #
-        # The field now includes a fitted head (and ears), so head-weighted
-        # verts have real coverage and take the same exact correction as
-        # everything else.  Keep the fraction computed for the fallback below.
-        # Measure the head fraction against the geometry's TOTAL skin weight.
-        # absum only accumulates bones found in the Oblivion skeleton, so a
-        # mesh already skinned to renamed Skyrim bones has absum == 0 and any
-        # ratio against it is meaningless.
-        w_total = sum(float(w[(idx < nv) & (w > 1e-6)].sum())
-                      for idx, w in bones_w.values())
-        hw_total = float(head_w.sum())
-        geom_is_head = w_total > 1e-6 and hw_total / w_total > 0.5
-        gate_head = geom_is_head and not getattr(field, 'has_head', False)
-        hf = np.full(nv, 1.0 if gate_head else 0.0)
-        # HEAD GEAR IS A PROPERTY OF THE GEOMETRY, NOT OF A VERTEX.  The
-        # head-fit blend below must see this per vertex, so carry the
-        # per-geometry verdict out with the other parts.
-        hg = np.full(nv, 1.0 if geom_is_head else 0.0)
+    has = absum > 1e-6
+    abc[has] /= absum[has][:, None]
+    abc[~has] = vw[~has]
+    w_total = float(tot_w.sum())
+    is_head = w_total > 1e-6 and float(head_w.sum()) / w_total > 0.5
+    return abc, head_w / np.maximum(tot_w, 1e-6), is_head
 
-        metas.append((block, G_id, G, off, nv))
-        vw_parts.append(vw)
-        pre_parts.append(v0)
-        abc_parts.append(abc)
-        hf_parts.append(hf)
-        hwf_parts.append(hwf)
-        hg_parts.append(hg)
-        tri_parts.append(geom_triangles(block) + off)
-        off += nv
 
+def _shape_parts(block, skel_root, v0, alias, gate):
+    """One shape's rows: (world verts, authored verts, anchors, head gate, head fraction, head-gear flag)."""
+    nv = len(v0)
+    vw = _world_verts(block, skel_root)
+    abc, hwf, is_head = _head_weights(_geom_bone_weights(block, alias), nv,
+                                      load_skeleton(SKEL_OBLIVION), vw)
+    return (vw, v0, abc, np.full(nv, float(is_head and gate)), hwf, np.full(nv, float(is_head)))
+
+
+def _gather(skinned_geoms, skel_root, pre_fk, alias, field):
+    """Every non-PRN skinned shape as ONE system, or None when there is none.
+
+    The namespace holds `metas` [(shape, start, nv)] and the stacked rows VW (posed world
+    verts), PRE (authored), ABC (anchors), HF (head gate), HW (head fraction), HG (head
+    gear) and TRIS. Head gear is gated only when `field` has no head surface.
+    See: docs/commentary/asset_convert_armor.md#body-wrap-armor-fitting
+    """
+    gate = not getattr(field, 'has_head', False)
+    metas, rows, tris, off = [], [], [], 0
+    for block, is_prn, _pb in skinned_geoms:
+        v0 = None if is_prn else pre_fk.get(id(block))
+        skin = block.skin_instance
+        if v0 is None or skin is None or skin.data is None or len(v0) != block.data.num_vertices:
+            continue
+        rows.append(_shape_parts(block, skel_root, v0, alias, gate))
+        metas.append((block, off, len(v0)))
+        tris.append(geom_triangles(block) + off)
+        off += len(v0)
     if not metas:
-        return 0
+        return None
+    cols = [np.vstack(c) if c[0].ndim == 2 else np.concatenate(c) for c in zip(*rows)]
+    return SimpleNamespace(metas=metas, VW=cols[0], PRE=cols[1], ABC=cols[2], HF=cols[3],
+                           HW=cols[4], HG=cols[5], TRIS=np.vstack(tris))
 
-    VW = np.vstack(vw_parts)
-    PRE = np.vstack(pre_parts)
-    ABC = np.vstack(abc_parts)
-    HF = np.concatenate(hf_parts)
-    TRIS = np.vstack(tri_parts) if tri_parts else np.zeros((0, 3), np.int64)
 
-    # single cross-block weld: seam twins across blocks (pauldron/torso)
-    # must receive identical output positions
-    wg = weld_groups(VW)
-    n_g = int(wg.max()) + 1
-    ABC = _group_mean(ABC, wg, n_g)[wg]
-    HF = _group_mean(HF[:, None], wg, n_g)[wg][:, 0]
+def _weld(s) -> None:
+    """Weld the system once across shapes; seam twins share ABC, HF, HW and HG.
 
-    corr = _field_corrections(field, VW, ABC, weight)
-    corr = corr * (1.0 - HF)[:, None]
-    new_w = VW + corr
+    See: docs/commentary/asset_convert_armor.md#body-wrap-armor-fitting
+    """
+    s.wg = weld_groups(s.VW)
+    s.n_g = int(s.wg.max()) + 1
+    s.ABC = _group_mean(s.ABC, s.wg, s.n_g)[s.wg]
+    for name in ('HF', 'HW', 'HG'):
+        setattr(s, name, _group_mean(getattr(s, name)[:, None], s.wg, s.n_g)[s.wg][:, 0])
 
-    # HEAD-WEIGHTED GEOMETRY TAKES THE HEAD-FIT FIELD DIRECTLY.  The wrap's
-    # correction field is graph-smoothed (DELTA_SMOOTH_PASSES), which smears
-    # the real jaw/cheek widening across the whole head — a skinned guard
-    # helmet's head band shipped +2.5 units wide ("comically large").  Head-
-    # weighted verts instead map exactly as a rigid PRN helmet would: their
-    # authored position samples head_fit's scalp displacement field, so the
-    # shell keeps its authored standoff everywhere.  Blending by head-weight
-    # fraction hands the shoulder drape (clavicle/spine weights) back to the
-    # wrap, seamlessly at the mixed-weight collar ring.
-    HW = _group_mean(np.concatenate(hwf_parts)[:, None], wg, n_g)[wg][:, 0]
-    # ONLY ACTUAL HEAD GEAR TAKES THE HEAD-FIT FIELD.  head_fit's field is a
-    # SCALP displacement map: it is defined on the head surface and means
-    # nothing below it.  Keying the blend on per-VERTEX head weight fed it
-    # the collar ring of ordinary body armor, which carries head weights so
-    # the neck deforms with the head -- and those verts sit ~3 units off the
-    # OB head surface and well below the scalp, so the sampled delta is an
-    # extrapolation.  Measured on the iron cuirass: 157 collar verts (hwf up
-    # to 1.00) were moved 6.78 mean / 7.98 max, lifting them from z
-    # 105.6-113.0 to 111.9-120.2 -- armor visibly dragged up toward the head
-    # (in-game 2026-08-25).  The mythic dawn robe showed the same thing.
-    # `geom_is_head` is the existing per-GEOMETRY test (>50% of the mesh's
-    # skin weight on the head) that already distinguishes a helmet from a
-    # cuirass; requiring it here means helmets and hoods still fit through
-    # the head field exactly as before, and no body piece is touched by it.
-    HG = _group_mean(np.concatenate(hg_parts)[:, None], wg, n_g)[wg][:, 0]
-    m_head = (HW > 1e-3) & (HG > 0.5)
-    if m_head.any():
-        from asset_convert.character import head_fit
-        hfit = head_fit._get(female)
-        if hfit is not None:
-            delta = head_fit.field_deltas(PRE[m_head] - hfit.o_ob, female,
-                                          race=race)
-            if delta is not None:
-                tgt = PRE[m_head] + (hfit.o_sk - hfit.o_ob) + delta
-                w_h = HW[m_head][:, None]
-                new_w[m_head] = (1.0 - w_h) * new_w[m_head] + w_h * tgt
-                HF = np.maximum(HF, HW)   # field-fitted verts skip the push
 
-    # --- minimum-clearance enforcement ------------------------------------
-    # authored clearance (T-pose vert vs OB body) must be preserved, plus an
-    # outward safety margin near the body: residual field noise must never
-    # leave armor under the Skyrim body skin.  The deficit is DIFFUSED over
-    # the (global) armor mesh graph before pushing: per-vertex estimator
-    # noise cancels against neighbouring slack, while genuine deficit
-    # regions survive and get pushed out coherently.
-    c0, _n0, _r0 = _blended_clearance(field, PRE, field.src,
-                                      field.src_tri_n, field.src_tree,
-                                      k=CLEAR_K)
-    # outward margin fades with authored clearance in BOTH directions:
-    # far-off verts (hoods, hems) get none, and verts authored inside the
-    # body (collar necklines) get none either — but their authored depth is
-    # still enforced (target = c0), so a sinking collar gets pushed back.
-    margin = CLEAR_MARGIN * np.exp(
-        -(np.maximum(c0, 0.0) / CLEAR_MARGIN_RANGE) ** 2) * np.exp(
+def head_origin(src_skel, default):
+    """The source rig's Bip01 Head world position, else `default`.
+
+    See: docs/commentary/asset_convert_armor.md#head-gear-fit
+    """
+    if src_skel and 'Bip01 Head' in src_skel:
+        return np.asarray(src_skel['Bip01 Head'], dtype=np.float64)[3, :3]
+    return default
+
+
+def _fit_head_gear(s, new_w, female, race, src_skel):
+    """`new_w` with head gear's head-weighted verts mapped through head_fit's scalp field.
+
+    Verts are taken head-local about the SOURCE rig's head bone and blended by head-weight
+    fraction; fitted verts are exempted from the clearance push (HF raised).
+    See: docs/commentary/asset_convert_armor.md#head-gear-fit
+    """
+    m_head = (s.HW > 1e-3) & (s.HG > 0.5)
+    hfit = head_fit._get(female) if m_head.any() else None
+    if hfit is None:
+        return new_w
+    o_src = head_origin(src_skel, hfit.o_ob)
+    delta = head_fit.field_deltas(s.PRE[m_head] - o_src, female, race=race)
+    if delta is None:
+        return new_w
+    tgt = s.PRE[m_head] + (hfit.o_sk - o_src) + delta
+    w_h = s.HW[m_head][:, None]
+    new_w[m_head] = (1.0 - w_h) * new_w[m_head] + w_h * tgt
+    s.HF = np.maximum(s.HF, s.HW)
+    return new_w
+
+
+def _push_clear(s, new_w, field, weight):
+    """`new_w` pushed out to the authored clearance plus margin from the fitted Skyrim body.
+
+    PUSH_ITERS rounds; each deficit is diffused over the armor graph, keeping PUSH_RAW_KEEP
+    of the raw deficit as a floor.
+    See: docs/commentary/asset_convert_armor.md#body-wrap-armor-fitting
+    """
+    c0, _n0, _r0 = _blended_clearance(field, s.PRE, field.src, field.src_tri_n,
+                                      field.src_tree, k=CLEAR_K)
+    margin = CLEAR_MARGIN * np.exp(-(np.maximum(c0, 0.0) / CLEAR_MARGIN_RANGE) ** 2) * np.exp(
         -(np.minimum(c0, 0.0) / CLEAR_INNER_FADE) ** 2)
     prox = np.exp(-(np.maximum(c0, 0.0) / CLEAR_PROX) ** 2)
-    a_idx = a_ptr = None
-    if len(TRIS):
-        a_idx, a_ptr = _build_adjacency(TRIS, wg, n_g)
+    adj = _build_adjacency(s.TRIS, s.wg, s.n_g) if len(s.TRIS) else None
     for _ in range(PUSH_ITERS):
-        c1, n1, rel1 = _blended_clearance(field, new_w, field.dst[weight],
-                                          field.dst_tri_n[weight],
-                                          field.dst_tree[weight],
-                                          field.tri_rel[weight], k=CLEAR_K)
-        raw = ((c0 + margin) - c1) * prox * rel1 * (1.0 - HF)
-        deficit = raw
-        if a_idx is not None:
-            deficit_g = _group_mean(raw[:, None], wg, n_g)
-            deficit_g = _smooth_group_field(deficit_g, a_idx, a_ptr,
-                                            PUSH_SMOOTH_PASSES)
-            # diffusion cancels per-vertex noise but also dilutes genuine
-            # isolated deficits (collar rings) — keep a floor of the raw
-            deficit = np.maximum(deficit_g[wg][:, 0], PUSH_RAW_KEEP * raw)
-        push = np.clip(deficit, 0.0, PUSH_CAP)
-        new_w = new_w + n1 * push[:, None]
+        c1, n1, rel1 = _blended_clearance(field, new_w, field.dst[weight], field.dst_tri_n[weight],
+                                          field.dst_tree[weight], field.tri_rel[weight], k=CLEAR_K)
+        deficit = raw = ((c0 + margin) - c1) * prox * rel1 * (1.0 - s.HF)
+        if adj is not None:
+            smooth = _smooth_group_field(_group_mean(raw[:, None], s.wg, s.n_g), adj[0], adj[1],
+                                         PUSH_SMOOTH_PASSES)
+            deficit = np.maximum(smooth[s.wg][:, 0], PUSH_RAW_KEEP * raw)
+        new_w = new_w + n1 * np.clip(deficit, 0.0, PUSH_CAP)[:, None]
+    return new_w
 
-    # weld final positions (coincident twins must stay coincident)
-    new_w = _group_mean(new_w, wg, n_g)[wg]
 
-    for block, G_id, G, start, nv in metas:
+def _write_back(metas, new_w, skel_root) -> None:
+    """Store each shape's rows of `new_w` back into its own vertex frame."""
+    for block, start, nv in metas:
+        world, is_id = _shape_world(block, skel_root)
         seg = new_w[start:start + nv]
-        out = seg if G_id else (seg - G[3, :3]) @ np.linalg.inv(G[:3, :3])
-        geom_data = block.data
+        out = seg if is_id else (seg - world[3, :3]) @ np.linalg.inv(world[:3, :3])
         for vi in range(nv):
-            geom_data.vertices[vi].x = float(out[vi, 0])
-            geom_data.vertices[vi].y = float(out[vi, 1])
-            geom_data.vertices[vi].z = float(out[vi, 2])
-    return len(metas)
+            vert = block.data.vertices[vi]
+            vert.x, vert.y, vert.z = (float(c) for c in out[vi])
+
+
+def deform_geoms_wrap(skinned_geoms, skel_root, field, female: bool,
+                      weight: int = 0, race=None, src_skel: dict = None) -> int:
+    """FK deform + exact body-fit correction for all non-PRN skinned shapes; how many (0 = run plain FK).
+
+    FK first, then the wrap field cancels FK's measured error against the Skyrim body,
+    all shapes solved as one system. `weight` picks the _0/_1 body, `race` a beast head
+    pack, `src_skel` (the source rest skeleton) the pose cache and head origin.
+    See: docs/commentary/asset_convert_armor.md#body-wrap-armor-fitting
+    """
+    bone_deltas, alias = load_animation_deltas(src_skel), oblivion_alias_map(src_skel)
+    if not bone_deltas:
+        return 0
+    pre_fk = _pre_fk_world(skinned_geoms, skel_root)
+    deform_vertices_animation_fk(skinned_geoms, skel_root, bone_deltas)
+    s = _gather(skinned_geoms, skel_root, pre_fk, alias, field)
+    if s is None:
+        return 0
+    _weld(s)
+    new_w = s.VW + _field_corrections(field, s.VW, s.ABC, weight) * (1.0 - s.HF)[:, None]
+    new_w = _push_clear(s, _fit_head_gear(s, new_w, female, race, src_skel), field, weight)
+    _write_back(s.metas, _group_mean(new_w, s.wg, s.n_g)[s.wg], skel_root)
+    return len(s.metas)
 
 
 def morph_converted_to_weight1(data, female: bool) -> int:
@@ -1526,25 +715,3 @@ def morph_converted_to_weight1(data, female: bool) -> int:
             count += 1
     return count
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(
-        description='Build the body-wrap fields (OB body fitted onto SK body)')
-    parser.add_argument('--gender', choices=['male', 'female'],
-                        help='build a single gender (default: both)')
-    args = parser.parse_args()
-    if args.gender:
-        ok = build_field(args.gender)
-        print('OK' if ok else 'FAILED')
-    else:
-        n = build_all_fields()
-        print(f'{n}/2 wrap fields built')
-
-
-if __name__ == '__main__':
-    main()

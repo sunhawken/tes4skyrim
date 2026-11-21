@@ -1,4 +1,4 @@
-"""animationdata / animationsetdata emission as TESRuntime cache fragments.
+"""animationdata / animationsetdata emission as CreatureRuntime cache fragments.
 
 The Skyrim engine loads a creature behavior project ONLY if it is registered
 in the two merged text databases shipped in ``Skyrim - Animations.bsa``:
@@ -8,8 +8,8 @@ in the two merged text databases shipped in ``Skyrim - Animations.bsa``:
                                          CRC list per project)
 
 Each is ONE global file, so the converter never writes it: every plugin
-emits one fragment (``SKSE/Plugins/TESRuntime/animation/<plugin>.json``)
-holding its own projects' already-formatted blocks, and the TESRuntime plugin
+emits one fragment (``SKSE/Plugins/CreatureRuntime/animation/<plugin>.json``)
+holding its own projects' already-formatted blocks, and the CreatureRuntime plugin
 composes ``vanilla base + every fragment`` in memory when the engine parses
 the files. ``compose_animationdata`` / ``compose_animationsetdata`` are the
 reference composition the DLL mirrors line for line.
@@ -54,7 +54,9 @@ VANILLA_SINGLEFILES = ('animationdatasinglefile.txt',
                        'animationsetdatasinglefile.txt')
 
 #: Mod-root-relative folder every fragment lives in; the DLL reads all *.json here.
-FRAGMENT_DIR = os.path.join('SKSE', 'Plugins', 'TESRuntime', 'animation')
+FRAGMENT_DIR = os.path.join('SKSE', 'Plugins', 'CreatureRuntime', 'animation')
+#: Where a build from before the runtime split put it; CreatureRuntime still reads it (deprecated).
+LEGACY_FRAGMENT_DIR = os.path.join('SKSE', 'Plugins', 'TESRuntime', 'animation')
 FRAGMENT_VERSION = 1
 
 
@@ -275,12 +277,28 @@ def fragment_path(plugin_out_dir: str, plugin_name: str) -> str:
     return os.path.join(plugin_out_dir, FRAGMENT_DIR, f'{stem}.json')
 
 
+def remove_legacy_fragment(plugin_out_dir: str, plugin_name: str) -> bool:
+    """Delete the plugin's pre-split fragment, if any; whether one went.
+
+    See: docs/reference/tes_runtime_fragments.md#legacy-sidecar-paths
+    """
+    stem = os.path.splitext(os.path.basename(plugin_name))[0]
+    path = os.path.join(plugin_out_dir, LEGACY_FRAGMENT_DIR, f'{stem}.json')
+    if not os.path.isfile(path):
+        return False
+    os.remove(path)
+    folder = os.path.dirname(path)
+    if not os.listdir(folder):
+        os.rmdir(folder)
+    return True
+
+
 def write_fragment(manifests: list, out_meshes_dir: str,
                    plugin_name: str, appends: dict = None,
                    plugin_out_dir: str = None) -> str:
     """Write the plugin's fragment from its OWN project manifests.
 
-    Goes in `plugin_out_dir`'s SKSE/Plugins/TESRuntime/animation (defaulting
+    Goes in `plugin_out_dir`'s SKSE/Plugins/CreatureRuntime/animation (defaulting
     to the parent of `out_meshes_dir`). Entries are ordered by project name
     so composition is deterministic; `appends` carries the entries that
     extend a VANILLA project. Returns the fragment path.
@@ -302,6 +320,7 @@ def write_fragment(manifests: list, out_meshes_dir: str,
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(frag, f)
+    remove_legacy_fragment(root, plugin_name)
     _write_project_sources(manifests, out_meshes_dir)
     _remove_stale_singlefiles(out_meshes_dir)
     return path
@@ -340,16 +359,79 @@ def _write_project_sources(manifests: list, out_meshes_dir: str) -> None:
 
 
 def read_fragments(fragment_dir: str) -> list:
-    """Every *.json fragment under `fragment_dir`, sorted by filename."""
-    out = []
+    """Every *.json fragment under `fragment_dir`, sorted by filename, then
+    one fragment per subfolder holding singlefile copies, sorted by folder."""
     if not os.path.isdir(fragment_dir):
-        return out
-    for fn in sorted(os.listdir(fragment_dir), key=str.lower):
-        if not fn.lower().endswith('.json'):
-            continue
-        with open(os.path.join(fragment_dir, fn), encoding='utf-8') as f:
-            out.append(json.load(f))
+        return []
+    entries = sorted(os.listdir(fragment_dir), key=str.lower)
+    out = []
+    for fn in entries:
+        if fn.lower().endswith('.json'):
+            with open(os.path.join(fragment_dir, fn), encoding='utf-8') as f:
+                out.append(json.load(f))
+    for sub in entries:
+        frag = _read_singlefile_copy(os.path.join(fragment_dir, sub))
+        if frag:
+            out.append(frag)
     return out
+
+
+def _read_singlefile_copy(folder: str):
+    """The fragment for one folder of full singlefile copies, or None when it
+    holds neither file or either is malformed.
+
+    See: docs/reference/tes_runtime_fragments.md#singlefile-copies
+    """
+    if not os.path.isdir(folder):
+        return None
+    lines = {}
+    for fn in VANILLA_SINGLEFILES:
+        path = os.path.join(folder, fn)
+        if os.path.isfile(path):
+            with open(path, encoding='latin-1') as f:
+                lines[fn] = f.read().splitlines()
+    if not lines:
+        return None
+    try:
+        return singlefile_fragment(os.path.basename(folder), lines)
+    except (IndexError, ValueError):
+        return None
+
+
+def singlefile_fragment(source: str, lines_by_file: dict) -> dict:
+    """Every project in a mod's full singlefile copies, as one fragment.
+
+    Composition skips each project the base already registers, so only the
+    mod's new projects land. Raises ValueError on a malformed file.
+    """
+    frag = {'version': FRAGMENT_VERSION, 'source': source,
+            'animdata': [], 'animsetdata': []}
+    ad = lines_by_file.get('animationdatasinglefile.txt')
+    if ad is not None:
+        names, body = _split_registry(ad)
+        spans = _project_block_spans(names, body)
+        for name in names:
+            start, mid, end = _checked(spans, name, len(body))
+            frag['animdata'].append({
+                'project': name, 'clip_block': body[start + 1:mid],
+                'motion_block': body[mid + 1:end] if end > mid else None})
+    asd = lines_by_file.get('animationsetdatasinglefile.txt')
+    if asd is not None:
+        names, body = _split_registry(asd)
+        spans = _setdata_spans(names, body)
+        for name in names:
+            start, _, end = _checked(spans, name, len(body))
+            frag['animsetdata'].append({'entry': name,
+                                        'block': body[start:end]})
+    return frag
+
+
+def _checked(spans: dict, name: str, size: int) -> tuple:
+    """`name`'s (start, mid, end) span, which must be ordered and in range."""
+    span = spans.get(name.lower())
+    if not span or not span[0] < span[1] <= span[2] <= size:
+        raise ValueError(f'malformed singlefile block for {name!r}')
+    return span
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +441,8 @@ def read_fragments(fragment_dir: str) -> list:
 def _split_registry(base_lines: list) -> tuple:
     """(names, body) of a singlefile: the leading count + name list, rest."""
     n = int(base_lines[0])
+    if not 0 <= n < len(base_lines):
+        raise ValueError(f'singlefile registers {n} names in {len(base_lines)} lines')
     return list(base_lines[1:1 + n]), list(base_lines[1 + n:])
 
 
@@ -368,10 +452,10 @@ def _wrapped(block: list) -> list:
 
 
 def _project_block_spans(names: list, body: list) -> dict:
-    """{project name lower: (start, end)} of each project's wrapped blocks.
+    """{project name lower: (start, mid, end)} of each project's wrapped blocks.
 
-    A project's span covers its clip wrapper and, when the has-clip-data
-    flag is set, its motion wrapper.
+    `start`..`mid` is the clip wrapper; `mid`..`end` is the motion wrapper,
+    empty unless the has-clip-data flag is set.
     """
     spans, pos = {}, 0
     for name in names:
@@ -382,9 +466,10 @@ def _project_block_spans(names: list, body: list) -> dict:
             flag_at += 1 + int(body[pos + 2])
         has_cache = flag_at < pos + 1 + count and body[flag_at] == '1'
         pos += 1 + count
+        mid = pos
         if has_cache:
             pos += 1 + int(body[pos])
-        spans[name.lower()] = (start, pos)
+        spans[name.lower()] = (start, mid, pos)
     return spans
 
 
@@ -421,12 +506,12 @@ def _append_animdata(names: list, body: list, appends: list) -> list:
     spans = _project_block_spans(names, body)
     out = list(body)
     for e in sorted(appends, key=lambda a: spans.get(a['project'].lower(),
-                                                     (0, 0))[0],
+                                                     (0, 0, 0))[0],
                     reverse=True):
         span = spans.get(e['project'].lower())
         if not span:
             continue
-        start, end = span
+        start, _, end = span
         clip_count = int(out[start])
         clip_end = start + 1 + clip_count
         motion = list(e.get('motions') or [])

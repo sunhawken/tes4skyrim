@@ -52,6 +52,12 @@ _OBSE_INPUT_NOTE = '{f} {a}  ;OBSE input command, no Papyrus equivalent'
 ACTOR, AV, SELF, OBJREF, RAW, MAP = ('ACTOR', 'AV', 'SELF', 'OBJREF',
                                     'RAW', 'MAP')
 
+#: The realm list property: the plugin's crime factions, main realm first.
+CRIME_REALMS = ('TES4CrimeFactions', 'FormList')
+
+#: The crime faction of the realm the player is in.
+CRIME_FACTION = 'TES4Polyfill.CrimeFaction(TES4CrimeFactions)'
+
 
 class Cmd:
     """One command's conversion, as data.
@@ -83,9 +89,9 @@ class Cmd:
 
 #: See: docs/commentary/script_convert.md#command-rows
 COMMAND_ROWS = {
-    #: Int because TES4 call sites compare and assign 0/1.
+    #: Int for TES4's 0/1 tests; TESRuntime answers the variable from the mesh's own animation sequences.
     'isanimplaying': Cmd(
-        '({ref}.GetAnimationVariableBool("bAnimPlaying") as Int)', OBJREF),
+        '({ref}.GetAnimationVariableBool("TES4IsAnimPlaying") as Int)', OBJREF),
 
     #: GetArmorRating -> DamageResist actor value (what armor rating feeds).
     'getarmorrating': Cmd('{ref}.GetActorValue("DamageResist")', ACTOR, flags='actor_only'),
@@ -108,8 +114,9 @@ COMMAND_ROWS = {
     #: Reset3DState -> MoveTo self (reloads 3D).
     'reset3dstate': Cmd('{ref}.MoveTo({ref})'),
 
-    #: SetRestrained -> SetDontMove.
-    'setrestrained': Cmd('{ref}.SetDontMove({b0})', ACTOR, defaults={0: '0'}),
+    #: SetRestrained -> Skyrim's SetRestrained (SetDontMove only stops being pushed), via the polyfill.
+    'setrestrained': Cmd('TES4Polyfill.SetRestrained({ref}, {b0}, {restrained})', ACTOR, defaults={0: '0'},
+                         flags='actor_arg'),
 
     #: IsOnGround: Skyrim has only the inverse.
     'isonground': Cmd('!({ref}.IsFlying())', RAW),
@@ -122,6 +129,18 @@ COMMAND_ROWS = {
 
     #: IsActorUsingATorch: equipped-item type 11 is the torch slot.
     'isactorusingatorch': Cmd('({ref}.GetEquippedItemType(0) == 11)', ACTOR, flags='cmp_bool'),
+
+    #: A runtime type test on any reference: a non-actor casts to None.
+    'isactor': Cmd('(({ref} as Actor) != None)', OBJREF,
+                   flags='bare_bool cmp_bool zero_arg'),
+
+    #: The engine's AI-enabled flag; vanilla EnableAI writes it, SKSE IsAIEnabled reads it.
+    'setactorsai': Cmd('{ref}.EnableAI({b0})', ACTOR, defaults={0: '1'},
+                       flags='actor_only'),
+    'toggleactorsai': Cmd('{ref}.EnableAI(!{ref}.IsAIEnabled())', ACTOR,
+                          flags='actor_only zero_arg'),
+    'isactorsaioff': Cmd('(!{ref}.IsAIEnabled())', ACTOR,
+                         flags='actor_only bare_bool cmp_bool zero_arg'),
 
     #: Unlock takes no argument in TES4; Skyrim's Lock(false) is the unlock.
     'unlock': Cmd('{ref}.Lock(false)', OBJREF),
@@ -146,7 +165,7 @@ COMMAND_ROWS = {
     'printtoconsole': Cmd('Debug.Trace({fmt})'),
     'printc': Cmd('Debug.Trace({fmt})'),
 
-    #: Button list is dropped. See: docs/commentary/script_convert.md#obse-constructs-no-shape-to-translate
+    #: The text-only fallback; a static `|` button box is a MESG. See: docs/commentary/script_convert.md#messageboxex-buttons
     'messageboxex': Cmd('Debug.MessageBox({fmt})'),
     'messageex': Cmd('Debug.MessageBox({fmt})'),
 
@@ -260,18 +279,18 @@ COMMAND_ROWS = {
     #: GetContainer: item.GetContainer -> item.GetContainer()
     'getcontainer': Cmd('{ref}.GetContainer()', SELF),
     #: Crime/fame/infamy writes: argument 0 cast to what the setter declares.
-    'setcrimegold': Cmd('TES4CyrodiilCrimeFaction.SetCrimeGold({i0})', self_type=('TES4CyrodiilCrimeFaction', 'Faction'), flags='actor_only'),
-    'modcrimegold': Cmd('TES4CyrodiilCrimeFaction.ModCrimeGold({c0}, false)', self_type=('TES4CyrodiilCrimeFaction', 'Faction'), flags='actor_only'),
+    'setcrimegold': Cmd(f'TES4Polyfill.SetCrimeGold({CRIME_FACTION}, {{i0}})', self_type=CRIME_REALMS, flags='actor_only'),
+    'modcrimegold': Cmd(f'{CRIME_FACTION}.ModCrimeGold({{c0}}, false)', self_type=CRIME_REALMS, flags='actor_only'),
     'modpcfame': Cmd('TES4Fame.Mod({f0})', self_type=('TES4Fame', 'GlobalVariable')),
     'modpcinfamy': Cmd('TES4Infamy.Mod({f0})', self_type=('TES4Infamy', 'GlobalVariable')),
     'setpcfame': Cmd('TES4Fame.SetValueInt({i0})', self_type=('TES4Fame', 'GlobalVariable')),
     'setpcinfamy': Cmd('TES4Infamy.SetValueInt({i0})', self_type=('TES4Infamy', 'GlobalVariable')),
-    #: GotoJail → faction.SendPlayerToJail()
-    'gotojail': Cmd('TES4CyrodiilCrimeFaction.SendPlayerToJail()', self_type=('TES4CyrodiilCrimeFaction', 'Faction')),
-    #: Crime gold functions → TES4CyrodiilCrimeFaction proxy
-    'getcrimegold': Cmd('TES4CyrodiilCrimeFaction.GetCrimeGold()', self_type=('TES4CyrodiilCrimeFaction', 'Faction'), flags='actor_only'),
-    'payfine': Cmd('TES4CyrodiilCrimeFaction.PlayerPayCrimeGold(false, false)', self_type=('TES4CyrodiilCrimeFaction', 'Faction')),
-    'payfinethief': Cmd('TES4CyrodiilCrimeFaction.PlayerPayCrimeGold(false, false)', self_type=('TES4CyrodiilCrimeFaction', 'Faction')),
+    #: Crime calls act on the realm the player is in; PayFine confiscates and releases.
+    'gotojail': Cmd(f'{CRIME_FACTION}.SendPlayerToJail()', self_type=CRIME_REALMS),
+    'getcrimegold': Cmd(f'{CRIME_FACTION}.GetCrimeGold()', self_type=CRIME_REALMS, flags='actor_only'),
+    'payfine': Cmd(f'{CRIME_FACTION}.PlayerPayCrimeGold(true, true)', self_type=CRIME_REALMS),
+    'payfinethief': Cmd(f'{CRIME_FACTION}.PlayerPayCrimeGold(false, false)', self_type=CRIME_REALMS),
+    'getplayerinseworld': Cmd('TES4Polyfill.CrimeRealm(TES4CrimeFactions)', self_type=CRIME_REALMS),
     #: Fame/Infamy → GlobalVariable
     'getpcfame': Cmd('TES4Fame.GetValueInt()', self_type=('TES4Fame', 'GlobalVariable')),
     'getpcinfamy': Cmd('TES4Infamy.GetValueInt()', self_type=('TES4Infamy', 'GlobalVariable')),
@@ -287,9 +306,6 @@ COMMAND_ROWS = {
 
     #: See: docs/commentary/script_convert.md#advancepclevel-level-actor-value
     'advancepclevel': Cmd('Game.GetPlayer().ModActorValue("Level", 1)'),
-    #: Slot name dropped. See: docs/commentary/script_convert.md#argument-that-looks-ignorable
-    'con_save': Cmd('Game.RequestSave()'),
-    'con_savegame': Cmd('Game.RequestSave()'),
     'getdisposition': Cmd('50'),
     #: GetIsPlayableRace
     'getisplayablerace': Cmd('true', flags='zero_arg'),
@@ -303,7 +319,6 @@ COMMAND_ROWS = {
     'isplayerinprison': Cmd('Game.GetPlayer().IsArrested()'),
     'isthirdperson': Cmd('False'),
     'releaseweatheroverride': Cmd('Weather.ReleaseOverride()'),
-    'savegame': Cmd('Game.RequestSave()'),
     'senttojail': Cmd('Game.GetPlayer().IsArrested()'),
     'triggerhitshader': Cmd('Game.TriggerScreenBlood(3)'),
 
@@ -313,7 +328,6 @@ COMMAND_ROWS = {
     'bookread': Cmd(note='GetBookRead'),
     'disablelinkedpathpoints': Cmd(note='{f}', flags='zero_arg'),
     'enablelinkedpathpoints': Cmd(note='{f}', flags='zero_arg'),
-    'essentialdeathreload': Cmd(note='{f}'),
     'flamesoff': Cmd(note='{f} has no Skyrim equivalent'),
     'flameson': Cmd(note='{f} has no Skyrim equivalent'),
     #: ForceFlee → StartCombat avoidance (approximate)
@@ -329,12 +343,15 @@ COMMAND_ROWS = {
     'getfullgoldvalue': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     #: Bare literal, operand position. See: docs/commentary/script_convert.md#reads-skyrim-cannot-answer
     'getgamerestarted': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
-    #: IgnoreFriendlyHits is a SETTER only; Papyrus cannot read it back.
-    'getignorefriendlyhits': Cmd(note='GetIgnoreFriendlyHits — Skyrim exposes only the setter', flags='bare_bool zero_arg'),
+    'getignorefriendlyhits': Cmd('{ref}.IsIgnoringFriendlyHits()', OBJREF, flags='bare_bool cmp_bool zero_arg'),
     'getisalerted': Cmd(note='{f}', flags='zero_arg'),
     #: The CK wiki names IsAlarmed as GetAlarmed's own Papyrus version.
     'getalarmed': Cmd('{ref}.IsAlarmed()', ACTOR,
                       flags='actor_only zero_arg cmp_bool'),
+    #: Save managers' console saves. See: docs/commentary/script_convert.md#console-saves-are-dropped
+    'con_save': Cmd(note='{f}'),
+    'con_savegame': Cmd(note='{f}'),
+    'savegame': Cmd(note='{f}'),
     'getdisease': Cmd(note='{f} has no Papyrus equivalent (read as 0)',
                       flags='zero_arg'),
     'getfriendhit': Cmd(note='{f} has no Papyrus equivalent (read as 0)',
@@ -379,8 +396,6 @@ COMMAND_ROWS = {
     'iskeypressed2': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     'iskeypressed3': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     'isonguard': Cmd(note='{f}'),
-    'isplayable': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
-    'isplayable2': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     'isplayermovingintonewspace': Cmd(note='{f} has no Papyrus equivalent (read as 0)'),
     'isplayerslastriddenhorse': Cmd(note='{f} has no Skyrim equivalent', flags='bare_bool zero_arg'),
     #: IsSwimming → no vanilla equivalent, approximate with submerged check
@@ -390,7 +405,8 @@ COMMAND_ROWS = {
     'offerhorse': Cmd(note='{f}'),
     'opencurrentcontainer': Cmd(note='{f}'),
     'pcb': Cmd(note='{f}'),
-    'playbink': Cmd(note='{f}'),
+    'playbink': Cmd('Game.PlayBink({a0}, false, {?11}, false, true)',
+                    arms=('true', 'false'), defaults={1: '0'}),
     'purgecellbuffers': Cmd(note='{f}'),
     'refreshtopiclist': Cmd(note='{f}'),
     'removeflames': Cmd(note='{f} has no Skyrim equivalent', flags='zero_arg'),
@@ -401,8 +417,6 @@ COMMAND_ROWS = {
     'sendtrespassalarm': Cmd(note='{f}'),
     #: SetActorFullName → no-op (SKSE required for SetDisplayName)
     'setactorfullname': Cmd(note='SetActorFullName'),
-    #: SetActorsAI → no-op
-    'setactorsai': Cmd(note='SetActorsAI'),
     'setallreachable': Cmd(note='{f}'),
     'setallvisible': Cmd(note='{f}'),
     #: SetCellFullName no-op
@@ -417,7 +431,7 @@ COMMAND_ROWS = {
     'setdoordisabletakeoff': Cmd(note='{f}'),
     #: SetForceSneaking
     'setforcesneak': Cmd(note='SetForceSneak', flags='actor_only'),
-    'setignorefriendlyhits': Cmd(note='{f}'),
+    'setignorefriendlyhits': Cmd('{ref}.IgnoreFriendlyHits({b0})', OBJREF, defaults={0: '1'}),
     #: SetInCharGen: no-op
     'setinchargen': Cmd(note='SetInCharGen'),
     'setinvestmentgold': Cmd(note='{f}'),
@@ -429,8 +443,8 @@ COMMAND_ROWS = {
     'setnoavoidance': Cmd(note='{f}'),
     'setnorumors': Cmd(note='{f}'),
     'setpackduration': Cmd(note='{f}'),
-    #: SetPlayerInSEWorld: no-op
-    'setplayerinseworld': Cmd(note='SetPlayerInSEWorld'),
+    #: SetPlayerInSEWorld: which realm's bounty the crime calls read and write.
+    'setplayerinseworld': Cmd('TES4Polyfill.SetCrimeRealm(TES4CrimeFactions, {i0})', self_type=CRIME_REALMS),
     'setpublic': Cmd(note='{f}'),
     'setquestobject': Cmd(note='{f}'),
     #: SetRigidBodyMass → no-op
@@ -467,7 +481,7 @@ COMMAND_ROWS = {
     #: getfirstref/getnextref are NOT here. See: docs/commentary/script_convert.md#equivalent-in-a-different-subsystem
     'getformfrommod': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
     'getaltcontrol2': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
-    'sifh': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
+    'sifh': Cmd('{ref}.IgnoreFriendlyHits({b0})', OBJREF, defaults={0: '1'}),
     'equipme': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
     'modavmod': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
     'getvelocity': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
@@ -491,7 +505,6 @@ COMMAND_ROWS = {
     'getplayerskeletonpath': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
     #: Form-type tests and fileexists are NOT here -- both need handlers.
     'getgodmode': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
-    'getplayerbirthsign': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
     'getdisplayname': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
     'getname': Cmd(note='{f} - no Papyrus equivalent ({f} {a})'),
     #: Dead by construction. See: docs/commentary/script_convert.md#neutralised-command-inert-in-position
@@ -608,6 +621,7 @@ COMMAND_ROWS = {
     'message': Cmd('Debug.Notification', MAP, bare=True),
     'messagebox': Cmd('Debug.MessageBox', MAP, bare=True),
     'showmessage': Cmd('Debug.MessageBox', MAP, bare=True),
+    'essentialdeathreload': Cmd('TES4Polyfill.EssentialDeathReload', MAP, bare=True),
 
     # --------------------------------------------------------------------------
     # Math (OBSE)
@@ -658,7 +672,7 @@ COMMAND_ROWS = {
     #: See: docs/commentary/script_convert.md#zero-arg-reads-need-function-map
     'equipitem2': Cmd('EquipItem', MAP),
     #: See: docs/commentary/script_convert.md#receiver-and-argument-not-interchangeable
-    'isplugininstalled': Cmd('TES4Polyfill.IsModLoaded', MAP, bare=True),
+    'isplugininstalled': Cmd('TES4Polyfill.IsPluginInstalled', MAP, bare=True),
     #: Debug.Trace is Papyrus's own log write, the same capability.
     'print': Cmd('Debug.Trace', MAP, bare=True),
 
@@ -775,7 +789,6 @@ COMMAND_ROWS = {
 
     #: --- Player Skill/Misc ---
     'modpcskill': Cmd('Game.AdvanceSkill', MAP, bare=True, flags='av'),
-    'modpcmiscstat': Cmd('Game.IncrementStat', MAP, bare=True),
 
     #: --- Trap/Custom functions that are quest-specific ---
 
@@ -834,12 +847,12 @@ COMMAND_ROWS = {
 
     #: SetDestroyed writes that same shadow list.
     'setdestroyed': Cmd(
-        'TES4Polyfill.SetDestroyed({ref}, {destroyed}, {b0})',
+        'TES4Polyfill.SetDestroyed({ref}, {destroyed}, {b0})', OBJREF,
         defaults={0: '1'}),
 
     #: See: docs/commentary/script_convert.md#closing-oblivion-gate-destroyed-flag
     'closecurrentobliviongate': Cmd(
-        'TES4Polyfill.CloseCurrentOblivionGate({destroyed})'),
+        'TES4Polyfill.CloseCurrentOblivionGate({destroyed}, {gates_shut})'),
     'forcecloseobliviongate': Cmd(
         'TES4Polyfill.CloseOblivionGate({ref}, {destroyed})'),
     'closeobliviongate': Cmd(
@@ -851,25 +864,18 @@ COMMAND_ROWS = {
         self_type=('TES4GoldFenced', 'GlobalVariable')),
 
     #: See: docs/commentary/script_convert.md#equivalent-in-a-different-subsystem
-    'ispcamurderer': Cmd(
-        '(TES4CyrodiilCrimeFaction.GetCrimeGoldViolent() >= 1000)',
-        self_type=('TES4CyrodiilCrimeFaction', 'Faction')),
-    'ispcanmurderer': Cmd(
-        '(TES4CyrodiilCrimeFaction.GetCrimeGoldViolent() >= 1000)',
-        self_type=('TES4CyrodiilCrimeFaction', 'Faction')),
-    'getpcismurderer': Cmd(
-        '(TES4CyrodiilCrimeFaction.GetCrimeGoldViolent() >= 1000)',
-        self_type=('TES4CyrodiilCrimeFaction', 'Faction')),
+    'ispcamurderer': Cmd(f'({CRIME_FACTION}.GetCrimeGoldViolent() >= 1000)',
+                         self_type=CRIME_REALMS),
+    'ispcanmurderer': Cmd(f'({CRIME_FACTION}.GetCrimeGoldViolent() >= 1000)',
+                          self_type=CRIME_REALMS),
+    'getpcismurderer': Cmd(f'({CRIME_FACTION}.GetCrimeGoldViolent() >= 1000)',
+                           self_type=CRIME_REALMS),
 
     #: See: docs/commentary/script_convert.md#argument-that-looks-ignorable
     'setdoordefaultopen': Cmd('{ref}.SetOpen({b0})', defaults={0: '1'}),
 
     #: SetScale / SetSize.
     'setsize': Cmd('{ref}.SetScale({a0})', defaults={0: '1.0'}),
-
-    #: GetPCMiscStat reads one of the game's own tracked statistics.
-    'getpcmiscstat': Cmd('Game.QueryStat("{s0}")',
-                         defaults={0: 'Items Stolen'}),
 
     #: Not promoted. See: docs/commentary/script_convert.md#commands-that-must-not-promote
     'getinsamecell': Cmd('({ref}.GetParentCell() == {a0}.GetParentCell())',
@@ -940,10 +946,6 @@ COMMAND_ROWS = {
     'setforcerun': Cmd('{ref}.SetActorValue("SpeedMult", {?01})', ACTOR,
                        defaults={0: '0'}, arms=('150.0', '100.0'), flags='actor_only branch_only'),
 
-    #: ResetInterior -> Cell.Reset().
-    'resetinterior': Cmd('{p0}.Reset()', RAW, types={0: 'Cell'},
-                         defaults={0: 'Self'}),
-
     #: IsPCRace / GetPCIsRace -> the player's race compared to the argument.
     'ispcrace': Cmd('Game.GetPlayer().GetRace() == {a0}',
                     defaults={0: 'None'}, types={0: 'Race'}),
@@ -973,12 +975,6 @@ COMMAND_ROWS = {
                              defaults={0: 'Game.GetPlayer()'},
                              types={0: 'Actor'}, flags='actor_arg'),
 
-    #: See: docs/commentary/script_convert.md#equivalent-in-a-different-subsystem
-    'flee': Cmd('{ref}.SetActorValue("Confidence", 0)\n'
-                '  {ref}.EvaluatePackage()', ACTOR, flags='bare_no_equiv'),
-    'forceflee': Cmd('{ref}.SetActorValue("Confidence", 0)\n'
-                     '  {ref}.EvaluatePackage()', ACTOR),
-
     #: Answers PRESENT. See: docs/commentary/script_convert.md#neutralised-command-inert-in-position
     'fileexists': Cmd('1', note='FileExists - converted assets are deployed '
                                 'by the pipeline, not under the TES4 path'),
@@ -1006,9 +1002,10 @@ COMMAND_ROWS = {
     'enablecontrol': Cmd(note=_OBSE_INPUT_NOTE, flags='bare_no_equiv'),
     'tapcontrol': Cmd(note=_OBSE_INPUT_NOTE, flags='bare_no_equiv'),
 
-    #: GMST substitute. See: docs/commentary/script_convert.md#equivalent-in-a-different-subsystem
+    #: A falling-damage perk window. See: docs/commentary/script_convert.md#fall-damage-is-a-perk
     'resetfalldamagetimer': Cmd(
-        'TES4Polyfill.SuppressFallDamage({event_actor})', flags='zero_arg'),
+        'TES4Polyfill.SuppressFallDamage({ref}, TES4NoFallDamage)', ACTOR,
+        self_type=('TES4NoFallDamage', 'Spell'), flags='zero_arg'),
 
 }
 
@@ -1034,11 +1031,12 @@ HANDLED_COMMANDS = frozenset((
     'getmenustringvalue', 'getmodindex', 'getnextref', 'getnthspell',
     'getownership', 'getpcfactionattack', 'getpcfactionattack',
     'getpcfactionmurder', 'getpcfactionsteal', 'getpcfactionsteal',
-    'getpcisclass', 'getpcismurderer', 'getpcisrace', 'getpcissex',
-    'getplayerinseworld', 'getsecondspassed', 'getself', 'getspellcount',
-    'holdkey', 'isactionref', 'isactivator', 'isactor', 'isarmor', 'isbook',
+    'getpcisclass', 'getpcismurderer', 'getpcisrace', 'getpcissex', 'getplayerbirthsign',
+    'getsecondspassed', 'getself', 'getspellcount',
+    'holdkey', 'isactionref', 'isactivator', 'isarmor', 'isbook',
     'isclothing', 'iscontainer', 'isdoor', 'isingredient', 'iskey', 'islight',
     'ismisc', 'isowner', 'ispcamurderer', 'ispcanmurderer', 'ispcrace',
+    'isplayable', 'isplayable2',
     'isplayersleeping', 'ispotion', 'israining', 'isspelltarget', 'isweapon',
     'lookismile', 'modamountsoldstolen', 'moddisposition', 'pathtoref',
     'pickidle', 'playback', 'playbackalt', 'playgroup', 'playidle',
@@ -1145,16 +1143,15 @@ GMST_TO_ACTOR_VALUE = {
 }
 
 
-#: Actor values TES5 stores as an enum tier, with the tier count.
+#: Actor values TES5 stores as an enum tier, with the tier count; Confidence goes through TES4Polyfill.
 ENUM_ACTOR_VALUES = {
-    'aggression': 3, 'confidence': 4, 'assistance': 2,
+    'aggression': 3, 'assistance': 2,
     'mood': 8, 'morality': 3,
 }
 
 #: See: docs/commentary/script_convert.md#aggression-confidence-are-enums
 ENUM_AV_LADDERS = {
     'aggression': ((106, 3), (65, 2), (5.000001, 1), (0, 0)),
-    'confidence': ((100, 4), (70, 3), (40, 2), (15, 1), (0, 0)),
 }
 
 
@@ -1200,14 +1197,14 @@ ACTOR_VALUE_READ_FUNCTIONS = _flagged('av_read')
 
 #: Boolean (0/1) and usable as a bare check.
 BARE_BOOL_FUNCTIONS = _flagged('bare_bool') | frozenset({
-    'is3dloaded',
+    'is3dloaded', 'isplayable', 'isplayable2',
 })
 
 BARE_NO_EQUIV_COMMANDS = _flagged('bare_no_equiv') | frozenset({
     'con_runmemorypass', 'emcgetplaylist', 'emcisbattleoverridden',
     'emcismusiconhold', 'emcmusicnexttrack', 'emcmusicresume',
     'emcmusicstop', 'emcplaytrack', 'emcsetbattleoverride',
-    'emcsetmusichold', 'emcsetmusictype', 'getmenufloatvalue',
+    'emcsetmusichold', 'emcsetmusictype', 'flee', 'getmenufloatvalue',
     'getmenuhastrait', 'getmenustringvalue', 'streammusic',
 })
 
@@ -1221,7 +1218,7 @@ BRANCH_ONLY_COMMANDS = _flagged('branch_only') | frozenset({
 COMPARISON_BOOL_FUNCTIONS = _flagged('cmp_bool') | frozenset({
     'getincell', 'getisclass', 'getiscurrentpackage', 'getisid',
     'getpcisclass', 'gettalkedtopcparam', 'isactionref',
-    'isinfaction', 'isowner',
+    'isinfaction', 'isowner', 'isplayable', 'isplayable2',
 })
 
 OBJREF_IMPLICIT_SELF_FUNCTIONS = _flagged('objref_self') | frozenset({
@@ -1235,7 +1232,7 @@ OBJREF_SHARED_FUNCTIONS = _flagged('objref_shared') | frozenset({
 })
 
 #: Comma-written receivers. See: docs/commentary/script_convert.md#commands-that-must-not-promote
-ZERO_ARG_REF_FUNCTIONS = _flagged('zero_arg') | frozenset({'isactor'})
+ZERO_ARG_REF_FUNCTIONS = _flagged('zero_arg')
 
 #: What `emit/expr.py` reads: every name either list above calls boolean.
 BOOL_VALUED_FUNCTIONS = BARE_BOOL_FUNCTIONS | COMPARISON_BOOL_FUNCTIONS

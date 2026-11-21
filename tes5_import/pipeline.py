@@ -34,25 +34,69 @@ import os
 import sys
 import time
 
-from core.plugin_masters import masters_from_export_header
+from core.plugin_masters import (master_dir, master_dirs,
+                                 masters_from_export_header)
+from core.worldspace_names import set_worldspace_plugins
 from asset_convert.game_paths import namespace_for, set_namespace
-from .registry import IMPORT_DISPATCH, SKIP_TYPES
+from .registry import IMPORT_DISPATCH, RUNTIME_ONLY_TYPES, SKIP_TYPES
 from .navmesh.pool import collision_cache_chain
+from .base.master_export import values_of
+from .overrides.adoption import MasterAdoption
 from .overrides.nested import (DELETED_FLAG as OVERRIDE_DELETED_FLAG,
-                        OverrideContext, detect_injected_records)
-from .actors.magic_effects import set_tes4_effect_names
+                        detect_injected_records, open_masters)
+from .record_types import magic_art
+from .record_types.crime import plan_crime
+from .record_types.npc_markers_morrowind import place_npc_markers, write_idle_table
+from .record_types.spell_tomes import create_spell_tomes
+from .record_types.spell_tomes_morrowind import chain_tables
+from .record_types.npc_morrowind import load_tes3_tables
+from .record_types.weather_morrowind import set_weather_masters, with_weather_masters
+from .record_types.world_falloutnv import is_fallout_export
+from .actors.combat_approach import create_combat_approach
+from .actors.combat_style import create_combat_styles
+from .actors.confidence import create_confidence_records
+from .actors.misc_stats import create_misc_stat_globals
+from .actors import npc_face_morrowind
+from .actors.stat_factions import create_stat_factions
+from .actors.brawl import create_brawl_ability
+from .actors.disease_contact import load_contact_settings
+from .actors.vampirism_morrowind import create_vampirism
+from .actors.disposition import create_disposition_factions
+from script_convert.constants import FORCE_FLEE_QUEST, FORCE_GREET_QUEST
+from script_convert.context_setup import topic_reveals
+from .packages.force_flee import write_force_flee_quest
+from .packages.actor_wiring import set_stand_still_list
+from .packages.stand_still import create_stand_still
+from .packages.hosts import PackageHosts, forced_lists
+from .packages.aliases import initially_disabled
+from script_convert.cross_ref import hosted_script_type, index_record_details
 from .dialogue.converter import build_npc_to_vtyp_map
+from .dialogue.force_greets import dial_index, write_force_greet_quest
+from .dialogue.morrowind_sidecar import is_tes3_export
+from .dialogue.say_topics import (FORCE_GREET_SLOTS, build_force_flee_slots,
+                                   build_force_greet_slots)
+from .runtime_sidecars import begin_sidecar_run
+from .base.adopted_records import adopt_master_special_records
+from .base.cell_family import set_cell_families
+from .base.conditions import set_whole_day_global
 from .base.owned_records import (
     WELL_KNOWN_PROPERTIES,
     create_ambient_gmst_overrides,
     create_chargen_menu_records,
+    create_day_clock,
     create_destroyed_formlist,
+    create_runtime_formlists,
+    create_dialogue_open_global,
+    create_fall_damage_spell,
     create_force_combat_factions,
     create_message_menu_records,
+    create_missing_globals,
     create_tes4_special_records,
     create_vtyp_records,
 )
 from .base.equivalents import VTYP_EDID_BY_FID
+from .base.race_factions import build_race_factions
+from .base.race_lookup import register_races
 from .record_types.world import (
     set_cloud_bank_output,
 )
@@ -77,14 +121,14 @@ from .pipeline_finalize import run_finalize_phases
 #: Record types an MGEF Assoc. Item can name; LVLC covers summon indirection.
 _ASSOC_ITEM_SIGS = ('CREA', 'NPC_', 'WEAP', 'ARMO', 'CLOT', 'LIGH', 'LVLC')
 
-#: Synthesized stand-in records -> signature; a mastered plugin adopts the master's.
-_TES4_SPECIAL_RECORD_SIGS = {
-    'TES4Fame': b'GLOB',
-    'TES4Infamy': b'GLOB',
-    'TES4GoldFenced': b'GLOB',
-    'TES4ControlsDisabled': b'GLOB',
-    'TES4CyrodiilCrimeFaction': b'FACT',
-}
+#: Record types whose conversion reads the package plan, script vars or quest-package set.
+_PACKAGE_READERS = ('NPC_', 'CREA', 'QUST', 'PACK', 'DIAL', 'INFO')
+
+
+def _begin_worldspace_chain(output_path: str, export_dir: str) -> None:
+    """Make this plugin and its source masters the run's worldspace renames."""
+    set_worldspace_plugins([os.path.basename(output_path),
+                            *masters_from_export_header(export_dir)])
 
 class ImportState:
     """Everything one import run shares across its phases.
@@ -96,7 +140,7 @@ class ImportState:
     See: docs/reference/tes5_import_architecture.md#4-invariants
     """
 
-    __slots__ = ('all_skip', 'output_path', 'plugin_out_dir', 'num_tes4_masters', 'ctx', 'output_root', 'by_type', 'writer', 'npc_to_vtyp', 'unlock_plan', 'unlock_globals', 'fid_to_edid', 'xref', '_script_vars', 'pack_plan', 'pack_ctx', 'converted', 'errors', 't2', 'sge_quest_fids', 'navm_cache', 'navm_metas', 'base_model_by_fid', 'door_fids')
+    __slots__ = ('all_skip', 'output_path', 'plugin_out_dir', 'num_tes4_masters', 'ctx', 'output_root', 'by_type', 'writer', 'npc_to_vtyp', 'unlock_plan', 'unlock_globals', 'fid_to_edid', 'xref', '_script_vars', 'pack_plan', 'pack_ctx', 'converted', 'errors', 't2', 'sge_quest_fids', 'navm_cache', 'navm_metas', 'base_model_by_fid', 'door_fids', 'chargen_plan')
 
     def __init__(self, **kw):
         """Every field starts None; the caller supplies the run's inputs."""
@@ -117,8 +161,7 @@ def _mgef_records_with_masters(by_type: dict, ctx) -> list:
     own = by_type.get('MGEF', [])
     if not ctx or not getattr(ctx, 'master_export', None):
         return own
-    from_master = [rec for rec in ctx.master_export.values()
-                   if rec.get('Signature') == 'MGEF']
+    from_master = values_of(ctx.master_export, 'MGEF')
     own_codes = {rec.get('EditorID') for rec in own}
     return [r for r in from_master
             if r.get('EditorID') not in own_codes] + own
@@ -145,10 +188,7 @@ def _build_assoc_item_index(by_type: dict, ctx=None) -> tuple:
     sigs = {}
     lvlc_recs = []
 
-    sources = []
-    if ctx and getattr(ctx, 'master_export', None):
-        sources.append(r for r in ctx.master_export.values()
-                       if r.get('Signature') in _ASSOC_ITEM_SIGS)
+    sources = [values_of(getattr(ctx, 'master_export', None), *_ASSOC_ITEM_SIGS)]
     sources.append(r for sig in _ASSOC_ITEM_SIGS for r in by_type.get(sig, []))
 
     for source in sources:
@@ -189,142 +229,112 @@ def _build_assoc_item_index(by_type: dict, ctx=None) -> tuple:
 
 
 def master_export_dirs(ctx) -> list:
-    """The export directory of each TES4 master, in _HEADER.txt order.
-
-    `load_master_export` resolves masters exactly this way (sibling directories
-    of the plugin's own export, named after the master file). Both the master's
-    VTYP creation and this plugin's adoption of it must read the SAME RACE.txt,
-    so the derivation is shared rather than reproduced.
-    """
+    """The export directory of each TES4 master of `ctx`'s plugin, in header order."""
     export_dir = getattr(ctx, 'export_dir', None)
-    if not export_dir:
-        return []
-    header = os.path.join(export_dir, '_HEADER.txt')
-    if not os.path.isfile(header):
-        return []
-    from .overrides.nested import export_root, master_export_dir
-    root = export_root(export_dir)
-    try:
-        with open(header, 'r', encoding='utf-8') as f:
-            names = [line.partition('=')[2].strip() for line in f
-                     if line.startswith('Master[')]
-    except OSError:
-        return []
-    dirs = [master_export_dir(root, n) for n in names]
-    return [d for d in dirs if os.path.isdir(d)]
+    return master_dirs(export_dir) if export_dir else []
 
 
-def _adopt_master_special_records(ctx) -> None:
-    """Point the well-known registry at the MASTER's synthesized records.
+#: Types converted outside IMPORT_DISPATCH, reported as CONVERT.
+_SPECIAL_TYPES = frozenset({'LTEX', 'SOUN', 'WTHR', 'CELL', 'WRLD', 'REFR',
+                            'ACHR', 'ACRE', 'LAND', 'DIAL', 'INFO'})
 
-    `create_tes4_special_records` runs only for a root master, so a dependent
-    plugin's registry is empty — yet its converted scripts still declare
-    TES4ControlsDisabled / TES4Fame / … properties. An unbound property is None
-    at runtime and the first call on it aborts the entire Papyrus function
-    (Morroblivion's chargen stage 1 died on `TES4ControlsDisabled.SetValue(1)`
-    before it could set JiubSpeak). These records have no TES4 source FormID,
-    so the companion manifest cannot name them — find_by_edid exists for
-    exactly this case.
+
+def _read_export(export_dir: str, ctx, all_skip) -> tuple:
+    """(records, records by type) of the plugin's export, each type reported."""
+    print(f"Reading exports from: {export_dir}")
+    started = time.time()
+    all_records = drop_author_deleted_records(
+        parse_export_directory(export_dir, exclude=RUNTIME_ONLY_TYPES), ctx)
+    by_type = group_records_by_type(all_records)
+    print(f"  Parsed {len(all_records)} records in {len(by_type)} types "
+          f"({time.time() - started:.2f}s)")
+    for sig in sorted(by_type):
+        status = ("SKIP" if sig in all_skip else "CONVERT"
+                  if sig in IMPORT_DISPATCH or sig in _SPECIAL_TYPES else "UNKNOWN")
+        print(f"  {sig}: {len(by_type[sig])} records [{status}]")
+    return all_records, by_type
+
+
+def _bind_formid_space(all_records: list, by_type: dict, masters: list,
+                       num_tes4_masters: int, ctx, writer) -> int:
+    """Shift export ids into the TES5 master list and reserve our own; the shift.
+
+    Every master ahead of the header's (Skyrim.esm, inherited ones) moves each
+    export index by the same amount.
     """
-    index = getattr(ctx, 'master_index', None)
-    if index is None:
-        return
-    found = 0
-    for edid, sig in _TES4_SPECIAL_RECORD_SIGS.items():
-        try:
-            fid = index.find_by_edid(sig, edid)
-        except Exception:
-            continue
-        if fid:
-            WELL_KNOWN_PROPERTIES[edid] = fid
-            found += 1
-    if found:
-        print(f"  Adopted {found} synthesized master records "
-              f"(TES4ControlsDisabled, TES4Fame, ...)")
-
-    from .base.equivalents import CUSTOM_VTYP_EDIDS, set_voice_type
-    voices = 0
-
-    def _adopt(vtyp_edid: str, race_edid: str, gender: str) -> bool:
-        try:
-            fid = index.find_by_edid(b'VTYP', vtyp_edid)
-        except Exception:
-            return False
-        if not fid:
-            return False
-        set_voice_type(race_edid, gender, fid)
-        return True
-
-    for vtyp_edid, (race_edid, gender) in CUSTOM_VTYP_EDIDS.items():
-        if _adopt(vtyp_edid, race_edid, gender):
-            voices += 1
-
-    derived = 0
-    try:
-        from asset_convert.audio.voice_races import load_race_voices
-        from asset_convert.audio.voice_races import vtyp_edid as _vtyp_edid
-    except ImportError:
-        load_race_voices = None     # asset_convert unavailable — fixed set only
-    if load_race_voices is not None:
-        for mdir in master_export_dirs(ctx):
-            try:
-                races = load_race_voices(mdir)
-            except OSError:
-                continue
-            for race_edid, key in sorted(races.by_race_edid.items()):
-                for gender in ('Male', 'Female'):
-                    if _adopt(_vtyp_edid(key, gender), race_edid, gender):
-                        derived += 1
-    if voices or derived:
-        extra = f"; {derived} from the master's own races" if derived else ''
-        print(f"  Adopted {voices + derived} master voice types (VTYP){extra}")
+    num_new_masters = len(masters) - num_tes4_masters
+    set_formid_index_offset(num_new_masters)
+    max_formid = _reserve_formid_space(all_records, num_tes4_masters,
+                                       len(masters), writer)
+    _repair_null_land_formids(by_type, num_tes4_masters, max_formid)
+    if num_tes4_masters:
+        injected = detect_injected_records(
+            all_records, ctx.master_export if ctx else {},
+            num_tes4_masters, writer)
+        set_injected_formids(injected)
+        if injected:
+            print(f"  Injected records: {len(injected)} moved out of the "
+                  f"master's FormID space into ours")
+    return num_new_masters
 
 
-
-
-def _reconcile_masters(masters: list, tes4_master_names: list) -> list:
-    """`masters` reduced to the export header's list, plus Skyrim.esm.
-
-    The header is the authority on what this plugin was BUILT against; the
-    caller's binary-derived list can name files the conversion replaced.
-    See: docs/commentary/tes4_export_morrowind.md#masters
-    """
-    if not tes4_master_names:
-        return masters
-    wanted = {n.lower() for n in tes4_master_names}
-    if [n.lower() for n in masters] == [n.lower() for n in tes4_master_names]:
-        return masters
-    kept = [m for m in masters
-            if m.lower() not in wanted and m.lower() == 'skyrim.esm']
-    merged = kept + tes4_master_names
-    print(f"  Masters (from export header): {', '.join(merged)}")
-    return merged
+def _register_run_tables(by_type: dict, ctx, writer) -> None:
+    """Register the tables record conversion reads: races, cell families, adoptable master records."""
+    master_races = values_of(getattr(ctx, 'master_export', None), 'RACE')
+    register_races(master_races + list(by_type.get('RACE', ())))
+    if ctx:
+        writer.adoption = MasterAdoption(ctx.master_index)
+    set_cell_families(by_type, ctx.master_export if ctx else None, writer,
+                      getattr(ctx, 'master_index', None))
 
 
 def _prescan_special_records(by_type: dict, ctx, writer, export_dir: str, _step_done):
     """Create the VTYP/GLOB/FACT support records, or adopt the master's.
 
-    A root master creates them; a plugin WITH TES4 masters adopts the
-    master's FormIDs instead, since re-creating them duplicates master
-    content and the duplicates compete with the originals.
+    A plugin adopts the FormIDs a master supplies, since re-creating them
+    makes duplicates that compete with the originals, and creates them when no
+    master in its list does -- a root master, or the Morroblivion patch.
 
     See: docs/commentary/tes5_import_pipeline.md#phase-0-dependent-skips-support-records
     """
     _step_t = time.time()
     from .record_types.actor_common import (create_origin_faction, reset_origin_faction)
-    reset_origin_faction()
-    if not ctx:
+    reset_origin_faction(getattr(ctx, 'master_index', None))
+    build_race_factions(by_type, ctx, writer)
+    support_root = not ctx or not adopt_master_special_records(ctx, master_export_dirs(ctx))
+    if support_root:
         create_vtyp_records(writer, export_dir, by_type)
-
-        _origin_fact = create_origin_faction(writer)
-        print(f"  Plugin-origin faction: {_origin_fact:08X} "
-              f"(TES4PluginOriginFaction)")
-
+    _origin_fact = create_origin_faction(writer, support_root, by_type)
+    print(f"  Plugin-origin faction: {_origin_fact:08X} (TES4PluginOriginFaction)")
+    if support_root:
         create_tes4_special_records(writer)
-
         create_ambient_gmst_overrides(writer, by_type)
     else:
-        _adopt_master_special_records(ctx)
+        create_missing_globals(writer)
+    WELL_KNOWN_PROPERTIES.update(create_fall_damage_spell(
+        writer, getattr(ctx, 'master_index', None)))
+    tes4_source = not is_tes3_export(export_dir) and not is_fallout_export(by_type)
+    WELL_KNOWN_PROPERTIES.update(create_confidence_records(
+        writer, by_type, getattr(ctx, 'master_export', None),
+        getattr(ctx, 'master_index', None), wanted=tes4_source))
+    WELL_KNOWN_PROPERTIES.update(create_stat_factions(
+        writer, getattr(ctx, 'master_index', None), wanted=tes4_source))
+    WELL_KNOWN_PROPERTIES.update(create_disposition_factions(
+        writer, getattr(ctx, 'master_index', None),
+        wanted=tes4_source or is_tes3_export(export_dir), tes3=is_tes3_export(export_dir)))
+    WELL_KNOWN_PROPERTIES.update(create_brawl_ability(
+        writer, getattr(ctx, 'master_index', None), wanted=is_tes3_export(export_dir)))
+    WELL_KNOWN_PROPERTIES.update(create_vampirism(writer, by_type, getattr(ctx, 'master_export', None),
+                                                  getattr(ctx, 'master_index', None), is_tes3_export(export_dir)))
+    load_contact_settings(by_type, getattr(ctx, 'master_export', None))
+    if tes4_source:
+        WELL_KNOWN_PROPERTIES.update(create_misc_stat_globals(
+            writer, getattr(ctx, 'master_index', None), by_type))
+    create_combat_styles(writer, by_type, getattr(ctx, 'master_export', None),
+                         getattr(ctx, 'master_index', None), wanted=tes4_source)
+    WELL_KNOWN_PROPERTIES.update(create_combat_approach(writer, getattr(ctx, 'master_index', None)))
+    set_stand_still_list(create_stand_still(writer, getattr(ctx, 'master_index', None)))
+    set_whole_day_global(create_day_clock(writer, by_type, ctx))
     _step_done('vtyp/special records')
 
 
@@ -339,12 +349,10 @@ def _prescan_npc_voice_map(by_type: dict, ctx, writer, num_new_masters: int, _st
     See: docs/commentary/tes5_import_pipeline.md#phase-0-voice-map-reads-masters
     """
     _vtyp_by_type = by_type
-    if ctx and getattr(ctx, 'master_export', None):
-        _master_races = [r for r in ctx.master_export.values()
-                         if r.get('Signature') == 'RACE']
-        if _master_races:
-            _vtyp_by_type = dict(by_type)
-            _vtyp_by_type['RACE'] = _master_races + by_type.get('RACE', [])
+    _master_races = values_of(getattr(ctx, 'master_export', None), 'RACE')
+    if _master_races:
+        _vtyp_by_type = dict(by_type)
+        _vtyp_by_type['RACE'] = _master_races + by_type.get('RACE', [])
     npc_to_vtyp = build_npc_to_vtyp_map(_vtyp_by_type, num_new_masters,
                                         ctx.master_export if ctx else None)
     from .record_types.actor_common import set_npc_voice_map
@@ -360,16 +368,21 @@ def _prescan_npc_voice_map(by_type: dict, ctx, writer, num_new_masters: int, _st
     _spk_reset()
     _n_spk = build_speaker_activators(by_type, writer, npc_to_vtyp,
                                       num_new_masters)
-    from .dialogue.speak_as import export_speaker_map, speaker_property_name
-    for (_em, _vo), _fid in export_speaker_map().items():
-        WELL_KNOWN_PROPERTIES[speaker_property_name(_em, _vo)] = _fid
-    print(f"  Speaker activators: {_n_spk} TACT+REFR pairs "
-          f"(voiced stand-ins for Say speak-as markers)")
+    from .dialogue.speak_as import export_scene_map, scene_property_name
+    for (_em, _vo, _to), _fid in export_scene_map().items():
+        WELL_KNOWN_PROPERTIES[scene_property_name(_em, _vo, _to)] = _fid
+    print(f"  Speaker activators: {_n_spk} TACT+REFR pairs, "
+          f"{len(export_scene_map())} speak-as scenes")
+    from .dialogue.reset_interior import build_reset_movers
+    _movers = build_reset_movers(by_type, writer, num_new_masters)
+    WELL_KNOWN_PROPERTIES.update(_movers)
+    print(f"  ResetInterior mover lists: {len(_movers)}")
     _step_done('npc voice map')
     return npc_to_vtyp
 
 
-def _prescan_unlock_plan(by_type: dict, writer, _step_done):
+def _prescan_unlock_plan(by_type: dict, writer, num_tes4_masters: int,
+                         _step_done):
     """Plan the AddTopic unlock gates; returns (plan, globals, ScriptConverter).
 
     Gated topics get one GLOB each plus `GetGlobalValue` conditions,
@@ -379,30 +392,50 @@ def _prescan_unlock_plan(by_type: dict, writer, _step_done):
     See: docs/commentary/tes5_import_pipeline.md#reserved-ids-and-preflight
     """
     from .dialogue.unlocks import build_unlock_plan, create_unlock_globals
-    unlock_plan = build_unlock_plan(by_type)
+    unlock_plan = build_unlock_plan(by_type, num_tes4_masters)
     unlock_globals = create_unlock_globals(writer, unlock_plan)
 
     from script_convert.converter import ScriptConverter as _SC
-    _SC.topic_unlock_globals = {
-        (d.get('EditorID') or '').lower(): gname
-        for d in by_type.get('DIAL', [])
-        if (d.get('EditorID') or '')
-        for gname in [unlock_plan['gated'].get(
-            int(d.get('FormID', '0'), 16) & 0xFFFFFF)]
-        if gname
-    }
+    _SC.topic_reveals = topic_reveals(by_type, unlock_plan)
     WELL_KNOWN_PROPERTIES.update(unlock_globals)
 
     print(f"  AddTopic unlocks: {len(unlock_globals)} gated topics, "
           f"{len(unlock_plan['info_reveals'])} revealer INFOs, "
-          f"{len(unlock_plan['stage_reveals'])} revealer quest stages, "
-          f"{len(_SC.topic_unlock_globals)} topic->global names for scripts")
+          f"{len(unlock_plan['stage_reveals'])} revealer quest stages")
     _step_done('addtopic unlock plan')
     return (unlock_plan, unlock_globals, _SC)
 
 
-def _prescan_menu_records(by_type: dict, writer, _SC, _step_done):
-    """Create the button-menu and chargen-menu MESG records.
+def _prescan_force_greets(by_type: dict, ctx, writer, _SC) -> None:
+    """Mint the StartConversation force-greet and ForceFlee quests and share their alias pools.
+
+    Before any script VMAD, so the converted call's Quest property binds.
+    """
+    slots = build_force_greet_slots(by_type)
+    FORCE_GREET_SLOTS.clear()
+    FORCE_GREET_SLOTS.update(slots)
+    _SC.force_greet_slots = slots
+    quest_fid = write_force_greet_quest(
+        writer, slots, dial_index(by_type, ctx.master_export if ctx else None))
+    if quest_fid:
+        WELL_KNOWN_PROPERTIES[FORCE_GREET_QUEST] = quest_fid
+    print(f"  StartConversation force greets: {len(slots)} topics, "
+          f"{sum(n for _f, n in slots.values())} alias slots")
+    flee_slots = build_force_flee_slots(by_type)
+    _SC.force_flee_slots = flee_slots
+    flee_fid = write_force_flee_quest(writer, flee_slots, by_type,
+                                      getattr(ctx, 'master_index', None))
+    if flee_fid:
+        WELL_KNOWN_PROPERTIES[FORCE_FLEE_QUEST] = flee_fid
+    print(f"  ForceFlee pools: {len(flee_slots)} destinations, "
+          f"{sum(n for _f, n in flee_slots.values())} alias slots")
+
+
+def _prescan_menu_records(by_type: dict, writer, _SC, _step_done, export_dir: str,
+                          master_index=None) -> dict:
+    """Create the button-menu and chargen-menu MESG records, and the ForceCombat
+    factions and destroyed-refs list unless `master_index` supplies them;
+    returns the chargen plan.
 
     Chargen pages live at FIXED ids in the reserved FormID gap because
     the page/button block must be contiguous and ordered.  Chargen
@@ -420,14 +453,29 @@ def _prescan_menu_records(by_type: dict, writer, _SC, _step_done):
           f"{len(message_plan)} scripts")
     _step_done('button menu MESGs')
 
-    from script_convert.message_menus import build_chargen_menus
-    _spel_map = {int(r['FormID'], 16) & 0xFFFFFF: r['EditorID']
-                 for r in by_type.get('SPEL', [])
-                 if r.get('FormID') and r.get('EditorID')}
-    chargen_plan = build_chargen_menus(by_type.get('BSGN', []),
-                                       by_type.get('CLAS', []), _spel_map)
-    _SC.chargen_menus = chargen_plan
-    chargen_mesgs = create_chargen_menu_records(writer, chargen_plan)
+    chargen_plan = _chargen_menu_records(writer, _SC, export_dir)
+    WELL_KNOWN_PROPERTIES.update(create_force_combat_factions(writer, master_index))
+    WELL_KNOWN_PROPERTIES.update(create_destroyed_formlist(writer, master_index))
+    WELL_KNOWN_PROPERTIES.update(create_runtime_formlists(writer, master_index))
+    WELL_KNOWN_PROPERTIES.update(create_dialogue_open_global(writer, master_index))
+    _step_done('chargen menu MESGs')
+    return chargen_plan
+
+
+def _chargen_menu_records(writer, _SC, export_dir: str) -> dict:
+    """The chargen plan (script_convert.context_setup), its MESG pages and
+    globals, and the conditions routed through its choice globals.
+
+    A TES3 source asks for no menu from Papyrus, so it writes no birthsign
+    pages: they would come first and move its class pages' fixed ids.
+    See: docs/commentary/morrowind_runtime.md#chargen-menus
+    """
+    from script_convert.context_setup import chargen_menu_plan
+    chargen_plan = chargen_menu_plan(export_dir)
+    mesg_plan = {key: menu for key, menu in chargen_plan.items()
+                 if not (key == 'birthsign' and is_tes3_export(export_dir))}
+    _SC.chargen_menus = mesg_plan
+    chargen_mesgs = create_chargen_menu_records(writer, mesg_plan)
     if chargen_mesgs:
         WELL_KNOWN_PROPERTIES.update(chargen_mesgs)
         print(f"  Chargen menus: {len(chargen_mesgs)} MESG pages+globals "
@@ -435,14 +483,12 @@ def _prescan_menu_records(by_type: dict, writer, _SC, _step_done):
     from .base.conditions import set_chargen_choice
     set_chargen_choice({})
     for func_idx, key in ((224, 'birthsign'), (129, 'class')):
-        menu = chargen_plan.get(key)
+        menu = mesg_plan.get(key)
         if menu and menu['choice_global'] in chargen_mesgs:
             set_chargen_choice(
                 {func_idx: (chargen_mesgs[menu['choice_global']],
                             menu['fid_to_index'])}, merge=True)
-    WELL_KNOWN_PROPERTIES.update(create_force_combat_factions(writer))
-    WELL_KNOWN_PROPERTIES.update(create_destroyed_formlist(writer))
-    _step_done('chargen menu MESGs')
+    return chargen_plan
 
 
 def _prescan_fid_to_edid(all_records: list, ctx, _step_done):
@@ -493,6 +539,8 @@ def _index_xref_record(xref, fid_str: str, rec: dict, rekey) -> None:
         if sig == 'QUST':
             xref.quest_edids.add(edid_low)
     xref.record_type[fid_str] = sig
+    index_record_details(vars(xref), sig, fid_str, edid_str, rec,
+                         lambda v: rekey(v, own_raw, own_key))
     if sig == 'SCPT':
         _index_xref_script(xref, fid_str, rec, edid_str)
     scri = rekey(rec.get('SCRI', ''), own_raw, own_key)
@@ -560,7 +608,8 @@ def _index_xref_script(xref, fid_str: str, rec: dict, edid_str: str) -> None:
     schr_type = rec.get('SCHR.Type')
     if schr_type is not None:
         try:
-            xref.script_formid_to_type[fid_str] = int(schr_type)
+            xref.script_formid_to_type[fid_str] = hosted_script_type(
+                int(schr_type), rec.get('SCTX', ''))
         except ValueError:
             pass
 
@@ -614,51 +663,75 @@ def _prescan_cross_ref_graph(all_records: list, ctx, export_dir: str, _step_done
         _index_xref_record(xref, fid_str, rec, _rekey_ref)
     scpt_path = os.path.join(export_dir, 'SCPT.txt')
     if os.path.exists(scpt_path):
-        xref.build_ref_as_int_map(scpt_path)
+        xref.build_script_indexes(scpt_path)
     print(f"  Built CrossRefGraph: {len(xref.edid_to_formid)} entries, "
           f"{len(xref.quest_edids)} quests, {len(xref.script_formid_to_edid)} scripts")
     _step_done('cross-ref graph')
     return xref
 
 
-def _prescan_script_plans(by_type: dict, ctx, xref, fid_to_edid: dict, _step_done):
+def _prescan_script_plans(by_type: dict, ctx, xref, fid_to_edid: dict,
+                          export_dir: str, _step_done):
     """Plan object + quest script VMADs; returns the master export or None.
 
     Each scriptable record gets a VMAD naming its compiled Papyrus
     script plus FormID bindings.  The MASTERS' SCPTs are indexed: a
     SCRI that misses the index drops the record's VMAD entirely.
+    A Morrowind source plans none: the Morrowind runtime runs its scripts.
 
     See: docs/commentary/tes5_import_pipeline.md#phase-0-master-key-not-formid
+    See: docs/commentary/tes5_import_pipeline.md#phase-0-tes3-no-papyrus-scripts
     """
     _scpt_master_export = ctx.master_export if ctx else None
+    planned, masters = by_type, _scpt_master_export
+    if is_tes3_export(export_dir):
+        planned, masters = {}, None
     from .base.object_scripts import build_object_script_plan, build_quest_script_plan
-    n_obj_scripts = build_object_script_plan(by_type, xref, fid_to_edid,
-                                             _scpt_master_export)
+    n_obj_scripts = build_object_script_plan(planned, xref, fid_to_edid, masters)
     print(f"  Object scripts: attached {n_obj_scripts} SCPT scripts to records via VMAD")
-    n_qust_scripts = build_quest_script_plan(by_type, xref, fid_to_edid,
-                                             _scpt_master_export)
+    n_qust_scripts = build_quest_script_plan(planned, xref, fid_to_edid, masters)
     print(f"  Quest scripts: planned {n_qust_scripts} SCRI attachments for QUST VMADs")
     _step_done('object/quest script plans')
     return _scpt_master_export
 
 
-def _prescan_magic_effects(by_type: dict, ctx, writer, xref, fid_to_edid: dict, _scpt_master_export, _step_done):
-    """Register MGEF ids, the AssocItem index, AV/script variants and ENCH.
+def _prescan_effect_families(by_type: dict, ctx, writer) -> None:
+    """Index every MGEF and settle its family keyword, before any script plan binds one.
+
+    See: docs/commentary/tes5_import_magic.md#effect-families
+    """
+    from .record_types.magic import register_mgef_formids, settle_family_keywords
+
+    register_mgef_formids(_mgef_records_with_masters(by_type, ctx),
+                          getattr(ctx, 'master_index', None), by_type.get('MGEF', []))
+    n_fam = settle_family_keywords(by_type.get('MGEF', []), writer,
+                                   getattr(ctx, 'master_index', None))
+    print(f"  Magic effect families: {n_fam} keywords written")
+
+
+def _prescan_magic_effects(by_type: dict, ctx, writer, xref, fid_to_edid: dict,
+                           _scpt_master_export, _step_done, export_dir):
+    """Register MGEF ids and art, the AssocItem index, AV/script variants and ENCH.
 
     All of these must exist before any SPEL/ENCH/ALCH/INGR/SGST record
     converts.  A dependent plugin usually defines no MGEF at all, so the
-    effect table comes from the MASTER's export.
+    effect table comes from the MASTER's export; the art reads this plugin's
+    own source meshes and sounds.
 
     See: docs/commentary/tes5_import_pipeline.md#phase-0-magic-effect-prerequisites
     """
-    from .record_types.magic import (build_av_variants, build_seff_variants,
-                                     register_mgef_formids,
-                                     set_assoc_item_index)
+    from .record_types.magic import set_assoc_item_index
+    from .record_types.magic_morrowind import is_morrowind_effect, register_effect_perks
+    from .record_types.magic_variants import build_av_variants, build_seff_variants
     from .base.object_scripts import build_magic_effect_script_plan
 
+    magic_art.begin(writer, assets_for(export_dir) / 'meshes', by_type.get('SOUN', []),
+                    getattr(ctx, 'master_index', None), by_type.get('MGEF', []))
     _mgefs = _mgef_records_with_masters(by_type, ctx)
-    register_mgef_formids(_mgefs)
     set_assoc_item_index(*_build_assoc_item_index(by_type, ctx))
+    if any(is_morrowind_effect(r) for r in _mgefs):
+        n_perks = register_effect_perks(writer, getattr(ctx, 'master_index', None))
+        print(f"  Morrowind effect perks and faction: {n_perks} written")
 
     _effect_recs = [r for sig in ('SPEL', 'ENCH', 'ALCH', 'INGR', 'SGST')
                     for r in by_type.get(sig, [])]
@@ -668,10 +741,8 @@ def _prescan_magic_effects(by_type: dict, ctx, writer, xref, fid_to_edid: dict, 
     n_seff = build_seff_variants(_mgefs, _effect_recs, writer,
                                  {f'{k:08X}': v for k, v in fid_to_edid.items()})
     from .record_types.equipment import set_ench_index
-    _enchs = list(by_type.get('ENCH', []))
-    if ctx and getattr(ctx, 'master_export', None):
-        _enchs = [r for r in ctx.master_export.values()
-                  if r.get('Signature') == 'ENCH'] + _enchs
+    _enchs = (values_of(getattr(ctx, 'master_export', None), 'ENCH')
+              + list(by_type.get('ENCH', [])))
     set_ench_index(_enchs)
 
     print(f"  Magic effects: {len(_mgefs)} MGEF + {n_av} per-actor-value "
@@ -680,53 +751,92 @@ def _prescan_magic_effects(by_type: dict, ctx, writer, xref, fid_to_edid: dict, 
     _step_done('magic effect plans')
 
 
-def _prescan_vendor_trainer(by_type: dict, ctx, writer, _step_done):
-    """Create vendor factions and the trainer faction + CLAS clones.
+def _prescan_vendor_trainer(by_type: dict, ctx, writer, export_dir: str,
+                            plugin: str, _step_done):
+    """Create the vendor factions, the trainer faction + CLAS clones, and the spell tomes.
 
-    Root masters only: these are support records a dependent plugin
-    inherits from its master rather than duplicating.
-
-    See: docs/commentary/tes5_import_pipeline.md#phase-0-dependent-skips-support-records
+    The TES3 chain's tables are read only when this plugin has actors: they
+    answer nothing but its own merchants' and trainers' offers.
     """
-    if not ctx:
-        from .record_types.actor_common import (create_trainer_records, create_vendor_factions)
-        create_vendor_factions(by_type, writer)
-        create_trainer_records(by_type, writer)
+    from .record_types.actor_common import create_service_records
+    has_actors = by_type.get('NPC_') or by_type.get('CREA')
+    tes3_tables = chain_tables(export_dir, plugin) if has_actors else None
+    load_tes3_tables(tes3_tables)
+    create_service_records(by_type, writer, ctx, export_dir, tes3_tables)
+    create_spell_tomes(by_type, writer, ctx, export_dir, tes3_tables)
     _step_done('vendor/trainer records')
+
+
+def rescan_mesh_caches(export_dir, mesh_dir: str, force: bool = False) -> bool:
+    """Rebuild one export's bounds+collision caches if stale or behind the mesh stage.
+
+    True when either cache was rewritten.  A stale cache (older entry schema)
+    or `force` rescans in full; a current one still takes the entries a later
+    mesh run left as fragments (a scoped `--mesh-subdirs` rebuild), or the
+    script stage keeps reading old physics flags.
+
+    See: docs/commentary/tes5_import_pipeline.md#phase-0-stale-bounds-cache
+    """
+    from asset_convert.collision.collision_extract import (
+        fold_mesh_entries, scan_mesh_data, bounds_cache_is_current,
+        collision_cache_is_current)
+    from asset_convert.collision.mesh_scan_fragments import (clear_fragments,
+                                                             merge_fragments)
+    assets_dir = assets_for(export_dir)
+    cache_path = str(assets_dir / 'mesh_bounds_cache.json')
+    col_path = str(assets_dir / 'collision_cache.bin')
+    if not os.path.isdir(mesh_dir):
+        return False
+    seed_b, seed_c = merge_fragments(assets_dir)
+    current = (not force and bounds_cache_is_current(cache_path)
+               and collision_cache_is_current(col_path))
+    if current and not (seed_b or seed_c):
+        return False
+    if current:
+        print(f"  Mesh bounds/collision: folding "
+              f"{len(set(seed_b) | set(seed_c))} rebuilt meshes into the caches")
+        fold_mesh_entries(mesh_dir, col_path, cache_path, seed_b, seed_c)
+    else:
+        print(f"  Mesh bounds/collision cache missing or stale, "
+              f"scanning {mesh_dir}...")
+        scan_mesh_data(mesh_dir, col_path, cache_path,
+                       seed_bounds=seed_b, seed_collision=seed_c)
+    clear_fragments(assets_dir)
+    return True
+
+
+def _refresh_master_mesh_caches(export_dir: str) -> None:
+    """Rescan every MASTER whose bounds/collision cache is stale.
+
+    A cache-format bump strands each master not re-run since: the chain loads
+    masters-first and skips a reject per-path, so the plugin navmeshes with
+    only the meshes it ships itself and master-owned statics carve nothing.
+
+    See: docs/commentary/tes5_import_pipeline.md#stale-master-asset-caches
+    """
+    from output_layout import paths as plugin_paths
+    for name in masters_from_export_header(export_dir):
+        mdir = master_dir(export_dir, name)
+        if os.path.isdir(mdir):
+            rescan_mesh_caches(
+                mdir, os.path.join(str(plugin_paths(name).out), 'meshes'))
 
 
 def _prescan_mesh_caches(export_dir: str, plugin_out_dir: str, _step_done):
     """Load the mesh-bounds and collision caches, scanning them if stale.
 
-    One scan fills both, since they share the expensive NIF parse.  A
-    bounds cache predating the current entry schema counts as missing:
-    it would parse cleanly and read as all-zeroes for the new field.
+    The MASTERS' caches are refreshed FIRST: the chain loads masters-first and
+    a stale entry is skipped rather than fatal.
 
-    See: docs/commentary/tes5_import_pipeline.md#phase-0-stale-bounds-cache
+    See: docs/commentary/tes5_import_pipeline.md#stale-master-asset-caches
     """
     from .base.mesh_bounds import load_mesh_bounds
-    from asset_convert.collision.collision_extract import (load_collision, scan_mesh_data,
-                                                 bounds_cache_is_current,
-                                                 collision_cache_is_current,
-                                                 door_axis_cache_is_current,
-                                                 scan_door_axes)
-    from asset_convert.collision.mesh_scan_fragments import (clear_fragments,
-                                                             merge_fragments)
-    cache_path = str(assets_for(export_dir) / 'mesh_bounds_cache.json')
-    col_path = str(assets_for(export_dir) / 'collision_cache.bin')
+    from asset_convert.collision.collision_extract import (
+        load_collision, door_axis_cache_is_current, scan_door_axes)
     axis_path = str(assets_for(export_dir) / 'door_panel_axis_cache.json')
-    mesh_dir = os.path.join(plugin_out_dir, 'meshes')
-    assets_dir = assets_for(export_dir)
-    if (not bounds_cache_is_current(cache_path)
-            or not collision_cache_is_current(col_path)) \
-            and os.path.isdir(mesh_dir):
-        print(f"  Mesh bounds/collision cache missing or stale, "
-              f"scanning {mesh_dir}...")
-        seed_b, seed_c = merge_fragments(assets_dir)
-        scan_mesh_data(mesh_dir, col_path, cache_path,
-                       seed_bounds=seed_b, seed_collision=seed_c)
-        clear_fragments(assets_dir)
-    if not door_axis_cache_is_current(axis_path):
+    _refresh_master_mesh_caches(export_dir)
+    rescan_mesh_caches(export_dir, os.path.join(plugin_out_dir, 'meshes'))
+    if not door_axis_cache_is_current(axis_path, export_dir):
         print("  Door threshold cache missing or stale, measuring door "
               "panels...")
         scan_door_axes(export_dir, axis_path)
@@ -745,7 +855,8 @@ def _prescan_furniture_and_actors(by_type: dict, ctx, writer, export_dir: str, _
     See: docs/commentary/tes5_import_pipeline.md#phase-0-stale-bounds-cache
     """
     from .record_types.items import load_furniture_models
-    load_furniture_models(str(assets_for(export_dir) / 'meshes'), by_type, ctx)
+    load_furniture_models(str(assets_for(export_dir) / 'meshes'), by_type, ctx,
+                          record_dir=export_dir)
     _step_done('furniture seats')
 
     from .dialogue.objective_text import load_objective_text
@@ -756,15 +867,37 @@ def _prescan_furniture_and_actors(by_type: dict, ctx, writer, export_dir: str, _
     build_actor_indexes(by_type, writer, export_dir, ctx, _step_done)
 
 
-def _prescan_package_plan(by_type: dict, ctx, writer, fid_to_edid: dict, _step_done):
-    """Build the package plan; returns (plan, context, script var map).
+def _prescan_forced_lists(ctx, writer) -> tuple:
+    """The forced-package FormLists, registered before any script binds."""
+    lists = forced_lists(writer, getattr(ctx, 'master_index', None))
+    WELL_KNOWN_PROPERTIES.update(lists[0])
+    return lists
+
+
+def _hosted_plan(plan, by_type: dict, ctx, writer, lists: tuple):
+    """`plan` with its forced-package `lists`, and host quests when the plugin has no masters.
+
+    See: docs/commentary/tes5_import_package.md#package-hosts
+    """
+    plan.forced_lists = lists
+    plan.starts_disabled = initially_disabled(by_type, ctx.master_export if ctx else None)
+    if not ctx:
+        plan.hosts = PackageHosts(writer, {get_formid(r, 'FormID'): r for r in by_type.get('QUST', [])})
+    return plan
+
+
+def _prescan_package_plan(by_type: dict, ctx, writer, fid_to_edid: dict, _step_done, lists: tuple):
+    """Build the package plan around the forced-package `lists`; returns (plan, context, script var map).
 
     The MASTERS' packages, quests, actors and placements are indexed --
     an unresolved one silently drops the actor to its standing Sandbox
-    schedule.  Hunt chains derive their ids from authored ids only.
+    schedule.  Hunt chains derive their ids from authored ids only.  A plugin
+    exporting none of `_PACKAGE_READERS` gets (None, None, {}).
 
     See: docs/commentary/tes5_import_pipeline.md#phase-0-hunt-chains-and-script-packages
     """
+    if not any(by_type.get(sig) for sig in _PACKAGE_READERS):
+        return (None, None, {})
     from .packages.aliases import (PackagePlan, build_script_var_map,
                                build_scriptvar_owner_map,
                                build_assigned_var_names,
@@ -777,8 +910,8 @@ def _prescan_package_plan(by_type: dict, ctx, writer, fid_to_edid: dict, _step_d
     _script_vars = build_script_var_map(by_type, _master_export)
     set_assigned_var_names(
         build_assigned_var_names(by_type, _master_export))
-    _sv_owner = build_scriptvar_owner_map(by_type, fid_to_edid)
-    pack_plan = PackagePlan()
+    _sv_owner = build_scriptvar_owner_map(by_type, fid_to_edid, _master_export)
+    pack_plan = _hosted_plan(PackagePlan(), by_type, ctx, writer, lists)
     _script_assigned = build_script_assigned_packages(by_type, fid_to_edid,
                                                       _master_export)
     print(f"  Script-forced packages (AddScriptPackage) bound to an alias: "
@@ -824,23 +957,17 @@ def _prescan_leveled_actors(by_type: dict, ctx, writer, _step_done):
 
     See: docs/commentary/tes5_import_pipeline.md#phase-0-ordering-constraints
     """
-    from .actors.leveled_actors import (build_leveled_actor_shells,
-                                 register_leveled_bases)
-    _lvlc_fids = {int(r['FormID'], 16) for r in by_type.get('LVLC', [])
-                  if r.get('FormID')}
-    if ctx is not None:
-        _lvlc_fids |= {int(k, 16)
-                       for k, r in (ctx.master_export or {}).items()
-                       if r.get('Signature') == 'LVLC'}
-    register_leveled_bases(_lvlc_fids)
+    from .actors.leveled_actors import build_leveled_actor_shells, register_from
+    n_bases = register_from(by_type,
+                            ctx.master_export if ctx is not None else None)
     n_lvl_achr = build_leveled_actor_shells(by_type, writer)
     print(f"  Leveled creature placements: {n_lvl_achr} REFR -> ACHR "
-          f"via generated shell NPCs ({len(_lvlc_fids)} LVLC bases known)")
+          f"via generated shell NPCs ({n_bases} LVLC bases known)")
     _step_done('leveled actor shells')
 
 
-def _prescan_outfits_hair_skin(by_type: dict, ctx, export_dir: str):
-    """Load the item/outfit index, faction reactions, hair lengths, skin tones.
+def _prescan_outfits_hair_skin(by_type: dict, ctx, export_dir: str, writer):
+    """Load the item/outfit index, faction reactions, the hair plan, skin tones.
 
     Master exports are indexed throughout: a dependent plugin's actors
     wear their MASTER's hair and use their MASTER's races, so a
@@ -852,17 +979,19 @@ def _prescan_outfits_hair_skin(by_type: dict, ctx, export_dir: str):
     load_item_index(by_type, ctx.master_export if ctx else None)
 
     from .record_types.actor_common import load_faction_player_reactions
-    load_faction_player_reactions(by_type)
+    load_faction_player_reactions(by_type, ctx.master_export if ctx else None)
 
     try:
         from .actors import hair_variants
-        hair_variants.load(getattr(ctx, 'export_dir', None) or export_dir,
-                           master_export_dirs(ctx) if ctx else ())
-        print(f"  Hair length variants: "
-              f"{sum(len(v) for v in hair_variants._BUCKETS.values())} baked "
-              f"lengths across {len(hair_variants._BUCKETS)} hair records")
+        from .record_types.npc import emit_master_hair_variants
+        plan = hair_variants.load(getattr(ctx, 'export_dir', None) or export_dir)
+        n_extra = emit_master_hair_variants(
+            writer, ctx.master_export if ctx else None)
+        print(f"  Hair variants: {sum(len(e['variants']) for e in plan.values())} "
+              f"planned across {len(plan)} hair records, {n_extra} added to "
+              f"masters' hairs")
     except Exception as _hair_exc:
-        print(f"  WARNING: hair length index unavailable: {_hair_exc}")
+        print(f"  WARNING: hair variant plan unavailable: {_hair_exc}")
 
     try:
         from .actors.npc_face_mapper import load_race_skin_tones, RACE_SKIN_RGB
@@ -870,16 +999,32 @@ def _prescan_outfits_hair_skin(by_type: dict, ctx, export_dir: str):
         if ctx:
             _skin_dirs.extend(master_export_dirs(ctx))
         _skin_by_type = dict(by_type)
-        if ctx and getattr(ctx, 'master_export', None):
-            _m_races = [r for r in ctx.master_export.values()
-                        if r.get('Signature') == 'RACE']
-            if _m_races:
-                _skin_by_type['RACE'] = _m_races + (by_type.get('RACE') or [])
+        _m_races = values_of(getattr(ctx, 'master_export', None), 'RACE')
+        if _m_races:
+            _skin_by_type['RACE'] = _m_races + (by_type.get('RACE') or [])
         load_race_skin_tones(_skin_by_type, _skin_dirs)
         print(f"  Race skin tones: {len(RACE_SKIN_RGB)} races resolved "
               f"from authored textures")
     except Exception as _skin_exc:
         print(f"  WARNING: race skin tone index unavailable: {_skin_exc}")
+    _measure_morrowind_heads(by_type, ctx, export_dir)
+
+
+def _measure_morrowind_heads(by_type: dict, ctx, export_dir: str) -> None:
+    """Measure the head and hair parts this plugin's Morrowind NPCs wear.
+
+    See: docs/commentary/tes5_import_actors.md#morrowind-faces
+    """
+    npcs = [r for r in by_type.get('NPC_', []) if npc_face_morrowind.is_morrowind_face(r)]
+    if not npcs:
+        return
+    dirs = [getattr(ctx, 'export_dir', None) or export_dir]
+    if ctx:
+        dirs.extend(master_export_dirs(ctx))
+    started = time.time()
+    n = npc_face_morrowind.load(npcs, dirs)
+    print(f"  Morrowind faces: {n} head and hair parts measured for {len(npcs)} NPCs "
+          f"in {time.time() - started:.1f}s")
 
 
 def _apply_dobj_battle_override(battle, writer) -> None:
@@ -930,7 +1075,8 @@ def _prescan_music_records(by_type: dict, writer, export_dir: str, plugin_out_di
     """
     try:
         from .record_types.music import (build_music_records,
-                                         load_music_manifest)
+                                         load_music_manifest,
+                                         master_music_types)
         from .record_types.common import (register_music_types,
                                           register_world_music)
         from .base.text_reader import get_formid as _gf, get_int as _gi
@@ -942,6 +1088,7 @@ def _prescan_music_records(by_type: dict, writer, export_dir: str, plugin_out_di
             plugin_out_dir,
             export_dir=os.path.dirname(os.path.normpath(export_dir)),
             plugin=os.path.basename(output_path))
+        _by_enum = master_music_types(writer)
         if _music_manifest.get('tracks'):
             _plugin_name = _music_manifest.get('plugin') or os.path.basename(
                 os.path.normpath(plugin_out_dir))
@@ -950,17 +1097,18 @@ def _prescan_music_records(by_type: dict, writer, export_dir: str, plugin_out_di
                 writer.add_record('MUST', _b)
             for _fid, _b in _music['musc']:
                 writer.add_record('MUSC', _b)
-            register_music_types(_music['by_enum'])
+            _by_enum.update(_music['by_enum'])
             if _music.get('battle'):
                 _apply_dobj_battle_override(_music['battle'], writer)
             print(f"  Music: {len(_music['must'])} MUST + "
                   f"{len(_music['musc'])} MUSC records "
                   f"({len(_music['by_enum'])} enum categories)")
+        register_music_types(_by_enum)
     except Exception as e:
         print(f"  ERROR building music records: {e}")
 
 
-def _drop_author_deleted_records(all_records: list, ctx) -> list:
+def drop_author_deleted_records(all_records: list, ctx) -> list:
     """`all_records` without the plugin's OWN records the author deleted.
 
     There is nothing to remove for one of those, so converting it would emit a
@@ -1040,16 +1188,16 @@ def _open_import_run(masters, skip_types, output_path: str,
     set_namespace(namespace_for(export_dir))
     if masters is None:
         masters = ['Skyrim.esm']
-    if skip_types is None:
-        skip_types = set()
-    all_skip = SKIP_TYPES | skip_types
+    all_skip = SKIP_TYPES | (skip_types or set())
     if os.path.isdir(output_path):
         output_path = os.path.join(
             output_path, os.path.basename(os.path.normpath(output_path)))
+    begin_sidecar_run(output_path)
     plugin_out_dir = os.path.dirname(output_path)
     from .base.artifact_schema import preflight_artifacts
     preflight_artifacts(export_dir)
     set_cloud_bank_output(plugin_out_dir)
+    _begin_worldspace_chain(output_path, export_dir)
     return masters, all_skip, output_path, plugin_out_dir
 
 
@@ -1060,7 +1208,8 @@ def _new_plugin_writer(masters: list, is_esm: bool, export_dir: str):
     `convert_BOOK` resolves inventory-art basenames through the same
     collision-aware map the asset side uses: two BOOK models can share a leaf
     filename across directories, and only the whole-plugin view can tell which
-    one keeps the bare name.
+    one keeps the bare name.  `book_roots` are the asset trees a BOOK model's
+    source mesh may live in: this plugin's, then its masters'.
 
     See: docs/commentary/tes5_import_pipeline.md#phase-0-ordering-constraints
     """
@@ -1071,6 +1220,8 @@ def _new_plugin_writer(masters: list, is_esm: bool, export_dir: str):
     writer = PluginWriter(masters=masters, is_esm=is_esm,
                           description="Converted from TES4 by tes4_export")
     writer.export_dir = export_dir
+    writer.book_roots = [str(assets_for(d)) for d in
+                         [export_dir] + master_export_dirs(writer)]
     from .record_types.sound import set_sound_source_dir
     set_sound_source_dir(str(assets_for(export_dir)))
     try:
@@ -1080,6 +1231,47 @@ def _new_plugin_writer(masters: list, is_esm: bool, export_dir: str):
         print(f"  [book INAM] model list unavailable ({exc}); using leaf names")
         writer.book_models = []
     return writer
+
+
+def _run_prescans(st: ImportState, all_records: list, num_new_masters: int,
+                  export_dir: str, _step_done) -> None:
+    """Phase 0: every pre-scan, in order, filling `st` with what records read.
+
+    See: docs/commentary/tes5_import_pipeline.md#phase-0-ordering-constraints
+    """
+    by_type, ctx, writer = st.by_type, st.ctx, st.writer
+    _register_run_tables(by_type, ctx, writer)
+    _prescan_special_records(by_type, ctx, writer, export_dir, _step_done)
+    st.npc_to_vtyp = _prescan_npc_voice_map(by_type, ctx, writer,
+                                            num_new_masters, _step_done)
+    st.unlock_plan, st.unlock_globals, _SC = _prescan_unlock_plan(
+        by_type, writer, st.num_tes4_masters, _step_done)
+    _prescan_force_greets(by_type, ctx, writer, _SC)
+    st.chargen_plan = _prescan_menu_records(by_type, writer, _SC, _step_done, export_dir,
+                                            getattr(ctx, 'master_index', None))
+    st.fid_to_edid = _prescan_fid_to_edid(all_records, ctx, _step_done)
+    st.xref = _prescan_cross_ref_graph(all_records, ctx, export_dir,
+                                       _step_done)
+    _prescan_effect_families(by_type, ctx, writer)
+    plan_crime(by_type, ctx, writer, export_dir, st.plugin_out_dir,
+               st.output_path, st.output_root)
+    place_npc_markers(by_type, writer, st.num_tes4_masters)
+    write_idle_table(st.output_path)
+    lists = _prescan_forced_lists(ctx, writer) if any(by_type.get(sig) for sig in _PACKAGE_READERS) else ({}, False)
+    _scpt_master_export = _prescan_script_plans(by_type, ctx, st.xref,
+                                                st.fid_to_edid, export_dir,
+                                                _step_done)
+    _prescan_magic_effects(by_type, ctx, writer, st.xref, st.fid_to_edid,
+                           _scpt_master_export, _step_done, export_dir)
+    _prescan_vendor_trainer(by_type, ctx, writer, export_dir,
+                            os.path.basename(st.output_path), _step_done)
+    _prescan_mesh_caches(export_dir, st.plugin_out_dir, _step_done)
+    _prescan_furniture_and_actors(by_type, ctx, writer, export_dir,
+                                  _step_done)
+    st.pack_plan, st.pack_ctx, st._script_vars = _prescan_package_plan(
+        by_type, ctx, writer, st.fid_to_edid, _step_done, lists)
+    _prescan_leveled_actors(by_type, ctx, writer, _step_done)
+    _prescan_outfits_hair_skin(by_type, ctx, export_dir, writer)
 
 
 def import_plugin(export_dir: str, output_path: str, masters: list = None,
@@ -1114,121 +1306,27 @@ def import_plugin(export_dir: str, output_path: str, masters: list = None,
             print(f"    Phase: {label} ({now - _step_t:.1f}s)")
         _step_t = now
 
-    tes4_master_names = masters_from_export_header(export_dir)
-    num_tes4_masters = len(tes4_master_names)
-    masters = _reconcile_masters(masters, tes4_master_names)
-    ctx = None
-    if num_tes4_masters:
-        print(f"  TES4 masters: {num_tes4_masters} "
-              f"(records below index {num_tes4_masters:02X} are overrides)")
-        if output_root is None:
-            output_root = os.path.dirname(plugin_out_dir) or '.'
-        _t = time.time()
-        ctx = OverrideContext(export_dir, masters, num_tes4_masters,
-                              output_root)
-        print(f"  Master: {len(ctx.master_index)} converted records, "
-              f"{len(ctx.master_manifest)} manifest entries, "
-              f"{len(ctx)} exported records ({time.time() - _t:.1f}s)")
-        if not len(ctx):
-            ctx = None
-
-    print(f"Reading exports from: {export_dir}")
-    t0 = time.time()
-
-    all_records = parse_export_directory(export_dir)
-    all_records = _drop_author_deleted_records(all_records, ctx)
-    by_type = group_records_by_type(all_records)
-
-    t1 = time.time()
-    print(f"  Parsed {len(all_records)} records in {len(by_type)} types ({t1-t0:.2f}s)")
+    if output_root is None and masters_from_export_header(export_dir):
+        output_root = os.path.dirname(plugin_out_dir) or '.'
+    masters, num_tes4_masters, ctx = open_masters(
+        export_dir, with_weather_masters(masters, export_dir), output_root)
+    set_weather_masters(masters)
+    all_records, by_type = _read_export(export_dir, ctx, all_skip)
     _phase_done('parse export text')
 
-    for sig in sorted(by_type.keys()):
-        special_types = {'LTEX', 'SOUN', 'WTHR', 'CELL', 'WRLD', 'REFR', 'ACHR', 'ACRE', 'LAND', 'DIAL', 'INFO'}
-        status = "SKIP" if sig in all_skip else ("CONVERT" if sig in IMPORT_DISPATCH or sig in special_types else "UNKNOWN")
-        print(f"  {sig}: {len(by_type[sig])} records [{status}]")
-
     writer = _new_plugin_writer(masters, is_esm, export_dir)
+    num_new_masters = _bind_formid_space(all_records, by_type, masters,
+                                         num_tes4_masters, ctx, writer)
 
-    num_new_masters = len(masters) - num_tes4_masters
-    set_formid_index_offset(num_new_masters)
-
-    file_index = len(masters)
-    max_formid = _reserve_formid_space(all_records, num_tes4_masters,
-                                       file_index, writer)
-
-    _repair_null_land_formids(by_type, num_tes4_masters, max_formid)
-
-    if num_tes4_masters:
-        injected = detect_injected_records(
-            all_records, ctx.master_export if ctx else {},
-            num_tes4_masters, writer)
-        set_injected_formids(injected)
-        if injected:
-            print(f"  Injected records: {len(injected)} moved out of the "
-                  f"master's FormID space into ours")
-
-    set_tes4_effect_names(by_type.get('MGEF', []))
-
-    _prescan_special_records(by_type, ctx, writer, export_dir,
-                             _step_done)
-
-    npc_to_vtyp = _prescan_npc_voice_map(by_type, ctx, writer,
-                                         num_new_masters, _step_done)
-
-    unlock_plan, unlock_globals, _SC = _prescan_unlock_plan(
-        by_type, writer, _step_done)
-
-    _prescan_menu_records(by_type, writer, _SC, _step_done)
-
-    fid_to_edid = _prescan_fid_to_edid(all_records, ctx, _step_done)
-
-    xref = _prescan_cross_ref_graph(all_records, ctx, export_dir,
-                                    _step_done)
-
-    _scpt_master_export = _prescan_script_plans(by_type, ctx, xref,
-                                                fid_to_edid,
-                                                _step_done)
-
-    _prescan_magic_effects(by_type, ctx, writer, xref, fid_to_edid,
-                           _scpt_master_export, _step_done)
-
-    _prescan_vendor_trainer(by_type, ctx, writer, _step_done)
-
-    _prescan_mesh_caches(export_dir, plugin_out_dir, _step_done)
-
-    _prescan_furniture_and_actors(by_type, ctx, writer, export_dir,
-                                  _step_done)
-
-    pack_plan, pack_ctx, _script_vars = _prescan_package_plan(
-        by_type, ctx, writer, fid_to_edid, _step_done)
-
-    _prescan_leveled_actors(by_type, ctx, writer, _step_done)
-
-    _prescan_outfits_hair_skin(by_type, ctx, export_dir)
-
+    st = ImportState(all_skip=all_skip, output_path=output_path,
+                     plugin_out_dir=plugin_out_dir,
+                     num_tes4_masters=num_tes4_masters, ctx=ctx,
+                     output_root=output_root, by_type=by_type, writer=writer)
+    _run_prescans(st, all_records, num_new_masters, export_dir, _step_done)
     _phase_done('pre-scans')
 
     _prescan_music_records(by_type, writer, export_dir,
                            plugin_out_dir, output_path)
-
-    st = ImportState(
-        all_skip=all_skip,
-        output_path=output_path,
-        plugin_out_dir=plugin_out_dir,
-        num_tes4_masters=num_tes4_masters,
-        ctx=ctx,
-        output_root=output_root,
-        by_type=by_type,
-        writer=writer,
-        npc_to_vtyp=npc_to_vtyp,
-        unlock_plan=unlock_plan,
-        unlock_globals=unlock_globals,
-        fid_to_edid=fid_to_edid,
-        xref=xref,
-        pack_plan=pack_plan,
-        pack_ctx=pack_ctx,
-        _script_vars=_script_vars)
     run_record_phases(st, export_dir, _phase_done, skip_types)
     return run_finalize_phases(st, export_dir, _phase_done, is_esm,
                                masters)

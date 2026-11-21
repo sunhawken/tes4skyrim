@@ -9,7 +9,16 @@ Constants, lookup tables, and dispatch maps for TES4→TES5 conversion.
 from .equivalents import DEFAULT_RACE, RACE_MAP
 
 #: Re-exported from `equivalents` so race lookups keep one import site.
-__all__ = ['DEFAULT_RACE', 'RACE_MAP']
+__all__ = ['DEFAULT_RACE', 'RACE_MAP', 'mgef_family_keyword_name']
+
+
+def mgef_family_keyword_name(effect_edid: str) -> str:
+    """EditorID and script property name of the KYWD every copy of one MGEF carries.
+
+    See: docs/commentary/tes5_import_magic.md#effect-families
+    """
+    return 'TES4FX_' + effect_edid.strip().strip('"').lower()
+
 
 # Engine-owned globals, keyed by lowercase EditorID.  Skyrim ships these at the
 # SAME FormIDs Oblivion uses (GameYear 0x35 ... TimeScale 0x3A — verified
@@ -37,7 +46,7 @@ BIPED_SLOT_MAP = {
     0: 0,    # Head → 30-Head
     1: 1,    # Hair → 31-Hair
     2: 2,    # Upper Body → 32-Body
-    3: 14,   # Lower Body → 44-LowerBody (greaves get their own slot)
+    3: 19,   # Lower Body → 49-Pelvis primary (greaves get their own slot)
     4: 3,    # Hand → 33-Hands
     5: 7,    # Foot → 37-Feet
     6: 6,    # Right Ring → 36-Ring
@@ -61,22 +70,15 @@ BIPED_SLOT_MAP = {
 BIPED_SLOT_EXTRA = {
     0: [1, 11, 12, 13],  # Head (full-face) → also Hair(31)+LongHair(41)+Circlet(42)+Ears(43)
     1: [11, 12],         # Hair (open-face helm) → also LongHair(41)+Circlet(42)
+    3: [29],             # Hands (both) → also the right hand(59); 33 alone is the left
 }
 
-# Extra TES5 slots for ARMA body coverage.  ARMA records need to declare
-# which body regions the mesh covers (beyond the primary equipment slot).
-# This controls which body NIF partitions are HIDDEN when armor is equipped.
-# Derived from vanilla Skyrim:
-#   IronCuirassAA ARMA: Body(32) + ForeArms(34) + Calves(38)
-#   IronBootsAA ARMA:   Feet(37) + Calves(38)
-#   IronGlovesAA ARMA:  Hands(33) + ForeArms(34)
-#   GreavesAA ARMA:     LowerBody(44) + Calves(38)
-#   IronHelmetAA ARMA:  Hair(31) + Ears(43)  (hides character ears through helm)
+#: ARMA-only body coverage beyond the equip slot. See: docs/commentary/asset_convert_armor.md#biped-slot-conversion
 ARMA_BODY_COVERAGE_EXTRA = {
     2: [4],      # Body (cuirass) → also 34-ForeArms
     3: [4],      # Hands (gauntlets) → also 34-ForeArms
     7: [8],      # Feet (boots) → also 38-Calves
-    14: [8],     # LowerBody (greaves) → also 38-Calves
+    19: [8],     # LowerBody (greaves) → also 38-Calves
     # Hair (helmet ARMA slot) → also 41-LongHair + 43-Ears.  LongHair hides
     # the hairline headpart / long-hair strands (partition 141) that slot 31
     # alone leaves visible — they clip through tight Oblivion helm shells.
@@ -111,6 +113,9 @@ ENCH_CAST_TYPE_MAP = {
     3: 0,  # Apparel → Constant Effect
 }
 
+#: TES5 EFSH particle count per TES4 particle birth ratio; Bethesda's port of LifeDetected maps 1.0 to 300.
+EFSH_PARTICLES_PER_RATIO = 300.0
+
 # Map marker type mapping (TES4 → TES5).
 # TES4 enum (wbDefinitionsTES4.pas): 0 None, 1 Camp, 2 Cave, 3 City,
 #   4 Elven Ruin, 5 Fort Ruin, 6 Mine, 7 Landmark, 8 Tavern, 9 Settlement,
@@ -143,19 +148,40 @@ SKYRIM_MAP_MARKER_LCRT = 0x0010F63C
 # Oblivion uses the same FormID for its MapMarker static.
 SKYRIM_MAP_MARKER_STAT = 0x00000010
 
-# LTEX material type → Skyrim MATT FormID
+#: TES4 LTEX HNAM.Material enum -> Skyrim MATT FormID. See: docs/commentary/tes5_import_landscape.md#ltex-material-types
 MATT_MAP = {
-    0: 0x00012F34,   # Stone
-    1: 0x00012F38,   # Dirt
-    2: 0x00012F3A,   # Grass
-    3: 0x00012F42,   # HeavyWood (Glass approximation)
-    4: 0x00012F3B,   # Metal
-    5: 0x00012F3F,   # Wood
-    6: 0x00012F3C,   # Organic
-    7: 0x00012F3D,   # Skin
-    8: 0x00012F3E,   # Water
-    9: 0x00012F37,   # Cloth (Book approximation)
-    10: 0x00012F44,  # Snow
+    0: 0x00012F34,   # Stone       → MaterialStone
+    1: 0x00012F37,   # Cloth       → MaterialCloth
+    2: 0x00012F38,   # Dirt        → MaterialDirt
+    3: 0x00012F39,   # Glass       → MaterialGlass
+    4: 0x00012F46,   # Grass       → MaterialGrass
+    5: 0x00012F3C,   # Metal       → MaterialSolidMetal
+    6: 0x00012F3D,   # Organic     → MaterialOrganic
+    7: 0x00012F3F,   # Skin        → MaterialSkin
+    8: 0x00012F40,   # Water       → MaterialWater
+    9: 0x00043DCC,   # Wood        → MaterialWoodMedium
+    10: 0x00012F36,  # Heavy Stone → MaterialHeavyStone
+    11: 0x00012F3B,  # Heavy Metal → MaterialHeavyMetal
+    12: 0x00012F42,  # Heavy Wood  → MaterialWoodHeavy
+    13: 0x00012F3A,  # Chain       → MaterialChainMetal
+    14: 0x00012F45,  # Snow        → MaterialSnow
+    15: 0x0002EE2C,  # Stone Stairs  → MaterialStairsStone
+    16: 0x0002EE2D,  # Cloth Stairs  → MaterialStairsWood (carpeted)
+    17: 0x0002EE2C,  # Dirt Stairs   → MaterialStairsStone
+    18: 0x000C6FB1,  # Glass Stairs  → MaterialGlassStairs
+    19: 0x0002EE2C,  # Grass Stairs  → MaterialStairsStone
+    20: 0x0002EE2C,  # Metal Stairs  → MaterialStairsStone
+    21: 0x0002EE2D,  # Organic Stairs → MaterialStairsWood
+    22: 0x0002EE2D,  # Skin Stairs   → MaterialStairsWood
+    23: 0x0002EE2C,  # Water Stairs  → MaterialStairsStone
+    24: 0x0002EE2D,  # Wood Stairs   → MaterialStairsWood
+    25: 0x0002EE2C,  # Heavy Stone Stairs → MaterialStairsStone
+    26: 0x0002EE2C,  # Heavy Metal Stairs → MaterialStairsStone
+    27: 0x0002EE2D,  # Heavy Wood Stairs  → MaterialStairsWood
+    28: 0x0002EE2C,  # Chain Stairs  → MaterialStairsStone
+    29: 0x00052ED0,  # Snow Stairs   → MaterialStairsSnow
+    30: 0x00012F3C,  # Elevator      → MaterialSolidMetal
+    31: 0x00012F3D,  # Rubber        → MaterialOrganic
 }
 
 # TES4 skill index → TES5 skill name for NPC DNAM
@@ -172,12 +198,12 @@ TES4_SKILL_TO_TES5 = {
     21: 'Conjuration',    # Conjuration
     22: 'Destruction',    # Destruction
     23: 'Illusion',       # Illusion
-    24: 'Illusion',       # Mysticism → Illusion
+    24: 'Alteration',     # Mysticism → Alteration
     25: 'Restoration',    # Restoration
     # 26: Acrobatics removed
     27: 'LightArmor',    # Light Armor
     28: 'Marksman',       # Marksman
-    29: 'Pickpocket',     # Mercantile → Pickpocket
+    29: 'Speechcraft',    # Mercantile → Speech
     30: 'Lockpicking',    # Security
     31: 'Sneak',          # Sneak
     32: 'Speechcraft',    # Speechcraft

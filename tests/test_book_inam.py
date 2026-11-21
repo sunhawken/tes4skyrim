@@ -13,15 +13,15 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+from asset_convert.ui import book_inam
 from asset_convert.ui.book_inam import (
     CANVAS,
-    Calibration,
     Island,
     bake_atlas,
     calibrate,
+    find_source_mesh,
     inv_basename,
     write_dds,
-    bbox_fit,
 )
 
 REFS = os.path.join(os.path.dirname(__file__), '..', 'references', 'Skyrim Meshes')
@@ -84,7 +84,7 @@ def _synthetic_sheet():
 
 def test_calibrate_book_finds_cover_and_spine():
     cal = calibrate(_synthetic_book())
-    assert cal.kind == 'book'
+    assert cal is not None
     assert cal.cover_tex == 'textures\\t\\cover.dds'
     # front cover fit maps normalized (x,y) into the art rect
     uv = cal.cover.uv_from_n(np.array([[0.0, 0.0], [1.0, 1.0]]))
@@ -96,14 +96,13 @@ def test_calibrate_book_finds_cover_and_spine():
     assert 0.0 <= suv[0, 0] <= 0.18
 
 
-def test_calibrate_sheet():
-    cal = calibrate(_synthetic_sheet())
-    assert cal.kind == 'sheet'
-    assert cal.cover_tex == 'textures\\t\\sheet.dds'
+def test_a_sheet_is_not_a_book():
+    """Notes have no binding to remap: they read on the vanilla note rig."""
+    assert calibrate(_synthetic_sheet()) is None
 
 
-def test_calibrate_unfittable_falls_back_to_identity():
-    # a full-wrap cylinder whose uv is NOT an affine function of position
+def test_a_rolled_scroll_is_not_a_book():
+    """A full-wrap cylinder (rolled scroll) has no cover spanning its footprint."""
     n = 24
     ang = np.linspace(0, 2 * np.pi, n)
     verts, uvs, tris = [], [], []
@@ -116,8 +115,7 @@ def test_calibrate_unfittable_falls_back_to_identity():
     shape = {'name': 's', 'verts': np.array(verts, dtype=float),
              'uvs': np.array(uvs, dtype=float), 'norms': None,
              'tris': tris, 'texs': ['textures\\t\\scroll.dds']}
-    cal = calibrate([shape])
-    assert cal.kind == 'identity'
+    assert calibrate([shape]) is None
 
 
 def test_island_uv_wrap_normalization():
@@ -156,23 +154,6 @@ def test_bake_book_atlas_regions():
     assert spx[0] <= int(0.20 * 255)
 
 
-def test_bake_sheet_is_uv_space_copy():
-    """Sheets bake as a plain uv rect copy (no mesh-axis rotation), so a
-    source gradient must arrive unrotated regardless of mesh orientation."""
-    # sheet lying in the XY plane but with uv rotated 90 deg vs position
-    sheet = _quad([(-4, -5, 0), (4, -5, 0), (4, 5, 0), (-4, 5, 0)],
-                  [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)])
-    obl = calibrate([_merge([sheet], 'textures\\t\\s.dds')])
-    assert obl.kind == 'sheet'
-    tpl = Calibration('sheet', cover=bbox_fit((0, 0), (1, 1)))
-    src = _gradient_img()
-    atlas = bake_atlas(obl, tpl, src, None)
-    # left edge of atlas = left edge of source (red channel low), even though
-    # the mesh-space fit would have rotated it
-    assert atlas[CANVAS // 2, 2, 0] < 30
-    assert atlas[CANVAS // 2, CANVAS - 3, 0] > 225
-
-
 # ---------------------------------------------------------------------------
 # DDS writer
 # ---------------------------------------------------------------------------
@@ -195,18 +176,69 @@ def test_inv_basename():
 
 
 # ---------------------------------------------------------------------------
+# source mesh lookup
+# ---------------------------------------------------------------------------
+
+def test_find_source_mesh_ignores_case(tmp_path):
+    """A MODL's mixed case finds the mesh a lowercase tree holds."""
+    real = tmp_path / 'meshes' / 'clutter' / 'books' / 'octavo02.nif'
+    real.parent.mkdir(parents=True)
+    real.write_bytes(b'')
+    got = find_source_mesh([str(tmp_path)], 'Clutter\\Books\\Octavo02.NIF')
+    assert got is not None and os.path.samefile(got, real)
+    assert find_source_mesh([str(tmp_path)], 'clutter\\books\\octavo02.nif') \
+        == os.path.join(str(tmp_path), 'meshes', 'clutter', 'books', 'octavo02.nif')
+    assert find_source_mesh([str(tmp_path)], 'Clutter\\Books\\Quarto02.NIF') is None
+
+
+def test_find_source_mesh_matches_every_root_in_any_case(tmp_path):
+    """A master's tree is matched the same way when the plugin's own lacks the mesh."""
+    (tmp_path / 'Mod.esp').mkdir()
+    real = tmp_path / 'Base.esm' / 'meshes' / 'clutter' / 'books' / 'octavo02.nif'
+    real.parent.mkdir(parents=True)
+    real.write_bytes(b'')
+    got = find_source_mesh([str(tmp_path / 'Mod.esp'), str(tmp_path / 'Base.esm')],
+                           'Clutter\\Books\\Octavo02.NIF')
+    assert isinstance(got, str) and os.path.samefile(got, real)
+
+
+def test_a_books_cover_and_its_normal_are_found_in_any_case(tmp_path):
+    """A loose mod's mixed-case cover resolves, and so does the `_n` beside it."""
+    cover = tmp_path / 'textures' / 'Clutter' / 'Books' / 'Octavo02.dds'
+    cover.parent.mkdir(parents=True)
+    cover.write_bytes(b'DDS ')
+    normal = cover.with_name('Octavo02_N.dds')
+    normal.write_bytes(b'DDS ')
+    got = book_inam._find_source_texture([str(tmp_path)], 'textures\\clutter\\books\\octavo02.dds')
+    assert isinstance(got, str) and os.path.samefile(got, cover)
+    sibling = book_inam._normal_sibling(got)
+    assert isinstance(sibling, str) and os.path.samefile(sibling, normal)
+    assert book_inam._normal_sibling(str(normal)) is None
+    exact = cover.with_name('Plain_n.dds')
+    exact.write_bytes(b'DDS ')
+    assert book_inam._normal_sibling(str(cover.with_name('Plain.dds'))) == str(exact)
+
+
+def test_a_cover_is_found_in_a_masters_tree_and_under_its_dds_name(tmp_path):
+    """Every root gets the case-blind pass, for the name as written and as `.dds`."""
+    (tmp_path / 'Mod.esp').mkdir()
+    cover = tmp_path / 'Base.esm' / 'textures' / 'Clutter' / 'Books' / 'Folio.DDS'
+    cover.parent.mkdir(parents=True)
+    cover.write_bytes(b'DDS ')
+    roots = [str(tmp_path / 'Mod.esp'), str(tmp_path / 'Base.esm')]
+    got = book_inam._find_source_texture(roots, 'textures\\clutter\\books\\folio.tga')
+    assert isinstance(got, str) and os.path.samefile(got, cover)
+
+
+# ---------------------------------------------------------------------------
 # template integration (needs a references clone of the Skyrim meshes)
 # ---------------------------------------------------------------------------
 
 @pytest.mark.skipif(not os.path.isdir(REFS), reason='Skyrim meshes refs not present')
 def test_template_calibration():
     from asset_convert.ui.book_inam import (
-        BOOK_TEMPLATE, NOTE_TEMPLATE, calibrate_book_template,
-        calibrate_note_template, read_shapes)
+        BOOK_TEMPLATE, calibrate_book_template, read_shapes)
     book = calibrate_book_template(
         read_shapes(os.path.join(REFS, *BOOK_TEMPLATE.split('\\'))))
-    assert book.kind == 'book' and book.spine is not None
+    assert book.spine is not None
     assert book.pages_islands, 'page-edge strips must be found'
-    note = calibrate_note_template(
-        read_shapes(os.path.join(REFS, *NOTE_TEMPLATE.split('\\'))))
-    assert note.kind == 'sheet'

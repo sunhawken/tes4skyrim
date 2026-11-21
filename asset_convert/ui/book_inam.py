@@ -1,4 +1,4 @@
-r"""Inventory-art (INAM) generator for TES4 books, notes and scrolls.
+r"""Inventory-art (INAM) generator for TES4 books.
 
 Skyrim's BookMenu does not render the world model when a book is opened: it
 renders the BOOK record's INAM inventory-art mesh, which must be one of the
@@ -14,8 +14,10 @@ Strategy (keeps the template's UVs and rig untouched — animation guaranteed):
      UV islands and fit an affine map from normalized cover coordinates to the
      Oblivion texture layout.  (Layouts differ per family: Octavo has the spine
      on the left edge, Quarto/Folio in the middle — hence per-mesh fitting.)
-  2. Calibrate the Skyrim template (BookSkyrim01 for bound books, Note02 for
-     flat sheets) the same way.
+  2. Calibrate the Skyrim template (BookSkyrim01) the same way.  Models that
+     are not bound books (notes, parchment, scrolls) get nothing: their BOOKs
+     read on the untouched vanilla note rig, whose clean paper sits under the
+     rendered text.
   3. Bake the Oblivion textures (cover + normal map) into a new atlas laid out
      in the *template's* UV space, by composing dst-uv -> normalized cover
      coords -> src-uv per region.
@@ -23,9 +25,10 @@ Strategy (keeps the template's UVs and rig untouched — animation guaranteed):
      atlas.  Pages keep the vanilla Skyrim paper textures (loaded from the
      game's own BSAs).
 
-One INAM mesh + texture pair is generated per *distinct* TES4 book model
-(~38 for Oblivion.esm); tes5_import/record_types/equipment.py synthesizes one
-shared STAT per model pointing at meshes\tes4\clutter\books\inv\<base>.nif.
+One INAM mesh + texture pair is generated per *distinct* TES4 bound-book
+model; tes5_import/record_types/equipment.py synthesizes one shared STAT per
+such model pointing at meshes\tes4\clutter\books\inv\<base>.nif, and points
+every other model's BOOK at vanilla HighPolyNote02.
 
 CLI:
     python -m asset_convert.ui.book_inam Oblivion.esm [--extract-dir export]
@@ -35,7 +38,8 @@ CLI:
 Templates are auto-extracted from the SSE BSAs by default (skyrim_assets).
 """
 
-from asset_convert.game_paths import current_namespace
+from asset_convert.game_paths import current_namespace, find_nocase
+from asset_convert.sources import base_plugins, skyrim_assets
 import argparse
 import os
 import struct
@@ -83,12 +87,10 @@ def _out_root(output_dir, plugin, extract_dir=None):
 CANVAS = 512  # baked atlas size (matches vanilla LargeBookSkyrim.dds density)
 
 BOOK_TEMPLATE = 'meshes\\clutter\\books\\book02\\character assets\\bookskyrim01.nif'
-NOTE_TEMPLATE = 'meshes\\clutter\\books\\note01\\note02.nif'
 
 # Template texture basenames whose texture set gets retargeted at the atlas.
 # Pages (largebookpaper01.dds) intentionally stay vanilla.
 BOOK_COVER_TEXES = ('largebookskyrim.dds', 'largebookskyrimback.dds')
-NOTE_SHEET_TEXES = ('largenote02.dds',)
 
 FLAT_NORMAL = (128, 128, 255, 255)  # RGBA flat tangent-space normal
 
@@ -202,9 +204,13 @@ def read_shapes(source):
     return shapes
 
 
-def _islands(tris, nverts):
-    """Connected components over shared vertices -> list of triangle-id lists."""
-    parent = list(range(nverts))
+#: Face normals meeting at a sharper angle than ~45 degrees start a new island.
+CREASE_COS = 0.7
+
+
+def _union_roots(count, links):
+    """Union-find over `count` items joined by (a, b) links -> root of each item."""
+    parent = list(range(count))
 
     def find(a):
         while parent[a] != a:
@@ -212,13 +218,48 @@ def _islands(tris, nverts):
             a = parent[a]
         return a
 
-    for a, b, c in tris:
-        ra, rb, rc = find(a), find(b), find(c)
-        parent[ra] = rb
-        parent[find(rb)] = find(rc)
+    for a, b in links:
+        parent[find(a)] = find(b)
+    return [find(i) for i in range(count)]
+
+
+def _islands(tris, nverts):
+    """Connected components over shared vertices -> list of triangle-id lists."""
+    roots = _union_roots(nverts, ((t[i], t[i + 1]) for t in tris for i in (0, 1)))
     groups = {}
     for i, t in enumerate(tris):
-        groups.setdefault(find(t[0]), []).append(i)
+        groups.setdefault(roots[t[0]], []).append(i)
+    return list(groups.values())
+
+
+def _welded_tris(shape):
+    """Triangles re-indexed so vertices equal in position AND uv share one index."""
+    key = np.round(np.hstack([shape['verts'], shape['uvs']]), 4)
+    _, first, inverse = np.unique(key, axis=0, return_index=True, return_inverse=True)
+    canon = first[inverse.reshape(-1)]
+    return [tuple(int(canon[i]) for i in t) for t in shape['tris']]
+
+
+def _facets(v, tris, tri_ids):
+    """Split one island at creases -> list of triangle-id lists.
+
+    Triangles stay together only when they share a vertex AND their face
+    normals agree within CREASE_COS, so a cover skinned continuously round
+    the spine (Morrowind) separates into front, spine and back exactly as an
+    Oblivion cover with split seam vertices already does.
+    """
+    t = np.asarray([tris[i] for i in tri_ids])
+    n = np.cross(v[t[:, 1]] - v[t[:, 0]], v[t[:, 2]] - v[t[:, 0]])
+    n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-12
+    by_vert = {}
+    for k, tri in enumerate(t):
+        for vid in tri:
+            by_vert.setdefault(vid, []).append(k)
+    links = ((a, b) for ks in by_vert.values() for i, a in enumerate(ks)
+             for b in ks[i + 1:] if n[a] @ n[b] > CREASE_COS)
+    groups = {}
+    for k, root in enumerate(_union_roots(len(t), links)):
+        groups.setdefault(root, []).append(tri_ids[k])
     return list(groups.values())
 
 
@@ -292,11 +333,10 @@ class RegionFit:
 # ---------------------------------------------------------------------------
 
 class Calibration:
-    """Per-mesh region fits.  kind: 'book' | 'sheet' | 'identity'."""
+    """A book's per-region fits (see calibrate)."""
 
-    def __init__(self, kind, cover=None, spine=None, pages=None,
+    def __init__(self, cover=None, spine=None, pages=None,
                  cover_tex=None, pages_tex=None, pages_islands=None):
-        self.kind = kind
         self.cover = cover              # RegionFit (front cover, plane x/y)
         self.spine = spine              # RegionFit (plane y/z) or None
         self.pages = pages              # RegionFit for page-edge src or None
@@ -305,84 +345,123 @@ class Calibration:
         self.pages_tex = pages_tex
 
 
-def _all_islands(shapes):
+def _all_islands(shapes, weld=False):
+    """Every shape's islands, crease-split into flat facets.
+
+    `weld` joins vertices equal in position and uv first, so a mesh stored as
+    loose triangles still forms islands.
+    """
     out = []
     for shape in shapes:
-        for tri_ids in _islands(shape['tris'], len(shape['verts'])):
-            out.append(Island(shape, tri_ids))
+        tris = _welded_tris(shape) if weld else shape['tris']
+        for tri_ids in _islands(tris, len(shape['verts'])):
+            out += [Island(shape, part) for part in _facets(shape['verts'], tris, tri_ids)]
     return out
 
 
 def calibrate(shapes):
-    """Classify a mesh's UV islands into book regions.
+    """Fit a book's cover regions, or None when the mesh is not a book.
 
-    Books: a large flat +Z island (front cover, book lying face-up) plus a
-    tall |n_x| island on the same texture (spine).  Flat sheets: one dominant
-    flat island.  Anything unfittable (rolled scrolls, crumpled paper) falls
-    back to an identity full-texture map.
+    Books lie closed (_closed_book) or open (_open_book).  Everything else --
+    notes, parchment, posters, scrolls, crumpled paper -- has no binding to
+    remap and reads on the untouched vanilla note rig instead.
     """
     islands = _all_islands(shapes)
     if not islands:
-        return Calibration('identity')
+        return None
     all_min = np.min([i.pos_min for i in islands], axis=0)
     all_max = np.max([i.pos_max for i in islands], axis=0)
     total_span = np.maximum(all_max - all_min, 1e-6)
-    z_mid = (all_min[2] + all_max[2]) / 2.0
+    return (_closed_book(shapes, islands, total_span, (all_min[2] + all_max[2]) / 2.0)
+            or _open_book(_all_islands(shapes, weld=True), total_span))
 
-    # front cover: largest flat island facing up, centered above the midplane
+
+def reads_as_book(source_mesh):
+    """True when the BOOK model at `source_mesh` is a bound book (see calibrate)."""
+    return calibrate(read_shapes(source_mesh)) is not None
+
+
+def _closed_book(shapes, islands, total_span, z_mid):
+    """Calibrate a book lying CLOSED, face-up, or None.
+
+    Front cover: the largest flat +Z island above the midplane, spanning the
+    footprint.  Spine: the largest tall |n_x| island on the same texture.
+    Page edges: the largest island of the first shape on another texture
+    (matched by id(): shapes hold numpy arrays, so `in` would compare them).
+    """
     flats = [i for i in islands if i.normal[2] > 0.85
              and (i.pos_min[2] + i.pos_max[2]) / 2.0 >= z_mid]
-    front = max(flats, key=lambda i: i.area) if flats else None
+    front = max(flats, key=lambda i: i.area, default=None)
+    if front is None or not _spans_footprint(front, total_span) or total_span[2] <= 1.0:
+        return None
+    front_tex = _tex_of(front.shape)
+    spines = [i for i in islands
+              if abs(i.normal[0]) > 0.7
+              and i.span()[1] > 0.6 * total_span[1]
+              and _tex_of(i.shape) == front_tex]
+    if not spines:
+        return None
+    page_shapes = [s for s in shapes if s['texs'] and s['texs'][0] != front_tex]
+    page_ids = {id(s) for s in page_shapes}
+    big = max((i for i in islands if id(i.shape) in page_ids),
+              key=lambda i: i.area, default=None)
+    return Calibration(
+        cover=RegionFit(front, (0, 1)),
+        spine=RegionFit(max(spines, key=lambda i: i.area), (1, 2)),
+        pages=big and RegionFit(big, (int(np.argmax(big.span()[:2])), 2)),
+        cover_tex=front_tex,
+        pages_tex=page_shapes[0]['texs'][0] if page_shapes else None,
+    )
 
-    spine = None
-    if front is not None:
-        front_tex = front.shape['texs'][0] if front.shape['texs'] else None
-        spines = [i for i in islands
-                  if abs(i.normal[0]) > 0.7
-                  and i.span()[1] > 0.6 * total_span[1]
-                  and (i.shape['texs'][0] if i.shape['texs'] else None) == front_tex]
-        spine = max(spines, key=lambda i: i.area) if spines else None
 
-    if front is not None and spine is not None and total_span[2] > 1.0:
-        pages_tex = None
-        pages_fit = None
-        front_tex = front.shape['texs'][0] if front.shape['texs'] else None
-        page_shapes = [s for s in shapes
-                       if s['texs'] and s['texs'][0] != front_tex]
-        if page_shapes:
-            pages_tex = page_shapes[0]['texs'][0]
-            # Identity, not `in`: shapes are dicts holding numpy arrays, so
-            # `i.shape in page_shapes` runs dict __eq__ -> element-wise array
-            # comparison, which raises as soon as two shapes have different
-            # vertex counts ("operands could not be broadcast together").
-            # Uniform-vertex-count books hid it; mixed ones failed to bake.
-            page_ids = {id(s) for s in page_shapes}
-            page_isles = [i for i in islands if id(i.shape) in page_ids]
-            if page_isles:
-                big = max(page_isles, key=lambda i: i.area)
-                long_axis = int(np.argmax(big.span()[:2]))
-                pages_fit = RegionFit(big, (long_axis, 2))
-        return Calibration(
-            'book',
-            cover=RegionFit(front, (0, 1)),
-            spine=RegionFit(spine, (1, 2)),
-            pages=pages_fit,
-            cover_tex=front.shape['texs'][0] if front.shape['texs'] else None,
-            pages_tex=pages_tex,
-        )
+def _spans_footprint(isle, total_span):
+    """True when `isle` covers >= 75% of the mesh footprint on both horizontal axes."""
+    return bool(np.all(isle.span()[:2] >= 0.75 * total_span[:2]))
 
-    # flat sheet: largest island, plane = the two axes orthogonal to the
-    # dominant normal axis (x before z / y before z keeps width-then-height)
-    big = max(islands, key=lambda i: i.area)
-    d = int(np.argmax(np.abs(big.normal)))
-    axes = tuple(a for a in (0, 1, 2) if a != d)
-    fit = RegionFit(big, axes)
-    tex = big.shape['texs'][0] if big.shape['texs'] else None
-    if fit.rms > 0.08:
-        # UV not an affine function of the surface (rolled scroll, crumpled
-        # paper): show the source texture as-is on the sheet template.
-        return Calibration('identity', cover_tex=tex)
-    return Calibration('sheet', cover=fit, cover_tex=tex)
+
+def _open_book(islands, total_span):
+    """Calibrate a book lying OPEN, or None.
+
+    Cover: one flat down-facing island (back | spine | front) whose inner
+    vertex rows bound the spine; front = the higher-u side.  Requires an
+    up-facing page spread on another texture of >= half the cover's area
+    (a folded note has none).  Fits follow the closed-book convention in
+    texture space: cover n = (spine -> fore-edge, bottom -> top), spine
+    n = (length, back -> front).
+    """
+    unders = [i for i in islands
+              if i.normal[2] < -0.85 and _spans_footprint(i, total_span)]
+    if not unders:
+        return None
+    under = max(unders, key=lambda i: i.area)
+    spread = sum(i.area for i in islands if i.normal[2] > 0.85
+                 and _tex_of(i.shape) not in (None, _tex_of(under.shape)))
+    if spread < 0.5 * under.area:
+        return None
+    across = int(np.argmax(np.abs(RegionFit(under, (0, 1)).M[0])))
+    rows = {}
+    for pos, u in zip(under.verts[:, across], under.uvs[:, 0]):
+        rows.setdefault(round(float(pos), 1), []).append(u)
+    us = [float(np.mean(rows[k])) for k in sorted(rows)]
+    if len(us) < 4:
+        return None
+    spine_lo, spine_hi = sorted((us[1], us[-2]))
+    v_bot, v_top = under.uv_max[1], under.uv_min[1]
+    edges = [i for i in islands
+             if abs(i.normal[2]) < 0.5 and i.shape is not under.shape]
+    pages = max(edges, key=lambda i: i.area, default=None)
+    return Calibration(
+        cover=_BBoxFit((spine_hi, v_bot), (max(us[0], us[-1]), v_top)),
+        spine=_SpineFit((spine_lo, v_bot), (spine_hi, v_top)),
+        pages=pages and RegionFit(pages, (int(np.argmax(pages.span()[:2])), 2)),
+        cover_tex=_tex_of(under.shape),
+        pages_tex=pages and _tex_of(pages.shape),
+    )
+
+
+def _tex_of(shape):
+    """First texture path of a read_shapes() shape, or None."""
+    return shape['texs'][0] if shape['texs'] else None
 
 
 def _tex_basename(path: str) -> str:
@@ -396,7 +475,7 @@ def calibrate_book_template(shapes):
     as the Oblivion side, plus the page-edge strips of the cover shape (the
     thin islands that wrap the page block between the covers)."""
     cal = calibrate(shapes)
-    if cal.kind != 'book':
+    if cal is None:
         raise ValueError('book template did not calibrate as a book')
     cover_shape = None
     for s in shapes:
@@ -422,13 +501,6 @@ def calibrate_book_template(shapes):
             long_axis = int(np.argmax(isle.span()[:2]))
             strips.append((isle, RegionFit(isle, (long_axis, 2))))
     cal.pages_islands = strips
-    return cal
-
-
-def calibrate_note_template(shapes):
-    cal = calibrate(shapes)
-    if cal.kind != 'sheet':
-        raise ValueError('note template did not calibrate as a flat sheet')
     return cal
 
 
@@ -497,23 +569,6 @@ def bake_atlas(obl_cal, tpl_cal, cover_img, pages_img):
     """Bake the Oblivion textures into the template's UV layout."""
     if cover_img is None:
         return None
-    if obl_cal.kind in ('identity', 'sheet') or tpl_cal.kind == 'sheet':
-        # sheet path: plain UV-space rect copy of the source sheet region onto
-        # the whole canvas.  Deliberately NOT composed through mesh coords:
-        # sheet art is always authored upright in texture space, while the
-        # world mesh may lie in any orientation (a flat-lying broadsheet would
-        # otherwise arrive rotated 90 degrees on the portrait note template).
-        canvas = np.empty((CANVAS, CANVAS, 4), dtype=np.uint8)
-        if obl_cal.kind == 'sheet':
-            src_fit = bbox_fit(np.clip(obl_cal.cover.uv_min, 0, 1),
-                                np.clip(obl_cal.cover.uv_max, 0, 1))
-        else:
-            src_fit = _identity_fit()
-        _paint_region(canvas, (0.0, 0.0, 1.0, 1.0), _identity_fit(), src_fit, cover_img)
-        return canvas
-
-    # book path: base layer = cover art everywhere (edge-extended), then the
-    # spine strip, then the page-edge strips
     canvas = np.empty((CANVAS, CANVAS, 4), dtype=np.uint8)
     _paint_region(canvas, (0.0, 0.0, 1.0, 1.0), tpl_cal.cover, obl_cal.cover, cover_img)
     sr = tpl_cal.spine
@@ -528,7 +583,7 @@ def bake_atlas(obl_cal, tpl_cal, cover_img, pages_img):
 
 
 class _BBoxFit:
-    """Axis-aligned rect map: n in [0,1]^2 <-> uv in [lo,hi]."""
+    """Axis-aligned rect map: n in [0,1]^2 -> uv in [lo,hi] (a source-side fit)."""
 
     def __init__(self, lo, hi):
         self.uv_min = np.asarray(lo, dtype=float)
@@ -537,17 +592,12 @@ class _BBoxFit:
     def uv_from_n(self, n):
         return self.uv_min + n * (self.uv_max - self.uv_min)
 
-    def n_from_uv(self, uv):
-        rng = np.maximum(self.uv_max - self.uv_min, 1e-9)
-        return np.clip((uv - self.uv_min) / rng, 0.0, 1.0)
 
+class _SpineFit(_BBoxFit):
+    """Rect map with the axes crossed: n = (along uv v, along uv u)."""
 
-def bbox_fit(lo, hi):
-    return _BBoxFit(lo, hi)
-
-
-def _identity_fit():
-    return _BBoxFit((0.0, 0.0), (1.0, 1.0))
+    def uv_from_n(self, n):
+        return super().uv_from_n(n[..., ::-1])
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +679,9 @@ def _find_source_texture(extract_roots, tex_rel):
             p = os.path.join(root, *candidate.split('\\'))
             if os.path.isfile(p):
                 return p
+            p = find_nocase(root, candidate)
+            if p:
+                return str(p)
     return None
 
 
@@ -653,52 +706,55 @@ def _as_roots(roots):
     return [str(r) for r in roots]
 
 
-def _find_source_mesh(extract_roots, rel):
-    """Locate a book model across this plugin's export tree then its masters'."""
+def find_source_mesh(extract_roots, model):
+    """Locate BOOK MODL `model` across this plugin's asset root then its masters'.
+
+    Each root is tried exactly, then ignoring case.
+    """
+    parts = model.replace('/', '\\').strip('\\').split('\\')
     for root in _as_roots(extract_roots):
-        p = os.path.join(root, 'meshes', *rel.split('\\'))
+        p = os.path.join(root, 'meshes', *parts)
         if os.path.isfile(p):
             return p
+        p = find_nocase(root, 'meshes', *parts)
+        if p:
+            return str(p)
     return None
 
 
 def _normal_sibling(tex_path):
+    """The `_n` map beside `tex_path`, in whatever case it is spelled, or None."""
     if not tex_path:
         return None
     root, ext = os.path.splitext(tex_path)
     p = root + '_n' + ext
-    return p if os.path.isfile(p) else None
+    if os.path.isfile(p):
+        return p
+    p = find_nocase(os.path.dirname(p), os.path.basename(p))
+    return str(p) if p else None
 
 
-def load_templates(templates_dir=None, skyrim_data=None):
-    """Return {'book': bytes, 'note': bytes} template NIFs.
+def load_book_template(templates_dir=None, skyrim_data=None):
+    """Return the BOOK_TEMPLATE NIF bytes.
 
     Sources, in order: an explicit on-disk Skyrim meshes tree (templates_dir),
     then asset_convert.sources.skyrim_assets (references tree -> extraction cache ->
     the game's own SSE BSAs, auto-detected via registry).
     """
-    from asset_convert.sources import skyrim_assets
-
     if skyrim_data:
         skyrim_assets.set_skyrim_data(skyrim_data)
-    out = {}
-    wanted = {'book': BOOK_TEMPLATE, 'note': NOTE_TEMPLATE}
-    for key, rel in wanted.items():
-        if templates_dir:
-            p = os.path.join(templates_dir, *rel.split('\\'))
-            if os.path.isfile(p):
-                out[key] = open(p, 'rb').read()
-                continue
-        raw = skyrim_assets.get_asset_bytes(rel)
-        if raw is not None:
-            out[key] = raw
-    still = [k for k in wanted if k not in out]
-    if still:
+    if templates_dir:
+        p = os.path.join(templates_dir, *BOOK_TEMPLATE.split('\\'))
+        if os.path.isfile(p):
+            with open(p, 'rb') as f:
+                return f.read()
+    raw = skyrim_assets.get_asset_bytes(BOOK_TEMPLATE)
+    if raw is None:
         raise FileNotFoundError(
-            'book INAM templates not found (%s); no references tree and no '
+            'book INAM template not found (%s); no references tree and no '
             'SSE install detected — pass --templates-dir or --skyrim-data'
-            % ', '.join(wanted[k] for k in still))
-    return out
+            % BOOK_TEMPLATE)
+    return raw
 
 
 def distinct_book_models(export_subdir):
@@ -782,11 +838,9 @@ def inv_basename_map(models):
 _W = {}
 
 
-def _worker_init(book_tpl, note_tpl, extract_root, out_root, basenames=None):
+def _worker_init(book_tpl, extract_root, out_root, basenames=None):
     _W['book_tpl'] = book_tpl
-    _W['note_tpl'] = note_tpl
     _W['book_cal'] = calibrate_book_template(read_shapes(book_tpl))
-    _W['note_cal'] = calibrate_note_template(read_shapes(note_tpl))
     _W['extract_root'] = extract_root
     _W['out_root'] = out_root
     # Collision-resolved {model -> basename}; workers must not re-derive it
@@ -794,19 +848,32 @@ def _worker_init(book_tpl, note_tpl, extract_root, out_root, basenames=None):
     _W['basenames'] = basenames or {}
 
 
+def _inv_outputs(base):
+    """The (atlas, normal atlas, mesh) paths generated for asset basename `base`."""
+    tex = os.path.join(_W['out_root'], *inv_tex_dir().split('\\'), base)
+    return (tex + '.dds', tex + '_n.dds',
+            os.path.join(_W['out_root'], *inv_mesh_dir().split('\\'), base + '.nif'))
+
+
 def _convert_one(model_rel):
     """Generate the INAM NIF + baked textures for one TES4 book model.
-    Returns (model_rel, status, detail)."""
+
+    A model that is not a book gets nothing (any earlier output for it is
+    removed): its BOOK reads on the vanilla note rig.
+    Returns (model_rel, status, detail).
+    """
     base = _W['basenames'].get(model_rel) or inv_basename(model_rel)
-    rel = model_rel.replace('/', '\\')
-    src_nif = _find_source_mesh(_W['extract_root'], rel)
+    src_nif = find_source_mesh(_W['extract_root'], model_rel)
     if src_nif is None:
         return (model_rel, 'skip', 'source mesh missing')
     try:
         obl_cal = calibrate(read_shapes(src_nif))
-        kind = 'book' if obl_cal.kind == 'book' else 'note'
-        tpl_bytes = _W[kind + '_tpl']
-        tpl_cal = _W[kind + '_cal']
+        if obl_cal is None:
+            for stale in _inv_outputs(base):
+                if os.path.isfile(stale):
+                    os.remove(stale)
+            return (model_rel, 'note', 'vanilla note rig')
+        tpl_cal = _W['book_cal']
 
         cover_src = _find_source_texture(_W['extract_root'], obl_cal.cover_tex)
         pages_src = _find_source_texture(_W['extract_root'], obl_cal.pages_tex)
@@ -821,44 +888,27 @@ def _convert_one(model_rel):
         atlas_n = (bake_atlas(obl_cal, tpl_cal, cover_n, pages_n)
                    if cover_n is not None else _flat_canvas(FLAT_NORMAL))
 
-        out_root = _W['out_root']
-        tex_dir, mesh_dir = inv_tex_dir(), inv_mesh_dir()
-        dds_out = os.path.join(out_root, *tex_dir.split('\\'), base + '.dds')
-        dds_n_out = os.path.join(out_root, *tex_dir.split('\\'), base + '_n.dds')
-        nif_out = os.path.join(out_root, *mesh_dir.split('\\'), base + '.nif')
+        dds_out, dds_n_out, nif_out = _inv_outputs(base)
         write_dds(dds_out, atlas)
         write_dds(dds_n_out, atlas_n)
-        emit_inam_nif(
-            tpl_bytes, nif_out,
-            BOOK_COVER_TEXES if kind == 'book' else NOTE_SHEET_TEXES,
-            tex_dir + '\\' + base + '.dds',
-            tex_dir + '\\' + base + '_n.dds')
-        return (model_rel, 'ok', kind)
+        tex_dir = inv_tex_dir()
+        emit_inam_nif(_W['book_tpl'], nif_out, BOOK_COVER_TEXES,
+                      tex_dir + '\\' + base + '.dds', tex_dir + '\\' + base + '_n.dds')
+        return (model_rel, 'ok', 'book')
     except Exception as exc:  # keep the batch going; report per-model
         return (model_rel, 'fail', '%s: %s' % (type(exc).__name__, exc))
 
 
-def split_master_owned(models, asset_subdir, extract_roots):
-    """Drop the models whose source assets belong to a MASTER, not to us.
+def split_master_owned(models, asset_subdir, extract_roots, master_books):
+    """Split `models` into (the ones this plugin bakes, count left to a master).
 
-    A plugin's BOOK.txt lists every book it PLACES, including its masters'.
-    Baking from a master's assets is what lets those books have inventory art
-    at all (`_find_source_mesh` searches the masters for exactly that reason),
-    but the generated pair is named after the model's leaf filename, so two
-    plugins placing the same master book both write
-    `clutter/books/inv/<base>.nif|.dds`. The bytes differ -- the atlas is baked
-    from whichever extract root won -- so the copies genuinely conflict and the
-    install order decides which one the game loads.
+    A model in `asset_subdir` (this plugin's ASSET root, never its record dir)
+    is its own.  One a master root in `extract_roots` ships AND that
+    `master_books` lists (the masters' own BOOK models, lowercased,
+    backslashed) is left to that master's run, which writes the same path.
+    Anything else is baked here.
 
-    Ownership follows the SOURCE mesh: a model this plugin extracted itself is
-    its own to bake, and one that resolves only in a master's export is the
-    master's.  `asset_subdir` is therefore this plugin's ASSET root, never its
-    record dir -- the record dir has no meshes/ and every model would defer. The master's own run generates it at the identical path, so
-    deferring loses nothing -- the STAT that `equipment.py` synthesizes points
-    at the same `inv_basename`, and Data holds one file per path.
-
-    A plugin that OVERRIDES a master's book mesh still ships its own copy in
-    its export, so it keeps the bake and legitimately wins the path.
+    See: docs/commentary/asset_convert_nif.md#book-inam-master-ownership
     """
     own, deferred = [], 0
     # `asset_subdir` is this plugin's own ASSET root -- the tree that actually
@@ -870,51 +920,44 @@ def split_master_owned(models, asset_subdir, extract_roots):
     if not master_roots:
         return list(models), 0
     for model in models:
-        rel = model.replace('/', chr(92)).strip(chr(92))
-        if _find_source_mesh([asset_subdir], rel) is not None:
+        if find_source_mesh([asset_subdir], model) is not None:
             own.append(model)                 # we ship the source: ours to bake
-        elif _find_source_mesh(master_roots, rel) is not None:
-            deferred += 1                     # master ships it: master bakes it
+        elif (model.lower().replace('/', '\\') in master_books
+              and find_source_mesh(master_roots, model) is not None):
+            deferred += 1
         else:
             own.append(model)                 # missing everywhere: report as before
     return own, deferred
 
 
 def generate_book_inams(source_file, extract_dir='export', output_dir='output',
-                        templates_dir=None, skyrim_data=None, workers=None,
-                        master_names=None):
+                        templates_dir=None, skyrim_data=None, workers=None):
     """Generate INAM meshes/textures for every distinct book model of a plugin.
 
-    `master_names` are this plugin's TES4 masters, in load order. A plugin
-    routinely places its masters' book models, whose meshes and textures were
-    extracted into the MASTER's export dir only; without them every such model
-    resolves to "source mesh missing" and ships no inventory art.
+    A plugin routinely places its masters' book models, whose meshes and
+    textures were extracted into the MASTER's export dir only, so its base
+    plugins' asset roots (base_plugins.names_for) are searched after its own:
+    nearest wins, so a plugin overriding a master's asset keeps its own copy.
 
-    Returns {'ok': n, 'skip': n, 'fail': n}.
+    Returns {'ok', 'note', 'skip', 'fail'} counts; a 'note' model gets no output.
     """
     source_name = Path(source_file).name
-    # Records are per plugin; the meshes/textures they name live in the mod's
-    # SHARED asset tree, which for an imported mod is the group folder.
     export_subdir = str(record_dir(extract_dir, source_name))
     asset_subdir = str(_asset_root(extract_dir, source_name))
     out_root = str(_out_root(output_dir, source_name, extract_dir))
-    # This plugin's assets first, then its masters' — nearest wins, so a
-    # plugin that overrides a master's asset still uses its own copy.
     extract_roots = [asset_subdir]
-    for m in (master_names or []):
+    for m in base_plugins.names_for(export_subdir):
         d = str(_asset_root(extract_dir, m))
         if os.path.isdir(d) and os.path.normpath(d) != os.path.normpath(asset_subdir):
             extract_roots.append(d)
     models = distinct_book_models(export_subdir)
     if not models:
-        return {'ok': 0, 'skip': 0, 'fail': 0}
-    # The plugin's own ASSET root, not its record dir: ownership is decided by
-    # which tree ships the source MESH, and the record dir holds no meshes at
-    # all. Passing it meant the own-mesh probe always missed, the plugin's own
-    # asset root was classed as a MASTER root (it no longer equals the record
-    # dir), and every book a grouped mod ships was deferred to a master that
-    # never bakes it -- so those books shipped with no inventory art.
-    models, deferred = split_master_owned(models, asset_subdir, extract_roots)
+        return {'ok': 0, 'note': 0, 'skip': 0, 'fail': 0}
+    master_books = {m.lower().replace('/', '\\')
+                    for name in base_plugins.names_for(export_subdir)
+                    for m in distinct_book_models(record_dir(extract_dir, name))}
+    models, deferred = split_master_owned(models, asset_subdir, extract_roots,
+                                          master_books)
     if deferred:
         print('  [book_inam] %d model(s) left to the master that ships them'
               % deferred)
@@ -925,11 +968,11 @@ def generate_book_inams(source_file, extract_dir='export', output_dir='output',
     models = sorted(models, key=lambda m: m.lower())
     basenames = inv_basename_map(models)
 
-    tpls = load_templates(templates_dir, skyrim_data)
-    stats = {'ok': 0, 'skip': 0, 'fail': 0}
+    stats = {'ok': 0, 'note': 0, 'skip': 0, 'fail': 0}
     n_workers = workers if workers is not None else max(1, cpu_count() - 1)
     n_workers = min(n_workers, len(models))
-    init_args = (tpls['book'], tpls['note'], extract_roots, out_root, basenames)
+    init_args = (load_book_template(templates_dir, skyrim_data), extract_roots,
+                 out_root, basenames)
     # Validate templates in the parent BEFORE spawning workers: an initializer
     # crash in a pool worker (e.g. an SSE-format BSTriShape template pyffi
     # can't parse) surfaces only as an opaque BrokenProcessPool — and the
@@ -943,7 +986,7 @@ def generate_book_inams(source_file, extract_dir='export', output_dir='output',
             results = list(ex.map(_convert_one, models))
     for model_rel, status, detail in results:
         stats[status] += 1
-        if status != 'ok':
+        if status in ('skip', 'fail'):
             print('  [book_inam] %s %s: %s' % (status.upper(), model_rel, detail))
     return stats
 
@@ -961,12 +1004,9 @@ def main(argv=None):
     ap.add_argument('--workers', type=int, default=None)
     args = ap.parse_args(argv)
 
-    from asset_convert.lod.terrain_lod import master_names
     stats = generate_book_inams(args.source_file, args.extract_dir, args.output_dir,
-                                args.templates_dir, args.skyrim_data, args.workers,
-                                master_names=master_names(
-                                    Path(args.extract_dir) / args.source_file))
-    print('book_inam: ok=%(ok)d skip=%(skip)d fail=%(fail)d' % stats)
+                                args.templates_dir, args.skyrim_data, args.workers)
+    print('book_inam: ok=%(ok)d note=%(note)d skip=%(skip)d fail=%(fail)d' % stats)
     return 0 if stats['fail'] == 0 else 1
 
 

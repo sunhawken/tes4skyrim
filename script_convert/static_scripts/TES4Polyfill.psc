@@ -119,6 +119,18 @@ Float Function TES4AttributeStub() Global
   Return 100.0
 EndFunction
 
+; The higher of two actor values: an Oblivion skill Skyrim split in two (Blade
+; and Blunt covered one- and two-handed weapons alike).
+; See: docs/plans/character_sheet.md#bug-blade-blunt
+Float Function HigherActorValue(Actor akActor, String asFirst, String asSecond) Global
+  Float first = akActor.GetActorValue(asFirst)
+  Float second = akActor.GetActorValue(asSecond)
+  If first > second
+    Return first
+  EndIf
+  Return second
+EndFunction
+
 String Function MapActorValue(String avName) Global
   ; Skills (renamed and/or merged in TES5). "Speechcraft" and "Marksman" are
   ; the engine's internal AV names for the skills Skyrim's UI calls Speech and
@@ -134,7 +146,7 @@ String Function MapActorValue(String avName) Global
   ElseIf avName == "HandToHand"
     Return "UnarmedDamage"
   ElseIf avName == "Mysticism"
-    Return "Illusion"
+    Return "Alteration"
   ElseIf avName == "Mercantile"
     Return "Speechcraft"
   ElseIf avName == "Security"
@@ -235,9 +247,129 @@ Function SetAngle(ObjectReference akRef, String axis, Float afValue) Global
   akRef.SetAngle(x, y, z)
 EndFunction
 
+; A SetPos/SetAngle inside a converted GameMode poll.  TES4 moved objects by
+; calling them every frame; Skyrim's SetPosition/SetAngle reload the 3D, which
+; fades back in, so called every poll the object never finishes fading.  Each
+; step is a TranslateTo glide arriving as the next poll starts instead -- the
+; MorrowindRuntime GlideTo, confirmed smooth in game.
+; akRefs/afGoals are this pass's poses, twelve floats per slot: the goal
+; (position X Y Z, angle X Y Z) then where the reference stood when the pass
+; first touched it.  A second axis set in the same pass chains from the first
+; rather than reading back a glide that has only just started, and no pose is
+; read from the engine twice.
+; aiAxis: 0-2 position, 3-5 angle.  afSeconds is the measured gap since the
+; last pass, so the glide ends as the next one begins even when the VM is late;
+; a near-zero gap (two passes armed at once) floors at half the fastest poll.
+; With TESRuntime 6 or later a non-actor's target goes to its 30 Hz tick
+; instead ("TES4Track"), which reaches it over 1.5 pass gaps.
+; See: docs/commentary/script_convert.md#gamemode-steps-are-rates
+Function GlideAxis(ObjectReference akRef, Int aiAxis, Float afValue, ObjectReference[] akRefs, Float[] afGoals, Float afSeconds) Global
+  If akRef == None
+    Return
+  EndIf
+  If !(akRef as Actor) && SKSE.GetPluginVersion("TESRuntime") >= 6
+    akRef.SendModEvent("TES4Track", aiAxis as String, afValue)
+    Return
+  EndIf
+  Int slot = akRefs.Find(akRef)
+  If slot < 0
+    slot = akRefs.Find(None)
+    If slot < 0
+      slot = akRefs.Length - 1
+    EndIf
+    akRefs[slot] = akRef
+    Int i = slot * 12
+    afGoals[i] = akRef.GetPositionX()
+    afGoals[i + 1] = akRef.GetPositionY()
+    afGoals[i + 2] = akRef.GetPositionZ()
+    afGoals[i + 3] = akRef.GetAngleX()
+    afGoals[i + 4] = akRef.GetAngleY()
+    afGoals[i + 5] = akRef.GetAngleZ()
+    While i < slot * 12 + 6
+      afGoals[i + 6] = afGoals[i]
+      i += 1
+    EndWhile
+  EndIf
+  Int b = slot * 12
+  afGoals[b + aiAxis] = afValue
+  Float x = afGoals[b]
+  Float y = afGoals[b + 1]
+  Float z = afGoals[b + 2]
+  If !akRef.Is3DLoaded()
+    akRef.SetPosition(x, y, z)
+    akRef.SetAngle(afGoals[b + 3], afGoals[b + 4], afGoals[b + 5])
+    Return
+  EndIf
+  If afSeconds < 0.05
+    afSeconds = 0.05
+  EndIf
+  Float dx = x - afGoals[b + 6]
+  Float dy = y - afGoals[b + 7]
+  Float dz = z - afGoals[b + 8]
+  Float distance = Math.sqrt(dx * dx + dy * dy + dz * dz)
+  ; A rotation ends when the position arrives, so a pure rotation glides over
+  ; a 0.01-unit Z nudge, alternating up and down so it never drifts.
+  If distance < 0.005
+    If Math.Floor(z * 100.0 + 0.5) % 2 == 0
+      z += 0.01
+    Else
+      z -= 0.01
+    EndIf
+    distance = 0.01
+  EndIf
+  akRef.TranslateTo(x, y, z, NearAngle(afGoals[b + 9], afGoals[b + 3]), NearAngle(afGoals[b + 10], afGoals[b + 4]), NearAngle(afGoals[b + 11], afGoals[b + 5]), distance / afSeconds, 0.0)
+EndFunction
+
+; afTo moved by whole turns to lie within 180 degrees of afFrom, so a glide
+; takes the short way round.
+Float Function NearAngle(Float afFrom, Float afTo) Global
+  Float d = afTo - afFrom
+  While d > 180.0
+    d -= 360.0
+  EndWhile
+  While d < -180.0
+    d += 360.0
+  EndWhile
+  Return afFrom + d
+EndFunction
+
+; A SetPos/SetAngle that steps from the object's own pose, inside a converted
+; GameMode poll: TES4 turned or moved it that much every frame.  afRate is the
+; step as a rate per second.  TESRuntime turns it at that rate on its own 30 Hz
+; tick, re-aimed each tick like MorrowindRuntime's Rotate, so the motion does
+; not wait on the next Papyrus pass; each pass renews the rate and TESRuntime
+; stops the object once passes stop.  An actor (the player's view in a
+; cutscene) and a game without TESRuntime take a GlideAxis glide instead.
+; See: docs/commentary/script_convert.md#gamemode-steps-are-rates
+Function SpinAxis(ObjectReference akRef, Int aiAxis, Float afValue, Float afRate, ObjectReference[] akRefs, Float[] afGoals, Float afSeconds) Global
+  If akRef == None
+    Return
+  EndIf
+  If !(akRef as Actor) && SKSE.GetPluginVersion("TESRuntime") >= 5
+    akRef.SendModEvent("TES4Spin", aiAxis as String, afRate)
+  Else
+    GlideAxis(akRef, aiAxis, afValue, akRefs, afGoals, afSeconds)
+  EndIf
+EndFunction
+
 ; ==========================================================================
 ; Combat
 ; ==========================================================================
+
+; TES4 `begin OnHitWith <ammo>`.  Skyrim's OnHit passes the BOW as akSource and
+; no projectile for an actor target, so the arrow is read off the shooter: the
+; ammo is equipped and a bow (7) or crossbow (12) is in hand.
+Bool Function HitWithAmmo(ObjectReference akAggressor, Ammo akAmmo) Global
+  Actor shooter = akAggressor as Actor
+  If shooter == None || !shooter.IsEquipped(akAmmo)
+    Return False
+  EndIf
+  Int weaponType = shooter.GetEquippedItemType(1)
+  If weaponType != 7 && weaponType != 12
+    weaponType = shooter.GetEquippedItemType(0)
+  EndIf
+  Return weaponType == 7 || weaponType == 12
+EndFunction
 
 ; TES4 StartCombat FORCES the fight: the actor attacks the target regardless
 ; of aggression, disposition or faction relations.  CharacterGen's finale
@@ -269,21 +401,310 @@ EndFunction
 ; The memberships persist until death or an explicit stopcombat, matching
 ; TES4 StartCombat (fight until someone dies or a script stands them down).
 ; Cross-pair contamination (attacker A hostile to victim B forced in a
-; different scene) is accepted: forced attackers are overwhelmingly scene
-; actors that die in their scene, and TES4's own disposition damage from
-; StartCombat leaked comparably.
+; different scene) is accepted between NPCs, but NEVER for the player: the
+; Nehrim intro forces trolls onto the player and Celebro onto the trolls, so
+; a player in Victims made the ally Celebro (an Attacker) turn on them.  A
+; fight involving the player instead puts the other actor in vanilla's
+; WIPlayerEnemyFaction (Skyrim.esm 0x06E02D, Hidden, sole relation Enemy of
+; PlayerFaction -- the faction vanilla WI scripts add an actor to before
+; StartCombat on the player), and the player is taken back out of the pair
+; (saves made before this fix already hold that membership).
+;
+; TES4 StartCombat also RETARGETS an actor already fighting someone else
+; (SE02's Gatekeeper is steered onto one orc at a time while all four are
+; hitting him).  Skyrim's does not: its queued task (1.6.1170 0x657e1f) does
+; nothing when the target is already in the actor's combat group, and
+; StopCombat (0x9eb250) only flags the controller to stop on its next
+; update.  So an attacker busy with another target is stood down, the
+; function waits for combat to actually end, and then starts it afresh.
+; Kept for scripts compiled before ForceCombatApproach; the signature must not change.
 Function ForceCombat(Actor akAttacker, Actor akTarget, Faction akAttackers, Faction akVictims) Global
-  If akAttacker == None || akTarget == None
-    Return
+  ForceCombatNow(akAttacker, akTarget, akAttackers, akVictims)
+EndFunction
+
+; ForceCombat, then the attacker and target join a pair of the importer's
+; TES4CombatApproaches quest, whose combat override package keeps the attacker
+; closing on the target the way TES4 combat does instead of hiding or searching.
+; Both happen on the pool's own thread (TES4_CombatQueue), so the caller goes
+; on at once as TES4's StartCombat does; a pool without the queue, or a full
+; queue, fights at once without a pair.
+; See docs/commentary/script_convert.md#startcombat-approaches-an-undetected-target
+Function ForceCombatApproach(Actor akAttacker, Actor akTarget, Faction akAttackers, Faction akVictims, Quest akPool) Global
+  TES4_CombatQueue queue = akPool as TES4_CombatQueue
+  If !queue || !queue.Push(akAttacker, akTarget, akAttackers, akVictims)
+    ForceCombatNow(akAttacker, akTarget, akAttackers, akVictims)
   EndIf
+EndFunction
+
+; The forced StartCombat itself; False when either actor is missing or dead. abAdd joins
+; akTarget to the attacker's fight instead of standing it down first (TES4's same-frame calls).
+Bool Function ForceCombatNow(Actor akAttacker, Actor akTarget, Faction akAttackers, Faction akVictims, Bool abAdd = False) Global
+  If akAttacker == None || akTarget == None || akAttacker.IsDead() || akTarget.IsDead()
+    Return False
+  EndIf
+  Actor player = Game.GetPlayer()
   If akAttackers != None && akVictims != None
+    player.RemoveFromFaction(akAttackers)
+    player.RemoveFromFaction(akVictims)
+  EndIf
+  If akTarget == player || akAttacker == player
+    Faction hatesPlayer = Game.GetFormFromFile(0x06E02D, "Skyrim.esm") as Faction
+    If akTarget == player
+      akAttacker.AddToFaction(hatesPlayer)
+    Else
+      akTarget.AddToFaction(hatesPlayer)
+    EndIf
+  ElseIf akAttackers != None && akVictims != None
     akAttacker.AddToFaction(akAttackers)
     akTarget.AddToFaction(akVictims)
   EndIf
   If akAttacker.GetActorValue("Aggression") < 1.0
     akAttacker.SetActorValue("Aggression", 1)
   EndIf
+  If !abAdd && akAttacker.IsInCombat() && akAttacker.GetCombatTarget() != akTarget
+    StandDown(akAttacker)
+  EndIf
   akAttacker.StartCombat(akTarget)
+  Return True
+EndFunction
+
+; TES4 StopCombat on an attacker ForceCombatApproach may have paired: queued
+; behind its StartCombat, it empties the pair, then EndCombat.
+Function EndCombatApproach(Actor akActor, Faction akAttackers, Quest akPool) Global
+  TES4_CombatQueue queue = akPool as TES4_CombatQueue
+  If !queue || !queue.Push(akActor, None, akAttackers, None)
+    EndCombat(akActor, akAttackers)
+  EndIf
+EndFunction
+
+; StopCombat, then wait (up to a second) for the controller to actually let go.
+Function StandDown(Actor akActor) Global
+  akActor.StopCombat()
+  Int waited = 0
+  While akActor.IsInCombat() && waited < 20
+    Utility.Wait(0.05)
+    waited += 1
+  EndWhile
+EndFunction
+
+; TES4 StopCombat.  Takes the actor back out of the memberships ForceCombat
+; gave it as an ATTACKER (TES4ForceCombatAttackers, WIPlayerEnemyFaction), then
+; stops the fight; left in them, the actor re-engaged the moment it saw its
+; target again and its AI packages never ran (Nehrim's rope troll).  Victims
+; membership stays: TES4 StopCombat on a victim does not stop its attacker.
+Function EndCombat(Actor akActor, Faction akAttackers) Global
+  If akActor == None
+    Return
+  EndIf
+  If akAttackers != None
+    akActor.RemoveFromFaction(akAttackers)
+  EndIf
+  Faction hatesPlayer = Game.GetFormFromFile(0x06E02D, "Skyrim.esm") as Faction
+  If hatesPlayer != None
+    akActor.RemoveFromFaction(hatesPlayer)
+  EndIf
+  akActor.StopCombat()
+EndFunction
+
+; ==========================================================================
+; Confidence
+; ==========================================================================
+; Oblivion flees once its flee score (Confidence, own health) beats the actor's
+; best attack; Skyrim's tiers 1-3 instead compare strength with the enemy.  So
+; a converted actor is only ever Cowardly (0) or Foolhardy (4).  Its authored
+; Confidence is its rank in TES4ConfidenceFaction; its flee margin, rank in
+; TES4FleeMarginFaction, flees on sight below 0, never at Q
+; (TES4FleeHealthScale) or more, and in between once health is under
+; 1 - margin/Q, which the TES4ConfidenceFlee ability watches.  A Confidence
+; change shifts the margin by the same amount.  The combat controller copies
+; the tier when combat STARTS (1.6.1170 0x840c90, reached only from combat
+; start), so a change made mid-fight restarts the fight against the same target.
+; See docs/commentary/tes5_import_actors.md#flee-margin
+
+Function SetConfidenceTier(Actor akActor, Int aiTier) Global
+  If akActor == None || akActor.GetActorValue("Confidence") as Int == aiTier
+    Return
+  EndIf
+  akActor.SetActorValue("Confidence", aiTier)
+  Actor target = akActor.GetCombatTarget()
+  If target != None
+    StandDown(akActor)
+    akActor.StartCombat(target)
+  EndIf
+  akActor.EvaluatePackage()
+EndFunction
+
+; Cowardly below margin 0 or while health is under 1 - margin/Q, else Foolhardy.
+Function ApplyConfidence(Actor akActor, Faction akMargin, GlobalVariable akScale) Global
+  If akActor == None || akMargin == None || akScale == None || akActor.IsDead()
+    Return
+  EndIf
+  If !akActor.IsInFaction(akMargin)
+    Return
+  EndIf
+  Int margin = akActor.GetFactionRank(akMargin)
+  Float scale = akScale.GetValue()
+  If margin < 0
+    SetConfidenceTier(akActor, 0)
+  ElseIf margin < scale && akActor.GetActorValuePercentage("Health") < 1.0 - margin / scale
+    SetConfidenceTier(akActor, 0)
+  Else
+    SetConfidenceTier(akActor, 4)
+  EndIf
+EndFunction
+
+; TES4 GetAV Confidence: the value the actor was converted or set to.  Without
+; the faction (an FO3/FNV plugin, whose Confidence is already the Skyrim tier)
+; the tier itself.
+Float Function GetConfidence(Actor akActor, Faction akFaction) Global
+  If akActor == None
+    Return 0.0
+  ElseIf akFaction == None
+    Return akActor.GetActorValue("Confidence")
+  ElseIf akActor.IsInFaction(akFaction)
+    Return akActor.GetFactionRank(akFaction) as Float
+  ElseIf akActor.GetActorValue("Confidence") >= 1.0
+    Return 100.0
+  EndIf
+  Return 0.0
+EndFunction
+
+; Clamp to a faction rank's signed byte.
+Int Function ClampRank(Int aiValue) Global
+  If aiValue < -128
+    Return -128
+  ElseIf aiValue > 127
+    Return 127
+  EndIf
+  Return aiValue
+EndFunction
+
+; ==========================================================================
+; Disposition
+; ==========================================================================
+; An Oblivion actor's disposition toward the player is its rank in
+; TES4DispositionFaction, set at conversion from its Personality and its
+; factions' reactions to the player; dialogue conditions read the same rank.
+; Oblivion attacks on sight while disposition, read as 0-100, is below
+; aggression - 5 (so aggression 5 or less never attacks), the TES4 Aggression
+; being the actor's rank in TES4AggressionFaction.  A script that lowers
+; disposition or raises aggression past that line puts the actor in
+; TES4DispositionHostileFaction, an Enemy of the player, so its own aggression
+; tier attacks on sight; a change back the other way takes it out.  Only a
+; script's change applies the rule: the converted tier already covers where
+; the actor starts.
+; See docs/commentary/tes5_import_actors.md#faction-player-disposition
+
+; TES4 GetDisposition toward the player; Oblivion's neutral 50 for an actor without a rank.
+Int Function GetDisposition(Actor akActor, Faction akDisposition) Global
+  If akActor == None || akDisposition == None || !akActor.IsInFaction(akDisposition)
+    Return 50
+  EndIf
+  Return akActor.GetFactionRank(akDisposition)
+EndFunction
+
+; Oblivion's attack rule after a change that made it worse (abWorse) or better for the player.
+Function ApplyAttackRule(Actor akActor, Bool abWorse, Faction akDisposition, Faction akAggression, Faction akHostile) Global
+  If akActor == None || akHostile == None || akAggression == None || !akActor.IsInFaction(akAggression)
+    Return
+  EndIf
+  Int disp = GetDisposition(akActor, akDisposition)
+  If disp < 0
+    disp = 0
+  ElseIf disp > 100
+    disp = 100
+  EndIf
+  Bool attacks = disp < akActor.GetFactionRank(akAggression) - 5
+  If abWorse && attacks
+    akActor.AddToFaction(akHostile)
+  ElseIf !abWorse && !attacks && akActor.IsInFaction(akHostile)
+    akActor.RemoveFromFaction(akHostile)
+  EndIf
+EndFunction
+
+; TES4 ModDisposition toward the player.
+Function ModDisposition(Actor akActor, Int aiDelta, Faction akDisposition, Faction akAggression, Faction akHostile) Global
+  If akActor == None || akDisposition == None || aiDelta == 0
+    Return
+  EndIf
+  akActor.SetFactionRank(akDisposition, ClampRank(GetDisposition(akActor, akDisposition) + aiDelta))
+  ApplyAttackRule(akActor, aiDelta < 0, akDisposition, akAggression, akHostile)
+EndFunction
+
+; TES4 SetAV Aggression: the tier the conversion chose, and the TES4 value the attack rule reads.
+Function SetAggression(Actor akActor, Float afTier, Int aiRaw, Faction akDisposition, Faction akAggression, Faction akHostile) Global
+  If akActor == None
+    Return
+  EndIf
+  akActor.SetActorValue("Aggression", afTier)
+  If akAggression == None || !akActor.IsInFaction(akAggression)
+    Return
+  EndIf
+  Int before = akActor.GetFactionRank(akAggression)
+  akActor.SetFactionRank(akAggression, ClampRank(aiRaw))
+  If aiRaw != before
+    ApplyAttackRule(akActor, aiRaw > before, akDisposition, akAggression, akHostile)
+  EndIf
+EndFunction
+
+; TES4 SetAV/ForceAV Confidence (ModAV passes GetConfidence + delta): the margin
+; moves by the change.  Without the faction, afValue is already a tier and is
+; written as one; an actor without a margin (not converted from TES4) is
+; Cowardly at 0 and Foolhardy above.
+Function SetConfidence(Actor akActor, Float afValue, Faction akFaction, Faction akMargin, Spell akFlee, GlobalVariable akScale) Global
+  If akActor == None
+    Return
+  EndIf
+  Int raw = afValue as Int
+  If akFaction == None || akMargin == None || !akActor.IsInFaction(akMargin)
+    If akFaction == None && raw > 4
+      raw = 4
+    ElseIf akFaction != None && raw > 0
+      raw = 4
+    ElseIf raw < 0
+      raw = 0
+    EndIf
+    SetConfidenceTier(akActor, raw)
+    Return
+  EndIf
+  raw = ClampRank(raw)
+  Int margin = ClampRank(akActor.GetFactionRank(akMargin) + raw - (GetConfidence(akActor, akFaction) as Int))
+  akActor.SetFactionRank(akFaction, raw)
+  akActor.SetFactionRank(akMargin, margin)
+  If akFlee != None && akScale != None && margin >= 0 && margin < akScale.GetValue()
+    akActor.AddSpell(akFlee, False)
+  EndIf
+  ApplyConfidence(akActor, akMargin, akScale)
+EndFunction
+
+; TES4 SetAV Speed.  Skyrim has no Speed attribute, so the write becomes a
+; SpeedMult that scales the actor's movement by the ratio TES4's walk formula
+; (Min + (Max - Min) * Speed / 100) gives against its authored Speed.  A
+; SpeedMult change only applies once carry weight changes, hence the nudge.
+Function SetTES4Speed(Actor akActor, Float afSpeed, Float afBaseSpeed, Float afWalkMin, Float afWalkMax) Global
+  If akActor == None
+    Return
+  EndIf
+  Float span = afWalkMax - afWalkMin
+  Float baseWalk = afWalkMin + span * afBaseSpeed / 100.0
+  If baseWalk <= 0.0
+    Return
+  EndIf
+  akActor.SetActorValue("SpeedMult", 100.0 * (afWalkMin + span * afSpeed / 100.0) / baseWalk)
+  akActor.ModActorValue("CarryWeight", 0.1)
+  akActor.ModActorValue("CarryWeight", -0.1)
+EndFunction
+
+; TES4 GetAV/GetBaseAV Speed: the inverse of SetTES4Speed, read back from the
+; actor's SpeedMult, so a script that saves Speed and later restores it (or
+; adds to it) works from the same baseline the write uses.
+Int Function GetTES4Speed(Actor akActor, Float afBaseSpeed, Float afWalkMin, Float afWalkMax) Global
+  Float span = afWalkMax - afWalkMin
+  If akActor == None || span == 0.0
+    Return Math.Floor(afBaseSpeed + 0.5)
+  EndIf
+  Float walk = (afWalkMin + span * afBaseSpeed / 100.0) * akActor.GetActorValue("SpeedMult") / 100.0
+  Return Math.Floor((walk - afWalkMin) * 100.0 / span + 0.5)
 EndFunction
 
 ; TES4 "PlayerFaction" converts to a plugin faction the RUNTIME player was
@@ -315,8 +736,52 @@ EndFunction
 ; Crime / Faction
 ; ==========================================================================
 
+; TES4 SetCrimeGold sets the WHOLE bounty; Skyrim splits it into a violent and
+; a non-violent part, so the violent part is cleared first.
 Function SetCrimeGold(Faction akFaction, Int aiGold) Global
-  akFaction.SetCrimeGold(aiGold)
+  If akFaction
+    akFaction.SetCrimeGoldViolent(0)
+    akFaction.SetCrimeGold(aiGold)
+  EndIf
+EndFunction
+
+; A bounty realm list holds the plugin's crime factions: the main realm, then
+; the realm behind a SetPlayerInSEWorld border (tes5_import/record_types/
+; crime.py). SetPlayerInSEWorld 1 marks the second realm active by adding the
+; list ITSELF: AddForm refuses a form already in the list, and GetAt returns
+; script-added forms before the authored ones (FormList.AddForm / GetAt,
+; SkyrimSE 1.6.1170 0x319e20 / 0x319bb0).
+Int Function CrimeRealm(FormList akRealms) Global
+  If akRealms && akRealms.HasForm(akRealms)
+    Return 1
+  EndIf
+  Return 0
+EndFunction
+
+; The crime faction of the realm the player is in.
+Faction Function CrimeFaction(FormList akRealms) Global
+  If !akRealms
+    Return None
+  EndIf
+  If CrimeRealm(akRealms) == 1
+    Faction second = akRealms.GetAt(2) as Faction
+    If second
+      Return second
+    EndIf
+    Return akRealms.GetAt(1) as Faction
+  EndIf
+  Return akRealms.GetAt(0) as Faction
+EndFunction
+
+; SetPlayerInSEWorld n: 1 activates the second realm, 0 the main one.
+Function SetCrimeRealm(FormList akRealms, Int aiRealm) Global
+  If !akRealms
+    Return
+  EndIf
+  akRealms.Revert()
+  If aiRealm > 0
+    akRealms.AddForm(akRealms)
+  EndIf
 EndFunction
 
 Int Function GetCrimeGold(Faction akFaction) Global
@@ -325,6 +790,22 @@ EndFunction
 
 Function ModCrimeGold(Faction akFaction, Int aiGold) Global
   akFaction.ModCrimeGold(aiGold, false)
+EndFunction
+
+; TES4 `SetFactionRank <faction> -1` REMOVES the actor from the faction;
+; Papyrus SetFactionRank "adds the actor to the faction if necessary" and -1 is
+; a rank it keeps (vanilla parks Lydia in PotentialMarriageFaction at -1), so
+; the 1:1 mapping JOINS the faction the script meant to leave.
+; See: docs/commentary/script_convert.md#setfactionrank--1-is-removal
+Function SetFactionRank(Actor akActor, Faction akFaction, Int aiRank) Global
+  If akActor == None || akFaction == None
+    Return
+  EndIf
+  If aiRank < 0
+    akActor.RemoveFromFaction(akFaction)
+  Else
+    akActor.SetFactionRank(akFaction, aiRank)
+  EndIf
 EndFunction
 
 ; ==========================================================================
@@ -411,6 +892,83 @@ Function EvaluatePackage(Actor akActor) Global
   akActor.EvaluatePackage()
 EndFunction
 
+; From a package's OnEnd fragment: re-checks `akActor`'s packages once `akEnded`
+; is no longer its current one (at most 2 s later). A re-check made inside the
+; end left the next package chosen but never started (Baurus at the sewer gate
+; wheel, runs 27c / 54c); a later one starts it.
+; See docs/commentary/tes5_import_package.md#once-per-day-completion-latch
+Function ReevaluateAfterEnd(Actor akActor, Package akEnded) Global
+  Int waited = 0
+  While akActor.GetCurrentPackage() == akEnded && waited < 20
+    Utility.Wait(0.1)
+    waited += 1
+  EndWhile
+  akActor.EvaluatePackage()
+EndFunction
+
+; The mod event `akQuest`'s TES4_StagePackageAlias aliases listen on.
+String Function StageEventName(Quest akQuest) Global
+  Return "TES4StageSet" + akQuest.GetFormID()
+EndFunction
+
+; After a converted SetStage: every alias of `akQuest` carrying its packages
+; re-checks its actor, as Oblivion did on its own, each on its own thread.
+; See docs/commentary/script_convert.md#setstage-re-evaluates-alias-packages
+Function StageSet(Quest akQuest) Global
+  akQuest.SendModEvent(StageEventName(akQuest))
+  akQuest.SendModEvent(AnyStageEventName())
+EndFunction
+
+; The event an alias gated on more quests than it can name listens on.
+String Function AnyStageEventName() Global
+  Return "TES4StageSetAny"
+EndFunction
+
+; TES4 SetStage on a quest with no converted script (one that has uses its TES4SetStage).
+Bool Function SetStage(Quest akQuest, Int aiStage) Global
+  Bool done = akQuest.SetStage(aiStage)
+  StageSet(akQuest)
+  Return done
+EndFunction
+
+; TES4 `StartConversation Player [topic]`.  Papyrus cannot open dialogue, so the
+; actor joins one alias of the topic's pool on the importer's TES4ForceGreets
+; quest; that alias's ForceGreet package walks over and opens the topic.
+Function ForceGreet(Quest akPool, Int aiFirst, Int aiCount, Actor akActor) Global
+  FillPoolSlot(akPool, aiFirst, aiCount, akActor)
+EndFunction
+
+; Hand `akActor` the package of one alias in aiFirst .. aiFirst+aiCount-1 of
+; `akPool` (TES4ForceGreets, TES4ForceFlees).  The package's OnEnd fragment
+; (TES4_ForceGreetDone) empties the alias again.  An actor already holding a
+; slot is only re-evaluated; with every slot busy, the first is taken over.
+Function FillPoolSlot(Quest akPool, Int aiFirst, Int aiCount, Actor akActor) Global
+  If !akPool || !akActor
+    Return
+  EndIf
+  If !akPool.IsRunning()
+    akPool.Start()
+  EndIf
+  ReferenceAlias freeSlot = None
+  Int i = 0
+  While i < aiCount
+    ReferenceAlias slot = akPool.GetAlias(aiFirst + i) as ReferenceAlias
+    ObjectReference held = slot.GetReference()
+    If held == akActor
+      akActor.EvaluatePackage()
+      Return
+    ElseIf !held && !freeSlot
+      freeSlot = slot
+    EndIf
+    i += 1
+  EndWhile
+  If !freeSlot
+    freeSlot = akPool.GetAlias(aiFirst) as ReferenceAlias
+  EndIf
+  freeSlot.ForceRefTo(akActor)
+  akActor.EvaluatePackage()
+EndFunction
+
 ; ==========================================================================
 ; Container
 ; ==========================================================================
@@ -428,20 +986,6 @@ EndFunction
 ; Magic / Actor State
 ; ==========================================================================
 
-; TES4 IsSpellTarget: "is this actor currently affected by spell X".  The
-; converter resolves X to the Skyrim MGEF the imported spell actually carries
-; and passes its Skyrim.esm FormID here.
-Bool Function HasMagicEffectByID(Actor akActor, Int aiFormID) Global
-  If akActor == None
-    Return False
-  EndIf
-  MagicEffect fx = Game.GetFormFromFile(aiFormID, "Skyrim.esm") as MagicEffect
-  If fx == None
-    Return False
-  EndIf
-  Return akActor.HasMagicEffect(fx)
-EndFunction
-
 ; TES4 GetIsCreature: Skyrim marks people with the ActorTypeNPC keyword
 ; (Skyrim.esm 0x00013794) on their race; converted creatures use generated
 ; races without it.
@@ -456,6 +1000,19 @@ Bool Function GetIsCreature(Actor akActor) Global
   Return !akActor.HasKeyword(npcKeyword)
 EndFunction
 
+; OBSE IsPlayable / IsPlayable2: the base form's playable flag (SKSE
+; Form.IsPlayable).  TES4 accepted a placed reference too; it answers for its base.
+Bool Function IsPlayable(Form akForm) Global
+  ObjectReference placed = akForm as ObjectReference
+  If placed != None
+    Return placed.GetBaseObject().IsPlayable()
+  EndIf
+  If akForm == None
+    Return False
+  EndIf
+  Return akForm.IsPlayable()
+EndFunction
+
 ; TES4 HasVampireFed: Skyrim's PlayerVampireQuest (Skyrim.esm 0x000EAFD5)
 ; tracks feeding — VampireStatus is 1 exactly while a vampire has recently fed
 ; (it climbs to 2..4 as the player goes hungry).
@@ -466,6 +1023,17 @@ Bool Function HasVampireFed() Global
     Return False
   EndIf
   Return vs.VampireStatus == 1
+EndFunction
+
+; TES4 EssentialDeathReload: the message, then the game ends as at the player's own death
+; (Skyrim reloads the last save). The wait lets the box be read first: it runs on once menus close.
+Function EssentialDeathReload(String asMessage) Global
+  If Game.GetPlayer().IsDead()
+    Return
+  EndIf
+  Debug.MessageBox(asMessage)
+  Utility.Wait(0.1)
+  Game.GetPlayer().Kill()
 EndFunction
 
 ; TES4 IsGuard: Skyrim guards are all members of GuardDialogueFaction
@@ -481,6 +1049,55 @@ Bool Function IsGuard(Actor akActor) Global
   Return akActor.IsInFaction(guardFaction)
 EndFunction
 
+; TES4 SetRestrained: the actor stays put but still thinks and talks -- Skyrim's
+; SetRestrained.  SetDontMove (what older builds wrote) only stops it being
+; pushed: MQ09's first ghost walked off to the Shrine while "restrained" (run
+; 60a).  A release also clears SetDontMove, so a save from an older build lets
+; its actor go, and re-picks its package: one picked while it was restrained
+; does not change (MQ09's ghost kept ToShrine, run 60a).  akRestrained (None on an old save) lists the restrained actors
+; for MoveTo below.  See docs/commentary/script_convert.md#setrestrained-is-restrained
+Function SetRestrained(Actor akActor, Bool abRestrained, FormList akRestrained) Global
+  If akActor == None
+    Return
+  EndIf
+  akActor.SetRestrained(abRestrained)
+  If !abRestrained
+    akActor.SetDontMove(False)
+    akActor.EvaluatePackage()
+  EndIf
+  If akRestrained && abRestrained
+    akRestrained.AddForm(akActor)
+  ElseIf akRestrained
+    akRestrained.RemoveAddedForm(akActor)
+  EndIf
+EndFunction
+
+; TES4 `setrestrained 0` then `addscriptpackage P` on one actor ran in one frame,
+; so the freed actor's first package was P.  Its AI is held off while both
+; change: armed while restrained, P ended at once and disarmed itself; freed
+; first, it walked off on its list package (MQ09's first ghost, run 60a).
+; See docs/commentary/script_convert.md#setrestrained-is-restrained
+Function ReleaseIntoPackage(Actor akActor, Package akPackage, FormList akPackages, FormList akArmed, FormList akRestrained) Global
+  If akActor == None
+    Return
+  EndIf
+  akActor.EnableAI(False)
+  AddScriptPackage(akActor, akPackage, akPackages, akArmed)
+  SetRestrained(akActor, False, akRestrained)
+  akActor.EnableAI(True)
+  akActor.EvaluatePackage()
+EndFunction
+
+; TES4 MoveTo: a restrained actor stays restrained.  Skyrim's MoveTo drops the
+; restraint of an actor whose package is moving it (MQ09's ghosts, run 60a), so
+; a listed actor is restrained again.  See docs/commentary/script_convert.md#setrestrained-is-restrained
+Function MoveTo(ObjectReference akRef, ObjectReference akTarget, Float afX, Float afY, Float afZ, FormList akRestrained) Global
+  akRef.MoveTo(akTarget, afX, afY, afZ)
+  If akRestrained && akRestrained.HasForm(akRef)
+    (akRef as Actor).SetRestrained(True)
+  EndIf
+EndFunction
+
 ; TES4 SetActorRefraction: no refraction control in Papyrus; a translucent
 ; alpha is the closest visual.  0 restores full opacity, anything else fades.
 Function SetActorRefraction(Actor akActor, Float afValue) Global
@@ -494,48 +1111,104 @@ Function SetActorRefraction(Actor akActor, Float afValue) Global
   EndIf
 EndFunction
 
-; TES4 (OBSE) ResetFallDamageTimer cleared the accumulated fall distance so the
-; next landing did no damage.
-;
-; Skyrim has NO vanilla-Papyrus route to this.  The console command survives
-; (opcode 4404) but is not bound to Papyrus; the GMST the fall-damage formula
-; reads (fJumpFallHeightMin) has readers but no vanilla writer — SKSE's
-; Game.SetGameSettingFloat does not compile against the vanilla headers this
-; pipeline builds with, verified against the compiler; and the blunt
-; alternatives (SetGhost, SetInvulnerable) suppress ALL damage, which would
-; make a levitation scroll grant temporary immortality — a far worse defect
-; than the one being fixed.
-;
-; So this keeps the ONE effect that is both faithful and scoped: heal the
-; actor back up by the fall's cost.  DamageResist is applied for the window
-; instead of invulnerability, so ordinary combat damage still lands.
-;
-; Callers are per-frame effect updates that stop when the effect ends, so the
-; resistance is (re)applied on each call and RestoreFallDamage removes it —
-; the paired on/off contract in docs/papyrus_conversion_notes.md.  The
-; modifier is tracked so repeated calls cannot stack it without bound.
-Function SuppressFallDamage(Actor akActor = None) Global
-  If akActor == None
-    akActor = Game.GetPlayer()
+; TES4 (OBSE) ResetFallDamageTimer: the fall in progress does no damage.
+; Skyrim's falling damage is reachable only through perk entry point Mod
+; Falling Damage, so the importer's TES4NoFallDamage spell carries a perk
+; multiplying it by 0 for a short window; a caller that polls every tick keeps
+; renewing it.  Other damage is untouched.
+; See docs/commentary/script_convert.md#fall-damage-is-a-perk
+Function SuppressFallDamage(Actor akActor, Spell akFallSpell) Global
+  If akActor && akFallSpell
+    akFallSpell.Cast(akActor, akActor)
   EndIf
-  If akActor == None
-    Return
-  EndIf
-  ; ForceActorValue, not Mod: this runs every update tick, and a modifier
-  ; would otherwise accumulate for as long as the effect lasts.
-  akActor.ForceActorValue("DamageResist", 10000.0)
 EndFunction
 
-; Undo SuppressFallDamage.  Emitted by the effect-finish path of any script
-; that called it; also safe to call blind.
-Function RestoreFallDamage(Actor akActor = None) Global
-  If akActor == None
-    akActor = Game.GetPlayer()
+; End a SuppressFallDamage window early: a magic effect's teardown.
+Function RestoreFallDamage(Actor akActor, Spell akFallSpell) Global
+  If akActor && akFallSpell
+    akActor.DispelSpell(akFallSpell)
   EndIf
-  If akActor == None
+EndFunction
+
+; TES4 re-dressed an NPC whenever its inventory changed: the best wearable per
+; slot, the upper-body piece first.  Skyrim never does, so a converted
+; AddItem / RemoveItem of armor on an actor is followed by this pass over its
+; inventory (the importer's outfit split uses the same order).  Jewelry is left
+; alone; the player is never touched.
+; See docs/commentary/script_convert.md#redress-after-inventory-change
+Function Redress(ObjectReference akRef) Global
+  Actor who = akRef as Actor
+  If !who || who == Game.GetPlayer() || who.IsDead()
     Return
   EndIf
-  akActor.ForceActorValue("DamageResist", 0.0)
+  Armor[] worn = new Armor[128]
+  Int count = 0
+  Int i = who.GetNumItems()
+  While i > 0 && count < 128
+    i -= 1
+    Armor piece = who.GetNthForm(i) as Armor
+    If piece && RedressSlots(piece) != 0
+      worn[count] = piece
+      count += 1
+    EndIf
+  EndWhile
+  Int taken = 0
+  While count > 0
+    Int best = 0
+    i = 1
+    While i < count
+      If RedressRank(worn[i]) > RedressRank(worn[best])
+        best = i
+      EndIf
+      i += 1
+    EndWhile
+    Armor pick = worn[best]
+    count -= 1
+    worn[best] = worn[count]
+    Int slots = RedressSlots(pick)
+    If Math.LogicalAnd(slots, taken) == 0
+      taken = Math.LogicalOr(taken, slots)
+      RedressWear(who, pick, slots)
+    EndIf
+  EndWhile
+EndFunction
+
+; Wear akPiece: take off what holds its slots, then equip it LOCKED -- an NPC's
+; AI swaps an unlocked non-outfit piece back to its outfit at once (measured on
+; Baurus, 2026-11-17: GetEquipped 0 right after an unlocked equip).
+Function RedressWear(Actor akWho, Armor akPiece, Int aiSlots) Global
+  If akWho.IsEquipped(akPiece)
+    Return
+  EndIf
+  Int n = 0
+  While n < 32
+    Int bit = Math.LeftShift(1, n)
+    If Math.LogicalAnd(aiSlots, bit) != 0
+      Form held = akWho.GetWornForm(bit)
+      If held && held != akPiece
+        akWho.UnequipItem(held, False, True)
+      EndIf
+    EndIf
+    n += 1
+  EndWhile
+  akWho.EquipItem(akPiece, True, True)
+EndFunction
+
+; A wearable's slots for Redress, without amulet and ring (they never contend).
+Int Function RedressSlots(Armor akPiece) Global
+  Return Math.LogicalAnd(akPiece.GetSlotMask(), Math.LogicalNot(0x60))
+EndFunction
+
+; Redress order: upper body first, then armor over clothing, then gold value.
+Float Function RedressRank(Armor akPiece) Global
+  Float rank = akPiece.GetGoldValue() as Float
+  If akPiece.GetWeightClass() != 2
+    rank += 1000000.0
+  EndIf
+  If Math.LogicalAnd(akPiece.GetSlotMask(), 0x4) != 0
+    rank += 2000000.0
+  EndIf
+  Return rank
 EndFunction
 
 ; ==========================================================================
@@ -626,11 +1299,30 @@ EndFunction
 ; ==========================================================================
 
 ; OBSE `IsModLoaded "Foo.esp"` asks whether a plugin is in the load order.
-; Vanilla Papyrus has no direct query, but Game.GetFormFromFile returns None
-; for a file that is not loaded, so asking it for the plugin's own header
-; record (0x00000000 in that file's local space) answers the same question.
+; SKSE's GetModByName answers 255 for a file that is not loaded, without the
+; log line Game.GetFormFromFile writes for a missing file (scripts poll this).
 Bool Function IsModLoaded(String asPlugin) Global
-  Return Game.GetFormFromFile(0x00000000, asPlugin) != None
+  Return Game.GetModByName(asPlugin) != 255
+EndFunction
+
+; A TES4 topic the player has been given: opens its unlock gate, when it has
+; one, and tells MorrowindRuntime the display name, so the TES3 topic of that
+; name is known too (TES3 topics are named by their text).
+; See: docs/commentary/morrowind_runtime.md#tes4-addtopic-teaches-tes3-topics
+Function AddTopic(GlobalVariable akGate, String asName) Global
+  If akGate
+    akGate.SetValue(1)
+  EndIf
+  If asName != ""
+    Game.GetPlayer().SendModEvent("TES3LearnTopic", asName)
+  EndIf
+EndFunction
+
+; OBSE `IsPluginInstalled "Name"` asks for an OBSE DLL plugin, not a data
+; file; the matching question here is whether an SKSE plugin of that name is
+; loaded. SKSE.GetPluginVersion answers -1 for a missing one.
+Bool Function IsPluginInstalled(String asPlugin) Global
+  Return SKSE.GetPluginVersion(asPlugin) >= 0
 EndFunction
 
 ; ==========================================================================
@@ -671,6 +1363,23 @@ Function ReleaseBreakaway(ObjectReference akRef) Global
   akRef.SetMotionType(1, true)
 EndFunction
 
+; TES4 playgroup on an animated object.  An object enabled a moment ago in a
+; loaded cell has no 3D yet, and PlayAnimation then does nothing; Oblivion played
+; the group once the object had loaded.  So wait, at most 5 real seconds, while
+; the object is enabled in an attached cell and still loading.
+; See docs/commentary/script_convert.md#playgroup-waits-for-3d
+Function PlayGroup(ObjectReference akRef, String asGroup) Global
+  If akRef == None
+    Return
+  EndIf
+  Cell home = akRef.GetParentCell()
+  Float giveUp = Utility.GetCurrentRealTime() + 5.0
+  While !akRef.Is3DLoaded() && !akRef.IsDisabled() && home && home.IsAttached() && Utility.GetCurrentRealTime() < giveUp
+    Utility.Wait(0.05)
+  EndWhile
+  akRef.PlayAnimation(asGroup)
+EndFunction
+
 ; SetDestroyed(1) deferred until the clip that preceded it has finished.
 ;
 ; TES4 pairs `playgroup <grp>` with `setDestroyed 1` on the very next line
@@ -696,6 +1405,66 @@ Function DestroyAfterAnimation(ObjectReference akRef, FormList akDestroyed) Glob
   ; Through the mirroring setter, never the bare native: a converted
   ; `getdestroyed` reads the FormList (see SetDestroyed/GetDestroyed below).
   SetDestroyed(akRef, akDestroyed)
+EndFunction
+
+; TES4 `target.Activate actor 1`: run the target's OnActivate block with `actor`
+; as its action ref.  A converted door script skips its block for an NPC that
+; merely walks through the door; the target is listed in akUses so its
+; OnActivate can tell this call from that, and takes itself off the list.
+Function ActivateScripted(ObjectReference akTarget, ObjectReference akActor, FormList akUses) Global
+  If akTarget == None
+    Return
+  EndIf
+  If akTarget.GetBaseObject() as Door
+    akUses.AddForm(akTarget)
+  EndIf
+  akTarget.Activate(akActor)
+EndFunction
+
+; TES4 `ref.AddScriptPackage Pkg`: the package runs above the actor's whole
+; list from this call until it completes, is removed, or another is added.
+; A forced package no actor lists is gated on a faction of its own; akPackages
+; and akArmed pair each such package with its faction by index.  A package
+; that is not in the list is only re-checked.
+; See docs/commentary/tes5_import_package.md#package-hosts
+Function AddScriptPackage(ObjectReference akRef, Package akPackage, FormList akPackages, FormList akArmed) Global
+  Actor who = akRef as Actor
+  If who == None
+    Return
+  EndIf
+  DisarmScriptPackages(who, akArmed)
+  Int at = -1
+  If akPackages && akArmed
+    at = akPackages.Find(akPackage)
+  EndIf
+  If at >= 0
+    who.AddToFaction(akArmed.GetAt(at) as Faction)
+  EndIf
+  who.EvaluatePackage()
+EndFunction
+
+; TES4 `ref.RemoveScriptPackage`: the actor goes back to its own list.
+Function RemoveScriptPackage(ObjectReference akRef, FormList akArmed) Global
+  Actor who = akRef as Actor
+  If who == None
+    Return
+  EndIf
+  DisarmScriptPackages(who, akArmed)
+  who.EvaluatePackage()
+EndFunction
+
+Function DisarmScriptPackages(Actor akActor, FormList akArmed) Global
+  If akArmed == None
+    Return
+  EndIf
+  Faction[] held = akActor.GetFactions(-128, 127)
+  Int i = held.Length
+  While i > 0
+    i -= 1
+    If akArmed.HasForm(held[i])
+      akActor.RemoveFromFaction(held[i])
+    EndIf
+  EndWhile
 EndFunction
 
 ; ==========================================================================
@@ -859,16 +1628,17 @@ EndFunction
 
 ; NON-BLOCKING SayLine, for callers on the ENGINE'S DISPATCH PATH.
 ;
-; ð NEVER BLOCK A FRAGMENT OR AN ENGINE CALLBACK.  SayLine waits for the
+; ð DON'T BLOCK A FRAGMENT OR AN ENGINE CALLBACK.  SayLine waits for the
 ; engine's OnBegin fragment, which takes 0.18s median but up to SAY_START_WAIT
 ; (1.5s) when the line is refused.  In an OnUpdate poll that wait costs only
-; that script's own tick.  In a QUEST STAGE FRAGMENT, an INFO fragment, or an
+; that script's own tick.  In a quest stage fragment, an INFO fragment, or an
 ; OnPackageEnd / OnPackageStart / OnHit / OnCombatStateChanged callback it
-; stalls the engine's own dispatch -- the stage transition, the package swap
-; or the hit reaction cannot complete until the Say resolves.  That is the
-; "massive stutter as a new line starts" the user reported: it accompanies a
-; STAGE CHANGE (CharacterGen's Fragment_Stage_0016 / _0044 both blocked), not
-; an ordinary polled line, which is why only some lines stutter.
+; holds up the rest of that fragment or event, and the events queued behind it.
+;
+; UNCONFIRMED: this wait was once blamed for the "massive stutter as a new line
+; starts" the user reported (CharacterGen's Fragment_Stage_0016 / _0044 both
+; blocked).  Moving those sites to this form never fixed the stutter; its
+; cause is still unknown.
 ;
 ; So on those paths we fire the line and DO NOT WAIT.  The countdown gets the
 ; caller's authored fallback (the topic's measured longest response, supplied
@@ -990,8 +1760,83 @@ Float Function SayLine(ObjectReference akSpeaker, Topic akTopic, Float afFallbac
   Return len
 EndFunction
 
+; A poll calling a StartConversation walk stores this before the walk and 0.0
+; after; while WalkPending, the poll's 5s insurance passes skip, so the walk is
+; not restarted mid-conversation.  Game time, so it survives a reload; the
+; 15-minute bound frees the poll if the walking pass aborted.
+Float Function WalkDeadline() Global
+  Return Utility.GetCurrentGameTime() + _GameDays(900.0)
+EndFunction
+
+Bool Function WalkPending(Float afUntil) Global
+  Return afUntil > 0.0 && Utility.GetCurrentGameTime() < afUntil
+EndFunction
+
+; Marks the speaker's Variable05 while ConverseLine waits for LineBegan to name the line.
+Float Function CONVERSE_PENDING() Global
+  Return -77.0
+EndFunction
+
+; The length of a line LineBegan names within 1.5s of a SayLine that gave up
+; on it (ConverseLine's speaker still carries CONVERSE_PENDING), else 0.0.
+Float Function _BegunLate(Actor akSpeaker) Global
+  Float t = 0.0
+  While t < 1.5
+    If akSpeaker.GetActorValue("Variable05") != CONVERSE_PENDING()
+      Float len = akSpeaker.GetActorValue("Variable09")
+      If len < 0.02
+        len = 4.0
+      EndIf
+      Return len
+    EndIf
+    Utility.Wait(0.1)
+    t += 0.1
+  EndWhile
+  Return 0.0
+EndFunction
+
+; One line of a TES4 StartConversation walk (the generated ConvRoute scripts):
+; say akTopic, wait the line out, and return the played INFO's low 24 FormID
+; bits, or 0 when nothing under the topic played.  Variable05 is borrowed only
+; from the Say until the line begins, then restored: FNV scripts keep state there.
+Int Function ConverseLine(Actor akSpeaker, Topic akTopic) Global
+  If akSpeaker == None || akTopic == None || (akSpeaker as Form).GetFormID() == 0x14
+    Return 0
+  EndIf
+  Float saved = akSpeaker.GetActorValue("Variable05")
+  Float len = 0.5
+  Int tries = 0
+  Int drops = 0
+  Bool busy = True
+  While busy && tries < 40
+    akSpeaker.SetActorValue("Variable05", CONVERSE_PENDING())
+    len = SayLine(akSpeaker, akTopic, 4.0)
+    busy = len == 0.5 && akSpeaker.GetActorValue("Variable05") == CONVERSE_PENDING()
+    If !busy && len <= 0.0 && drops < 2
+      ; SayLine gave up on the line.  It may still begin (a busy engine starts
+      ; it after SayLine's short wait), or it was refused for the moment: the
+      ; walk has no poll behind it to ask again, so ask again here.
+      len = _BegunLate(akSpeaker)
+      busy = len <= 0.0
+      drops += 1
+    EndIf
+    If busy
+      Utility.Wait(0.5)   ; another SayLine owns this speaker: retry, as SayLine's own callers do
+    EndIf
+    tries += 1
+  EndWhile
+  Int info = akSpeaker.GetActorValue("Variable05") as Int
+  akSpeaker.SetActorValue("Variable05", saved)
+  If len <= 0.0 || info <= 0
+    Return 0
+  EndIf
+  Utility.Wait(len + 0.6)
+  Return info
+EndFunction
+
 ; OnBegin fragment hook: the engine has selected this INFO and started it.
-Function LineBegan(ObjectReference akSpeakerRef, Float afLength) Global
+; aiInfo is the INFO's FormID; a waiting ConverseLine reads it back.
+Function LineBegan(ObjectReference akSpeakerRef, Float afLength, Int aiInfo = 0) Global
   Actor a = akSpeakerRef as Actor
   If a == None
     ; A talking activator (a speak-as speaker, see SpeakAs): no actor values of
@@ -1015,6 +1860,9 @@ Function LineBegan(ObjectReference akSpeakerRef, Float afLength) Global
   EndIf
   If (a as Form).GetFormID() == 0x14
     Return
+  EndIf
+  If aiInfo != 0 && a.GetActorValue("Variable05") == CONVERSE_PENDING()
+    a.SetActorValue("Variable05", Math.LogicalAnd(aiInfo, 0xFFFFFF) as Float)
   EndIf
   Float len = afLength
   If len <= 0.0
@@ -1254,49 +2102,89 @@ Float Function _GameDays(Float afSeconds) Global
   Return afSeconds * scale / 86400.0
 EndFunction
 
-; ============================================================= speak-as ==
+; ======================================================== reset interior ==
 ;
-; TES4 `Say <topic> <force-subtitles> <speak-as NPC> [<in-head>]` -- a line
-; spoken THROUGH a marker, shrine or door AS some NPC.  Skyrim's Say has no
-; speak-as argument and keys voice lookup on the SPEAKER, and a bare XMarker
-; STAT has no voice type at all, so the engine finds no voice folder and
-; plays nothing.
-;
-; The importer gives each such call site a talking activator (TACT) carrying
-; that NPC's voice type, placed at the emitter's authored position
-; (tes5_import/speaker_activators.py).  Speaking on THAT reference is what
-; gives the line a real voice folder.
-;
-; abInHead is TES4's fourth argument and Skyrim's own third one, native on
-; Say: the voice comes from inside the player's head, at full volume,
-; wherever the player stands -- as in Oblivion, where the Arena announcer,
-; the Daedric princes and Mankar Camoran were heard regardless of the
-; marker's position.
+; TES4 `ResetInterior <cell>`.  Oblivion's cell cleanup also returned the
+; references scripts had moved into the cell (the Arena's combatants live in a
+; holding cell and die in the match cell); Skyrim's Cell.Reset() resets only
+; references whose editor location is that cell.  The importer lists the
+; moved-in references per cell (tes5_import/dialogue/reset_interior.py), and
+; each one still in the cell goes back to its editor location.
 
-Function SpeakAs(ObjectReference akSpeaker, Bool abInHead = False, Topic akTopic = None) Global
-  ; TES4 `marker.Say <topic> 1 <speak-as NPC> <in-head>` -- a line spoken
-  ; THROUGH a marker/shrine/door AS some NPC.  The importer gives each such
-  ; call site a talking activator carrying that NPC's voice type
-  ; (tes5_import/speaker_activators.py); speaking on THAT reference is what
-  ; gives the line a real voice folder, which a bare XMarker STAT has not.
-  ;
-  ; 🛑 THIS IS A PLAIN Say().  Two cleverer deliveries were tried and both
-  ; KILLED THE AUDIO outright (worse than the defect they targeted):
-  ;   * a one-action SCEN per call site;
-  ;   * Activate() on the talking activator (vanilla's own idiom -- but
-  ;     vanilla activates a TACT the PLAYER walked up to, which is not what a
-  ;     polled announcer line is).
-  ; Say() on the voiced stand-in is the only form measured to produce audio.
-  ;
-  ; abInHead is TES4's fourth argument and Skyrim's own third one, native on
-  ; Say: the voice comes from inside the player's head, at full volume,
-  ; wherever they stand.  🛑 NEVER emulate it by MoveTo'ing the speaker onto
-  ; the player -- that teleports the marker out of its authored position
-  ; permanently and costs the line its audio.
-  If akSpeaker == None || akTopic == None
+Function ResetInterior(Cell akCell, FormList akMovers) Global
+  If akCell == None
     Return
   EndIf
-  akSpeaker.Say(akTopic, None, abInHead)
+  Int i = 0
+  If akMovers
+    i = akMovers.GetSize()
+  EndIf
+  While i > 0
+    i -= 1
+    ObjectReference r = akMovers.GetAt(i) as ObjectReference
+    If r && r.GetParentCell() == akCell
+      r.MoveToMyEditorLocation()
+    EndIf
+  EndWhile
+  akCell.Reset()
+EndFunction
+
+; ============================================================= speak-as ==
+;
+; TES4 `Say <topic> <force-subtitles> <speak-as NPC> [<voice-at-player>]` --
+; a line spoken THROUGH a marker, shrine or door AS some NPC.  Skyrim's Say
+; has no speak-as argument and keys voice lookup on the SPEAKER, and a bare
+; XMarker STAT has no voice type at all.
+;
+; The importer gives each (emitter, NPC) pair a talking activator (TACT)
+; carrying that NPC's voice type, placed at the emitter, and each call site a
+; one-action scene in which that TACT speaks the topic
+; (tes5_import/dialogue/speak_as.py).  A SCENE, not Say(): a non-actor's line
+; only advances -- and so only retires its subtitle -- while a scene's
+; dialogue action drives it, which is how vanilla speaks through its TACTs
+; (Azura, the Night Mother, Potema).  A new TES4 Say cut the old line off:
+; ForceStart does that for another scene's line, but on the SAME scene while
+; it still plays it is ignored, so that scene is stopped first (the Arena
+; announcer's second line comes 6.8s after a 6.6s first one, inside the
+; line's 0.5s subtitle tail).
+;
+; The voice comes from each INFO's Speaker (the NPC TES4 spoke as), and
+; TES4's voice-at-the-player flag is the INFO's 2D audio output -- both set by
+; the importer, so nothing here moves or names a speaker.  akTopic is the
+; caller's, for its length fallback; the scene names the line.
+;
+; TES4 Say chose its INFO AT THE CALL, and callers rely on it: the Arena
+; announcer sets CityAnnounced = 1 on the next line, and the welcome INFO
+; requires CityAnnounced == 0.  A scene chooses when its action starts, a
+; moment later, so abWait holds the caller until the INFO's Begin fragment
+; reports the line (LineBegan -> the player's Variable09), capped at
+; SAY_START_WAIT.  The converter passes it only where blocking is safe (a
+; poll, never a fragment or engine callback -- see SayLineNoWait).
+
+Function SpeakAs(Topic akTopic = None, Scene akScene = None, Bool abWait = False) Global
+  If akScene == None
+    Return
+  EndIf
+  Actor gp = Game.GetPlayer()
+  If abWait
+    gp.SetActorValue("Variable09", 0.0)
+  EndIf
+  If akScene.IsPlaying()
+    akScene.Stop()
+    Float t = 0.0
+    While t < 1.0 && akScene.IsPlaying()
+      Utility.Wait(0.05)
+      t += 0.05
+    EndWhile
+  EndIf
+  akScene.ForceStart()
+  If abWait
+    Float w = 0.0
+    While w < SAY_START_WAIT() && gp.GetActorValue("Variable09") == 0.0
+      Utility.Wait(0.05)
+      w += 0.05
+    EndWhile
+  EndIf
 EndFunction
 
 ; The measuring form: `set T to marker.Say topic 1 voice 1` -- returns the
@@ -1304,24 +2192,12 @@ EndFunction
 ; INFO's Begin fragment reports it through LineBegan, which for a non-actor
 ; speaker stashes it on the PLAYER (Variable09; the game-wide "a line is
 ; playing until" record in Variable07 is stamped as for any speaker).
-Float Function SpeakAsLine(ObjectReference akSpeaker, Float afFallbackLength, Bool abInHead = False, Topic akTopic = None) Global
-  ; The measuring form: TES4 `set T to marker.Say topic 1 voice 1` returned
-  ; the selected line's length and the caller counted it down.  Delivery is
-  ; the plain Say above (the only form measured to produce audio); the length
-  ; comes from the INFO's Begin fragment, which stashes it on the PLAYER for a
-  ; non-actor speaker (see LineBegan).
-  If akSpeaker == None || akTopic == None
+Float Function SpeakAsLine(Float afFallbackLength, Topic akTopic = None, Scene akScene = None) Global
+  If akScene == None
     Return afFallbackLength
   EndIf
-  Actor gp = Game.GetPlayer()
-  gp.SetActorValue("Variable09", 0.0)
-  SpeakAs(akSpeaker, abInHead, akTopic)
-  Float t = 0.0
-  While t < SAY_START_WAIT() && gp.GetActorValue("Variable09") == 0.0
-    Utility.Wait(0.05)
-    t += 0.05
-  EndWhile
-  Float len = gp.GetActorValue("Variable09")
+  SpeakAs(akTopic, akScene, True)
+  Float len = Game.GetPlayer().GetActorValue("Variable09")
   If len <= 0.0
     Return afFallbackLength      ; no length reported: fall back, never 0
   EndIf
@@ -1332,8 +2208,8 @@ Float Function SpeakAsLine(ObjectReference akSpeaker, Float afFallbackLength, Bo
 EndFunction
 
 ; The non-blocking form, for the engine's dispatch path (see SayLineNoWait).
-Float Function SpeakAsLineNoWait(ObjectReference akSpeaker, Float afFallbackLength, Bool abInHead = False, Topic akTopic = None) Global
-  SpeakAs(akSpeaker, abInHead, akTopic)
+Float Function SpeakAsLineNoWait(Float afFallbackLength, Topic akTopic = None, Scene akScene = None) Global
+  SpeakAs(akTopic, akScene)
   Return afFallbackLength
 EndFunction
 
@@ -1524,7 +2400,10 @@ EndFunction
 ; some route that never ran a gate OnActivate (a coc, a scripted MoveTo).
 ; Nothing sensible can be done in that case, and teleporting to a stale
 ; reference would be worse than staying put.
-Bool Function CloseCurrentOblivionGate(FormList akDestroyed) Global
+;
+; A closed gate adds 1 to akGatesShut, Oblivion Gates Shut, as Oblivion.exe's
+; own CloseCurrentOblivionGate adds 1 to the player's misc stat 13.
+Bool Function CloseCurrentOblivionGate(FormList akDestroyed, GlobalVariable akGatesShut = None) Global
   ObjectReference gate = GetCurrentOblivionGate()
   If gate == None
     Return False
@@ -1548,6 +2427,9 @@ Bool Function CloseCurrentOblivionGate(FormList akDestroyed) Global
   ; the gate's own GameMode poll re-applies OblivionStormTamriel while the
   ; player stands next to it.
   Weather.ReleaseOverride()
+  If akGatesShut
+    akGatesShut.Mod(1)
+  EndIf
   Return True
 EndFunction
 

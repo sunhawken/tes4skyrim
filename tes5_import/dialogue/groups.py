@@ -9,11 +9,14 @@ See: docs/commentary/tes5_import_dialogue.md#branches-views-topic-ownership
 
 import re
 import struct
-from collections import defaultdict
+from collections import Counter, defaultdict
 from ..base.text_reader import get_formid_index_offset, info_result_script
 from .quest import (bark_choice_gate_bytes, compute_quest_priorities,
                     has_quest_state_condition, quest_state_ctdas)
+from ..base.vanilla_quests import engine_quest_edid
 from ..base.writer import pack_group
+from .arrest import force_greet_topic
+from .barks_morrowind import bark_voice_types
 from ..record_types.common import (get_formid, get_int, get_str,
                                    pack_record, pack_string_subrecord,
                                    pack_subrecord)
@@ -28,23 +31,27 @@ from ..base.conditions import (
     build_or_chain,
     convert_ctda,
     convert_ctda_list_with_strings,
+    get_speak_as_topics,
     has_any_conditions,
     has_audience_condition,
-    needs_origin_gate,
     read_func_param_fids,
     read_getisid_fids,
     shared_state_conditions,
 )
 
 from .converter import (DIAL_TYPE_CONVERSATION, SERVICE_MENU_SCRIPTS,
-    SERVICE_MENU_TOPICS, CONV_KEEP_EDIDS,
+    CONV_KEEP_EDIDS,
     is_npc_to_npc_conversation, make_conversation_quest,
     make_generic_quest, register_conversation_chains,
-    build_say_topic_dispositions, classify_topic, collect_tclt_target_fids,
-    convert_DIAL, convert_INFO, make_dlbr, make_dlvw, service_menu_kind,
+    SCENE_TOPIC, classify_topic, collect_tclt_target_fids,
+    convert_DIAL, convert_INFO, in_dialogue_gate, make_dlbr, make_dlvw, service_menu_entry,
+    service_menu_kind,
     should_skip_dial, voice_file_prefix,
-    GREET_TOPIC_BY_QUEST, EMPTY_DIAL_FIDS, SAY_TOPIC_DISPOSITIONS,
-    lip_texts, startable_quests)
+    GREET_TOPIC_BY_QUEST, EMPTY_DIAL_FIDS, lip_texts, startable_quests)
+from .conversation_routes import reachable_topics
+from .say_topics import (FORCE_GREET_SLOTS, SAY_TOPIC_DISPOSITIONS,
+                         build_say_topic_dispositions)
+from .speak_as import SCENE_QUEST_EDID, scene_quest_fid, speaker_subrecords
 
 
 def _scan_startable_quests(by_type: dict) -> set:
@@ -110,6 +117,8 @@ def _quest_lookup_tables(by_type, dials, fid_to_edid, generic_quest_fid,
             if edid:
                 quest_edid_by_fid[qfid] = edid
     quest_edid_by_fid[generic_quest_fid] = 'TES4DialogueGeneric'
+    if scene_quest_fid():
+        quest_edid_by_fid[scene_quest_fid()] = SCENE_QUEST_EDID
     quest_fid_by_edid = {e.lower(): f
                          for f, e in quest_edid_by_fid.items() if e}
 
@@ -127,28 +136,67 @@ def _quest_lookup_tables(by_type, dials, fid_to_edid, generic_quest_fid,
     return quest_edid_by_fid, quest_fid_by_edid, quest_dialog_ctdas
 
 
+def _is_script_topic(dial_rec, dial_fid) -> bool:
+    """A script-driven Conversation topic, kept off the menu (not CONV_KEEP_EDIDS)."""
+    return (get_int(dial_rec, 'DATA.Type') == DIAL_TYPE_CONVERSATION
+            and get_str(dial_rec, 'EditorID', '') not in CONV_KEEP_EDIDS
+            and (dial_fid & 0xFFFFFF) in SAY_TOPIC_DISPOSITIONS)
+
+
 def _branch_is_linked(dial_rec, dial_fid, tclt_targets, bark_choice_targets,
-                      unlock_plan, stats) -> bool:
+                      unlock_plan) -> bool:
     """True when this topic's DLBR must be a Normal (non-top-level) branch.
 
-    A TCLT target never explicitly AddTopic'd stays off the menu; one reached
-    from a bark/greeting choice does not.  Script-driven Conversation topics
-    are forced Normal, except CONV_KEEP_EDIDS.
+    A TCLT target or a StartConversation force-greet topic never explicitly
+    AddTopic'd stays off the menu; a TCLT target reached from a bark/greeting
+    choice does not.  Script-driven Conversation topics and topics nothing
+    ever adds are forced Normal.
 
     See: docs/commentary/tes5_import_dialogue.md#branches-views-topic-ownership
     """
-    is_linked = (dial_fid in tclt_targets
-                 and dial_fid not in bark_choice_targets
-                 and (dial_fid & 0xFFFFFF) not in unlock_plan['gated']
-                 and (dial_fid & 0xFFFFFF)
-                 not in unlock_plan.get('script_added', ()))
-    if (get_int(dial_rec, 'DATA.Type') == DIAL_TYPE_CONVERSATION
-            and get_str(dial_rec, 'EditorID', '') not in CONV_KEEP_EDIDS
-            and (dial_fid & 0xFFFFFF) in SAY_TOPIC_DISPOSITIONS):
-        is_linked = True
-        stats['script_topic_unlisted'] = \
-            stats.get('script_topic_unlisted', 0) + 1
-    return is_linked
+    fid24 = dial_fid & 0xFFFFFF
+    never_added = (fid24 not in unlock_plan['gated']
+                   and fid24 not in unlock_plan.get('script_added', ()))
+    forced = get_str(dial_rec, 'EditorID', '').lower() in FORCE_GREET_SLOTS
+    return ((never_added and (forced or (dial_fid in tclt_targets
+                                         and dial_fid not in bark_choice_targets)))
+            or _is_script_topic(dial_rec, dial_fid)
+            or fid24 in unlock_plan.get('unreachable', ()))
+
+
+def _topic_branch(dial_rec, writer, owner_qfid, tclt_targets,
+                  bark_choice_targets, unlock_plan, stats) -> tuple:
+    """(DLBR FormID, DLBR bytes) for a conversation topic; top-level unless linked."""
+    dial_fid = get_formid(dial_rec, 'FormID')
+    edid = get_str(dial_rec, 'EditorID', '')
+    is_linked = _branch_is_linked(dial_rec, dial_fid, tclt_targets,
+                                  bark_choice_targets, unlock_plan)
+    if _is_script_topic(dial_rec, dial_fid):
+        stats['script_topic_unlisted'] += 1
+    dlbr_fid = writer.derive_formid('DLBR', dial_fid)
+    dlbr_edid = f'TES4_{edid}_Branch' if edid else f'TES4_DLBR_{dlbr_fid:08X}'
+    stats['branches'] += 1
+    return dlbr_fid, make_dlbr(dlbr_fid, dlbr_edid, owner_qfid, dial_fid,
+                               top_level=not is_linked)
+
+
+def _menu_topic_fids(dials, info_by_dial, tclt_targets, bark_choice_targets,
+                     unlock_plan) -> set:
+    """FormIDs of the conversation topics that get a top-level branch.
+
+    A bark's choice into one of these is dropped: see
+    docs/commentary/tes5_import_dialogue.md#info-tclt-choice-filter
+    """
+    out = set()
+    for d in dials:
+        fid = get_formid(d, 'FormID')
+        if should_skip_dial(d) or fid in EMPTY_DIAL_FIDS or not info_by_dial.get(fid):
+            continue
+        is_bark = classify_topic(get_str(d, 'EditorID', ''), get_int(d, 'DATA.Type'))[3]
+        if not is_bark and not _branch_is_linked(
+                d, fid, tclt_targets, bark_choice_targets, unlock_plan):
+            out.add(fid)
+    return out
 
 
 def _bark_dial_fids(dials) -> set:
@@ -171,6 +219,34 @@ def _bark_dial_fids(dials) -> set:
     return out
 
 
+def _fill_say_dispositions(by_type: dict) -> None:
+    """Fill SAY_TOPIC_DISPOSITIONS; must run before the first should_skip_dial.
+
+    is_npc_to_npc_conversation reads it to spare script-spoken Type-1 topics,
+    including those a StartConversation walk reaches through Choice links.
+    Engine bark topics keep their non-identity RunOn=Target conditions.
+    See: docs/commentary/tes5_import_dialogue.md#engine-fired-say-topics
+    """
+    engine_fired = frozenset(
+        get_formid(d, 'FormID') & 0xFFFFFF for d in by_type.get('DIAL', [])
+        if classify_topic(get_str(d, 'EditorID', ''), get_int(d, 'DATA.Type'))[3])
+    SAY_TOPIC_DISPOSITIONS.clear()
+    SAY_TOPIC_DISPOSITIONS.update(build_say_topic_dispositions(by_type, engine_fired))
+    for fid in reachable_topics(by_type):
+        SAY_TOPIC_DISPOSITIONS.setdefault(fid & 0xFFFFFF, ('drop', None))
+    kinds = Counter(v[0] for v in SAY_TOPIC_DISPOSITIONS.values())
+    print(f"    say-driven topics: {len(SAY_TOPIC_DISPOSITIONS)} "
+          f"({kinds['ref']} retargeted to a unique ref, {kinds['drop']} drop "
+          f"target-conditions, {kinds['target']} engine-fired drop identity only)")
+
+
+def _conversation_choices(info_rec: dict, bark_dial_fids) -> list:
+    """The topics `info_rec` offers as choices, leaving out bark topics."""
+    fids = [get_formid(info_rec, f'Choice[{i}]') for i in range(get_int(info_rec, 'ChoiceCount'))]
+    fids.append(get_formid(info_rec, 'TCLT.Choice'))
+    return [fid for fid in fids if fid and fid not in bark_dial_fids]
+
+
 def _scan_bark_choice_links(dials, infos, offset, script_vars):
     """Bark topics and the conversation topics their choices reveal.
 
@@ -186,17 +262,11 @@ def _scan_bark_choice_links(dials, infos, offset, script_vars):
 
     bark_choice_targets = set()
     bark_choice_gate = defaultdict(list)
+    revealers = defaultdict(list)
     conv_choice_targets = set()
     for info_rec in infos:
         is_bark_info = get_formid(info_rec, 'ParentDIAL') in bark_dial_fids
-        targets_here = []
-        for i in range(get_int(info_rec, 'ChoiceCount')):
-            cfid = get_formid(info_rec, f'Choice[{i}]')
-            if cfid and cfid not in bark_dial_fids:
-                targets_here.append(cfid)
-        cfid = get_formid(info_rec, 'TCLT.Choice')
-        if cfid and cfid not in bark_dial_fids:
-            targets_here.append(cfid)
+        targets_here = _conversation_choices(info_rec, bark_dial_fids)
         if not targets_here:
             continue
         if not is_bark_info:
@@ -205,6 +275,10 @@ def _scan_bark_choice_links(dials, infos, offset, script_vars):
         gate = quest_state_ctdas(info_rec, offset, script_vars)
         for cfid in targets_here:
             bark_choice_gate[cfid].append(gate)
+            revealers[cfid].append(info_rec)
+    for cfid, recs in revealers.items():
+        if len(recs) == 1:
+            bark_choice_gate[cfid] = [quest_state_ctdas(recs[0], offset, script_vars, place=True)]
 
     for cfid, gates in bark_choice_gate.items():
         if cfid in conv_choice_targets:
@@ -220,8 +294,10 @@ def _scan_bark_choice_links(dials, infos, offset, script_vars):
 def _quest_npc_sets(dials, info_by_dial) -> dict:
     """Per-quest NPC FormID sets, for fallback identity gating.
 
-    Service-menu topics are excluded: their per-merchant GetIsIDs would widen
-    the identity gate on every other topic the quest owns.
+    Each line counts toward its own QSTI quest, so a shared topic such as
+    GREETING credits every quest it serves.  Service-menu topics are excluded:
+    their per-merchant GetIsIDs would widen the identity gate on every other
+    topic the quest owns.
 
     See: docs/commentary/tes5_import_dialogue.md#voice-types-conditions
     """
@@ -229,13 +305,12 @@ def _quest_npc_sets(dials, info_by_dial) -> dict:
     for d in dials:
         if should_skip_dial(d) or service_menu_kind(d):
             continue
-        qfid = get_formid(d, 'Quest[0]')
-        if not qfid:
-            continue
-        npcs = read_getisid_fids_for_topic(
-            info_by_dial.get(get_formid(d, 'FormID'), []))
-        if npcs:
-            quest_npc_fids[qfid] |= npcs
+        topic_qfid = get_formid(d, 'Quest[0]')
+        for info_rec in info_by_dial.get(get_formid(d, 'FormID'), []):
+            qfid = get_formid(info_rec, 'QSTI.Quest') or topic_qfid
+            if qfid:
+                quest_npc_fids[qfid] |= read_getisid_fids(info_rec,
+                                                          positive_only=True)
     return quest_npc_fids
 
 
@@ -337,18 +412,7 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
     # Populated on demand by _build_bark_topics_per_quest; drained into SGE.
     bark_generic_quests = {}   # source DIAL EditorID -> synthetic quest FID
 
-    # --- Pre-scan ---
-    # Say-driven topics MUST be resolved before the first should_skip_dial call:
-    # is_npc_to_npc_conversation consults _SAY_TOPIC_DISPOSITIONS to spare the
-    # 293 scripted Type-1 topics (CharGen, Announcers, Daedric speeches) from
-    # the NPC-to-NPC drop. With an empty map every one of them would be skipped
-    # and the tutorial would lose its dialogue.
-    SAY_TOPIC_DISPOSITIONS.clear()
-    SAY_TOPIC_DISPOSITIONS.update(build_say_topic_dispositions(by_type))
-    n_ref = sum(1 for v in SAY_TOPIC_DISPOSITIONS.values() if v[0] == 'ref')
-    print(f"    say-driven topics: {len(SAY_TOPIC_DISPOSITIONS)} "
-          f"({n_ref} retargeted to a unique ref, "
-          f"{len(SAY_TOPIC_DISPOSITIONS) - n_ref} drop target-conditions)")
+    _fill_say_dispositions(by_type)
 
     # --- NPC-to-NPC conversation chains ------------------------------------
     # Quest-advancing engine-scheduled conversations (CharacterGen 26→27,
@@ -463,7 +527,9 @@ def build_dialog_groups(by_type: dict, writer, npc_to_vtyp: dict,
         quest_edid_by_fid=quest_edid_by_fid, quest_priority=quest_priority,
         quest_fid_by_edid=quest_fid_by_edid,
         quest_dialog_ctdas=quest_dialog_ctdas, vtyp_edid_by_fid=vtyp_edid_by_fid,
-        bark_dial_fids=bark_dial_fids, stats=stats, script_vars=script_vars)
+        bark_dial_fids=bark_dial_fids, stats=stats, script_vars=script_vars,
+        menu_topic_fids=_menu_topic_fids(dials, info_by_dial, tclt_targets,
+                                         bark_choice_targets, unlock_plan))
     bark_content, bark_sge = _build_bark_pass(
         bark_dials, info_by_dial, writer,
         bark_generic_quests, bark_ctx)
@@ -543,7 +609,7 @@ def _topic_voice_types(child_infos: list, npc_to_vtyp: dict, offset: int) -> set
     return vtyps
 
 
-def _service_gate(service_kind: str) -> bytes:
+def service_gate(service_kind: str) -> bytes:
     """The CTDAs gating a Barter/Training menu topic, or b''.
 
     Two ANDed conditions: WHO offers the service (merchant marker faction for
@@ -606,7 +672,7 @@ def _record_voice_entry(info_rec, owner_qfid, ctx) -> None:
     """
     info_fid = get_formid(info_rec, 'FormID')
     prefix = voice_file_prefix(
-        ctx['quest_edid_by_fid'].get(owner_qfid, ''), ctx['edid'])
+        engine_quest_edid(ctx['quest_edid_by_fid'].get(owner_qfid, '')), ctx['edid'])
     for ri in range(get_int(info_rec, 'ResponseCount')):
         rtext = get_str(info_rec, f'Response[{ri}].ResponseText')
         rnum = (get_int(info_rec, f'Response[{ri}].ResponseNumber')
@@ -623,6 +689,103 @@ def _record_voice_entry(info_rec, owner_qfid, ctx) -> None:
     ctx['voice_map'][info_fid & 0xFFFFFF] = prefix
 
 
+def _topic_shape(edid: str, dtype: int, dial_fid: int) -> tuple:
+    """(category, subtype, snam, is_bark, is_scene) of one topic.
+
+    A topic only speak-as sites speak is delivered by a scene, so it takes the
+    Scene shape every vanilla scene topic has, and no branch.
+    See: docs/commentary/tes5_import_dialogue.md#speaker-activator-construction
+    """
+    category, subtype, snam, is_bark = classify_topic(edid, dtype)
+    if (dial_fid & 0xFFFFFF) in get_speak_as_topics():
+        return (*SCENE_TOPIC, is_bark, True)
+    return category, subtype, snam, is_bark, False
+
+
+def _topic_owner(dial_rec, generic_quest_fid: int, is_scene: bool) -> tuple:
+    """(TES4 quest, owning quest) of a topic.
+
+    A single-quest topic keeps its own quest, so Skyrim evaluates its INFOs
+    only while that quest runs -- Oblivion's QSTI gating. A shared topic, or
+    one filed under a quest nothing can start (Oblivion never gated on QSTI;
+    Nehrim's MQ01Topic01 holds MQ00's completion stage), goes to the
+    always-running generic quest, and each INFO is gated on its own quest.
+    A scene topic belongs to its scenes' quest, which names its voice files.
+    See: docs/commentary/tes5_import_dialogue.md#speaker-activator-construction
+    """
+    orig = get_formid(dial_rec, 'Quest[0]')
+    if is_scene and scene_quest_fid():
+        return orig, scene_quest_fid()
+    if (orig and get_int(dial_rec, 'QuestCount') <= 1
+            and (not startable_quests or orig in startable_quests)):
+        return orig, orig
+    return orig, generic_quest_fid
+
+
+def _topic_audience(child_infos, conversation: bool, service_kind,
+                    orig_quest_fid: int, offset: int, quest_npc_fids: dict,
+                    npc_to_vtyp: dict) -> dict:
+    """The NPCs and voice types a conversation topic's generic lines reach.
+
+    A service topic inherits neither: its lines serve every vendor or trainer,
+    and the service-faction gate is its filter.
+    """
+    npcs = set()
+    if conversation:
+        npcs = read_getisid_fids_for_topic(child_infos)
+        for info_rec in child_infos:
+            npcs |= read_getisid_fids(info_rec, offset=offset)
+        if not npcs and orig_quest_fid:
+            npcs = quest_npc_fids.get(orig_quest_fid, set())
+    vtyps = (set() if service_kind
+             else _topic_voice_types(child_infos, npc_to_vtyp, offset))
+    return dict(topic_npc_fids=npcs, topic_vtyps=vtyps)
+
+
+def _unlock_gate(dial_fid: int, unlock_plan: dict, unlock_globals: dict) -> bytes:
+    """`GetGlobalValue(TES4Unlock_<topic>) == 1` for an AddTopic-gated topic.
+
+    AddTopic is Oblivion's central visibility mechanic; revealer fragments set
+    the global.
+    """
+    gname = unlock_plan['gated'].get(dial_fid & 0xFFFFFF)
+    gfid = unlock_globals.get(gname) if gname else None
+    if not gfid:
+        return b''
+    return pack_subrecord('CTDA', build_ctda(FUNC_GET_GLOBAL_VALUE, param1=gfid))
+
+
+def _shared_state_gate(child_infos, offset: int) -> bytes:
+    """The world-state gate every other line of a topic shares.
+
+    A conditionless line inherits it: Oblivion scoped the loose line through
+    the topic's AddTopic gate, and Skyrim has no such scoping, so the line
+    would keep the topic alive forever (see shared_state_conditions).
+    """
+    parts = []
+    for raw_hex in shared_state_conditions(child_infos):
+        try:
+            ctda = convert_ctda(bytes.fromhex(raw_hex), offset)
+        except (ValueError, struct.error):
+            continue
+        if ctda is not None:
+            parts.append(pack_subrecord('CTDA', ctda))
+    return b''.join(parts)
+
+
+def _chargen_fallback_box(writer):
+    """The chargen fail-open fallback id slots, shared across the import run.
+
+    Fixed slots in the reserved gap (base+0x60..0x7F), so adding one can never
+    shift an allocated id.
+    """
+    if not hasattr(writer, 'chargen_fallback_box'):
+        base = getattr(writer, 'chargen_fid_base', 0)
+        writer.chargen_fallback_box = ([base + 0x60, base + 0x80] if base
+                                       else None)
+    return writer.chargen_fallback_box
+
+
 def _build_one_topic(dial_rec, info_by_dial, writer, offset,
                      generic_quest_fid, tclt_targets, bark_choice_targets,
                      bark_choice_gate,
@@ -637,131 +800,38 @@ def _build_one_topic(dial_rec, info_by_dial, writer, offset,
     (dial_group_bytes, dlbr_bytes, owner_quest_fid, dial_fid, dlbr_fid)."""
     dial_fid = get_formid(dial_rec, 'FormID')
     edid = get_str(dial_rec, 'EditorID', '')
-    dtype = get_int(dial_rec, 'DATA.Type')
-
-    # Service-menu topics (Barter/Training): the Oblivion NPC lines become the
-    # responses of a player-selectable topic whose prompt is synthesized and
-    # whose INFOs open the Skyrim menu (fragment) — gated so the topic only
-    # shows on NPCs that actually offer the service. Gate: barter -> the
-    # merchant marker faction; training -> the trainer faction. ONE condition
-    # either way: a Barter gate that OR-chained every vendor faction put 25-30
-    # CTDAs on each INFO, past anything vanilla ships (max 22, max OR-run 20),
-    # and the engine silently dropped every gated line — merchants lost the
-    # topic while 1-condition Training kept working.
-    service_kind = service_menu_kind(dial_rec)
+    service_kind, service_prompt = service_menu_entry(dial_rec)
     service_gate_bytes = b''
     if service_kind:
-        service_gate_bytes = _service_gate(service_kind)
+        service_gate_bytes = service_gate(service_kind)
         if not service_gate_bytes:
             return b'', b'', 0, 0, 0
-        dial_rec['FULL'] = SERVICE_MENU_TOPICS[edid][1]
+        dial_rec['FULL'] = service_prompt
 
-    child_infos = info_by_dial.get(dial_fid, [])
-    # Oblivion's arbitration: highest quest priority wins, then file order.
-    # Skyrim walks the topic's INFO list in physical order, so bake it in.
     child_infos = sorted(
-        child_infos,
+        info_by_dial.get(dial_fid, []),
         key=lambda r: -quest_priority.get(get_formid(r, 'QSTI.Quest'), 0))
+    category, subtype, snam, is_bark, is_scene = _topic_shape(
+        edid, get_int(dial_rec, 'DATA.Type'), dial_fid)
+    orig_quest_fid, owner_qfid = _topic_owner(dial_rec, generic_quest_fid, is_scene)
 
-    category, subtype, snam, is_bark = classify_topic(edid, dtype)
-
-    # --- Owning quest. A single-quest topic is owned by its original quest
-    # (remapped): Skyrim then only evaluates its INFOs while that quest runs,
-    # which is exactly Oblivion's QSTI gating. A SHARED topic (multiple QSTI
-    # quests) has no single faithful owner — Skyrim would gate every INFO by
-    # whichever quest we picked — so it is owned by the always-running generic
-    # quest and each INFO is gated on its own quest below.
-    #
-    # ...but only when that quest can ever RUN.  Oblivion's QSTI is an
-    # organisational grouping the engine never gates on, so a topic filed under
-    # a quest nothing starts still worked there; Skyrim's QNAM is a hard
-    # runtime gate, so the same topic would be permanently dead.  Those fall
-    # back to the always-running generic quest, exactly like a shared topic.
-    # (Nehrim's MQ01Topic01 is filed under the vestigial MQ01, and its INFO
-    # holds the only `SetStage MQ00 65` — MQ00's completion stage.)
-    orig_quest_fid = get_formid(dial_rec, 'Quest[0]')
-    quest_count = get_int(dial_rec, 'QuestCount')
-    if (orig_quest_fid and quest_count <= 1
-            and (not startable_quests or orig_quest_fid in startable_quests)):
-        owner_qfid = orig_quest_fid
-    else:
-        owner_qfid = generic_quest_fid
-
-    # --- DLBR (conversation topics only; barks have no branch) ---
-    dlbr_fid = 0
-    dlbr_bytes = b''
-    if not is_bark and child_infos:
-        is_linked = _branch_is_linked(
-            dial_rec, dial_fid, tclt_targets, bark_choice_targets,
+    dlbr_fid, dlbr_bytes = 0, b''
+    if not is_bark and not is_scene and child_infos:
+        dlbr_fid, dlbr_bytes = _topic_branch(
+            dial_rec, writer, owner_qfid, tclt_targets, bark_choice_targets,
             unlock_plan, stats)
-        dlbr_fid = writer.derive_formid('DLBR', dial_fid)
-        dlbr_edid = (f'TES4_{edid}_Branch' if edid
-                     else f'TES4_DLBR_{dlbr_fid:08X}')
-        dlbr_bytes = make_dlbr(dlbr_fid, dlbr_edid, owner_qfid, dial_fid,
-                               top_level=not is_linked)
-        stats['branches'] += 1
 
-    # --- Identity gating data for conversation topics ---
-    # Service-menu topics must not inherit identity/voice gates: their generic
-    # lines serve EVERY vendor/trainer, not just the NPCs named by sibling
-    # GetIsID lines — the service-faction gate below is the real filter.
-    topic_npc_fids = set()
-    if not is_bark and not service_kind:
-        topic_npc_fids = read_getisid_fids_for_topic(child_infos)
-        for info_rec in child_infos:
-            topic_npc_fids |= read_getisid_fids(info_rec, offset=offset)
-        if not topic_npc_fids and orig_quest_fid:
-            topic_npc_fids = quest_npc_fids.get(orig_quest_fid, set())
-
-    # Voice types named anywhere in the topic (for generic siblings/greetings).
-    topic_vtyps = (set() if service_kind
-                   else _topic_voice_types(child_infos, npc_to_vtyp, offset))
-
-    # AddTopic unlock gate: Oblivion's central visibility mechanic — this topic
-    # only appears once a revealing line/script fired. Re-expressed as
-    # GetGlobalValue(TES4Unlock_<topic>) == 1; revealer fragments set it.
-    unlock_gate_bytes = b''
-    gname = unlock_plan['gated'].get(dial_fid & 0xFFFFFF)
-    gfid = unlock_globals.get(gname) if gname else None
-    if gfid:
-        unlock_gate_bytes = pack_subrecord('CTDA', build_ctda(
-            FUNC_GET_GLOBAL_VALUE, param1=gfid))
-
-    bark_gate_bytes = bark_choice_gate_bytes(
-        bark_choice_gate.get(dial_fid, []))
-
-    # A conditionless line in a topic whose every other line shares a world-
-    # state gate inherits that gate. Oblivion could leave the line loose because
-    # the TOPIC was AddTopic-gated; Skyrim has no such implicit scoping, so the
-    # loose line would keep the topic alive forever (see shared_state_conditions).
-    shared_state_bytes = b''
-    if not is_bark and not service_kind:
-        parts = []
-        for raw_hex in shared_state_conditions(child_infos):
-            try:
-                ctda = convert_ctda(bytes.fromhex(raw_hex), offset)
-            except (ValueError, struct.error):
-                continue
-            if ctda is not None:
-                parts.append(pack_subrecord('CTDA', ctda))
-        shared_state_bytes = b''.join(parts)
-
-    # Chargen fail-open fallback ids: fixed slots in the reserved gap
-    # (base+0x60..0x7F), shared across every topic of this import run via
-    # the writer, so adding them can never shift an allocated id.
-    if not hasattr(writer, 'chargen_fallback_box'):
-        _cb = getattr(writer, 'chargen_fid_base', 0)
-        writer.chargen_fallback_box = ([_cb + 0x60, _cb + 0x80] if _cb
-                                       else None)
-
-    # Shared context passed to the per-INFO converter.
+    conversation = not is_bark and not service_kind
     info_ctx = dict(
-        chargen_fallback_fids=writer.chargen_fallback_box,
-        is_bark=is_bark, npc_to_vtyp=npc_to_vtyp, topic_vtyps=topic_vtyps,
-        topic_npc_fids=topic_npc_fids, service_gate_bytes=service_gate_bytes,
-        unlock_gate_bytes=unlock_gate_bytes,
-        shared_state_bytes=shared_state_bytes,
-        bark_choice_gate_bytes=bark_gate_bytes, service_kind=service_kind,
+        chargen_fallback_fids=_chargen_fallback_box(writer),
+        is_bark=is_bark, npc_to_vtyp=npc_to_vtyp,
+        service_gate_bytes=service_gate_bytes,
+        unlock_gate_bytes=_unlock_gate(dial_fid, unlock_plan, unlock_globals),
+        shared_state_bytes=(_shared_state_gate(child_infos, offset)
+                            if conversation else b''),
+        bark_choice_gate_bytes=bark_choice_gate_bytes(
+            bark_choice_gate.get(dial_fid, [])),
+        service_kind=service_kind,
         orig_quest_fid=orig_quest_fid, sge_quest_fids=sge_quest_fids,
         offset=offset, unlock_plan=unlock_plan,
         unlock_globals=unlock_globals, fid_to_edid=fid_to_edid,
@@ -769,7 +839,10 @@ def _build_one_topic(dial_rec, info_by_dial, writer, offset,
         quest_edid_by_fid=quest_edid_by_fid, edid=edid,
         quest_fid_by_edid=quest_fid_by_edid,
         quest_dialog_ctdas=quest_dialog_ctdas, vtyp_edid_by_fid=vtyp_edid_by_fid,
-        stats=stats, script_vars=script_vars)
+        stats=stats, script_vars=script_vars,
+        **_topic_audience(child_infos, conversation, service_kind,
+                          orig_quest_fid, offset, quest_npc_fids,
+                          npc_to_vtyp))
 
     # Bark topics are handled by the global bark pass (grouped by quest+subtype
     # across ALL bark DIALs), never here — see _build_bark_pass.
@@ -797,6 +870,19 @@ def _build_one_topic(dial_rec, info_by_dial, writer, offset,
     return content, dlbr_bytes, owner_qfid, dial_fid, dlbr_fid
 
 
+def _reveal_props(info_rec, ctx):
+    """{global name: GLOB FormID} the INFO's fragment sets (VMAD properties), or None."""
+    reveal_names = ctx['unlock_plan']['info_reveals'].get(
+        get_formid(info_rec, 'FormID') & 0xFFFFFF)
+    if not reveal_names:
+        return None
+    reveal_props = {n: ctx['unlock_globals'][n] for n in reveal_names
+                    if n in ctx['unlock_globals']}
+    if reveal_props:
+        ctx['stats']['revealers'] += 1
+    return reveal_props or None
+
+
 def _convert_topic_infos(child_infos, owner_qfid, ctx):
     """Convert a list of child INFOs for a topic owned by owner_qfid.
 
@@ -822,24 +908,19 @@ def _convert_topic_infos(child_infos, owner_qfid, ctx):
                 sibling_factions=ctx.get('sibling_factions'),
                 sibling_npcs=ctx.get('sibling_npcs'),
                 shared_state_bytes=ctx.get('shared_state_bytes', b''))
-            # Revealer INFO: its OnEnd fragment sets the unlock globals; bind
-            # each global name -> GLOB FormID as a VMAD property.
-            reveal_names = ctx['unlock_plan']['info_reveals'].get(
-                get_formid(info_rec, 'FormID') & 0xFFFFFF)
-            reveal_props = None
-            if reveal_names:
-                reveal_props = {n: ctx['unlock_globals'][n] for n in reveal_names
-                                if n in ctx['unlock_globals']}
-                if reveal_props:
-                    ctx['stats']['revealers'] += 1
+            if get_formid(info_rec, 'FormID') in ctx.get('greeting_infos', ()):
+                injected += in_dialogue_gate()
             info_bytes = convert_INFO(
                 info_rec, injected_ctdas=injected,
                 fid_to_edid=ctx['fid_to_edid'],
                 well_known_props=ctx['well_known_props'], xref=ctx['xref'],
-                reveal_props=reveal_props, service_menu=ctx['service_kind'],
+                reveal_props=_reveal_props(info_rec, ctx),
+                service_menu=ctx['service_kind'],
                 bark_dial_fids=(ctx.get('bark_dial_fids')
                                 if ctx['is_bark'] else None),
-                script_vars=ctx.get('script_vars'))
+                menu_topic_fids=ctx.get('menu_topic_fids', ()),
+                script_vars=ctx.get('script_vars'),
+                speaker=speaker_subrecords(info_rec, ctx['offset']))
             topic_children += info_bytes
             child_count += 1
             ctx['stats']['infos'] += 1
@@ -894,6 +975,64 @@ def _ctdas_scope_audience(ctda_bytes: bytes) -> bool:
     return False
 
 
+def _bark_owner_quest(info_rec, snam, writer, bark_generic_quests, ctx,
+                      sge_extra):
+    """The quest a bark INFO belongs to, making the synthetic one on demand.
+
+    🛑 The synthetic quest's EditorID is registered in `quest_edid_by_fid`:
+    the voice-file prefix is built from it, and without the entry every
+    Morrowind bark filed as `_hello_<fid>` instead of `tes4generichelo_...`,
+    naming a path the engine never asks for. Oblivion never hit this because
+    its barks carry a real QSTI.
+    See: docs/commentary/tes5_import_dialogue.md#voice-files-lip-sync-audio
+    """
+    raw_q = get_formid(info_rec, 'QSTI.Quest')
+    if raw_q:
+        return raw_q
+    qkey = f'TES4Generic{snam.decode("latin1")}'
+    if qkey not in bark_generic_quests:
+        qfid = make_generic_quest(writer, qkey,
+                                  f'TES4 Generic {snam.decode("latin1")}')
+        bark_generic_quests[qkey] = qfid
+        ctx['quest_edid_by_fid'][qfid] = qkey
+        sge_extra.add(qfid)
+    return bark_generic_quests[qkey]
+
+
+def _group_bark_infos(bark_dials, info_by_dial, writer, bark_generic_quests,
+                      ctx):
+    """`(groups, order, sge_extra)` keyed by (owning quest, subtype).
+
+    GREETING and HELLO are both HELO, so INFOs of either owned by one quest
+    share a single topic -- which is why the regroup is global rather than
+    per-DIAL. INFOs sort by quest priority, highest first, matching the
+    conversation-topic sort so Skyrim's physical order is Oblivion's, and the
+    first source DIAL seen for a key donates its record and, if free, its id.
+    """
+    groups, order, sge_extra = {}, [], set()
+    for dial_rec in bark_dials:
+        dial_fid = get_formid(dial_rec, 'FormID')
+        edid = get_str(dial_rec, 'EditorID', '')
+        category, subtype, snam, _is_bark = classify_topic(
+            edid, get_int(dial_rec, 'DATA.Type'))
+        child_infos = sorted(
+            info_by_dial.get(dial_fid, []),
+            key=lambda r: -ctx['quest_priority'].get(
+                get_formid(r, 'QSTI.Quest'), 0))
+        for info_rec in child_infos:
+            owner_qfid = _bark_owner_quest(info_rec, snam, writer,
+                                           bark_generic_quests, ctx, sge_extra)
+            key = (owner_qfid, subtype)
+            if key not in groups:
+                groups[key] = {'infos': [], 'src': dial_rec, 'cat': category,
+                               'snam': snam, 'edid': edid, 'src_fid': dial_fid}
+                order.append(key)
+            groups[key]['infos'].append(info_rec)
+            if edid.upper() == 'GREETING':
+                ctx.setdefault('greeting_infos', set()).add(get_formid(info_rec, 'FormID'))
+    return groups, order, sge_extra
+
+
 def _build_bark_pass(bark_dials, info_by_dial, writer,
                      bark_generic_quests, ctx):
     """Emit bark topics grouped by (owning quest, subtype) across ALL bark DIALs.
@@ -913,143 +1052,81 @@ def _build_bark_pass(bark_dials, info_by_dial, writer,
     Returns (dial_group_bytes, sge_quest_fids) — the synthetic generic quests
     are StartGameEnabled and must be added to the .seq file to run from a new
     game."""
-    # (owner_qfid, subtype) -> {'infos': [...], 'src': dial_rec,
-    #                           'cat': category, 'snam': snam, 'dial_fid': fid}
-    groups = {}
-    order = []
-    sge_extra = set()
-
-    for dial_rec in bark_dials:
-        dial_fid = get_formid(dial_rec, 'FormID')
-        edid = get_str(dial_rec, 'EditorID', '')
-        dtype = get_int(dial_rec, 'DATA.Type')
-        category, subtype, snam, _is_bark = classify_topic(edid, dtype)
-        child_infos = info_by_dial.get(dial_fid, [])
-        # Priority-order the INFOs (highest quest priority first), matching the
-        # conversation-topic sort so Skyrim's physical order == Oblivion's.
-        child_infos = sorted(
-            child_infos,
-            key=lambda r: -ctx['quest_priority'].get(
-                get_formid(r, 'QSTI.Quest'), 0))
-        for info_rec in child_infos:
-            raw_q = get_formid(info_rec, 'QSTI.Quest')
-            if raw_q:
-                owner_qfid = raw_q
-            else:
-                # Synthetic per-subtype generic quest (created once).
-                snam_code = snam.decode('latin1')
-                qkey = f'TES4Generic{snam_code}'
-                if qkey not in bark_generic_quests:
-                    qfid = make_generic_quest(
-                        writer, qkey, f'TES4 Generic {snam_code}')
-                    bark_generic_quests[qkey] = qfid
-                    sge_extra.add(qfid)
-                owner_qfid = bark_generic_quests[qkey]
-            key = (owner_qfid, subtype)
-            if key not in groups:
-                # Prefer a real DIAL FormID for the group's topic; the first
-                # source DIAL seen for this key donates its record + (if unused)
-                # its FormID.
-                groups[key] = {'infos': [], 'src': dial_rec, 'cat': category,
-                               'snam': snam, 'edid': edid, 'src_fid': dial_fid}
-                order.append(key)
-            groups[key]['infos'].append(info_rec)
-
-    # Assign FormIDs: each group tries to reuse the original FormID of its
-    # donor source DIAL, but a DIAL FormID can be claimed by only one group —
-    # and only when this plugin OWNS the donor. A dependent plugin's bark
-    # INFOs point at its MASTER's shared GREETING/HELLO record; reusing that
-    # fid here emits an OVERRIDE of the master's topic, re-keyed to this
-    # plugin's quest. Morrowind_ob shipped Oblivion's GREETING_0102466E
-    # re-keyed to its own chargen quest (twice), which clobbered the
-    # CharacterGen Emperor's greeting topic — his choices vanished and only
-    # 'Rumors' survived whenever Morrowind_ob was loaded.
+    groups, order, sge_extra = _group_bark_infos(
+        bark_dials, info_by_dial, writer, bark_generic_quests, ctx)
     claimed = set()
     content = b''
     for key in order:
-        owner_qfid, subtype = key
-        g = groups[key]
-        src_fid = g['src_fid']
-        if src_fid not in claimed and \
-                (src_fid >> 24) == writer.own_index:
-            this_dial_fid = src_fid
-            claimed.add(src_fid)
-        else:
-            this_dial_fid = writer.derive_formid('BARK_DIAL', key)
-        this_edid = f"{g['edid']}_{owner_qfid:08X}" if g['edid'] else \
-            f"TES4Bark_{subtype}_{owner_qfid:08X}"
-        # Remember this quest's GREETING so a ForceGreet package can open it.
-        if (g['edid'] or '').upper() == 'GREETING':
-            GREET_TOPIC_BY_QUEST.setdefault(owner_qfid, this_dial_fid)
-        # (owner quest, subtype) -> output DIAL, so the NPC-conversation driver
-        # can Say a bark-grouped hop (a chain's GOODBYE line lives in its
-        # quest's GBYE group, not at the source GOODBYE DIAL's FormID).
-        ctx.setdefault('bark_topic_fids', {})[key] = this_dial_fid
-
-        # Per-group INFO context: voice types are pooled from THIS group's INFOs
-        # (a generic bark line inherits its siblings' voices). The voice-file
-        # prefix MUST use the EditorID actually written into the DIAL record
-        # (the split-suffixed one) — the engine builds the voice path from the
-        # record's own EditorID, so a voicemap keyed on the pre-split name would
-        # name every file something the game never looks for (= silent lines).
-        # Barks carry no identity/unlock/service gates. Ownership is the group's
-        # quest, so quest gates never fire (owner == info's own quest).
-        group_ctx = dict(ctx)
-        group_ctx['is_bark'] = True
-        group_ctx['topic_vtyps'] = _topic_voice_types(
-            g['infos'], ctx['npc_to_vtyp'], ctx['offset'])
-        group_ctx['topic_npc_fids'] = set()
-        group_ctx['service_gate_bytes'] = b''
-        group_ctx['unlock_gate_bytes'] = b''
-        group_ctx['bark_choice_gate_bytes'] = b''
-        group_ctx['service_kind'] = ''
-        group_ctx['edid'] = this_edid
-        # No fallback quest for quest-less INFOs: their owner IS the synthetic
-        # generic quest already, so leave info_qfid None -> no quest gate.
-        group_ctx['orig_quest_fid'] = None
-        # Audience the group's CONDITIONED siblings target, for conditionless
-        # lines to inherit — but only when the owning quest's own CTDAs don't
-        # already scope the audience (NQDBeggars does: GetInFaction(Beggars),
-        # so its conditionless beggar lines must stay quest-scoped, NOT be
-        # narrowed to whichever NPCs a sibling happens to name).
-        raw_q = get_formid(g['infos'][0], 'QSTI.Quest')
-        qctdas = ctx['quest_dialog_ctdas'].get(raw_q, b'')
-        if _ctdas_scope_audience(qctdas):
-            group_ctx['sibling_factions'] = set()
-            group_ctx['sibling_npcs'] = set()
-        else:
-            sib_f, sib_n = set(), set()
-            for ir in g['infos']:
-                sib_f |= read_func_param_fids(ir, FUNC_GET_IN_FACTION,
-                                              ctx['offset'])
-                sib_n |= read_getisid_fids(ir, offset=ctx['offset'],
-                                           positive_only=True)
-            group_ctx['sibling_factions'] = sib_f
-            group_ctx['sibling_npcs'] = sib_n
-
-        topic_children, child_count = _convert_topic_infos(
-            g['infos'], owner_qfid, group_ctx)
-        if not child_count:
-            continue
-        # PNAM stays at the vanilla 50.0 DEFAULT — quest arbitration rides on
-        # QUST.DNAM.Priority (see compute_quest_priorities), never here.
-        # Skyrim.esm leaves PNAM at 50.0 on 659 of 664 Misc/greeting topics and
-        # 5375 of 6535 player topics; greetings are NEVER ranked above the topic
-        # list. Writing the quest priority here instead put FGC01Rats' GREETING
-        # at PNAM 161 against its player topics' 50.0, and Pinarus lost every
-        # topic he owned (mountain-lion AND training) — two unrelated topics on
-        # one NPC, which no per-topic condition bug could explain.
-        dial_bytes = convert_DIAL(
-            g['src'], info_count=child_count, dlbr_fid=0,
-            quest_fid=owner_qfid, category=g['cat'], subtype=subtype,
-            snam=g['snam'], edid_override=this_edid,
-            formid_override=this_dial_fid)
-        content += dial_bytes
-        content += pack_group(7, struct.pack('<I', this_dial_fid),
-                              topic_children)
-        ctx['stats']['bark_topics'] = ctx['stats'].get('bark_topics', 0) + 1
-
+        content += _emit_bark_group(writer, key, groups[key], claimed, ctx)
     return content, sge_extra
+
+
+def _bark_topic_ids(writer, key, g, claimed: set, ctx) -> tuple:
+    """(DIAL FormID, EditorID) for one bark group; registers it for its readers.
+
+    See: docs/commentary/tes5_import_dialogue.md#bark-topic-ids
+    """
+    owner_qfid, subtype = key
+    src_fid = g['src_fid']
+    if src_fid not in claimed and (src_fid >> 24) == writer.own_index:
+        dial_fid = src_fid
+        claimed.add(src_fid)
+    else:
+        dial_fid = writer.derive_formid('BARK_DIAL', key)
+    edid = (f"{g['edid']}_{owner_qfid:08X}" if g['edid']
+            else f"TES4Bark_{subtype}_{owner_qfid:08X}")
+    if (g['edid'] or '').upper() == 'GREETING':
+        GREET_TOPIC_BY_QUEST.setdefault(owner_qfid, dial_fid)
+    ctx.setdefault('bark_topic_fids', {})[key] = dial_fid
+    return dial_fid, edid
+
+
+def _bark_group_ctx(ctx, g, edid: str) -> dict:
+    """The INFO context one bark group converts under.
+
+    See: docs/commentary/tes5_import_dialogue.md#bark-group-context
+    """
+    group_ctx = dict(ctx, is_bark=True, topic_npc_fids=set(),
+                     service_gate_bytes=b'', unlock_gate_bytes=b'',
+                     bark_choice_gate_bytes=b'', service_kind='', edid=edid,
+                     orig_quest_fid=None, sibling_factions=set(),
+                     sibling_npcs=set())
+    group_ctx['topic_vtyps'] = _topic_voice_types(
+        g['infos'], ctx['npc_to_vtyp'], ctx['offset'])
+    raw_q = get_formid(g['infos'][0], 'QSTI.Quest')
+    if not _ctdas_scope_audience(ctx['quest_dialog_ctdas'].get(raw_q, b'')):
+        for ir in g['infos']:
+            group_ctx['sibling_factions'] |= read_func_param_fids(
+                ir, FUNC_GET_IN_FACTION, ctx['offset'])
+            group_ctx['sibling_npcs'] |= read_getisid_fids(
+                ir, offset=ctx['offset'], positive_only=True)
+    return group_ctx
+
+
+def _emit_bark_group(writer, key, g, claimed: set, ctx) -> bytes:
+    """One bark group's DIAL and INFOs, plus a GREETING's arrest force-greet.
+
+    PNAM stays at the vanilla 50.0.
+    See: docs/commentary/tes5_import_dialogue.md#bark-pnam-stays-default
+    See: docs/commentary/tes5_import_dialogue.md#arrest-force-greet
+    """
+    owner_qfid, subtype = key
+    dial_fid, edid = _bark_topic_ids(writer, key, g, claimed, ctx)
+    children, count = _convert_topic_infos(
+        g['infos'], owner_qfid, _bark_group_ctx(ctx, g, edid))
+    if not count:
+        return b''
+    content = convert_DIAL(
+        g['src'], info_count=count, dlbr_fid=0, quest_fid=owner_qfid,
+        category=g['cat'], subtype=subtype, snam=g['snam'],
+        edid_override=edid, formid_override=dial_fid)
+    content += pack_group(7, struct.pack('<I', dial_fid), children)
+    ctx['stats']['bark_topics'] = ctx['stats'].get('bark_topics', 0) + 1
+    if (g['edid'] or '').upper() == 'GREETING':
+        content += force_greet_topic(
+            writer, g['src'], owner_qfid,
+            [(get_formid(r, 'FormID'), r) for r in g['infos']], children)
+    return content
 
 
 # Response text for the synthetic catch-all service INFOs (silent subtitle —
@@ -1212,8 +1289,9 @@ def _build_injected_ctdas(info_rec, is_bark, npc_to_vtyp, topic_vtyps,
     _speak_as_info = is_speak_as_record(info_rec)
     if _speak_as_info:
         vtyps = set()
-    elif own_npcs:
-        vtyps = {npc_to_vtyp[n] for n in own_npcs if n in npc_to_vtyp}
+    elif own_npcs or bark_voice_types(info_rec):
+        vtyps = ({npc_to_vtyp[n] for n in own_npcs if n in npc_to_vtyp}
+                 or bark_voice_types(info_rec))
     else:
         # Generic INFO: inherit the topic's voice types (greetings included).
         vtyps = set(topic_vtyps)
@@ -1265,12 +1343,9 @@ def _build_injected_ctdas(info_rec, is_bark, npc_to_vtyp, topic_vtyps,
     if quest_gate_bytes:
         stats['quest_gated'] += 1
 
-    from ..record_types.actor_common import get_origin_faction_fid
-    origin_faction_fid = get_origin_faction_fid()
-    origin_bytes = b''
-    if origin_faction_fid and needs_origin_gate(info_rec):
-        origin_bytes = build_or_chain(FUNC_GET_IN_FACTION,
-                                      [origin_faction_fid])
+    from ..record_types.actor_common import origin_gate
+    origin_bytes = origin_gate(info_rec)
+    if origin_bytes:
         stats['origin_gated'] = stats.get('origin_gated', 0) + 1
 
     return (origin_bytes + quest_gate_bytes + unlock_gate_bytes + state_bytes

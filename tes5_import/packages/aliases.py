@@ -32,11 +32,14 @@ This is exactly the gate Oblivion used, so reading it back gives us the same
 import re
 import struct
 
+from ..base.master_export import records_of
 from ..base.text_reader import (get_formid, get_int, get_str, remap_formid,
                           get_formid_index_offset)
+from .actor_wiring import authored_packages
+from .greet_topic import GreetTopics
 
 
-def _master_records(master_export, *sigs):
+def master_records(master_export, *sigs):
     """Yield (own-space FormID, record) for the masters' records of `sigs`.
 
     A master record's `FormID` FIELD is in the MASTER's index space, so
@@ -45,17 +48,19 @@ def _master_records(master_export, *sigs):
     names the master by, so the KEY is the correct source id; shift it the same
     way get_formid would and every id this module produces stays in one space.
     """
-    if not master_export:
-        return
-    want = frozenset(sigs)
     offset = get_formid_index_offset()
-    for key, rec in master_export.items():
-        if rec.get('Signature') not in want:
-            continue
+    for key, rec in records_of(master_export, *sigs):
         try:
             yield remap_formid(int(key, 16), offset), rec
         except (TypeError, ValueError):
             continue
+
+
+def masters_then_own(by_type: dict, master_export, sig: str):
+    """Yield the masters' records of `sig`, then the plugin's own."""
+    yield from (rec for _key, rec in records_of(master_export, sig))
+    yield from by_type.get(sig, [])
+
 
 # TES4 condition functions whose first parameter is a quest FormID.
 QUEST_PARAM_FUNCS = frozenset({
@@ -142,11 +147,8 @@ def build_script_var_map(by_type: dict, master_export: dict = None) -> dict:
     started at game load and its followers packaged onto the player.)
     """
     def _recs(sig):
-        if master_export:
-            for r in master_export.values():
-                if r.get('Signature') == sig:
-                    yield r
-        yield from by_type.get(sig, [])
+        """The masters' records of `sig`, then the plugin's own."""
+        return masters_then_own(by_type, master_export, sig)
 
     # 1. SCPT fid -> {index: name}
     script_vars = {}
@@ -241,41 +243,54 @@ def scriptvar_refs_from_conditions(rec: dict) -> list:
     return out
 
 
-def build_scriptvar_owner_map(by_type: dict, fid_to_edid: dict) -> dict:
+def _stage_scripts(rec: dict):
+    """Yield every stage result script of a TES4 QUST record."""
+    s = 0
+    while f'Stage[{s}].Index' in rec:
+        for j in range(max(get_int(rec, f'Stage[{s}].LogCount'), 1)):
+            yield get_str(rec, f'Stage[{s}].Log[{j}].ResultScript')
+        s += 1
+
+
+def _quest_scripts(by_type: dict, master_export: dict):
+    """Yield (quest_fid, script) from INFO and QUST result scripts, own first.
+
+    A master INFO's Quest field is in the master's id space, so it resolves
+    through the masters' re-keyed QUST ids by low 24 bits.
+    """
+    for rec in by_type.get('INFO', []):
+        yield get_formid(rec, 'Quest'), get_str(rec, 'ResultScript')
+    for rec in by_type.get('QUST', []):
+        qfid = get_formid(rec, 'FormID')
+        yield from ((qfid, text) for text in _stage_scripts(rec))
+    master_quests = dict(master_records(master_export, 'QUST'))
+    by_low = {q & 0x00FFFFFF: q for q in master_quests}
+    for _fid, rec in master_records(master_export, 'INFO'):
+        quest = get_formid(rec, 'Quest') & 0x00FFFFFF
+        yield by_low.get(quest, 0), get_str(rec, 'ResultScript')
+    for qfid, rec in master_quests.items():
+        yield from ((qfid, text) for text in _stage_scripts(rec))
+
+
+def build_scriptvar_owner_map(by_type: dict, fid_to_edid: dict,
+                              master_export: dict = None) -> dict:
     """ref_fid -> quest_fid, for refs whose script variables a quest writes.
 
-    An Oblivion quest package gated on `GetScriptVariable(SomeRef, var)` belongs
-    to whichever quest SETS that variable.  Quests set it from two places:
-      * a dialogue INFO result script  (INFO.Quest names the quest)
-      * a quest stage result script    (the QUST itself)
-    Both look like `set SomeRef.var to N` / `SomeRef.var = N`, so we scan the
-    result-script text for `<EditorID>.<anything>` and attribute the ref to that
-    quest.  This recovers the same "package belongs to quest" relation the
-    original author expressed.
+    A package gated on `GetScriptVariable(SomeRef, var)` belongs to the quest
+    whose INFO or stage result script names `SomeRef.<var>`. The masters'
+    scripts count too: a dependent plugin's actor lists master packages.
+
+    See: docs/commentary/tes5_import_override.md#scriptvar-owner-reads-masters
     """
     edid_to_fid = {v.lower(): k for k, v in fid_to_edid.items() if v}
     owner = {}
-
-    def _scan(text: str, qfid: int):
+    for qfid, text in _quest_scripts(by_type, master_export):
         if not text or not qfid:
-            return
+            continue
         for m in re.finditer(r'\b(\w+)\s*\.\s*\w+', text):
             ref = edid_to_fid.get(m.group(1).lower())
             if ref:
                 owner.setdefault(ref & 0x00FFFFFF, qfid)
-
-    for rec in by_type.get('INFO', []):
-        qfid = get_formid(rec, 'Quest')
-        _scan(get_str(rec, 'ResultScript'), qfid)
-
-    for rec in by_type.get('QUST', []):
-        qfid = get_formid(rec, 'FormID')
-        s = 0
-        while f'Stage[{s}].Index' in rec:
-            lc = get_int(rec, f'Stage[{s}].LogCount')
-            for j in range(max(lc, 1)):
-                _scan(get_str(rec, f'Stage[{s}].Log[{j}].ResultScript'), qfid)
-            s += 1
     return owner
 
 
@@ -328,6 +343,39 @@ _ADD_SCRIPT_PACKAGE_RE = re.compile(
 
 _SCRIPT_ESCAPES = (('\\r\\n', '\n'), ('\\n', '\n'), ('\\r', '\n'),
                    ('\\t', ' '))
+
+#: `set [owner.]var to value`: the variable and the value, a reference EditorID or another variable.
+_SET_REF_RE = re.compile(r'^\s*set\s+(?:\w+\s*\.\s*)?(\w+)\s+to\s+(\w+)\s*$', re.I)
+
+
+def _collect_ref_assignments(scan_sources) -> dict:
+    """variable (lowercase) -> every value (lowercase) a script `set`s it to, over every script source."""
+    assigned = {}
+
+    def _collect(text: str, _implicit_ref: int = 0):
+        """Records each `set var to value` line of `text`."""
+        for line in _script_lines(text):
+            m = _SET_REF_RE.match(line)
+            if m:
+                assigned.setdefault(m.group(1).lower(), set()).add(m.group(2).lower())
+
+    scan_sources(_collect)
+    return assigned
+
+
+def _resolve_receiver(name: str, edid_to_fid: dict, assigned: dict, seen=None) -> set:
+    """The reference FormIDs `name` can stand for: itself if a record, else what the scripts set it to."""
+    name = name.lower()
+    if name in edid_to_fid:
+        return {edid_to_fid[name]}
+    seen = seen if seen is not None else set()
+    if name in seen:
+        return set()
+    seen.add(name)
+    out = set()
+    for value in assigned.get(name, ()):
+        out |= _resolve_receiver(value, edid_to_fid, assigned, seen)
+    return out
 
 
 def _script_lines(text: str):
@@ -407,27 +455,12 @@ def _scan_qust_packages(recs, scan) -> None:
 
 def build_script_assigned_packages(by_type: dict, fid_to_edid: dict,
                                    master_export: dict = None) -> dict:
-    """pack_fid -> set(actor ref_fid) for packages forced on by script.
+    """pack_fid -> set(actor ref_fid) for packages forced on by script (TES4 `AddScriptPackage`).
 
-    TES4's `AddScriptPackage` puts a package on an actor that does NOT list it
-    in its AI package array — the package exists only to be forced on later.
-    Skyrim has no equivalent call (`SetOverridePackage` is a Fallout 4 API and
-    is absent from SkyrimSE.exe 1.6; only `EvaluatePackage` and
-    `KeepOffsetFromActor` exist), so the forced package must instead be
-    attached to the actor's quest alias as an ALPC.  Then the converted
-    `EvaluatePackage()` can actually select it, because it is finally ON the
-    stack the engine arbitrates.
-
-    Without this the package is invisible to arbitration and silently never
-    runs: 35 of Nehrim's 43 script-assigned packages and 75 of Oblivion's 97
-    appear on no actor at all.  MQ00CalebroPackage04 is the visible case —
-    Nehrim's Celebro stops following the player because the package that should
-    take over was never anywhere the engine could find it.
-
-    Both call forms are recovered.  `ref.AddScriptPackage Pkg` names the actor
-    explicitly; a bare `AddScriptPackage Pkg` targets the script's own owner,
-    which for an INFO result script is the SPEAKER — resolved by the caller
-    via `speaker_refs`, since only the dialogue converter knows who that is.
+    `ref.AddScriptPackage Pkg` names the actor, directly or through a ref variable resolved over the scripts'
+    `set var to Ref` lines; a bare call targets the script's owner (an INFO's SPEAKER). Skyrim has no such
+    call, so each package is wired onto those actors' aliases.
+    See: docs/commentary/tes5_import_package.md#package-hosts
     """
     # `fid_to_edid` is keyed on RAW export FormIDs, but every id this plan
     # produces has to be in the same space as `get_formid()` — which applies
@@ -437,31 +470,43 @@ def build_script_assigned_packages(by_type: dict, fid_to_edid: dict,
     offset = get_formid_index_offset()
     out = {}
 
+    def _recs(sig):
+        """The masters' records of `sig`, then the plugin's own."""
+        return masters_then_own(by_type, master_export, sig)
+
+    def _sources(scan):
+        """Every script source, in one order: SCPT, INFO results, QUST stage results."""
+        _scan_scpt_packages(_recs, scan)
+        _scan_info_packages(_recs, scan)
+        _scan_qust_packages(_recs, scan)
+
+    assigned = _collect_ref_assignments(_sources)
+
     def _scan(text: str, implicit_ref: int = 0):
         if not text or 'addscriptpackage' not in text.lower():
             return
         for line in _script_lines(text):
             for m in _ADD_SCRIPT_PACKAGE_RE.finditer(line):
                 pfid = edid_to_fid.get(m.group(2).lower())
-                if not pfid:
-                    continue
-                ref = (edid_to_fid.get(m.group(1).lower()) if m.group(1)
-                       else implicit_ref)
-                if ref:
-                    out.setdefault(remap_formid(pfid, offset), set()).add(
-                        remap_formid(ref, offset))
+                refs = (_resolve_receiver(m.group(1), edid_to_fid, assigned) if m.group(1)
+                        else {implicit_ref} - {0})
+                for ref in refs if pfid else ():
+                    out.setdefault(remap_formid(pfid, offset), set()).add(remap_formid(ref, offset))
 
-    def _recs(sig):
-        if master_export:
-            for r in master_export.values():
-                if r.get('Signature') == sig:
-                    yield r
-        yield from by_type.get(sig, [])
-
-    _scan_scpt_packages(_recs, _scan)
-    _scan_info_packages(_recs, _scan)
-    _scan_qust_packages(_recs, _scan)
+    _sources(_scan)
     return out
+
+
+#: TES4 record flag Initially Disabled.
+_INITIALLY_DISABLED = 0x800
+
+
+def initially_disabled(by_type: dict, master_export: dict = None) -> frozenset:
+    """Low-24 FormIDs of the placed references that start disabled."""
+    return frozenset(
+        _raw_fid(rec, 'FormID') & 0x00FFFFFF
+        for sig in ('REFR', 'ACHR', 'ACRE') for rec in masters_then_own(by_type, master_export, sig)
+        if get_int(rec, 'RecordFlags') & _INITIALLY_DISABLED)
 
 
 class PackagePlan:
@@ -480,6 +525,14 @@ class PackagePlan:
         self.alias_index = {}      # (qust_fid, ref_fid) -> alias id
         self.actor_packages = {}   # actor_fid -> [pack_fid,...] (TES4 order)
         self.alias_actor = {}      # ref_fid -> base actor fid
+        self.hosts = None
+        self.armed = set()
+        self.armed_factions = {}
+        self.source_quest = {}
+        self.greet_topics = None
+        self.forced_on = {}
+        self.starts_disabled = frozenset()
+        self.forced_lists = ({}, False)
 
     # -- build ----------------------------------------------------------
 
@@ -500,7 +553,7 @@ class PackagePlan:
         override included — overwrites the master's on the same key.
         """
         packs = {}
-        for fid, rec in _master_records(master_export, 'PACK'):
+        for fid, rec in master_records(master_export, 'PACK'):
             packs[fid] = rec
         for rec in by_type.get('PACK', []):
             fid = get_formid(rec, 'FormID')
@@ -511,13 +564,17 @@ class PackagePlan:
         # this only has to be the same id space as everything else here.
         quest_fids = set(quest_fids)
         quest_fids.update(fid for fid, _ in
-                          _master_records(master_export, 'QUST'))
+                          master_records(master_export, 'QUST'))
 
         scriptvar_owner = scriptvar_owner or {}
 
         self._own_quests(packs, quest_fids, scriptvar_owner)
-        base_to_ref = self._wire_actor_packages(by_type, master_export)
-        self._wire_script_assigned(base_to_ref, script_assigned)
+        self._read_actor_lists(by_type, master_export)
+        self.greet_topics = GreetTopics(by_type, master_export)
+        self.forced_on = script_assigned or {}
+        self._arm_unlisted(script_assigned)
+        base_to_refs = self._wire_actor_packages(by_type, master_export)
+        self._wire_script_assigned(base_to_refs, script_assigned)
         self._wire_package_targets(packs)
 
     def _own_quests(self, packs: dict, quest_fids: set,
@@ -545,89 +602,118 @@ class PackagePlan:
                     if owner:
                         break
             if owner:
-                self.owner_quest[fid] = owner
+                self.source_quest[fid] = owner
+                self.owner_quest[fid] = self.hosts.of(owner) if self.hosts else owner
+
+    def greet_quest(self, pack_fid: int, edid: str, gated: int):
+        """The quest whose GREETING force-greet `pack_fid` opens: its gating quest, else its speakers'."""
+        own = self.source_quest.get(pack_fid) or gated or None
+        if self.greet_topics is None:
+            return own
+        actors = [a for a, plist in self.actor_packages.items() if pack_fid in plist]
+        actors += sorted(self.forced_on.get(pack_fid, ()))
+        return self.greet_topics.quest_of(edid, actors, [own]) or own
+
+    def _read_actor_lists(self, by_type: dict, master_export: dict) -> None:
+        """Fill `actor_packages` from every actor's authored list; an override's list wins."""
+        recs = list(master_records(master_export, 'NPC_', 'CREA'))
+        recs += [(get_formid(r, 'FormID'), r) for r in by_type.get('NPC_', []) + by_type.get('CREA', [])]
+        for afid, rec in recs:
+            plist = [p for p in authored_packages(rec) if p]
+            if plist:
+                self.actor_packages[afid] = plist
+
+    def _arm_unlisted(self, script_assigned: dict) -> None:
+        """Move script-forced packages no actor lists to the forced host and mark them armed.
+
+        See: docs/commentary/tes5_import_package.md#package-hosts
+        """
+        if self.hosts is None:
+            return
+        listed = {p for plist in self.actor_packages.values() for p in plist}
+        for pfid in script_assigned or ():
+            if pfid not in listed:
+                self.owner_quest[pfid] = self.hosts.host
+                self.armed.add(pfid)
 
     @staticmethod
-    def _build_base_to_ref(by_type: dict, master_export: dict) -> dict:
-        """base actor fid -> the persistent ACHR/ACRE that places it.
+    def _build_base_to_refs(by_type: dict, master_export: dict) -> dict:
+        """base actor fid -> every ACHR/ACRE that places it, in record order.
 
-        The masters' placements are indexed first, then this plugin's own:
-        "first ACHR wins" holds WITHIN each source, but an own placement of the
-        same base overwrites the master's, since it is the one this plugin
-        actually converts.
+        Oblivion runs a base's packages on every copy, so each placement needs
+        its own alias. This plugin's placements of a base replace the masters'.
         """
-        base_to_ref = {}
-        for _fid, r in _master_records(master_export, 'ACHR', 'ACRE'):
+        base_to_refs = {}
+        for _fid, r in master_records(master_export, 'ACHR', 'ACRE'):
             base = get_formid(r, 'NAME')
-            if base and base not in base_to_ref:
-                base_to_ref[base] = _fid
+            if base:
+                base_to_refs.setdefault(base, []).append(_fid)
         own_refs = {}
         for sig in ('ACHR', 'ACRE'):
             for r in by_type.get(sig, []):
                 base = get_formid(r, 'NAME')
-                if base and base not in own_refs:
-                    own_refs[base] = get_formid(r, 'FormID')
-        base_to_ref.update(own_refs)
-        return base_to_ref
+                if base:
+                    own_refs.setdefault(base, []).append(get_formid(r, 'FormID'))
+        base_to_refs.update(own_refs)
+        return base_to_refs
+
+    def _add_alias_package(self, q: int, aref: int, pfid: int) -> None:
+        """List `pfid` once on `aref`'s alias of quest `q`."""
+        pkgs = self.quest_packages.setdefault(q, {}).setdefault(aref, [])
+        if pfid not in pkgs:
+            pkgs.append(pfid)
+        self.needed_aliases.setdefault(q, set()).add(aref)
 
     def _wire_actor_packages(self, by_type: dict, master_export: dict) -> dict:
-        """Wire each actor's AIPackage list to its quest alias; return
-        base_to_ref.
+        """Wire each actor's quest packages to every placement's alias; return
+        base_to_refs.
 
-        A quest alias fills a *reference* (ALFR), so the actor's persistent
-        ACHR takes the alias; actors with no ACHR (levelled spawns) keep their
-        packages on the base record's PKID list.  Actor records are read
-        masters-first, so an override re-pointing an AIPackage list replaces
-        the master's entry.  Each alias list stays unique: a second ALPC for
-        the same package says nothing the first does not.
+        A quest alias fills a *reference* (ALFR); actors with no placement
+        (levelled spawns) keep their packages on the base's PKID list.
         """
-        base_to_ref = self._build_base_to_ref(by_type, master_export)
-        actor_recs = [(fid, r) for fid, r
-                      in _master_records(master_export, 'NPC_', 'CREA')]
-        actor_recs += [(get_formid(r, 'FormID'), r)
-                       for r in by_type.get('NPC_', []) + by_type.get('CREA', [])]
-        for afid, rec in actor_recs:
-            n = get_int(rec, 'AIPackageCount')
-            plist = [get_formid(rec, f'AIPackage[{i}]') for i in range(n)]
-            plist = [p for p in plist if p]
-            if plist:
-                self.actor_packages[afid] = plist
-            aref = base_to_ref.get(afid)
-            for pfid in plist:
-                q = self.owner_quest.get(pfid)
-                if q is None or aref is None:
-                    continue
-                _pkgs = self.quest_packages.setdefault(q, {}).setdefault(
-                    aref, [])
-                if pfid not in _pkgs:
-                    _pkgs.append(pfid)
-                self.needed_aliases.setdefault(q, set()).add(aref)
-                self.alias_actor[aref] = afid
-        return base_to_ref
+        base_to_refs = self._build_base_to_refs(by_type, master_export)
+        fallback = self.hosts.host if self.hosts else None
+        for afid, plist in self.actor_packages.items():
+            for aref in base_to_refs.get(afid, ()):
+                for pfid in self._alias_list(plist):
+                    self._add_alias_package(self.owner_quest.get(pfid, fallback), aref, pfid)
+                    self.alias_actor[aref] = afid
+        return base_to_refs
 
-    def _wire_script_assigned(self, base_to_ref: dict,
+    def _alias_list(self, plist: list) -> list:
+        """The packages of an authored list that go on the actor's alias.
+
+        With a host and any hosted package in it, the WHOLE list in order;
+        else the list as is, of which only quest-owned packages are wired.
+        See: docs/commentary/tes5_import_package.md#package-hosts
+        """
+        host = self.hosts.host if self.hosts else None
+        if host is None or any(self.owner_quest.get(p) == host for p in plist):
+            return plist
+        return [p for p in plist if self.owner_quest.get(p) is not None]
+
+    def _wire_script_assigned(self, base_to_refs: dict,
                               script_assigned: dict) -> None:
-        """Hang `AddScriptPackage` packages off the actor's quest alias.
+        """Hang `AddScriptPackage` packages off the actor's alias on the package's host.
 
-        These are in no actor's AI array — that is the whole point of the call
-        — and Skyrim has no equivalent function, so an ALPC is the only way
-        arbitration can ever select one.  A call may name the placed ACHR (the
-        usual form) or the base actor; both normalize to the ref an alias
-        fills, and anything else cannot take an alias and is skipped.
+        Skyrim has no such call, so an ALPC is the only way arbitration can
+        select one.  A call names the placed ref, or a base, which resolves to
+        its first placement; anything else cannot take an alias and is skipped.
+        See: docs/commentary/tes5_import_package.md#package-hosts
         """
-        ref_to_base = {r: b for b, r in base_to_ref.items()}
+        ref_to_base = {r: b for b, refs in base_to_refs.items() for r in refs}
         for pfid, refs in (script_assigned or {}).items():
             q = self.owner_quest.get(pfid)
             if q is None:
                 continue
             for ref in refs:
-                aref = ref if ref in ref_to_base else base_to_ref.get(ref)
+                aref = ref if ref in ref_to_base else (base_to_refs.get(ref) or [None])[0]
                 if aref is None:
                     continue
-                pkgs = self.quest_packages.setdefault(q, {}).setdefault(aref, [])
-                if pfid not in pkgs:
-                    pkgs.append(pfid)
-                self.needed_aliases.setdefault(q, set()).add(aref)
+                self._add_alias_package(q, aref, pfid)
+                if pfid in self.armed:
+                    pkgs = self.quest_packages[q][aref]
+                    pkgs.insert(0, pkgs.pop(pkgs.index(pfid)))
                 self.alias_actor.setdefault(aref, ref_to_base.get(aref, ref))
 
     def _wire_package_targets(self, packs: dict) -> None:

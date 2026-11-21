@@ -441,6 +441,12 @@ class TestFunctionConversion:
         assert 'Debug.MessageBox' in result
         assert 'Hello World' in result
 
+    def test_essential_death_reload_ends_the_game_with_its_message(self, converter):
+        """Jauffre's / Martin's OnDeath game over is a real call, not a dropped comment."""
+        msg = '"You have failed. Jauffre has been slain. All hope is now lost."'
+        result = emit_function(converter, None, 'EssentialDeathReload', msg, 'Actor')
+        assert result.strip() == f'TES4Polyfill.EssentialDeathReload({msg})'
+
     def test_getpos_x(self, converter):
         result = emit_function(converter, 'myRef', 'GetPos', 'X', 'ObjectReference')
         assert 'GetPositionX' in result
@@ -459,9 +465,9 @@ class TestFunctionConversion:
         assert 'GetAngleZ' in result
 
     def test_setstage(self, converter_with_quests):
+        """A scriptless quest's SetStage re-checks alias packages via the Polyfill."""
         result = emit_function(converter_with_quests, None, 'SetStage', 'MQ01 20', 'Quest')
-        assert 'MQ01.SetStage' in result
-        assert '20' in result
+        assert result == 'TES4Polyfill.SetStage(MQ01, 20)'
 
     def test_getstage(self, converter_with_quests):
         result = emit_function(converter_with_quests, None, 'GetStage', 'MQ01', 'Quest')
@@ -484,9 +490,9 @@ class TestFunctionConversion:
         assert 'IsDead' in result
 
     def test_actor_value_function(self, converter):
-        result = emit_function(converter, None, 'GetActorValue', 'Blade', 'Actor')
+        result = emit_function(converter, None, 'GetActorValue', 'Armorer', 'Actor')
         assert 'GetActorValue' in result
-        assert 'OneHanded' in result
+        assert 'Smithing' in result
 
     def test_actor_value_alchemy(self, converter):
         result = emit_function(converter, None, 'ModActorValue', 'Alchemy 5', 'Actor')
@@ -532,10 +538,9 @@ class TestActorValueMap:
     def test_fatigue_to_stamina(self):
         assert ACTOR_VALUE_MAP['fatigue'] == 'Stamina'
 
-    def test_mysticism_to_illusion(self):
-        # Mysticism was folded into Illusion in Skyrim; must agree with the
-        # record side (skyrim_overrides.TES4_SKILL_TO_TES5_INDEX maps 24 -> 21).
-        assert ACTOR_VALUE_MAP['mysticism'] == 'Illusion'
+    def test_mysticism_to_alteration(self):
+        """Mysticism reads Alteration, the school its converted spells train."""
+        assert ACTOR_VALUE_MAP['mysticism'] == 'Alteration'
 
     def test_resistfire(self):
         assert ACTOR_VALUE_MAP['resistfire'] == 'FireResist'
@@ -552,24 +557,96 @@ class TestActorValueMap:
         for attr in TES4_ATTRIBUTES:
             assert attr not in ACTOR_VALUE_MAP
 
-    def test_attribute_read_is_stubbed_open(self, converter):
-        """A read of a removed attribute yields a value that passes the gate."""
+    def test_player_attribute_reads_its_global(self, converter):
+        """The player's attribute is the global MorrowindRuntime keeps current."""
         result = conv_expr(converter,
             'Player.GetAV Strength >= 30 && Player.GetAV Endurance >= 30',
             'Quest')
-        assert result == '100.0 >= 30 && 100.0 >= 30'
+        assert result == ('TES4_Attributes.Read(TES4PlayerStrength) >= 30 && '
+                          'TES4_Attributes.Read(TES4PlayerEndurance) >= 30')
 
-    def test_attribute_write_is_dropped(self, converter):
-        result = conv_line(converter, 'Player.SetAV Strength 50',
-                                                  'Quest')
-        assert result.lstrip().startswith(';')
-        assert 'SetActorValue' not in result
+    def test_player_attribute_writes_its_global(self, converter):
+        """SetAV writes the global and ModAV adds to it; the runtime moves the attribute."""
+        assert conv_line(converter, 'Player.SetAV Strength 50', 'Quest').strip() == \
+            'TES4_Attributes.Write(TES4PlayerStrength, 50)'
+        assert conv_line(converter, 'player.modav Luck 1', 'Quest').strip() == \
+            'TES4_Attributes.Modify(TES4PlayerLuck, 1)'
+
+    def test_npc_attribute_reads_its_stat_faction(self, converter):
+        """Another actor's attribute is its stat faction rank; the player global rides along."""
+        assert conv_expr(converter, 'OtherRef.GetAV Strength >= 30', 'Quest') == (
+            'TES4_Attributes.ReadActor(OtherRef, TES4AttributeStrength, TES4PlayerStrength) >= 30')
+        assert conv_line(converter, 'OtherRef.ModAV Luck 2', 'Quest').strip() == (
+            'TES4_Attributes.ModifyActor(OtherRef, TES4AttributeLuck, TES4PlayerLuck, 2)')
+
+    def test_npc_kept_skill_reads_its_stat_faction(self, converter):
+        """An NPC's Athletics is its rank; the player's still reads the Skyrim stand-in."""
+        assert conv_line(converter, 'OtherRef.SetAV Athletics 40', 'Quest').strip() == (
+            'TES4_Attributes.WriteSkill(OtherRef, TES4SkillAthletics, "Stamina", 40)')
+        assert conv_expr(converter, 'player.GetAV Athletics > 5', 'Quest') == (
+            'Game.GetPlayer().GetActorValue("Stamina") > 5')
 
     def test_skill_read_still_maps(self, converter):
         """Skills survive the attribute no-op -- only attributes are stubbed."""
         result = conv_expr(converter, 'Player.GetAV Armorer >= 10',
                                                'Quest')
         assert result == 'Game.GetPlayer().GetActorValue("Smithing") >= 10'
+
+
+class TestFalloutActorValueNames:
+    """FO3/FNV actor-value names read as the conditions map them, stub, or go inert.
+
+    See: docs/commentary/script_convert.md#fallout-actor-value-names
+    """
+
+    @pytest.mark.parametrize('name, skyrim', [
+        ('Repair', 'Smithing'), ('Speech', 'Speechcraft'), ('Barter', 'Speechcraft'),
+        ('Lockpick', 'Lockpicking'), ('Medicine', 'Restoration'), ('Guns', 'Marksman'),
+        ('EnergyWeapons', 'Marksman'), ('Unarmed', 'OneHanded')])
+    def test_renamed_skill_reads_skyrim_name(self, converter, name, skyrim):
+        """Each renamed skill reads the Skyrim value its condition reads."""
+        result = conv_expr(converter, f'player.getav {name} >= 50', 'Quest')
+        assert result == f'Game.GetPlayer().GetActorValue("{skyrim}") >= 50'
+
+    def test_melee_weapons_reads_the_higher_half(self, converter):
+        """Melee Weapons covered both hands, like Blade and Blunt."""
+        result = conv_expr(converter, 'player.getav MeleeWeapons >= 50', 'Quest')
+        assert 'HigherActorValue(Game.GetPlayer(), "OneHanded", "TwoHanded")' in result
+
+    def test_renamed_skill_write(self, converter):
+        """A write renames the argument too."""
+        assert 'ModActorValue("Speechcraft", 5)' in conv_line(converter, 'player.modav Speech 5', 'Quest')
+
+    @pytest.mark.parametrize('name', ['Perception', 'Charisma'])
+    def test_special_read_is_stubbed_open(self, converter, name):
+        """All seven S.P.E.C.I.A.L. stats read alike."""
+        assert conv_expr(converter, f'player.getav {name} >= 6', 'Quest') == '100.0 >= 6'
+
+    def test_special_write_is_dropped(self, converter):
+        """A S.P.E.C.I.A.L. write has nothing to write to."""
+        result = conv_line(converter, 'player.setav Charisma 7', 'Quest')
+        assert result.lstrip().startswith(';') and 'SetActorValue' not in result
+
+    def test_unmapped_read_is_inert(self, converter):
+        """Karma is no Skyrim actor value: the comparison folds, even against a negative."""
+        assert conv_expr(converter, 'player.getav Karma >= -250', 'Quest') == 'false'
+
+    def test_unmapped_write_is_dropped(self, converter):
+        """A write to a value Skyrim lacks becomes a comment."""
+        result = conv_line(converter, 'player.modav Science 10', 'Quest')
+        assert result.lstrip().startswith(';') and 'ModActorValue' not in result
+
+    def test_rename_applies_to_the_actor_value_argument_only(self, converter):
+        """`lockpick` is also Fallout's bobby-pin item, which must keep its name."""
+        assert 'Lockpicking' not in conv_expr(converter, 'player.GetItemCount lockpick < 1', 'Quest')
+
+
+def test_negative_comparand_folds_an_inert_read(converter):
+    """`-250` is unary minus over a literal, and still a number.
+
+    See: docs/commentary/script_convert.md#negative-comparand
+    """
+    assert conv_expr(converter, 'GetPCMiscStat 99 >= -250', 'Quest') == 'false'
 
 
 # ===========================================================================
@@ -596,6 +673,12 @@ End
         assert 'EndEvent' in result
 
     def test_gamemode_to_onupdate(self, converter):
+        """An object GameMode poll starts on OnCellAttach, re-arms first
+        through SafeGameModeGate (never a bare Is3DLoaded(), which throws on a
+        held item), and never unregisters on detach.
+
+        See: docs/commentary/script_convert.md#poll-lifecycle
+        """
         source = """ScriptName UpdateScript
 
 Begin GameMode
@@ -605,25 +688,10 @@ End
         result = converter.convert_standalone('UpdateScript', source, 'ObjectReference', 'UpdateScript')
         assert 'Event OnUpdate()' in result
         assert 'RegisterForSingleUpdate' in result
-        # Object/actor GameMode loops are gated on load state (OnCellAttach
-        # start) so that not every scripted object in the game begins ticking
-        # the moment the save loads.
         assert 'Event OnCellAttach()' in result
-        # The OnUpdate re-registration only continues while still loaded.
-        # Routed through SafeGameModeGate, NOT a bare Is3DLoaded(): that call
-        # throws on a reference held in a container (no native object bound)
-        # and the throw aborts the event before it can re-arm, killing the
-        # poll permanently.  See TES4Polyfill.SafeGameModeGate.
-        assert 'If (TES4Polyfill.SafeGameModeGate(Self))' in result
+        assert 'If (TES4Polyfill.SafeGameModeGate(Self)' in result
         assert 'If (Is3DLoaded())' not in result
-        # NO OnCellDetach unregister: cell-transition events have no
-        # guaranteed order, so the old cell's detach could land after
-        # OnLoad/OnCellAttach re-armed the poll for the new cell and kill a
-        # loaded actor's loop mid-scene (CharacterGen escorts going mute).
-        # The Is3DLoaded() arm gate winds the loop down by itself.
         assert 'UnregisterForUpdate()' not in result
-        # Arm-first: the re-register must be the FIRST thing OnUpdate does,
-        # so a runtime abort anywhere in the body cannot kill the poll.
         body = result.split('Event OnUpdate()', 1)[1].split('EndEvent', 1)[0]
         assert body.index('RegisterForSingleUpdate') < body.index('x = 1')
 
@@ -656,7 +724,7 @@ End
         assert 'Event OnInit()' in result, \
             'a GameMode poll must also start for an already-loaded reference'
         init = result.split('Event OnInit()', 1)[1].split('EndEvent', 1)[0]
-        assert 'If (TES4Polyfill.SafeGameModeGate(Self))' in init, \
+        assert 'If (TES4Polyfill.SafeGameModeGate(Self)' in init, \
             'OnInit registration must stay gated (anti-storm)'
         assert 'RegisterForSingleUpdate' in init
 
@@ -691,7 +759,7 @@ End
         result = converter.convert_standalone('EnableScript', source,
                                               'ObjectReference', 'EnableScript')
         init = result.split('Event OnInit()', 1)[1].split('EndEvent', 1)[0]
-        assert 'If (TES4Polyfill.SafeGameModeGate(Self))' in init
+        assert 'If (TES4Polyfill.SafeGameModeGate(Self)' in init
         assert 'Is3DLoaded()' not in result, \
             'the gate must go through the polyfill, never a bare 3D test'
 
@@ -703,6 +771,203 @@ End
         assert 'IsAttached()' in body, \
             'SafeGameModeGate fell back to a 3D-only test — see the ' \
             'self-disable deadlock (Nehrim MQ00, controls never re-enabled)'
+
+    def test_carried_item_poll_follows_its_holder(self, converter):
+        """A GameMode item keeps polling while carried: OnContainerChanged
+        records the holder and the gate also accepts a loaded holder.
+
+        See: docs/commentary/script_convert.md#carried-items-and-read-books
+        """
+        source = """ScriptName ItemScript
+Begin GameMode
+  set x to 1
+End
+"""
+        result = converter.convert_standalone('ItemScript', source,
+                                              'ObjectReference', 'ItemScript')
+        changed = result.split('Event OnContainerChanged(', 1)[1].split(
+            'EndEvent', 1)[0]
+        assert 'TES4_Holder = akNewContainer' in changed
+        assert 'RegisterForSingleUpdate' in changed
+        assert ('TES4Polyfill.SafeGameModeGate(Self) || '
+                'TES4Polyfill.SafeGameModeGate(TES4_Holder)') in result
+
+    def test_carried_menumode_runs_from_the_equip_event(self, converter):
+        """A carried item's bare MenuMode runs in-event while a menu is open.
+
+        See: docs/commentary/script_convert.md#carried-menumode-runs-in-event
+        """
+        source = """ScriptName DiaryScript
+short step
+Begin OnEquip player
+  set step to 1
+End
+Begin MenuMode
+  if step != 1
+    return
+  endif
+  set step to 2
+End
+"""
+        result = converter.convert_standalone('DiaryScript', source,
+                                              'ObjectReference', 'DiaryScript')
+        equipped = result.split('Event OnEquipped(', 1)[1].split('EndEvent', 1)[0]
+        assert equipped.rstrip().endswith('TES4_MenuPasses()')
+        update = result.split('Event OnUpdate()', 1)[1].split('EndEvent', 1)[0]
+        assert 'TES4_PollPass()' in update
+        passes = result.split('Function TES4_PollPass()', 1)[1].split('EndFunction', 1)[0]
+        assert 'RegisterForSingleUpdate' not in passes
+        loop = result.split('Function TES4_MenuPasses()', 1)[1].split('EndFunction', 1)[0]
+        assert 'Utility.WaitMenuMode(' in loop
+        assert 'RegisterForSingleUpdate' not in loop
+
+    def test_plain_poll_keeps_its_body_in_onupdate(self, converter):
+        """A GameMode-only item has no menu loop and no pass function."""
+        source = "ScriptName ItemScript\nBegin GameMode\n  set x to 1\nEnd\n"
+        result = converter.convert_standalone('ItemScript', source,
+                                              'ObjectReference', 'ItemScript')
+        assert 'TES4_PollPass' not in result
+        assert 'TES4_MenuPasses' not in result
+
+    def test_message_drops_a_repeat_still_on_screen(self, converter):
+        """A script's Message goes through TES4_Notify; a fragment's stays Debug.Notification.
+
+        See: docs/commentary/script_convert.md#message-rewrites-one-line
+        """
+        source = 'ScriptName NagScript\nBegin GameMode\n  Message "Level up!"\nEnd\n'
+        result = converter.convert_standalone('NagScript', source,
+                                              'ObjectReference', 'NagScript')
+        assert 'TES4_Notify("Level up!")' in result
+        helper = result.split('Function TES4_Notify(String asText)', 1)[1]
+        assert 'TES4_since >= 3.33' in helper
+        assert 'TES4_since < 0.0' in helper
+        fragment = '\n'.join(converter.convert_fragment('Message "Done"', 'Quest'))
+        assert 'Debug.Notification("Done")' in fragment
+
+    def test_stray_elseif_at_block_top_starts_a_new_chain(self, converter):
+        """An `elseif` after its chain closed tests its own condition, as Oblivion did.
+
+        See: docs/commentary/script_convert.md#stray-elseif-starts-a-chain
+        """
+        source = """ScriptName StepScript
+short step
+Begin GameMode
+  if step == 1
+    set step to 2
+  endif
+  endif
+  elseif step == -10
+    set step to 10
+  elseif step == -20
+    set step to 20
+  endif
+End
+"""
+        result = converter.convert_standalone('StepScript', source,
+                                              'ObjectReference', 'StepScript')
+        chain = result.split('If step == -10', 1)[1]
+        assert chain.index('step = 10') < chain.index('ElseIf step == -20')
+        assert 'elseif  ;unmatched closer' not in result
+
+    def test_button_box_passes_its_format_values(self, converter):
+        """A button MessageBox hands its format values to Show() as Floats.
+
+        See: docs/commentary/script_convert.md#messagebox-values-fill-show
+        """
+        source = ('ScriptName DiaryScript\nshort ep\n\nBegin GameMode\n'
+                  '  MessageBox "EP: %5.0f / %3.0f", ep, 7, "Level up", "Close"\nEnd\n')
+        converter.message_menus = build_message_plan(
+            [{'EditorID': 'DiaryScript', 'SCTX': source}])
+        out = converter.convert_standalone('DiaryScript', source, 'ObjectReference',
+                                           'DiaryScript')
+        assert ('TES4_ShowMsg(TES4Msg_DiaryScript_01, (ep) as Float, (7) as Float)'
+                in out)
+        assert 'Int TES4_shown = TES4_akMsg.Show(afArg1, afArg2, afArg3' in out
+
+    def test_a_second_box_request_leaves_the_open_box_alone(self, converter):
+        """While this script's box is up, TES4_ShowMsg shows nothing and keeps the pressed state.
+
+        See: docs/commentary/script_convert.md#one-box-at-a-time
+        """
+        source = ('ScriptName QuizScript\nshort stage\n\nBegin GameMode\n'
+                  '  if stage == 1\n    MessageBox "Pick", "A", "B"\n  endif\nEnd\n')
+        converter.message_menus = build_message_plan(
+            [{'EditorID': 'QuizScript', 'SCTX': source}])
+        out = converter.convert_standalone('QuizScript', source, 'Quest', 'QuizScript')
+        helper = out.split('Int Function TES4_ShowMsg(', 1)[1].split('EndFunction', 1)[0]
+        assert helper.index('If TES4_MsgOpen\n    Return TES4_MsgButton') < helper.index(
+            'TES4_MsgButton = -1')
+        assert helper.index('TES4_MsgOpen = True') < helper.index('.Show(') < helper.index(
+            'TES4_MsgOpen = False')
+
+    def test_messageboxex_pipe_buttons_are_a_button_box(self, converter):
+        """MessageBoxEX's `text|button` box is a MESG numbered after the MessageBox sites.
+
+        See: docs/commentary/script_convert.md#messageboxex-buttons
+        """
+        source = ('ScriptName QuizScript\nshort b\nstring_var q\nstring_var a\n\nBegin GameMode\n'
+                  '  MessageBoxEX "Take the quiz?|Take Quiz|Skip Quiz"\n'
+                  '  MessageBoxEX "%z|Yes|No", q\n'
+                  '  set q to sv_Construct "Pick one."\n'
+                  '  set a to sv_Construct "The sword"\n'
+                  '  MessageBoxEX "%z%r|%z|None", q, a\n'
+                  '  MessageBox "Rest?", "Yes", "No"\n'
+                  '  set b to GetButtonPressed\nEnd\n')
+        plan = build_message_plan([{'EditorID': 'QuizScript', 'SCTX': source}])
+        assert plan['quizscript'] == [('TES4Msg_QuizScript_01', 'Rest?', ['Yes', 'No']),
+                                      ('TES4Msg_QuizScript_02', 'Take the quiz?',
+                                       ['Take Quiz', 'Skip Quiz']),
+                                      ('TES4Msg_QuizScript_03', 'Pick one.\n',
+                                       ['The sword', 'None'])]
+        converter.message_menus = plan
+        out = converter.convert_standalone('QuizScript', source, 'ObjectReference', 'QuizScript')
+        for n in ('01', '02', '03'):
+            assert f'TES4_ShowMsg(TES4Msg_QuizScript_{n})' in out
+        assert out.count('TES4_ShowMsg(TES4Msg_') == 3
+        assert 'b = TES4_TakeMsgButton()' in out
+
+    def test_book_read_while_carried_runs_the_read_hook(self, converter):
+        """A book's opening OnActivate also runs from OnRead for a carried
+        read: the opening Activate is dropped, a flag skips the read the
+        world activation raised, and the poll runs once after the menu.
+
+        See: docs/commentary/script_convert.md#carried-items-and-read-books
+        """
+        source = """ScriptName NoteScript
+short lesen
+Begin OnActivate
+if ( lesen == 0 )
+  Activate
+  set lesen to 1
+endif
+End
+Begin GameMode
+if ( lesen == 1 )
+  set lesen to 2
+endif
+End
+"""
+        converter.sc.on_book = True
+        result = converter.convert_standalone('NoteScript', source,
+                                              'ObjectReference', 'NoteScript')
+        activate = result.split('Event OnActivate(', 1)[1].split(
+            'EndEvent', 1)[0]
+        read = result.split('Event OnRead()', 1)[1].split('EndEvent', 1)[0]
+        assert 'TES4_ReadByActivate = akActionRef == Game.GetPlayer()' in activate
+        assert 'lesen = 1' in read
+        assert 'Activate(' not in read
+        assert read.index('Utility.Wait(0.001)') < read.index('OnUpdate()')
+
+    def test_non_book_gets_no_read_hook(self, converter):
+        """Only scripts on BOOK records turn OnActivate into a read hook."""
+        source = """ScriptName LeverScript
+Begin OnActivate
+  Activate
+End
+"""
+        result = converter.convert_standalone('LeverScript', source,
+                                              'ObjectReference', 'LeverScript')
+        assert 'Event OnRead()' not in result
 
     def test_gamemode_oninit_not_duplicated(self, converter):
         """A script with its own OnInit must not get a second one."""
@@ -801,7 +1066,8 @@ End
         These bodies used to be merged, unguarded, into the GameMode OnUpdate
         loop — so MQ01Script's MenuMode 1014/1030 blocks ran `setstage MQ01 70/84`
         on the first tick of a new game, blowing the tutorial quest through its
-        whole stage machine and into stage 100's `stopquest MQ01`.
+        whole stage machine and into stage 100's `stopquest MQ01`. The body
+        survives only as a comment, so it can be hand-ported.
         """
         source = """ScriptName MQ01Script
 
@@ -820,10 +1086,8 @@ End
         lines = result.split('\n')
         onupdate = lines[lines.index('Event OnUpdate()'):]
         onupdate = onupdate[:onupdate.index('EndEvent')]
-        # The MenuMode SetStage must not appear anywhere inside OnUpdate...
-        assert not any('SetStage(70)' in ln for ln in onupdate)
-        # ...but must survive as a comment so it can be hand-ported.
-        assert any(ln.lstrip().startswith(';') and 'SetStage(70)' in ln
+        assert not any('SetStage(MQ01, 70)' in ln for ln in onupdate)
+        assert any(ln.lstrip().startswith(';') and 'SetStage(MQ01, 70)' in ln
                    for ln in lines)
 
 
@@ -1085,6 +1349,108 @@ class TestScroRefTyping:
         conv.convert_fragment('set MS14.QuestDone to 1', 'Quest')
         add_scro_ref(conv, '00017606', x)
         assert conv.get_property_refs()['myMS14'] == 'TES4_MS14Script'
+
+
+class TestPlaceAtMeBindsABaseForm:
+    """PlaceAtMe's argument is a BASE form, so its property takes a base type.
+
+    The SCRO typed a scripted CREA as its attached Actor script, which a base
+    record can never bind: Nehrim's rat-hole spawners read None and spawned
+    nothing.
+    See: docs/commentary/script_convert.md#property-type-merge
+    """
+
+    def _xref(self, rtype, edid, fid):
+        """A scripted base record of `rtype` named `edid`."""
+        x = CrossRefGraph()
+        x.formid_to_edid[fid] = edid
+        x.edid_to_formid[edid.lower()] = fid
+        x.record_type[fid] = rtype
+        x.record_scri[fid] = '001AB00E'
+        x.script_formid_to_edid['001AB00E'] = 'NQ00Ratte02Script'
+        x.script_formid_to_type['001AB00E'] = 0
+        return x
+
+    @pytest.mark.parametrize('rtype, ptype', [('CREA', 'ActorBase'), ('NPC_', 'ActorBase'),
+                                              ('ACTI', 'Activator')])
+    def test_scripted_base_is_typed_as_a_base(self, rtype, ptype):
+        """The spawned form's property is a base type, not its attached script."""
+        from script_convert.scro_refs import add_scro_ref
+        x = self._xref(rtype, 'NQRatte02', '001AB066')
+        conv = ScriptConverter(x)
+        add_scro_ref(conv, '001AB066', x)
+        out = conv.convert_fragment('PlaceAtMe NQRatte02 1,1,1', 'ObjectReference')
+        assert 'Self.PlaceAtMe(NQRatte02, 1)' in '\n'.join(out)
+        assert conv.get_property_refs()['NQRatte02'] == ptype
+
+
+class TestScroTableAsksWhetherAScriptClassBinds:
+    """The SCRO table types a scripted record by its script class only where that class binds.
+
+    See: docs/commentary/script_convert.md#script-type-property-binding
+    """
+
+    @staticmethod
+    def _conv(rtype, placed=0):
+        """A converter whose SCRO table named one scripted record of `rtype`, placed `placed` times."""
+        from script_convert.scro_refs import add_scro_ref
+        x = CrossRefGraph()
+        x.formid_to_edid['0001FEF0'] = 'TheThing'
+        x.edid_to_formid['thething'] = '0001FEF0'
+        x.record_type['0001FEF0'] = rtype
+        x.record_scri['0001FEF0'] = '000AAAAA'
+        x.script_formid_to_edid['000AAAAA'] = 'TheThingScript'
+        x.script_formid_to_type['000AAAAA'] = 1
+        for n in range(placed):
+            x.record_base['0002AAA%d' % n] = '0001FEF0'
+            x.record_type['0002AAA%d' % n] = 'REFR'
+        conv = ScriptConverter(x)
+        add_scro_ref(conv, '0001FEF0', x)
+        return conv
+
+    @pytest.mark.parametrize('rtype, ptype', [
+        ('KEYM', 'Key'), ('BOOK', 'Book'), ('ARMO', 'Armor'), ('CLOT', 'Armor'), ('WEAP', 'Weapon'),
+        ('INGR', 'Ingredient'), ('MISC', 'MiscObject'), ('ALCH', 'Potion'), ('AMMO', 'Ammo'),
+        ('SLGM', 'SoulGem'), ('SGST', 'Scroll'), ('APPA', 'MiscObject')])
+    def test_a_scripted_item_keeps_its_item_type(self, rtype, ptype):
+        """An inventory base is never declared with its script class."""
+        assert self._conv(rtype).get_property_refs()['TheThing'] == ptype
+
+    @pytest.mark.parametrize('placed', [1, 3])
+    def test_an_item_placed_in_the_world_is_still_a_base(self, placed):
+        """A lone world placement does not turn an item property into that reference."""
+        assert self._conv('KEYM', placed).get_property_refs()['TheThing'] == 'Key'
+
+    @pytest.mark.parametrize('rtype', ['NPC_', 'CREA', 'CONT', 'DOOR', 'FLOR', 'FURN', 'STAT'])
+    def test_a_reference_type_keeps_the_script_class(self, rtype):
+        """Where the record's own type is a reference type the script class binds."""
+        assert self._conv(rtype).get_property_refs()['TheThing'] == 'TES4_TheThingScript'
+
+    @pytest.mark.parametrize('sig', ['REFR', 'ACHR', 'ACRE'])
+    def test_a_placed_reference_keeps_its_bases_script_class(self, sig):
+        """The commonest SCRO entry: a reference whose base carries the script."""
+        from script_convert.scro_refs import add_scro_ref
+        conv = self._conv('ACTI' if sig == 'REFR' else 'NPC_', placed=2)
+        conv.xref.record_type['0002AAA0'] = sig
+        conv.xref.formid_to_edid['0002AAA0'] = 'TheThingRef'
+        conv.xref.edid_to_formid['thethingref'] = '0002AAA0'
+        add_scro_ref(conv, '0002AAA0', conv.xref)
+        assert conv.get_property_refs()['TheThingRef'] == 'TES4_TheThingScript'
+
+    @pytest.mark.parametrize('rtype, placed, ptype', [
+        ('ACTI', 1, 'TES4_TheThingScript'), ('LIGH', 1, 'TES4_TheThingScript'),
+        ('ACTI', 0, 'Activator'), ('ACTI', 2, 'Activator'), ('LIGH', 0, 'Light'), ('LIGH', 2, 'Light')])
+    def test_a_world_object_keeps_the_script_class_only_when_placed_once(self, rtype, placed, ptype):
+        """The measured exception: one placed reference carries the script instance."""
+        assert self._conv(rtype, placed).get_property_refs()['TheThing'] == ptype
+
+    def test_a_later_stage_table_does_not_undo_the_item_type(self):
+        """Each quest stage reads its own SCRO list after earlier stages' bodies."""
+        from script_convert.scro_refs import add_scro_ref
+        conv = self._conv('KEYM')
+        conv.convert_fragment('player.AddItem TheThing 1', 'Quest')
+        add_scro_ref(conv, '0001FEF0', conv.xref)
+        assert conv.get_property_refs()['TheThing'] == 'Key'
 
 
 # ===========================================================================
@@ -1665,7 +2031,8 @@ class TestQuestObjectiveCompletion:
 @pytest.fixture
 def xref_magic():
     """CrossRefGraph stocked with MGEF/EFSH/SPEL/PACK records the new
-    handlers resolve through."""
+    handlers resolve through.  DRHE is the one MGEF record, so SEFF is an
+    effect code with no record and TestScriptSpell has no MGEF effect."""
     x = CrossRefGraph()
     # EFSH records (converted, so bindable as EffectShader properties)
     for fid, edid in [('0014A0A2', 'effectSoulTrap'),
@@ -1679,7 +2046,9 @@ def xref_magic():
     x.mgef_shaders['strp'] = ('0014A0A2', '0018B57B', 4)
     x.mgef_shaders['dspl'] = ('00000000', '0018B57B', 4)
     x.mgef_shaders['babo'] = ('00000000', '00000000', 1)
-    # Spells: first effect DRHE -> AlchDamageHealth; pure-SEFF spell -> filler
+    x.formid_to_edid['00001234'] = 'DRHE'
+    x.edid_to_formid['drhe'] = '00001234'
+    x.record_type['00001234'] = 'MGEF'
     x.spell_effects['testdrainspell'] = [('SEFF', 69), ('DRHE', 8)]
     x.spell_effects['testscriptspell'] = [('SEFF', 69)]
     # A PACK record for GetIsCurrentPackage/GetCurrentAIPackage
@@ -1724,33 +2093,54 @@ class TestMagicEffectVisuals:
 
 
 class TestIsSpellTarget:
-    def test_resolves_first_surviving_effect(self, xref_magic):
-        # SEFF drops, DRHE -> AlchDamageHealth 0x0003EB42
-        assert xref_magic.get_spell_first_skyrim_mgef('TestDrainSpell') == 0x0003EB42
-
-    def test_pure_script_spell_uses_filler(self, xref_magic):
-        # matches the importer's first filler (AlchRestoreHealth)
-        assert xref_magic.get_spell_first_skyrim_mgef('TestScriptSpell') == 0x0003EB15
-
-    def test_emits_polyfill_call(self, xref_magic):
+    def test_tests_first_mgef_effect_family(self, xref_magic):
+        """The spell's first effect with an MGEF record is tested by its family keyword."""
         conv = ScriptConverter(xref_magic)
         result = conv_line(conv, 'if player.IsSpellTarget TestDrainSpell',
                                     'ObjectReference')
-        assert 'TES4Polyfill.HasMagicEffectByID(Game.GetPlayer(), 0x0003EB42)' in result
+        assert 'Game.GetPlayer().HasMagicEffectWithKeyword(TES4FX_drhe)' in result
+        assert conv.get_property_refs()['TES4FX_drhe'] == 'Keyword'
         assert ';TODO' not in result
+
+    def test_spell_without_mgef_reads_false(self, xref_magic):
+        """A spell none of whose effects has an MGEF record tests nothing."""
+        conv = ScriptConverter(xref_magic)
+        result = conv_line(conv, 'if player.IsSpellTarget TestScriptSpell',
+                                    'ObjectReference')
+        assert 'HasMagicEffectWithKeyword' not in result
+
+
+class TestHasMagicEffect:
+    """Every copy of an MGEF carries its family keyword; the script tests that."""
+
+    def test_mgef_tests_family_keyword(self, xref_magic):
+        """HasMagicEffect on an MGEF becomes HasMagicEffectWithKeyword on its family."""
+        conv = ScriptConverter(xref_magic)
+        result = conv_line(conv, 'if player.HasMagicEffect DRHE == 0',
+                                    'ObjectReference')
+        assert '!(Game.GetPlayer().HasMagicEffectWithKeyword(TES4FX_drhe))' in result
+        assert conv.get_property_refs()['TES4FX_drhe'] == 'Keyword'
+
+    def test_non_mgef_keeps_plain_call(self, xref_magic):
+        """An argument that is not an MGEF keeps the plain HasMagicEffect call."""
+        conv = ScriptConverter(xref_magic)
+        result = conv_line(conv, 'if player.HasMagicEffect SEFF',
+                                    'ObjectReference')
+        assert 'HasMagicEffect(' in result
+        assert 'WithKeyword' not in result
 
 
 class TestAnimAndPackage:
     def test_isanimplaying_bare(self, converter):
         result = conv_line(converter, 'if isAnimPlaying == 0', 'ObjectReference')
-        assert 'GetAnimationVariableBool("bAnimPlaying")' in result
+        assert 'GetAnimationVariableBool("TES4IsAnimPlaying")' in result
         assert ';TODO' not in result
 
     def test_isanimplaying_on_ref(self, converter):
         converter._property_refs['DoorRef'] = 'ObjectReference'
         result = conv_line(converter, 'if DoorRef.IsAnimPlaying == 0',
                                          'ObjectReference')
-        assert 'DoorRef.GetAnimationVariableBool("bAnimPlaying")' in result
+        assert 'DoorRef.GetAnimationVariableBool("TES4IsAnimPlaying")' in result
 
     def test_getiscurrentpackage(self, xref_magic):
         conv = ScriptConverter(xref_magic)
@@ -1818,6 +2208,150 @@ class TestSetAlert:
         assert '(Self as Actor).SetAlert(true)' in result
 
 
+class TestIgnoreFriendlyHits:
+    """Set/GetIgnoreFriendlyHits map to Skyrim's native pair.
+
+    Dropping the setter made Nehrim's Celebro turn on the player at the first
+    stray hit in the intro's troll fights (`CelebroRef.SetIgnoreFriendlyHits 3`).
+    """
+
+    def test_nonzero_flag_is_true(self, converter):
+        result = conv_line(converter, 'CelebroRef.SetIgnoreFriendlyHits 3', 'Quest')
+        assert 'CelebroRef.IgnoreFriendlyHits(true)' in result
+
+    def test_zero_flag_is_false(self, converter):
+        result = conv_line(converter, 'CelebroRef.sifh 0', 'Quest')
+        assert 'CelebroRef.IgnoreFriendlyHits(false)' in result
+
+    def test_getter_reads_the_flag(self, converter):
+        """The guard reads the real flag instead of folding to `false`."""
+        result = conv_line(converter, 'if Target.GetIgnoreFriendlyHits == 0', 'ObjectReference')
+        assert 'IsIgnoringFriendlyHits()' in result
+        assert ';NE:' not in result
+
+
+class TestLastActivator:
+    """A bare Activate in a timer block reuses the object's last activator.
+
+    Nehrim's mining rock opens itself for the player a second after the swing;
+    `Activate(None, true)` opened it for nobody.
+    """
+
+    SOURCE = ('scn Rock\nshort DoOnce\n'
+              'Begin OnActivate Player\n set DoOnce to 1\nEnd\n'
+              'Begin GameMode\n if DoOnce == 1\n  set DoOnce to 0\n  Activate\n endif\nEnd\n')
+
+    def test_timer_activate_uses_recorded_activator(self, converter):
+        """The poll activates with the variable OnActivate filled."""
+        out = converter.convert_standalone('Rock', self.SOURCE, 'ObjectReference', 'Rock')
+        assert 'Activate(TES4_LastActivator, true)' in out
+        assert 'ObjectReference TES4_LastActivator' in out
+        assert 'TES4_LastActivator = akActionRef' in out
+        assert 'Activate(None' not in out
+
+    def test_script_without_onactivate_is_untouched(self, converter):
+        """No OnActivate block means no recorded activator."""
+        source = 'scn Plain\nBegin GameMode\n Activate\nEnd\n'
+        out = converter.convert_standalone('Plain', source, 'ObjectReference', 'Plain')
+        assert 'TES4_LastActivator' not in out
+
+
+class TestObseBlockAndCallFixes:
+    """Nehrim's AAGeneralUpdateQuest: a forEach, a nested Call argument, misc stats."""
+
+    @staticmethod
+    def _poll(converter, body: str) -> str:
+        """The OnUpdate body converted from a GameMode block holding `body`."""
+        source = f'scn T\nshort n\nshort x\narray_var it\nref r\nbegin gameMode\n{body}\nend\n'
+        out = converter.convert_standalone('T', source, 'Quest', 'T')
+        return out.split('Event OnUpdate()', 1)[1].split('EndEvent', 1)[0]
+
+    def test_foreach_comments_only_its_own_block(self, converter):
+        """Statements after `loop` stay live."""
+        body = self._poll(converter, 'forEach it <- r.getItems\n set n to 1\nloop\nset x to 2')
+        assert ';n = 1' in body
+        assert '\n  x = 2' in body
+
+    def test_nested_call_keeps_outer_arguments(self, converter):
+        """A command inside one argument does not erase the ones after it."""
+        body = self._poll(converter, 'Call G 30 * ( getPCMiscStat 15 - x ), 1, 1, -1')
+        assert 'Houses Owned") - x), 1, 1, -1)' in body
+
+    def test_misc_stat_by_name(self, converter):
+        """The TES4 index becomes Skyrim's stat name; one no Skyrim stat stands for is our global."""
+        assert ('(Game.QueryStat("Locations Discovered") + TES4MiscStat07.GetValueInt())'
+                in self._poll(converter, 'set n to getPCMiscStat 7'))
+        assert 'Game.IncrementStat("Houses Owned", 2)' in self._poll(converter, 'ModPCMiscStat 15 2')
+        body = self._poll(converter, 'set n to getPCMiscStat 13')
+        assert 'QueryStat' not in body and 'TES4MiscStat13.GetValueInt()' in body
+
+    def test_engine_kept_stat_write_is_our_global(self, converter):
+        """Nehrim's EP write to stat 22 lands in our global, never Days as a Vampire."""
+        body = self._poll(converter, 'ModPCMiscStat 22 x')
+        assert 'IncrementStat' not in body and 'TES4MiscStat22.Mod(x)' in body
+        assert converter._property_refs['TES4MiscStat22'] == 'GlobalVariable'
+
+
+class TestSplitSkillReads:
+    """Blade and Blunt read the higher of One-Handed and Two-Handed; writes stay One-Handed."""
+
+    def test_read_takes_the_higher_half(self, converter):
+        """GetAV Blade goes through TES4Polyfill.HigherActorValue."""
+        body = TestObseBlockAndCallFixes._poll(converter, 'set n to player.getav blade')
+        assert 'TES4Polyfill.HigherActorValue(Game.GetPlayer(), "OneHanded", "TwoHanded")' in body
+
+    def test_base_read_matches_the_write(self, converter):
+        """A trainer's GetBaseAV Blade reads the One-Handed its SetAV writes."""
+        base = TestObseBlockAndCallFixes._poll(converter, 'set n to player.getbaseav blunt')
+        assert 'GetBaseActorValue("OneHanded")' in base and 'HigherActorValue' not in base
+
+    def test_write_stays_one_handed(self, converter):
+        """A trainer's SetAV Blade still lands on One-Handed."""
+        body = TestObseBlockAndCallFixes._poll(converter, 'player.setav blade 40')
+        assert 'SetActorValue("OneHanded", 40)' in body
+
+
+class TestSetFunctionValue:
+    """SetFunctionValue sets the result and the function keeps running (HMSfromFloat24h)."""
+
+    def test_result_survives_to_the_end(self, converter):
+        """No `return` after it: the value still comes back, typed as set."""
+        source = ('scn HMS\nstring_var s\nbegin Function {v}\n let s := "x"\n'
+                  ' SetFunctionValue s\n sv_destruct s\nend\n')
+        out = converter.convert_standalone('HMS', source, 'Quest', 'HMS')
+        assert 'String Function TES4Call(' in out
+        assert 'TES4_Result = s' in out
+        assert out.count('Return TES4_Result') == 1
+
+
+class TestUdfCallingReference:
+    """`Player.Call F x` runs F on Player; the function's `Self` is that reference."""
+
+    def test_body_self_is_the_calling_reference(self, converter):
+        """`MoveTo` in the body acts on the caller's reference."""
+        source = 'scn F\nref t\nbegin Function {t}\n MoveTo t\nend\n'
+        out = converter.convert_standalone('F', source, 'Quest', 'F')
+        assert 'Function TES4Call(ObjectReference akCallingRef, ' in out
+        assert 'TES4Polyfill.MoveTo(akCallingRef, ' in out
+
+    def test_call_passes_the_receiver(self, converter):
+        """An explicit receiver is passed first; a quest script passes None."""
+        assert 'TES4Call(Game.GetPlayer(), ' in conv_line(converter, 'Player.Call F Marker', 'ObjectReference')
+        assert 'TES4Call(None, ' in conv_line(converter, 'Call F Marker', 'Quest')
+
+
+class TestFunctionScriptHosting:
+    """An OBSE function script is hosted on its own quest, so it extends Quest."""
+
+    def test_function_script_is_quest_hosted(self):
+        """The export-escaped `begin Function` header marks a quest-hosted script."""
+        from script_convert.cross_ref import hosted_script_type
+        sctx = r'scn F\r\nshort x\r\n\r\nBegin Function{ a, b }\r\n\tset x to a\r\nEnd'
+        assert hosted_script_type(0, sctx) == 1
+        assert hosted_script_type(0, r'scn F\nBegin GameMode\nEnd') == 0
+        assert hosted_script_type(0, 'scn F\r\n\r\nBegin Function{ a }\r\nEnd') == 1
+
+
 class TestSingletonFixes:
     def test_getiscreature_polyfill(self, converter):
         result = conv_line(converter, 'if GetIsCreature == 0', 'ActiveMagicEffect')
@@ -1831,6 +2365,53 @@ class TestSingletonFixes:
         result = conv_line(converter, 'if player.HasVampireFed == 1',
                                          'ObjectReference')
         assert 'TES4Polyfill.HasVampireFed()' in result
+
+    def test_negative_setfactionrank_removes_instead_of_joining(self, converter):
+        """TES4 `SetFactionRank <faction> -1` means LEAVE the faction.
+
+        Papyrus SetFactionRank adds the actor if necessary and keeps a negative
+        rank, so the 1:1 mapping joined the faction the script meant to leave —
+        271 of 1033 corpus calls pass -1, and the vampirism CURES
+        (`playervampirefaction`, Morroblivion's `0clanS*`) are what made every
+        NPC read a non-vampire player as a vampire.
+        See: docs/commentary/script_convert.md#setfactionrank--1-is-removal
+        """
+        result = conv_line(converter,
+            'player.setfactionrank playervampirefaction -1', 'ObjectReference')
+        assert 'RemoveFromFaction(playervampirefaction)' in result
+        assert 'SetFactionRank' not in result
+        assert ';TODO' not in result
+
+    def test_comma_separated_negative_rank_also_removes(self, converter):
+        """The `-1` idiom is written with either separator."""
+        result = conv_line(converter,
+            'SrazirrRef.setfactionrank claudemaricthugfaction, -1',
+            'ObjectReference')
+        assert 'SrazirrRef.RemoveFromFaction(claudemaricthugfaction)' in result
+
+    def test_non_negative_setfactionrank_is_unchanged(self, converter):
+        """Rank 0 is a real rank — 374 corpus calls use it — and must not be
+        turned into a removal."""
+        result = conv_line(converter,
+            'player.setfactionrank fightersguild 0', 'ObjectReference')
+        assert 'SetFactionRank(fightersguild, 0)' in result
+        assert 'RemoveFromFaction' not in result
+
+    def test_variable_rank_defers_the_sign_test_to_runtime(self, converter):
+        """A non-literal rank (Nehrim's `NehrimSymbolVar`) cannot be decided at
+        conversion time, so the polyfill branches on the sign instead."""
+        result = conv_line(converter,
+            'Player.setfactionrank NehrimSymbolFaction NehrimSymbolVar',
+            'ObjectReference')
+        assert 'TES4Polyfill.SetFactionRank(' in result
+        assert 'NehrimSymbolVar' in result
+
+    def test_modfactionrank_negative_is_not_a_removal(self, converter):
+        """ModFactionRank is RELATIVE and means the same in both games."""
+        result = conv_line(converter,
+            'player.modfactionrank fightersguild -1', 'ObjectReference')
+        assert 'ModFactionRank(fightersguild, -1)' in result
+        assert 'RemoveFromFaction' not in result
 
     def test_setfactionreaction_mixed_separators(self, converter):
         """SetAlly, never SetReaction, whatever separators are used.
@@ -1982,6 +2563,111 @@ End
         assert 'RegisterForSleep' not in result
 
 
+class TestOwnerIsABase:
+    """SetOwnership and IsOwner name an actor BASE, a placed actor or a faction."""
+
+    @staticmethod
+    def _conv(edid, sig):
+        """A converter whose graph holds one record, `edid`, of type `sig`."""
+        x = CrossRefGraph()
+        x.edid_to_formid[edid.lower()] = '01001234'
+        x.formid_to_edid['01001234'] = edid
+        x.record_type['01001234'] = sig
+        return ScriptConverter(x)
+
+    @pytest.mark.parametrize('sig', ['NPC_', 'CREA'])
+    def test_a_base_owner_is_passed_as_it_is(self, sig):
+        """DLCFrostcrag's quest says `SetOwnership Aurelinwae`, an NPC_ base."""
+        conv = self._conv('Aurelinwae', sig)
+        out = conv_line(conv, 'AddonsRef.SetOwnership Aurelinwae', 'Quest')
+        assert out.strip() == 'AddonsRef.SetActorOwner(Aurelinwae)'
+        assert conv.sc.property_refs['Aurelinwae'] == 'ActorBase'
+
+    def test_a_placed_actor_owner_is_read_for_its_base(self):
+        """A reference is not the owner Skyrim wants; its base is."""
+        conv = self._conv('AurelinwaeRef', 'ACHR')
+        out = conv_line(conv, 'AddonsRef.SetOwnership AurelinwaeRef', 'Quest')
+        assert out.strip() == 'AddonsRef.SetActorOwner(AurelinwaeRef.GetActorBase())'
+        assert conv.sc.property_refs.get('AurelinwaeRef') != 'ActorBase'
+
+    def test_is_owner_compares_a_base_as_it_is(self):
+        """The read side is split the same way as the write side."""
+        conv = self._conv('Aurelinwae', 'NPC_')
+        out = conv_expr(conv, 'AddonsRef.IsOwner Aurelinwae', 'Quest')
+        assert out == '(AddonsRef.GetActorOwner() == Aurelinwae)'
+        assert conv.sc.property_refs['Aurelinwae'] == 'ActorBase'
+
+    def test_is_owner_reads_a_placed_actor_for_its_base(self):
+        """Unchanged: a reference is compared through its base."""
+        conv = self._conv('AurelinwaeRef', 'ACHR')
+        out = conv_expr(conv, 'AddonsRef.IsOwner AurelinwaeRef', 'Quest')
+        assert out == '(AddonsRef.GetActorOwner() == AurelinwaeRef.GetActorBase())'
+
+    def test_a_faction_owner_is_untouched(self):
+        """A faction never reaches the base test."""
+        conv = self._conv('ThievesGuild', 'FACT')
+        out = conv_line(conv, 'AddonsRef.SetOwnership ThievesGuild', 'Quest')
+        assert out.strip() == 'AddonsRef.SetFactionOwner(ThievesGuild)'
+        assert conv.sc.property_refs.get('ThievesGuild') != 'ActorBase'
+
+    @pytest.mark.parametrize('operand', ['aurelinwae', '"Aurelinwae"'])
+    def test_the_type_goes_to_the_property_however_the_owner_is_spelled(self, operand):
+        """Scripts spell an EditorID in any case, and some quote it."""
+        conv = self._conv('Aurelinwae', 'NPC_')
+        out = conv_line(conv, f'AddonsRef.SetOwnership {operand}', 'Quest')
+        assert out.strip() == 'AddonsRef.SetActorOwner(Aurelinwae)'
+        assert conv.sc.property_refs.get('Aurelinwae') == 'ActorBase'
+
+    def test_the_record_is_found_by_the_name_the_script_wrote(self):
+        """A property cannot start with a digit, so its name is not the EditorID."""
+        conv = self._conv('1stOwner', 'NPC_')
+        out = conv_line(conv, 'AddonsRef.SetOwnership 1stOwner', 'Quest')
+        assert out.strip() == 'AddonsRef.SetActorOwner(d1stOwner)'
+        assert conv.sc.property_refs.get('d1stOwner') == 'ActorBase'
+
+    @pytest.mark.parametrize('operand', ['player', 'Player', 'PlayerRef'])
+    def test_the_player_is_never_retyped(self, operand):
+        """`Player` is an NPC_ record, and every other command passes that name as a reference."""
+        conv = self._conv('Player', 'NPC_')
+        out = conv.convert_standalone(
+            'T', f'scn T\n\nbegin onactivate\n\tsetownership {operand}\n\tmoveto player\nend\n',
+            'ObjectReference', 'T')
+        assert 'ActorBase Property' not in out
+        assert 'SetActorOwner(Player)' not in out and 'SetActorOwner(PlayerRef)' not in out
+
+    def test_an_unresolved_owner_keeps_the_old_read(self):
+        """A local `ref`, or a name no record carries, is read as a reference."""
+        conv = self._conv('Aurelinwae', 'NPC_')
+        out = conv_line(conv, 'AddonsRef.SetOwnership myOwner', 'Quest')
+        assert out.strip() == 'AddonsRef.SetActorOwner(myOwner.GetActorBase())'
+        assert 'ActorBase' not in conv.sc.property_refs.values()
+
+    def test_a_record_that_is_no_actor_keeps_the_old_read(self):
+        """Only NPC_ and CREA are actor bases."""
+        conv = self._conv('SomeDoor', 'DOOR')
+        out = conv_line(conv, 'AddonsRef.SetOwnership SomeDoor', 'Quest')
+        assert out.strip() == 'AddonsRef.SetActorOwner(SomeDoor.GetActorBase())'
+        assert conv.sc.property_refs.get('SomeDoor') != 'ActorBase'
+
+    def test_is_owner_compares_a_faction_as_before(self):
+        """The only form the game files use (15 in Oblivion.esm)."""
+        conv = self._conv('ThievesGuild', 'FACT')
+        out = conv_expr(conv, 'AddonsRef.IsOwner ThievesGuild', 'Quest')
+        assert out == '(AddonsRef.GetFactionOwner() == ThievesGuild)'
+        assert conv.sc.property_refs.get('ThievesGuild') != 'ActorBase'
+
+    @pytest.mark.parametrize('body', ['setessential Aurelinwae 0\n\tsetownership Aurelinwae',
+                                      'setownership Aurelinwae\n\tsetessential Aurelinwae 0'])
+    def test_an_owner_that_is_also_set_essential_is_one_actorbase(self, body):
+        """SetEssential types the name `ActorBase`; reading its base then did not compile."""
+        conv = self._conv('Aurelinwae', 'NPC_')
+        out = conv.convert_standalone('T', f'scn T\n\nbegin onactivate\n\t{body}\nend\n',
+                                      'ObjectReference', 'T')
+        assert 'ActorBase Property Aurelinwae Auto' in out
+        assert 'SetActorOwner(Aurelinwae)' in out and 'Aurelinwae.SetEssential(false)' in out
+        assert 'Aurelinwae.GetActorBase()' not in out
+
+
 class TestInfoFragmentVmadLayout:
     """Every INFO VMAD declares BOTH fragments: Fragment_1 (OnBegin) and
     Fragment_0 (OnEnd) -- the line hooks TES4Polyfill.SayLine relies on.
@@ -2075,12 +2761,20 @@ class TestInfoFragmentEmission:
                          {'info:00032469': 12.62})
         begin = psc.split('Function Fragment_1', 1)[1].split('EndFunction')[0]
         end = psc.split('Function Fragment_0', 1)[1].split('EndFunction')[0]
-        assert 'TES4Polyfill.LineBegan(akSpeakerRef, 12.62)' in begin
+        assert 'TES4Polyfill.LineBegan(akSpeakerRef, 12.62, Self.GetFormID())' in begin
         assert 'TES4Polyfill.LineEnded(akSpeakerRef, 12.62)' in end
 
     def test_unmeasured_line_reports_zero(self, tmp_path):
         psc = self._emit(tmp_path, {'FormID': '00000ABC'})
-        assert 'TES4Polyfill.LineBegan(akSpeakerRef, 0)' in psc
+        assert 'TES4Polyfill.LineBegan(akSpeakerRef, 0, Self.GetFormID())' in psc
+
+    def test_a_plugin_with_masters_finds_its_line_by_the_low_bits(self, tmp_path):
+        """Voice files carry index 00, so 0103D326 is `info:0003D326`.
+
+        See: docs/commentary/script_convert.md#info-length-key
+        """
+        psc = self._emit(tmp_path, {'FormID': '0103D326'}, {'info:0003D326': 9.82})
+        assert 'TES4Polyfill.LineBegan(akSpeakerRef, 9.82, Self.GetFormID())' in psc
 
     def test_result_runs_before_line_ended(self, tmp_path):
         """A poll waiting on this speaker (SayLine's busy wait) proceeds the
@@ -2181,6 +2875,28 @@ class TestSayTimerConversion:
                                               'ObjectReference', 'TestNoPoll')
         assert 'TES4_SecondsPassed' not in result
 
+    def test_nothing_follows_a_poll_that_ends_in_return(self, converter):
+        """Papyrus parses `Return` and a next-line assignment as one statement and fails.
+
+        See: docs/commentary/script_convert.md#poll-pile-up
+        """
+        src = 'Scriptname TestReturn\n\nshort votes\n\nbegin gamemode\nreturn\nend\n'
+        result = converter.convert_standalone('TestReturn', src, 'Quest', 'TestReturn')
+        event = result.split('Event OnUpdate()', 1)[1].split('EndEvent', 1)[0]
+        assert event.rstrip().splitlines()[-1].strip() == 'Return'
+
+    def test_a_quest_stage_waits_for_its_line_and_an_info_does_not(self, converter):
+        """A stage's Say returns the line's own length; an INFO's still fires and goes on.
+
+        See: docs/commentary/script_convert.md#stage-say-waits
+        """
+        converter._property_refs['UrielSeptimRef'] = 'Actor'
+        body = 'set convTimer to UrielSeptimRef.Say CharGenVoice'
+        stage = '\n'.join(converter.convert_fragment(body, 'Quest'))
+        info = '\n'.join(converter.convert_fragment(body, 'TopicInfo'))
+        assert 'TES4Polyfill.SayLine(UrielSeptimRef, CharGenVoice' in stage
+        assert 'TES4Polyfill.SayLineNoWait(UrielSeptimRef, CharGenVoice' in info
+
     def test_say_assignment_becomes_a_blocking_sayline(self, converter):
         """`set T to ref.Say topic` -> T := TES4Polyfill.SayLine(ref, topic, fallback).
 
@@ -2198,6 +2914,84 @@ class TestSayTimerConversion:
         assert lines[1] == 'timer = TES4Polyfill.SayLine(ThadonRef, DeathSpeech01, 3)'
         # nothing else Says the line
         assert result.count('.Say(') == 0
+
+    def test_speak_as_waits_for_its_line_only_in_a_poll(self, converter):
+        """A speak-as Say picks its INFO at the call only if the caller waits.
+
+        The Arena announcer sets CityAnnounced = 1 right after speaking, and the
+        welcome INFO requires it to be 0 (confirmed in game: without the wait
+        the scene picked the next line).  An engine callback must not block.
+        See: docs/commentary/tes5_import_dialogue.md#speaker-activator-construction
+        """
+        x = converter.xref
+        x.edid_to_formid.update(arenamouth='00046653', announcer='00046652')
+        x.record_type.update({'00046653': 'NPC_', '00046652': 'DIAL'})
+        say = 'ArenaMatchPlayerRef.Say Announcer 1 ArenaMouth 1\n'
+        poll = converter.convert_standalone(
+            'TestPoll', 'scn TestPoll\nbegin GameMode\n' + say + 'end\n',
+            'Quest', 'TestPoll')
+        assert ('TES4Polyfill.SpeakAs(Announcer, '
+                'TES4Scene_arenamatchplayerref_arenamouth_announcer, True)') in poll
+        callback = converter.convert_standalone(
+            'TestAct', 'scn TestAct\nbegin OnActivate\n' + say + 'end\n',
+            'ObjectReference', 'TestAct')
+        assert ('TES4Polyfill.SpeakAs(Announcer, '
+                'TES4Scene_arenamatchplayerref_arenamouth_announcer)') in callback
+
+    def test_startconversation_player_joins_its_force_greet_pool(self, converter):
+        """`StartConversation Player <topic>` fills a slot of that topic's pool.
+
+        See: docs/commentary/tes5_import_dialogue.md#startconversation-player-force-greet
+        """
+        from tes5_import.dialogue.say_topics import build_force_greet_slots
+        by_type = {'SCPT': [{'SCTX': 'begin GameMode\nGaiusRef.StartConversation Player'
+                                     ' SE01GaiusForceGreet\nFooRef.StartConversation '
+                                     'player\nBarRef.StartConversation Baz Topic\nend'}]}
+        slots = build_force_greet_slots(by_type)
+        assert slots == {'': (0, 1), 'se01gaiusforcegreet': (1, 1)}
+        saved = ScriptConverter.force_greet_slots
+        ScriptConverter.force_greet_slots = slots
+        try:
+            converter._property_refs['GaiusRef'] = 'Actor'
+            result = conv_lines(converter,
+                'GaiusRef.StartConversation Player SE01GaiusForceGreet', 'Quest')
+        finally:
+            ScriptConverter.force_greet_slots = saved
+        assert 'TES4Polyfill.ForceGreet(TES4ForceGreets, 1, 1, GaiusRef)' in result
+
+    def test_startconversation_walk_runs_the_route_script(self, converter):
+        """A started topic whose lines continue hands both actors to the plugin's walk.
+
+        See: docs/commentary/tes5_import_dialogue.md#script-started-conversation-chains
+        """
+        saved = ScriptConverter.conversation_starts
+        ScriptConverter.conversation_starts = {'sermon01': 'TES4_ConvRoute_Knights'}
+        try:
+            result = conv_lines(converter, 'StartConversation ProphetRef Sermon01', 'Actor')
+        finally:
+            ScriptConverter.conversation_starts = saved
+        assert result.startswith('TES4_ConvRoute_Knights.Run(Self, ')
+        assert result.endswith(', Sermon01)')
+
+    def test_forceflee_joins_its_destinations_flee_pool(self, converter):
+        """`ForceFlee <cell>, <ref>` fills a slot of that destination's pool; a variable named Flee does not count.
+
+        See: docs/commentary/script_convert.md#forceflee-is-a-package
+        """
+        from tes5_import.dialogue.say_topics import build_force_flee_slots
+        by_type = {'INFO': [{'ResultScript': 'forceflee ParadiseGrotto01, MQ15ResurrectPad3'}],
+                   'SCPT': [{'SCTX': 'begin GameMode\nKimballRef.ForceFlee\n'
+                                     'set Flee to 1\nif Flee == 1\nendif\nend'}]}
+        slots = build_force_flee_slots(by_type)
+        assert slots == {'paradisegrotto01|mq15resurrectpad3': (0, 1), '|': (1, 1)}
+        saved = ScriptConverter.force_flee_slots
+        ScriptConverter.force_flee_slots = slots
+        try:
+            result = conv_lines(converter,
+                'forceflee ParadiseGrotto01, MQ15ResurrectPad3', 'Actor')
+        finally:
+            ScriptConverter.force_flee_slots = saved
+        assert result == 'TES4Polyfill.FillPoolSlot(TES4ForceFlees, 0, 1, Self)'
 
     def test_sayline_uses_the_topics_measured_maximum_as_fallback(self, converter):
         from script_convert.converter import ScriptConverter
@@ -2319,6 +3113,16 @@ class TestSayTimerConversion:
         name = decls[0].split()[1]
         assert all(name in g for g in guards), guards
 
+    def test_stage_latch_runs_before_an_early_return(self, converter):
+        """A pass that leaves by `return` still records the stage (MQ16 60 -> 65 -> 80)."""
+        src = ('scn T\n\nfloat timer\nshort setup\n\nbegin gamemode\n'
+               'if getstage MQ16 == 65 && timer <= 0\nsetstage MQ16 80\nendif\n'
+               'if setup == 0\nreturn\nendif\nset setup to 0\nend\n')
+        out = converter.convert_standalone('T', src, 'Quest', 'T')
+        lines = [l.strip() for l in out[out.index('Event OnUpdate()'):].split('\n')]
+        ret = lines.index('Return', lines.index('If setup == 0'))
+        assert lines[ret - 2] == 'TES4_LastStage_MQ16 = MQ16.GetStage()', lines[ret - 3:ret + 1]
+
     def test_stage_guard_without_a_timer_is_untouched(self, converter):
         """Only the timer-gated shape races; a plain stage test must not change."""
         src = ('scn T\n\nshort x\n\nbegin gamemode\n'
@@ -2413,6 +3217,26 @@ class TestSayTimerConversion:
             out = converter.convert_standalone('T', silent, ext, 'T')
             assert 'PlayerIsInDialogue' not in out
 
+    def test_the_runtime_dialogue_global_holds_a_speaking_poll(self, converter):
+        """A greeting with no fragment stamps no speaker (Kathutet, run 41e), so the
+        runtime's TES4DialogueOpen global holds actor and quest polls too."""
+        src = 'scn T\n\nshort x\n\nbegin gamemode\nset x to 1\nsayto player SomeTopic\nend\n'
+        for ext in ('Actor', 'Quest'):
+            out = converter.convert_standalone('T', src, ext, 'T')
+            assert 'GlobalVariable Property TES4DialogueOpen Auto' in out
+            assert '(TES4DialogueOpen && TES4DialogueOpen.GetValue() > 0)' in out
+
+    def test_a_poll_that_raises_a_message_box_holds_during_dialogue(self, converter):
+        """Blade1Script's practice box opened over Jauffre's greeting (run 46a): a MessageBox poll is gated too,
+        unless MenuMode work shares the poll."""
+        box = ('scn T\n\nshort x\n\nbegin gamemode\nif x == 0\nmessagebox "Learned."\nset x to 1\nendif\nend\n')
+        for ext in ('Actor', 'ObjectReference'):
+            out = converter.convert_standalone('T', box, ext, 'T')
+            assert 'TES4 GameMode did not run while a menu was open' in out
+        menu = box + 'begin menumode\nset x to 2\nend\n'
+        out = converter.convert_standalone('T', menu, 'ObjectReference', 'T')
+        assert 'TES4 GameMode did not run while a menu was open' not in out
+
     def test_say_driving_script_polls_fast(self, converter):
         """The `T <= 0` guard is what starts the next line, so the poll tick
         is dead air between lines: a script with a timer-Say ticks at 0.15s;
@@ -2457,6 +3281,29 @@ class TestFilterGuardTes4Type:
         conv.sc.property_refs['CGAssassin01Ref'] = 'TES4_CGAssassinScript'
         guard = block_filter_guard(conv, 'onhit', 'CGAssassin01Ref')
         assert guard == 'akAggressor == CGAssassin01Ref'
+
+
+class TestOnHitWithAmmo:
+    """OnHit's akSource is the bow, never the arrow: an AMMO filter reads the shooter.
+
+    See: docs/commentary/script_convert.md#onhitwith-ammo
+    """
+
+    def test_ammo_filter_tests_the_shooters_equipped_ammo(self, xref):
+        """An AMMO filter becomes HitWithAmmo on the aggressor, bound as an Ammo property."""
+        xref.edid_to_formid['se02gkbonearrow1'] = '0007E0BF'
+        xref.record_type['0007E0BF'] = 'AMMO'
+        conv = ScriptConverter(xref)
+        guard = block_filter_guard(conv, 'onhitwith', 'SE02GKBoneArrow1')
+        assert guard == 'TES4Polyfill.HitWithAmmo(akAggressor, SE02GKBoneArrow1)'
+        assert conv.sc.property_refs['SE02GKBoneArrow1'] == 'Ammo'
+
+    def test_weapon_filter_still_tests_the_source(self, xref):
+        """A WEAP filter is still the weapon OnHit passes as akSource."""
+        xref.edid_to_formid['ironsword'] = '00001234'
+        xref.record_type['00001234'] = 'WEAP'
+        conv = ScriptConverter(xref)
+        assert block_filter_guard(conv, 'onhitwith', 'IronSword') == 'akSource == IronSword'
 
 
 class TestGameHourFractional:
@@ -2509,7 +3356,7 @@ class TestEnumActorValues:
     def test_aggression_100_becomes_tier(self, converter):
         out = conv_line(converter,
             'SetActorValue Aggression, 100', 'ObjectReference')
-        assert 'SetActorValue("Aggression", 2)' in out
+        assert 'SetAggression((Self as Actor), 2, (100) as Int,' in out
 
     def test_low_aggression_fights_enemies_not_bystanders(self, converter):
         """`setav aggression 10` must NOT become "attack neutrals on sight".
@@ -2530,47 +3377,51 @@ class TestEnumActorValues:
         """
         out = conv_line(converter,
             'SetActorValue Aggression, 10', 'ObjectReference')
-        assert 'SetActorValue("Aggression", 1)' in out
+        assert 'SetAggression((Self as Actor), 1,' in out
 
     def test_high_aggression_still_attacks_on_sight(self, converter):
         """The real "now attack anyone" beats (90/100) must keep tier 2."""
         for value in (70, 90, 100):
             out = conv_line(converter,
                 f'SetActorValue Aggression, {value}', 'ObjectReference')
-            assert 'SetActorValue("Aggression", 2)' in out, value
+            assert 'SetAggression((Self as Actor), 2,' in out, value
 
     def test_aggression_five_never_initiates(self, converter):
         """<=5 is Oblivion's "never attack" floor."""
         out = conv_line(converter,
             'SetActorValue Aggression, 5', 'ObjectReference')
-        assert 'SetActorValue("Aggression", 0)' in out
+        assert 'SetAggression((Self as Actor), 0,' in out
 
     def test_frenzy_range_attacks_everyone(self, converter):
         """>=106 is Frenzy: attacks anyone, including allies."""
         out = conv_line(converter,
             'SetActorValue Aggression, 110', 'ObjectReference')
-        assert 'SetActorValue("Aggression", 3)' in out
+        assert 'SetAggression((Self as Actor), 3,' in out
 
     def test_in_range_value_passes_through(self, converter):
         """An already-legal tier is a deliberate value, not re-bucketed."""
         out = conv_line(converter,
             'SetActorValue Aggression, 0', 'ObjectReference')
-        assert 'SetActorValue("Aggression", 0)' in out
+        assert 'SetAggression((Self as Actor), 0,' in out
 
-    def test_confidence_scaled(self, converter):
-        """Oblivion 100 = fearless → Foolhardy (4), the only tier that never
-        flees.  Mapping it to Brave (3) left actors with a nonzero flee score
-        and made them run away constantly."""
-        out = conv_line(converter,
-            'SetActorValue Confidence, 100', 'ObjectReference')
-        assert 'SetActorValue("Confidence", 4)' in out
+    def test_confidence_write_goes_through_the_polyfill(self, converter):
+        """The 0-100 value reaches TES4Polyfill.SetConfidence unscaled.
 
-    def test_confidence_tiers_span_full_range(self, converter):
-        """Must mirror _convert_aidt: all five tiers are reachable."""
-        for raw, tier in ((100, 4), (75, 3), (50, 2), (20, 1), (5, 0)):
-            out = conv_line(converter,
-                f'SetActorValue Confidence, {raw}', 'ObjectReference')
-            assert f'SetActorValue("Confidence", {tier})' in out, (raw, out)
+        See: docs/commentary/script_convert.md#confidence-through-the-polyfill
+        """
+        out = conv_line(converter, 'SetActorValue Confidence, 80', 'Actor')
+        assert out == ('TES4Polyfill.SetConfidence(Self, 80, TES4ConfidenceFaction, '
+                       'TES4FleeMarginFaction, TES4ConfidenceFlee, TES4FleeHealthScale)')
+
+    def test_confidence_read_and_mod_round_trip(self, converter):
+        """GetAV reads the 0-100 value back; ModAV adds to it (the ULC fish script)."""
+        read = conv_line(converter, 'set baseConf to GetAV Confidence', 'Actor')
+        mod = conv_line(converter, 'ModAV Confidence fMod', 'Actor')
+        current = 'TES4Polyfill.GetConfidence(Self, TES4ConfidenceFaction)'
+        assert read == f'baseConf = {current}'
+        assert mod == (f'TES4Polyfill.SetConfidence(Self, {current} + (fMod), '
+                       'TES4ConfidenceFaction, TES4FleeMarginFaction, TES4ConfidenceFlee, '
+                       'TES4FleeHealthScale)')
 
     def test_non_enum_actor_value_untouched(self, converter):
         out = conv_line(converter,
@@ -2585,15 +3436,16 @@ class TestEnumActorValues:
 
 
 class TestZeroArgRefReceiver:
-    """Oblivion let the receiver of a zero-argument `ref.` command follow a
-    comma instead of a dot: `StopCombat, Player` means `Player.StopCombat`.
-    Treating it as an argument emitted `IsInCombat(Player)` ("function takes 0
-    parameters not 1") or dropped it and acted on the wrong actor.
+    """A zero-argument command's comma-led token (`StopCombat, Player`).
+
+    See: docs/commentary/script_convert.md#comma-argument-is-discarded
     """
 
-    def test_stopcombat_comma_receiver(self, converter):
+    def test_stopcombat_comma_argument_is_discarded(self, converter):
+        """Oblivion compiles `StopCombat, Player` as a bare StopCombat on Self."""
         out = conv_line(converter, 'StopCombat, Player', 'ObjectReference')
-        assert out == 'Game.GetPlayer().StopCombat()'
+        assert out == ('TES4Polyfill.EndCombatApproach((Self as Actor), TES4ForceCombatAttackers, '
+                       'TES4CombatApproaches)')
 
     def test_isincombat_comma_receiver_in_comparison(self, converter):
         out = conv_expr(converter, 'IsInCombat, Player == 1', 'ObjectReference')
@@ -2616,6 +3468,45 @@ class TestZeroArgRefReceiver:
         conv = ScriptConverter(xref)
         out = conv_expr(conv, 'GetInFaction, MyFaction == 1', 'ObjectReference')
         assert 'MyFaction' in out and 'IsInFaction(' in out
+
+
+class TestTES4SpeedAttribute:
+    """SetAV/GetAV Speed share one baseline so a saved Speed round-trips.
+
+    See: docs/commentary/script_convert.md#speed-write-becomes-speedmult
+    """
+
+    @staticmethod
+    def _converter(xref):
+        """A converter whose graph knows a Speed-33 NPC, the player, and the walk GMSTs."""
+        xref.edid_to_formid.update({'ravenref': '0001C001', 'player': '00000007'})
+        xref.record_base['0001C001'] = '0001C000'
+        xref.record_type.update({'0001C000': 'NPC_', '00000007': 'NPC_'})
+        xref.actor_speed.update({'0001C000': 33, '00000007': 40})
+        xref.move_gmsts.update({'fmovecharwalkmin': 90.0, 'fmovecharwalkmax': 130.0})
+        return ScriptConverter(xref)
+
+    def test_read_and_write_use_the_authored_baseline(self, xref):
+        """Raven's saved Speed is his own 33, never the attribute stub."""
+        conv = self._converter(xref)
+        read = conv_line(conv, 'set x to RavenRef.GetAV Speed', 'ObjectReference')
+        write = conv_line(conv, 'RavenRef.SetAV Speed x', 'ObjectReference')
+        assert 'GetTES4Speed(' in read and read.endswith(', 33, 90.0, 130.0)')
+        assert 'SetTES4Speed(' in write and write.endswith(', x, 33, 90.0, 130.0)')
+
+    def test_player_speed_stays_on_the_walk_formula(self, xref):
+        """Player Speed reads and writes share the movement baseline; a Mod adds to it."""
+        conv = self._converter(xref)
+        out = conv_line(conv, 'set x to player.GetBaseAV Speed', 'ObjectReference')
+        assert 'GetTES4Speed(Game.GetPlayer(), 100.0, 90.0, 130.0)' in out
+        write = conv_line(conv, 'player.modAV Speed 100', 'ObjectReference')
+        assert write.strip() == ('TES4Polyfill.SetTES4Speed(Game.GetPlayer(), TES4Polyfill.GetTES4Speed('
+                                 'Game.GetPlayer(), 100.0, 90.0, 130.0) + (100), 100.0, 90.0, 130.0)')
+
+    def test_unknown_subject_writes_its_stat_faction(self, converter):
+        """With no actor record to read a walk baseline from, Speed is the stat faction's."""
+        assert conv_line(converter, 'OtherRef.SetAV Speed 5', 'ObjectReference').strip() == (
+            'TES4_Attributes.WriteActor(OtherRef, TES4AttributeSpeed, TES4PlayerSpeed, 5)')
 
 
 class TestLocalVariableShadowsPlayer:
@@ -2681,15 +3572,12 @@ End
         assert body.lstrip().startswith('RegisterForSingleUpdate(5.0)')
 
     def test_early_return_re_arms_at_the_real_interval(self, converter):
+        """The authored Return re-arms at the real interval and ends the pass; the bottom arm stays."""
         out = converter.convert_standalone('T', self.SRC, 'Quest', 'T')
         body = out.split('Event OnUpdate()')[1].split('EndEvent')[0]
-        # (the IsRunning() gate's own Return keeps the 5s insurance: a quest
-        # that is not running need not poll faster)
         ret = body.index('Return', body.index('foo == 0'))
-        # the statement immediately before the authored Return is the arm
-        before = body[:ret].rstrip().splitlines()[-1].strip()
-        assert before == 'RegisterForSingleUpdate(0.5)'
-        # and the bottom arm is still there
+        before = [line.strip() for line in body[:ret].rstrip().splitlines()[-2:]]
+        assert before == ['RegisterForSingleUpdate(0.5)', 'TES4_PassAt = 0.0']
         assert body.rstrip().endswith('RegisterForSingleUpdate(0.5)')
 
     def test_object_script_uses_the_load_gated_form(self, converter):
@@ -2699,9 +3587,9 @@ End
         out = converter.convert_standalone('T', self.SRC, 'ObjectReference',
                                            'T')
         body = out.split('Event OnUpdate()')[1].split('EndEvent')[0]
-        idx = body.index('Return')
+        idx = body.index('Return', body.index('TES4_PassAt = TES4_passNow'))
         before = body[:idx]
-        assert before.count('If (TES4Polyfill.SafeGameModeGate(Self))') == 2
+        assert before.count('If (TES4Polyfill.SafeGameModeGate(Self)') == 2
         assert 'RegisterForSingleUpdate(5.0)' in before
         assert 'RegisterForSingleUpdate(0.5)' in before
 
@@ -2709,7 +3597,7 @@ End
         """`Return <value>` belongs to an OBSE user function, not a GameMode
         early-out, and must not have a poll re-arm spliced in front of it."""
         converter.sc.udf_returns = True
-        assert conv_line(converter, 'return', 'Quest') == 'Return 0'
+        assert conv_line(converter, 'return', 'Quest') == 'Return TES4_Result'
 
 
 class TestNoPollFreeze:
@@ -2750,8 +3638,55 @@ class TestChargenMenus:
                       ('TES4Msg_ChargenBirthsign_02', 'Title', ['J', 'K'])],
             'actions': [['SpellA'], [], [], [], [], [], [], [], [],
                         ['SpellJ1', 'SpellJ2'], []],
+            'choice_global': 'TES4ChargenBirthsignChoice',
         },
     }
+
+    def test_unchosen_class_and_sign_read_the_choice_globals(self, converter):
+        """Morroblivion opens each menu only while nothing is chosen: `GetPCIsClass
+        CharactergenClass` (the player record's starting class) and
+        `GetPlayerBirthsign == 0`. Both read the menus' choice globals, which stay 0
+        until a pick; a listed class is its row."""
+        converter.chargen_menus = dict(self.PLAN, **{'class': {
+            'choice_global': 'TES4ChargenClassChoice', 'start': 'charactergenclass',
+            'edid_to_index': {'mage': 2}}})
+        assert conv_expr(converter, 'GetPCIsClass CharactergenClass', 'Quest') == \
+            '(TES4ChargenClassChoice.GetValueInt() == 0)'
+        assert conv_expr(converter, 'player.GetIsClass Mage', 'Quest') == \
+            '(TES4ChargenClassChoice.GetValueInt() == 3)'
+        assert conv_expr(converter, 'GetPlayerBirthsign == 0', 'Quest') == \
+            'TES4ChargenBirthsignChoice.GetValueInt() == 0'
+        assert converter._property_refs['TES4ChargenClassChoice'] == 'GlobalVariable'
+
+    def test_runtime_menu_is_asked_first(self, converter):
+        """MorrowindRuntime's menu is asked for; the message pages show only when it
+        does not answer (-1), and only then does the script grant the spells and
+        write the choice -- the runtime did both for its own menu."""
+        converter.chargen_menus = self.PLAN
+        out = conv_lines(converter, 'ShowBirthsignMenu', 'Quest')
+        ask = ('Int TES4_menuPick1 = TES4_Chargen.Ask(TES4ChargenRequest, 2, '
+               'TES4ChargenBirthsignChoice)')
+        assert ask in out
+        branch = out.index('If TES4_menuPick1 == -1')
+        assert out.index(ask) < branch < out.index('.Show()')
+        assert branch < out.index('AddSpell(SpellA') < out.index('TES4_ChargenMenuBusy = False')
+        assert branch < out.index('.SetValue(TES4_menuPick1 + 1)')
+        assert converter._property_refs['TES4ChargenRequest'] == 'GlobalVariable'
+
+    def test_player_set_class_opens_the_menu_on_that_class(self, converter):
+        """A quiz's `Player.SetClass Mage` writes Mage's row, then asks for the class menu.
+
+        See: docs/commentary/morrowind_runtime.md#a-script-names-the-class
+        """
+        pages = [('TES4Msg_ChargenClass_01', 'Title', ['Warrior', 'Mage'])]
+        converter.chargen_menus = {'class': {
+            'pages': pages, 'actions': [[], []], 'choice_global': 'TES4ChargenClassChoice',
+            'start': 'charactergenclass', 'edid_to_index': {'mage': 1}}}
+        out = conv_lines(converter, 'Player.SetClass Mage', 'Quest')
+        ask = 'TES4_Chargen.Ask(TES4ChargenRequest, 1, TES4ChargenClassChoice)'
+        assert out.index('TES4ChargenClassChoice.SetValue(2)') < out.index(ask)
+        assert 'Ask' not in conv_lines(converter, 'SomeNPC.SetClass Mage', 'Quest')
+        assert 'Ask' not in conv_lines(converter, 'Player.SetClass Unlisted', 'Quest')
 
     def test_menu_emission(self, converter):
         converter.chargen_menus = self.PLAN
@@ -2848,6 +3783,15 @@ class TestChargenMenus:
         assert (converter._property_refs['TES4ChargenBirthsignChoice']
                 == 'GlobalVariable')
 
+    def test_page_variable_write_is_mirrored(self, converter):
+        """A write to a variable a game's statistics page showed also writes its
+        mirror global, which the Statistics tab reads; other writes do not."""
+        out = conv_lines(converter, 'set ErothinBankQuest.PlayerKontostand to 5', 'Quest')
+        mirror = 'TES4PageStat_ErothinBankQuest_PlayerKontostand'
+        assert f'{mirror}.SetValue(' in out
+        assert converter._property_refs[mirror] == 'GlobalVariable'
+        assert 'TES4PageStat' not in conv_lines(converter, 'set OtherQuest.Value to 5', 'Quest')
+
     def test_menu_show_retries_on_display_failure(self, converter):
         """Show() returns -1 when the box cannot display (a menu/dialogue
         transition still in flight — this menu opens 0.1s after an
@@ -2891,8 +3835,8 @@ class TestStartCombatIsForced:
         src = ('scn T\n\nbegin gamemode\n'
                '\tCGAssassinFinal.startcombat UrielSeptimRef\nend\n')
         out = converter.convert_standalone('T', src, 'Quest', 'T')
-        assert ('TES4Polyfill.ForceCombat(' in out
-                and 'TES4ForceCombatAttackers, TES4ForceCombatVictims)' in out)
+        assert ('TES4Polyfill.ForceCombatApproach(' in out
+                and 'TES4ForceCombatAttackers, TES4ForceCombatVictims, TES4CombatApproaches)' in out)
         assert '.StartCombat(' not in out
         # faction properties minted for VMAD binding to the import's records
         assert 'Faction Property TES4ForceCombatAttackers Auto' in out
@@ -2904,7 +3848,7 @@ class TestStartCombatIsForced:
         src = ('scn T\n\nbegin gamemode\n'
                '\tplayer.startcombat BanditRef\nend\n')
         out = converter.convert_standalone('T', src, 'Quest', 'T')
-        assert 'TES4Polyfill.ForceCombat(' not in out
+        assert 'TES4Polyfill.ForceCombatApproach(' not in out
         assert '.StartCombat(' in out
 
     def test_bare_startcombat_in_a_non_actor_script_casts_self(self, converter):
@@ -2916,18 +3860,103 @@ class TestStartCombatIsForced:
         src = ('scn T\n\nbegin gamemode\n'
                '\tStartCombat, Player\nend\n')
         out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
-        assert 'TES4Polyfill.ForceCombat((Self as Actor), Game.GetPlayer()' in out
+        assert 'TES4Polyfill.ForceCombatApproach((Self as Actor), Game.GetPlayer()' in out
         # An actor script keeps the plain Self
         out = converter.convert_standalone('T', src, 'Actor', 'T')
-        assert 'TES4Polyfill.ForceCombat(Self, Game.GetPlayer()' in out
+        assert 'TES4Polyfill.ForceCombatApproach(Self, Game.GetPlayer()' in out
 
     def test_moddisposition_hostile_idiom_is_forced_too(self, converter):
-        """`ModDisposition <target> -100` is the same "attack now" idiom and
-        has the same aggression-0 failure mode."""
+        """`ModDisposition <npc> -100` is the same "attack now" idiom; toward the
+        player the polyfill applies Oblivion's attack rule to the moved rank."""
         src = ('scn T\n\nbegin gamemode\n'
-               '\tUngolimRef.ModDisposition player -100\nend\n')
+               '\tUngolimRef.ModDisposition player -100\n'
+               '\tUngolimRef.ModDisposition GlarthirRef -100\nend\n')
         out = converter.convert_standalone('T', src, 'Quest', 'T')
-        assert 'TES4Polyfill.ForceCombat(' in out
+        assert ('TES4Polyfill.ModDisposition(UngolimRef, (-100) as Int, TES4DispositionFaction, '
+                'TES4AggressionFaction, TES4DispositionHostileFaction)') in out
+        assert 'TES4Polyfill.ForceCombatApproach(UngolimRef, GlarthirRef' in out
+
+    def test_forcecombat_retargets_an_actor_already_fighting(self):
+        """TES4 StartCombat steers an actor already in combat onto the new
+        target (SE02's Gatekeeper, one orc at a time); Skyrim's is a no-op once
+        the target is in the combat group and StopCombat only takes effect on
+        the controller's next update, so ForceCombat stops, waits for combat to
+        end, then starts.
+        See: docs/commentary/script_convert.md#startcombat-retargets"""
+        src = open('script_convert/static_scripts/TES4Polyfill.psc',
+                   encoding='utf-8').read()
+        body = src[src.index('Function ForceCombatNow('):]
+        body = body[:body.index('EndFunction')]
+        assert 'GetCombatTarget() != akTarget' in body
+        assert body.index('StandDown(akAttacker)') < body.index('StartCombat(akTarget)')
+        stand = src[src.index('Function StandDown('):]
+        stand = stand[:stand.index('EndFunction')]
+        assert stand.index('StopCombat()') < stand.index('While akActor.IsInCombat()')
+
+    def test_startcombat_pairs_after_the_native_and_stopcombat_unpairs(self):
+        """Dead actors are skipped; the queue pairs after the forced StartCombat and unpairs before StopCombat.
+
+        See: docs/commentary/script_convert.md#startcombat-approaches-an-undetected-target
+        """
+        src = open('script_convert/static_scripts/TES4Polyfill.psc', encoding='utf-8').read()
+        body = src[src.index('Function ForceCombatNow('):]
+        body = body[:body.index('EndFunction')]
+        assert 'akAttacker.IsDead() || akTarget.IsDead()' in body.split('\n')[1]
+        drain = open('script_convert/static_scripts/TES4_CombatQueue.psc', encoding='utf-8').read()
+        drain = drain[drain.index('Event OnUpdate()'):drain.index('EndEvent')]
+        assert drain.index('If TES4Polyfill.ForceCombatNow(') < drain.index('Hold(attacker, target)')
+        assert drain.index('Release(attacker)') < drain.index('TES4Polyfill.EndCombat(attacker')
+
+    def test_startcombat_and_stopcombat_return_at_once(self):
+        """Both queue on the pool, so a script starting a dozen fights keeps its timers (Nehrim's mine exit fire).
+
+        See: docs/commentary/script_convert.md#startcombat-approaches-an-undetected-target
+        """
+        src = open('script_convert/static_scripts/TES4Polyfill.psc', encoding='utf-8').read()
+        for name, push in (('ForceCombatApproach', 'queue.Push(akAttacker, akTarget'),
+                           ('EndCombatApproach', 'queue.Push(akActor, None')):
+            body = src[src.index(f'Function {name}('):]
+            body = body[:body.index('EndFunction')]
+            assert push in body and 'StartCombat' not in body and 'StopCombat()' not in body
+
+    def test_same_burst_startcombat_adds_a_target_and_unpairs(self):
+        """TES4 StartCombat calls in one frame ADD targets (Nehrim's elevator trolls: Player,
+        then Celebro): no stand-down, and the several-target fight leaves its pair.
+
+        See: docs/commentary/script_convert.md#startcombat-adds-targets
+        """
+        src = open('script_convert/static_scripts/TES4Polyfill.psc', encoding='utf-8').read()
+        body = src[src.index('Function ForceCombatNow('):]
+        body = body[:body.index('EndFunction')]
+        assert 'Bool abAdd = False' in body.split('\n')[0]
+        assert '!abAdd && akAttacker.IsInCombat()' in body
+        drain = open('script_convert/static_scripts/TES4_CombatQueue.psc', encoding='utf-8').read()
+        update = drain[drain.index('Event OnUpdate()'):drain.index('EndEvent')]
+        assert 'ForceCombatNow(attacker, target, attackerFaction, victimFaction, adds)' in update
+        assert update.index('If adds') < update.index('Release(attacker)') < update.index('Hold(attacker, target)')
+        adds = drain[drain.index('Bool Function AddsTarget('):]
+        adds = adds[:adds.index('EndFunction')]
+        assert 'HeldTargets[n].IsDead()' in adds and 'HeldAt[n] < 1.0' in adds
+
+    def test_queue_pair_count_matches_the_importer(self):
+        """The queue's fixed pair count is the number of alias pairs the importer writes."""
+        from tes5_import.actors.combat_approach import PAIRS
+        src = open('script_convert/static_scripts/TES4_CombatQueue.psc', encoding='utf-8').read()
+        assert f'Int Property Pairs = {PAIRS} AutoReadOnly' in src
+        assert f'new Actor[{PAIRS}]' in src
+
+    def test_forcecombat_never_puts_the_player_in_the_shared_pair(self):
+        """A player in TES4ForceCombatVictims makes every forced Attacker (Nehrim's
+        ally Celebro, set on the elevator trolls) hostile to them; a fight with
+        the player goes through vanilla WIPlayerEnemyFaction instead.
+        See: docs/commentary/script_convert.md#forcecombat-player-faction"""
+        src = open('script_convert/static_scripts/TES4Polyfill.psc',
+                   encoding='utf-8').read()
+        body = src[src.index('Function ForceCombatNow('):]
+        body = body[:body.index('EndFunction')]
+        assert 'GetFormFromFile(0x06E02D, "Skyrim.esm")' in body
+        assert 'player.RemoveFromFaction(akVictims)' in body
+        assert body.index('akTarget == player') < body.index('akTarget.AddToFaction(akVictims)')
 
 
 class TestJailIsNotExpulsion:
@@ -2952,7 +3981,7 @@ class TestJailIsNotExpulsion:
 
     def test_does_not_register_a_crime_faction_property(self, converter):
         conv_expr(converter, 'IsPlayerInJail', 'Quest')
-        assert 'TES4CyrodiilCrimeFaction' not in converter.get_property_refs()
+        assert 'TES4CrimeFactions' not in converter.get_property_refs()
 
 
 class TestScriptAddTopicOpensTheGate:
@@ -2962,21 +3991,27 @@ class TestScriptAddTopicOpensTheGate:
     whose reveal is reading the wanted poster / the mysterious note.
     """
 
-    def test_gated_topic_emits_the_setvalue(self, converter):
-        converter.topic_unlock_globals = {'tggrayfox': 'TES4Unlock_TGGrayFox'}
+    def test_gated_topic_opens_the_gate_and_names_the_topic(self, converter):
+        """The gate opens and MorrowindRuntime hears the display name."""
+        converter.topic_reveals = {'tggrayfox': ('TES4Unlock_TGGrayFox', 'Gray Fox')}
         out = conv_line(converter, 'AddTopic TGGrayFox', 'ObjectReference')
-        assert out == 'TES4Unlock_TGGrayFox.SetValue(1)'
+        assert out == 'TES4Polyfill.AddTopic(TES4Unlock_TGGrayFox, "Gray Fox")'
         assert converter.get_property_refs()['TES4Unlock_TGGrayFox'] \
             == 'GlobalVariable'
 
-    def test_ungated_topic_stays_inert(self, converter):
-        """An ungated topic is already visible and has no global to set."""
-        converter.topic_unlock_globals = {}
-        converter._line_comments = []
-        out = conv_line(converter, 'AddTopic SomeUngatedTopic',
-                                      'ObjectReference')
-        assert 'SetValue' not in out
+    def test_ungated_topic_still_names_the_topic(self, converter):
+        """An ungated topic has no global, but the runtime still learns it."""
+        converter.topic_reveals = {'1background': ('', 'Background')}
+        out = conv_line(converter, 'AddTopic 1Background', 'ObjectReference')
+        assert out == 'TES4Polyfill.AddTopic(None, "Background")'
         assert 'TES4Unlock_' not in str(converter.get_property_refs())
+
+    def test_unknown_topic_stays_inert(self, converter):
+        """A topic no DIAL defines emits no call."""
+        converter.topic_reveals = {}
+        converter._line_comments = []
+        out = conv_line(converter, 'AddTopic NoSuchTopic', 'ObjectReference')
+        assert 'AddTopic(' not in out
 
 
 class TestBareMenuModeRuns:
@@ -3053,8 +4088,8 @@ class TestIsPCAMurdererIsNotZero:
         out = conv_line(converter, 'if IsPCAMurderer == 1', 'Quest')
         assert '0 == 1' not in out
         assert 'GetCrimeGoldViolent()' in out
-        assert converter.get_property_refs()['TES4CyrodiilCrimeFaction'] \
-            == 'Faction'
+        assert converter.get_property_refs()['TES4CrimeFactions'] \
+            == 'FormList'
 
     def test_uses_the_murder_band_not_any_violence(self, converter):
         """`> 0` is R4-1's ASSAULT test — it would make the player a murderer
@@ -3410,7 +4445,7 @@ class TestResetFallDamageTimerIsPaired:
         lines = [ln.strip() for ln in out.splitlines()]
         start = lines.index('Event OnEffectFinish(Actor akTarget, Actor akCaster)')
         end = lines.index('EndEvent', start)
-        assert any('TES4Polyfill.RestoreFallDamage(akTarget)' in ln
+        assert any('TES4Polyfill.RestoreFallDamage(akTarget, TES4NoFallDamage)' in ln
                    for ln in lines[start:end])
 
     def test_restore_is_synthesized_when_there_is_no_teardown_block(self, converter):
@@ -3418,7 +4453,14 @@ class TestResetFallDamageTimerIsPaired:
             'T', 'scn T\nbegin scripteffectupdate\n  ResetFallDamageTimer\nend\n',
             'ActiveMagicEffect', 'T')
         assert 'Event OnEffectFinish(' in out
-        assert 'TES4Polyfill.RestoreFallDamage(akTarget)' in out
+        assert 'TES4Polyfill.RestoreFallDamage(akTarget, TES4NoFallDamage)' in out
+
+    def test_an_actor_script_suppresses_its_own_fall(self, converter):
+        """A GameMode caller names Self and the spell, never a defaulted player."""
+        out = converter.convert_standalone(
+            'G', 'scn G\nbegin gamemode\n  ResetFallDamageTimer\nend\n', 'Actor', 'G')
+        assert 'TES4Polyfill.SuppressFallDamage(Self, TES4NoFallDamage)' in out
+        assert 'Spell Property TES4NoFallDamage Auto' in out
 
     def test_the_flag_does_not_leak_between_scripts(self, converter):
         """The converter instance is reused across every SCPT in a job."""
@@ -3448,7 +4490,7 @@ class TestQuotedEditorIds:
     def test_quoted_and_unquoted_name_the_same_property(self, converter):
         quoted = conv_line(converter, 'SetStage "MQ01Tate" 20', 'Quest')
         bare = conv_line(converter, 'SetStage MQ01Tate 20', 'Quest')
-        assert quoted == bare == 'MQ01Tate.SetStage(20)'
+        assert quoted == bare == 'TES4Polyfill.SetStage(MQ01Tate, 20)'
 
     @pytest.mark.parametrize('line,expected', [
         ('if ( GetStage "MQ01Tate" == 15 )', 'If (MQ01Tate.GetStage() == 15)'),
@@ -3514,7 +4556,7 @@ class TestPlayerBaseScriptRidesAQuestAlias:
             f'ScriptName TES4_GlobalplayerScript extends {PLAYER_ALIAS_EXTENDS}')
 
     def test_the_stage_call_survives(self, out):
-        assert 'MQ00.SetStage(1)' in out
+        assert 'TES4Polyfill.SetStage(MQ00, 1)' in out
 
     def test_no_self_as_actor_cast(self, out):
         """`Self` is the ReferenceAlias, so the cast the compiler rejects must
@@ -3622,7 +4664,16 @@ class TestMoveToBindsItsDestination:
         """Oblivion writes the offsets space-separated; comma-splitting glued
         them onto the target name and the call did not parse."""
         out = conv_line(converter, 'ref.MoveTo SomeMarker 0 100 0', 'Quest')
-        assert out == 'ref.MoveTo(SomeMarker, 0, 100, 0)'
+        assert out == 'TES4Polyfill.MoveTo(ref, SomeMarker, 0, 100, 0, TES4Restrained)'
+
+    def test_an_npc_move_keeps_its_restraint(self, converter):
+        """A non-player MoveTo goes through the polyfill with the restrained list, which
+        SetRestrained fills, so a restrained actor is held again after the move."""
+        moved = conv_line(converter, 'ghostRef.MoveTo SomeMarker', 'Quest')
+        held = conv_line(converter, 'ghostRef.SetRestrained 1', 'Quest')
+        assert moved == 'TES4Polyfill.MoveTo(ghostRef, SomeMarker, 0, 0, 0, TES4Restrained)'
+        assert held == 'TES4Polyfill.SetRestrained(ghostRef, true, TES4Restrained)'
+        assert converter.get_property_refs()['TES4Restrained'] == 'FormList'
 
     def test_player_target_is_not_a_property(self, converter):
         """`player` is a converter keyword, never a bound property."""
@@ -3654,7 +4705,9 @@ end
 
     def test_body_stays_on_the_repeating_event(self, converter):
         out = converter.convert_standalone('T', self.SRC, 'ObjectReference', 'T')
-        body = out.split('Event OnTrigger(')[1].split('EndEvent')[0]
+        event = out.split('Event OnTrigger(')[1].split('EndEvent')[0]
+        assert 'TES4_OnTriggerBody(akActionRef)' in event
+        body = out.split('Function TES4_OnTriggerBody(')[1].split('EndFunction')[0]
         assert 'triggered = 1' in body
 
     def test_entry_event_is_emitted_and_delegates(self, converter):
@@ -3668,7 +4721,7 @@ end
         inherits it rather than running unfiltered."""
         src = "scn T\nshort x\nbegin onTrigger player\n  set x to 1\nend\n"
         out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
-        body = out.split('Event OnTrigger(')[1].split('EndEvent')[0]
+        body = out.split('Function TES4_OnTriggerBody(')[1].split('EndFunction')[0]
         assert 'Game.GetPlayer()' in body
 
     def test_actor_and_mob_variants_also_get_entry(self, converter):
@@ -3684,6 +4737,22 @@ end
                "begin onTriggerEnter\n  set x to 2\nend\n")
         out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
         assert out.count('Event OnTriggerEnter(') == 1
+
+    def test_trigger_actor_admits_only_actors(self, converter):
+        """OnTriggerActor's body runs only for an actor, not for clutter settling in the zone.
+
+        See: docs/commentary/script_convert.md#block-type-guards
+        """
+        src = "scn T\nshort x\nbegin onTriggerActor\n  set x to 1\nend\n"
+        out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
+        body = out.split('Function TES4_OnTriggerBody(')[1].split('EndFunction')[0]
+        assert body.split('\n')[1].strip() == 'If akActionRef as Actor'
+        assert 'x = 1' in body
+
+    def test_plain_trigger_stays_unguarded(self, converter):
+        """A plain OnTrigger fires for any object, as in TES4."""
+        out = converter.convert_standalone('T', self.SRC, 'ObjectReference', 'T')
+        assert 'as Actor' not in out.split('Function TES4_OnTriggerBody(')[1]
 
 
 class TestPhysicalTrapDamage:
@@ -3833,11 +4902,13 @@ class TestGetDestroyedReadsWhatSetDestroyedWrote:
 
     def test_gate_close_marks_the_gate_destroyed(self, converter):
         """The engine call that closes a gate feeds the same FormList, which is
-        what lets the gate's own `getdestroyed` poll advance the quest."""
+        what lets the gate's own `getdestroyed` poll advance the quest, and
+        counts Oblivion Gates Shut, as Oblivion.exe's own call did."""
         src = ("scn T\nbegin onActivate\n"
                "  CloseCurrentOblivionGate\nend\n")
         out = converter.convert_standalone('T', src, 'ObjectReference', 'T')
-        assert 'TES4Polyfill.CloseCurrentOblivionGate(TES4DestroyedRefs)' in out
+        assert 'TES4Polyfill.CloseCurrentOblivionGate(TES4DestroyedRefs, TES4MiscStat13)' in out
+        assert 'GlobalVariable Property TES4MiscStat13 Auto' in out
 
 
 class TestDisablingAGateStillAdvancesTheQuest:
@@ -3872,7 +4943,7 @@ class TestDisablingAGateStillAdvancesTheQuest:
         # Preamble still comes first (faithful), but it now reads False for a
         # destroyed gate, so the setstage below it can run.
         assert dis < des
-        assert 'MS48.SetStage(50)' in out or 'ms48.SetStage(50)' in out
+        assert 'TES4Polyfill.SetStage(MS48, 50)' in out or 'TES4Polyfill.SetStage(ms48, 50)' in out
 
 
 class TestBaseItemPropertiesKeepTheirRecordType:
@@ -4096,6 +5167,18 @@ class TestInfoFragmentSkipping:
     used to get one (19,278 .pex against vanilla Skyrim's ~5,500).
     """
 
+    def test_a_cut_lines_end_waits_for_its_begin_steps(self):
+        """OnEnd of a line cut at once can run while OnBegin is still stepping the counter; it must wait for the
+        step, or its `turn still ours` test fails and the hand-off is lost (run 57c, Mankar's 0001F876)."""
+        from script_convert import pipeline
+        begin = ['Function Fragment_1(ObjectReference akSpeakerRef)', '  MQ.TES4Add_n(1)', 'EndFunction', '']
+        end = ['Function Fragment_0(ObjectReference akSpeakerRef)', '  If MQ.n == 3', '    MQ.next = 2', '  EndIf',
+               'EndFunction', '']
+        out = pipeline._end_watch(begin, end, 5.0)
+        assert out.index('  TES4_stepped += 1') > out.index('  MQ.TES4Add_n(1)')
+        assert out.index('  While TES4_stepped <= 0 && TES4_waits < 40') < out.index('  If MQ.n == 3')
+        assert 'Int TES4_stepped' in out
+
     def _emit(self, tmp_path, rec, say_topics=(), info_reveals=None,
               service_topics=None):
         from script_convert import pipeline
@@ -4111,6 +5194,19 @@ class TestInfoFragmentSkipping:
             ScriptConverter.say_topics = saved
         assert not stats['errors'], stats['errors']
         return (tmp_path / f"TES4_TIF__{rec['FormID']}.psc").exists()
+
+    def test_reoffered_say_once_line_runs_its_result_only_the_first_time(self, tmp_path):
+        """A say-once greeting re-offered after an early exit must not give its item a second time."""
+        own = 'TES4SaidOnce_03C93C'
+        rec = {'FormID': '0003C93C', 'ParentDIAL': '000000AA',
+               'ResultScript': 'player.additem MQ15Key 1'}
+        assert self._emit(tmp_path, rec, info_reveals={0x03C93C: [own]})
+        psc = (tmp_path / 'TES4_TIF__0003C93C.psc').read_text()
+        assert f'TES4_firstSay = {own}.GetValue() == 0' in psc
+        first = psc.index(f'TES4_firstSay = {own}.GetValue() == 0')
+        assert first < psc.index(f'{own}.SetValue(1)')
+        gate = psc.index('If TES4_firstSay')
+        assert gate < psc.index('AddItem') < psc.index('TES4Polyfill.LineEnded')
 
     def test_plain_player_line_gets_no_fragment(self, tmp_path):
         """A menu line with no result script needs no fragment: the player
@@ -4208,7 +5304,7 @@ class TestObjectReferenceMethodsDoNotPromoteToActor:
     def test_moveto_does_not_promote_subject(self, converter):
         result = conv_line(converter,
             'SEHaskillSummonMarker.MoveTo SEHaskillSummonReturnMarker', 'Quest')
-        assert 'SEHaskillSummonMarker.MoveTo(' in result
+        assert 'TES4Polyfill.MoveTo(SEHaskillSummonMarker,' in result
         assert converter._property_refs.get('SEHaskillSummonMarker') != 'Actor'
 
     def test_actor_only_call_still_promotes(self, converter):
@@ -4282,6 +5378,133 @@ class TestQuestStartDoesNotClobberSeededWrites:
     def test_comparison_is_not_mistaken_for_a_write(self, converter):
         body = ['  If Arena.ReadyMatch == 1', '  Arena.Start()']
         assert self._hoist(converter, body) == body
+
+    def test_quest_script_restarts_keeping_its_variables(self, converter):
+        """TES4 kept quest variables across StopQuest/StartQuest; Skyrim's
+        Start() resets them, so the Arena re-armed its first, dead opponent."""
+        out = converter.convert_standalone(
+            'ArenaScript', 'scn ArenaScript\nshort CombatantsKilled\n'
+            'float OpenTimer\nbegin gamemode\nend', 'Quest', 'ArenaScript')
+        body = out[out.index('Function TES4Start(TES4_ArenaScript akQuest) Global'):]
+        assert body.index('Int v0 = akQuest.CombatantsKilled') \
+            < body.index('akQuest.Start()') \
+            < body.index('akQuest.CombatantsKilled = v0')
+        assert 'Float v1 = akQuest.OpenTimer' in body
+
+    def test_setstage_rechecks_alias_packages(self, converter):
+        """TES4SetStage sets the stage, then signals the quest's package aliases.
+
+        See: docs/commentary/script_convert.md#setstage-re-evaluates-alias-packages
+        """
+        out = converter.convert_standalone(
+            'ArenaScript', 'scn ArenaScript\nshort n\nbegin gamemode\nend', 'Quest', 'ArenaScript')
+        body = out[out.index('Bool Function TES4SetStage('):].split('EndFunction')[0]
+        assert body.index('akQuest.SetStage(aiStage)') < body.index('TES4Polyfill.StageSet(akQuest)') \
+            < body.index('Return done')
+
+    def test_polyfill_stage_advance_is_lifted(self):
+        """A scriptless quest's `TES4Polyfill.SetStage` is still lifted behind its GetStageDone guard."""
+        from script_convert.conversation_sequence import split_stage_advances
+        gated, advances = split_stage_advances(['  x = 1', '  TES4Polyfill.SetStage(MQ00, 20)'])
+        assert gated == ['  x = 1']
+        assert advances == ['  If !MQ00.GetStageDone(20)  ; advance survives a rejected turn',
+                            '    TES4Polyfill.SetStage(MQ00, 20)', '  EndIf']
+
+    def test_a_choice_topic_tests_what_its_lines_test(self):
+        """An INFO's tested set is the GetQuestVariable conditions of its choice topic's INFOs.
+
+        See: docs/commentary/script_convert.md#choice-gate-writes-run-at-begin
+        """
+        from script_convert.conversation_sequence import choice_tested_vars
+        raw = struct.pack('<BxxxfHxxII', 0, 2.0, 79, 0x36660, 3).hex()
+        infos = [{'FormID': '00036666', 'ParentDIAL': '00036600', 'Choice[0]': '00036700'},
+                 {'FormID': '00036667', 'ParentDIAL': '00036700', 'Condition[0].Raw': raw}]
+        tested = choice_tested_vars(infos, {0x36660: {3: 'ghostTalk'}}, {0x36660: 'MQ09'})
+        assert tested == {0x36666: {'MQ09.ghostTalk'}}
+
+    def test_a_choice_tested_write_moves_to_begin(self):
+        """A top-level step of a tested variable moves; one after a read or a return stays.
+
+        See: docs/commentary/script_convert.md#choice-gate-writes-run-at-begin
+        """
+        from script_convert.conversation_sequence import split_choice_writes
+        tested = {'MQ09.ghostTalk'}
+        step = '  MQ09.TES4Add_ghostTalk(1)'
+        assert split_choice_writes(['  Foo()', step], tested) == ([step], ['  Foo()'])
+        read = ['  If MQ09.ghostTalk == 1', '    Foo()', '  EndIf', step]
+        assert split_choice_writes(read, tested) == ([], read)
+        returned = ['  Return', step]
+        assert split_choice_writes(returned, tested) == ([], returned)
+
+    def test_a_stage_set_its_choice_tests_moves_to_begin(self):
+        """Burd (MQ10): the greeting sets stage 30 and its choice "Let's go." needs GetStage MQ10 == 30.
+
+        See: docs/commentary/script_convert.md#choice-gate-writes-run-at-begin
+        """
+        from script_convert.conversation_sequence import choice_tested_vars, split_choice_writes
+        raw = struct.pack('<BxxxfHxxII', 0, 30.0, 58, 0x1E72C, 0).hex()
+        infos = [{'FormID': '00026EE9', 'ParentDIAL': '000000C8', 'Choice[0]': '0003A83F'},
+                 {'FormID': '0003A853', 'ParentDIAL': '0003A83F', 'Condition[0].Raw': raw}]
+        tested = choice_tested_vars(infos, {}, {0x1E72C: 'MQ10'})[0x26EE9]
+        assert tested == {'stage:mq10'}
+        stage = '  TES4_MQ10Script.TES4SetStage(MQ10 as TES4_MQ10Script, 30)'
+        assert split_choice_writes([stage], tested) == ([stage], [])
+        assert split_choice_writes(['  Foo()', stage], tested) == ([], ['  Foo()', stage])
+        other = '  TES4_MQ11Script.TES4SetStage(MQ11 as TES4_MQ11Script, 30)'
+        assert split_choice_writes([other], tested) == ([], [other])
+
+    def test_object_script_has_no_restart(self, converter):
+        """Only a quest script is restarted, so only it carries TES4Start."""
+        out = converter.convert_standalone(
+            'DoorScript', 'scn DoorScript\nshort open\nbegin onactivate\nend',
+            'ObjectReference', 'DoorScript')
+        assert 'TES4Start' not in out
+
+    def test_startquest_calls_the_quest_scripts_restart(self, xref):
+        """StartQuest on a quest with a script goes through its TES4Start."""
+        xref.edid_to_formid['arena'] = '0002991F'
+        xref.record_scri['0002991F'] = '0002991E'
+        xref.script_formid_to_edid['0002991E'] = 'ArenaScript'
+        result = conv_line(ScriptConverter(xref), 'StartQuest Arena', 'Quest')
+        assert 'TES4_ArenaScript.TES4Start(Arena as TES4_ArenaScript)' in result
+
+    def test_resetinterior_sends_moved_refs_home(self, converter):
+        """ResetInterior passes the cell's moved-in references to the polyfill."""
+        result = conv_line(converter, 'ResetInterior ArenaMatchCell', 'Quest')
+        assert ('TES4Polyfill.ResetInterior(ArenaMatchCell, '
+                'TES4Movers_arenamatchcell)') in result
+
+    def test_global_call_on_a_generated_script_survives(self):
+        """`TES4_X.TES4Start(...)` names a script, not an undeclared property."""
+        from script_convert.pipeline import _comment_dangling
+        text = ('Quest Property Arena Auto\n'
+                'Function Fragment_0()\n'
+                '  TES4_ArenaScript.TES4Start(Arena as TES4_ArenaScript)\n'
+                '  fbmwMissing.follownow = 1\n'
+                'EndFunction')
+        out = _comment_dangling(text).split('\n')
+        assert out[2] == '  TES4_ArenaScript.TES4Start(Arena as TES4_ArenaScript)'
+        assert out[3].lstrip().startswith(';')
+
+    def test_static_script_call_survives_any_prefix(self, monkeypatch):
+        """Nehrim's own scripts are NEHRIM_, but its static scripts stay TES4_."""
+        from asset_convert.game_paths import NAMESPACE_ENV, current_namespace, set_namespace
+        from script_convert.pipeline import _comment_dangling
+        previous = current_namespace()
+        monkeypatch.setenv(NAMESPACE_ENV, previous)
+        set_namespace('nehrim')
+        try:
+            out = _comment_dangling('Function F()\n  TES4_Attributes.WriteActor(a, b, c, 1)\n'
+                                    'EndFunction')
+        finally:
+            set_namespace(previous)
+        assert out.split('\n')[1] == '  TES4_Attributes.WriteActor(a, b, c, 1)'
+
+    def test_converted_fragment_is_hoisted(self, converter):
+        """The emitter itself applies the hoist, not just the function."""
+        out = [ln.strip() for ln in converter.convert_fragment(
+            'set Arena.ReadyMatch to 1\nStartQuest Arena', 'Quest')]
+        assert out.index('Arena.Start()') < out.index('Arena.ReadyMatch = 1')
 
 
 # ===========================================================================
@@ -4754,10 +5977,9 @@ class TestScaleEnumAv:
         assert converter._scale_enum_av('aggression', '5.5') == '1'
         assert converter._scale_enum_av('aggression', '6') == '1'
 
-    def test_confidence_tiers(self, converter):
-        for value, tier in (('0', '0'), ('15', '1'), ('40', '2'),
-                            ('70', '3'), ('100', '4')):
-            assert converter._scale_enum_av('confidence', value) == tier
+    def test_confidence_is_not_bucketed(self, converter):
+        """Confidence keeps its 0-100 value for TES4Polyfill.SetConfidence."""
+        assert converter._scale_enum_av('confidence', '80') is None
 
     def test_value_already_in_range_passes_through(self, converter):
         # A deliberate Skyrim-style tier is not re-bucketed.
@@ -4878,7 +6100,7 @@ class TestFalloutShowMessageMenus:
                                            'VCG01SCRIPT')
         assert 'TES4_MsgButton = TES4_ShowMsg(VCG01ChooseSexMessage)' in out
         assert 'nButton = TES4_TakeMsgButton()' in out
-        assert 'Int Function TES4_ShowMsg(Message TES4_akMsg)' in out
+        assert 'Int Function TES4_ShowMsg(Message TES4_akMsg, Float afArg1 = 0.0' in out
         assert 'Message Property VCG01ChooseSexMessage Auto' in out
 
     def test_importer_writes_no_record_for_an_authored_site(self):
@@ -4975,3 +6197,163 @@ class TestFalloutCastAliases:
         line = conv_line(converter, 'player.CastImmediateOnSelf TestSpell',
                          'Quest')
         assert line == 'TestSpell.Cast(Game.GetPlayer(), Game.GetPlayer())'
+
+
+class TestConsoleSavesAreDropped:
+    """A save manager's console saves write nothing; `Autosave` still saves.
+
+    See docs/commentary/script_convert.md#console-saves-are-dropped.
+    """
+
+    @pytest.mark.parametrize('src', ['con_Save Autosave1', 'SaveGame foo',
+                                     'con_SaveGame bar'])
+    def test_console_save_is_a_note(self, converter, src):
+        """The line is a comment, with no RequestSave call."""
+        line = conv_line(converter, src, 'Quest')
+        assert line.lstrip().startswith(';')
+        assert 'RequestSave' not in line
+
+    def test_autosave_still_saves(self, converter):
+        """`Autosave` stays the engine's rotating autosave."""
+        assert conv_line(converter, 'Autosave', 'Quest') == 'Game.RequestAutoSave()'
+
+
+class TestGameModeStepsAreRates:
+    """A GameMode SetPos/SetAngle stepping from the object's own read is a rate for TESRuntime.
+
+    See docs/commentary/script_convert.md#gamemode-steps-are-rates.
+    """
+
+    WHEEL = ('scn W\nshort a\nshort b\nbegin GameMode\nset a to GetAngle Z\n'
+             'set b to a - 2\nSetAngle Z b\nend\n')
+
+    def test_per_frame_step_spins_at_thirty_frames(self, converter):
+        """Two degrees a frame is -(2) * 30.0 degrees a second."""
+        out = converter.convert_standalone('W', self.WHEEL, 'ObjectReference', 'W')
+        assert 'TES4Polyfill.SpinAxis(Self, 5, b, -(2) * 30.0,' in out
+
+    def test_base_read_once_is_not_a_step(self, converter):
+        """A base read behind a DoOnce is not this pass's pose: the lift stays a glide."""
+        src = ('scn L\nfloat base\nfloat t\nfloat p\nshort once\nbegin GameMode\n'
+               'if once == 0\n  set base to GetPos Z\n  set once to 1\nendif\n'
+               'set t to t + GetSecondsPassed\nset p to base + t * 62\n'
+               'SetPos Z p\nend\n')
+        out = converter.convert_standalone('L', src, 'ObjectReference', 'L')
+        assert 'TES4Polyfill.GlideAxis(Self, 2, p,' in out
+        assert 'SpinAxis' not in out
+
+    def test_seconds_passed_step_is_per_pass(self, converter):
+        """A step scaled by GetSecondsPassed is divided back into a rate."""
+        src = ('scn G\nbegin GameMode\n'
+               'SetAngle Z (GetAngle Z + 40 * GetSecondsPassed)\nend\n')
+        out = converter.convert_standalone('G', src, 'ObjectReference', 'G')
+        assert '/ TES4_SecondsPassed, TES4_GlideRefs' in out
+
+    def test_rotate_in_gamemode_spins_at_its_rate(self, converter):
+        """TES4 `Rotate z 10` is ten degrees a SECOND, handed over as that rate."""
+        src = 'scn R\nbegin GameMode\nRotate z, -20\nend\n'
+        out = converter.convert_standalone('R', src, 'ObjectReference', 'R')
+        assert ('TES4Polyfill.SpinAxis(Self, 5, Self.GetAngleZ() + (-20) * '
+                'TES4_SecondsPassed, -20,') in out
+
+    def test_absolute_glide_hands_its_target_to_tesruntime(self):
+        """GlideAxis sends a non-actor's target to TESRuntime's tick when it can."""
+        src = open('script_convert/static_scripts/TES4Polyfill.psc',
+                   encoding='utf-8').read()
+        body = src[src.index('Function GlideAxis('):]
+        body = body[:body.index('EndFunction')]
+        assert 'akRef.SendModEvent("TES4Track", aiAxis as String, afValue)' in body
+        assert '!(akRef as Actor)' in body
+
+def _shared_pack_export(tmp_path):
+    """Export side of a two-plugin `Pack` mod: Base.esm and its dependent Empty.esp."""
+    import json
+    export = tmp_path / 'export'
+    export.mkdir()
+    names = ['Base.esm', 'Empty.esp']
+    (export / 'sources.json').write_text(json.dumps({'version': 1, 'sources': {
+        name: {'kind': 'archive', 'plugin': name, 'group_id': 'pack',
+               'group_label': 'Pack', 'group_plugins': names} for name in names}}))
+    for name in names:
+        records = export / 'Pack' / name
+        records.mkdir(parents=True)
+        (records / '_HEADER.txt').write_text('Master[0]=Base.esm\n'
+                                             if name == 'Empty.esp' else '')
+
+
+def _shared_pack_output(tmp_path, owns_script):
+    """The shared output folder, where Base.esm already ships the current statics."""
+    import shutil
+    from script_convert.ownership import write_owned
+    from script_convert.static_scripts import STATIC_DIR, static_script_files
+    source = tmp_path / 'output' / 'Pack' / 'scripts' / 'source'
+    source.mkdir(parents=True)
+    (source / 'MasterScript.psc').write_text('Scriptname MasterScript extends Quest\n')
+    for name in static_script_files():
+        shutil.copy2(os.path.join(STATIC_DIR, name), source / name)
+    write_owned(source, 'Base.esm', ['MasterScript'])
+    write_owned(source, 'Empty.esp', ['OwnScript'] if owns_script else [])
+    if owns_script:
+        (source / 'OwnScript.psc').write_text('Scriptname OwnScript extends Quest\n')
+    return source
+
+
+def _fake_compiler_install(tmp_path):
+    """A placeholder compiler exe and vanilla header dir; returns the Data dir."""
+    executable = tmp_path / 'external' / 'papyrus-compiler' / 'papyrus.exe'
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    data = tmp_path / 'Skyrim' / 'Data'
+    headers = data / 'Source' / 'Scripts'
+    headers.mkdir(parents=True)
+    (headers / 'Debug.psc').write_text('Scriptname Debug\n')
+    return data
+
+
+def test_compile_dependent_refuses_stale_root_statics(tmp_path, monkeypatch, capsys):
+    """A root's out-of-date TES4Polyfill fails the dependent's compile and names the master to reconvert."""
+    import papyrus_compile as compiler
+
+    monkeypatch.setattr(compiler, 'SCRIPT_DIR', tmp_path)
+    _shared_pack_export(tmp_path)
+    source = _shared_pack_output(tmp_path, False)
+    (source / 'TES4Polyfill.psc').write_text('Scriptname TES4Polyfill Hidden\n')
+    data = _fake_compiler_install(tmp_path)
+    compiled = []
+    monkeypatch.setattr(compiler._Compiler, '_run',
+                        lambda self, argv, timeout: compiled.append(argv) or ('', 0))
+
+    result = compiler.phase_compile('Empty.esp', {'tes5DataPath': str(data)}, str(tmp_path / 'output'))
+
+    assert result is False and compiled == []
+    assert 'convert.py -f "Base.esm" --scripts-only' in capsys.readouterr().out
+    assert (source / 'TES4Polyfill.psc').read_text() == 'Scriptname TES4Polyfill Hidden\n'
+
+
+@pytest.mark.parametrize('owns_script', [False, True])
+def test_compile_shared_sources_respects_empty_plugin_ownership(tmp_path, monkeypatch, owns_script):
+    """Empty ownership succeeds; an owned script that fails compilation still fails."""
+    import papyrus_compile as compiler
+
+    monkeypatch.setattr(compiler, 'SCRIPT_DIR', tmp_path)
+    _shared_pack_export(tmp_path)
+    source = _shared_pack_output(tmp_path, owns_script)
+    output = tmp_path / 'output'
+    data = _fake_compiler_install(tmp_path)
+
+    compiled_names = set()
+    def fail_compile(self, argv, timeout):
+        from pathlib import Path
+        inputs = Path(argv[argv.index('-i') + 1])
+        scripts = list(inputs.glob('*.psc')) if inputs.is_dir() else [inputs]
+        compiled_names.update(path.stem for path in scripts)
+        if not scripts:
+            return '', 0
+        return 'OwnScript.psc:1:1: forced compilation failure', 1
+    monkeypatch.setattr(compiler._Compiler, '_run', fail_compile)
+    result = compiler.phase_compile('Empty.esp', {'tes5DataPath': str(data)}, str(output))
+
+    assert result is (not owns_script)
+    assert compiled_names == ({'OwnScript'} if owns_script else set())
+    assert (source / 'MasterScript.psc').is_file()
+

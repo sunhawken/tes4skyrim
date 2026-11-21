@@ -18,9 +18,9 @@ import math
 
 import numpy as np
 
-from ..base.text_reader import get_float, get_str
+from ..base.text_reader import get_float, get_formid, get_int, get_str
 from ..record_types.world import shifted_position
-from . import params
+from . import native_loader, params
 
 _CELL_SIZE = 4096.0
 _LAND_VERTS = 33
@@ -31,11 +31,9 @@ _VHGT_UNIT = 8.0
 MAX_PLACEMENT = 1e7
 
 
-def _finite_placement(pos, scale):
-    """True if a REFR's placement can contribute usable collision geometry."""
-    if not np.all(np.isfinite(pos)) or not math.isfinite(scale):
-        return False
-    return bool(np.all(np.abs(pos) <= MAX_PLACEMENT))
+def finite_placement(pos, scale=1.0):
+    """True if a REFR or pathgrid point is finite and within MAX_PLACEMENT."""
+    return math.isfinite(scale) and all(math.isfinite(v) and abs(v) <= MAX_PLACEMENT for v in pos)
 
 
 def rot_matrix(rx, ry, rz):
@@ -118,6 +116,63 @@ def _land_tris(land_rec, origin_x, origin_y):
     return np.concatenate([t1, t2], axis=0)
 
 
+class LandField:
+    """A cell's LAND heights, interpolated on the same diagonal `_land_tris` cuts.
+
+    See: docs/commentary/tes5_import_navmesh.md#terrain-standing-ribbons-follow-the-land
+    """
+
+    __slots__ = ('grid', 'ox', 'oy')
+
+    def __init__(self, grid, origin_x, origin_y):
+        """`grid` is decode_vhgt's 33x33 array, row = y."""
+        self.grid = np.ascontiguousarray(grid, dtype=np.float64)
+        self.ox, self.oy = float(origin_x), float(origin_y)
+
+    def covers(self, x, y):
+        """True when (x, y) lies inside this cell's LAND square."""
+        span = (_LAND_VERTS - 1) * _LAND_SPACING
+        return (self.ox <= x <= self.ox + span
+                and self.oy <= y <= self.oy + span)
+
+    def z(self, x, y):
+        """Terrain height at (x, y); points outside the cell clamp to its rim."""
+        last = _LAND_VERTS - 1
+        fx = min(float(last), max(0.0, (x - self.ox) / _LAND_SPACING))
+        fy = min(float(last), max(0.0, (y - self.oy) / _LAND_SPACING))
+        ix, iy = min(last - 1, int(fx)), min(last - 1, int(fy))
+        tx, ty = fx - ix, fy - iy
+        g = self.grid
+        z00, z10 = g[iy, ix], g[iy, ix + 1]
+        z01, z11 = g[iy + 1, ix], g[iy + 1, ix + 1]
+        if tx >= ty:
+            return float(z00 + (z10 - z00) * tx + (z11 - z10) * ty)
+        return float(z00 + (z11 - z01) * tx + (z01 - z00) * ty)
+
+    def rim_t(self, ax, ay, bx, by):
+        """Fraction along a->b (a inside the cell) where the segment leaves the LAND square."""
+        span = (_LAND_VERTS - 1) * _LAND_SPACING
+        t = 1.0
+        for a, b, lo in ((ax, bx, self.ox), (ay, by, self.oy)):
+            edge = lo + span if b > lo + span else lo if b < lo else None
+            if edge is not None:
+                t = min(t, (edge - a) / (b - a))
+        return t
+
+    def z_many(self, xy):
+        """`z` at every row of the (N, 2) array `xy`, as a list."""
+        return native_loader.load_native().land_z(
+            self.grid, self.ox, self.oy,
+            np.ascontiguousarray(xy, dtype=np.float64).reshape(-1, 2))
+
+
+def land_field(land_rec, origin_x, origin_y):
+    """The cell's LandField, or None when it has no readable LAND."""
+    vhgt = get_str(land_rec, 'VHGT') if land_rec is not None else None
+    grid = decode_vhgt(vhgt) if vhgt else None
+    return None if grid is None else LandField(grid, origin_x, origin_y)
+
+
 def _split_by_slope(tris):
     """Split an (N,3,3) array into (walkable, blocking) by face normal."""
     if tris is None or len(tris) == 0:
@@ -133,55 +188,110 @@ def _split_by_slope(tris):
     return tris[walk], tris[ok & ~walk]
 
 
-def _placed_soup(refr, base_model_by_fid, get_collision):
-    """Return (walkable, blocking) placed arrays for one REFR, or (None, None).
+def base_fid(rec: dict):
+    """The base id a REFR names, keyed as every carving index is.
 
-    Either element is None when that class is absent or the ref is unusable.
+    See: docs/commentary/tes5_import_navmesh.md#base-ids-carry-their-plugin-index
+    """
+    return get_formid(rec, 'NAME') or None
+
+
+def _placement(refr, base_model_by_fid, get_collision):
+    """(soup, rot, scale, pos) for one REFR, or None when it places no usable collision.
+
     Placement uses `shifted_position`, the SAME position the ESM writes, so
     furniture collision does not float above where the engine puts the object.
 
     See: docs/commentary/tes5_import_navmesh.md#wild-placements-are-dropped
     See: docs/commentary/asset_convert_nif.md#furniture-shift-third-consumer
     """
-    name = refr.get('NAME')
-    if not name:
-        return None, None
-    try:
-        base_low = int(name, 16) & 0x00FFFFFF
-    except ValueError:
-        return None, None
-    key = base_model_by_fid.get(base_low)
+    key = base_model_by_fid.get(base_fid(refr))
     soup = get_collision(key) if key else None
     if not soup:
-        return None, None
+        return None
     scale = get_float(refr, 'XSCL.Scale', 1.0) or 1.0
     pos = np.array(shifted_position(refr, scale), dtype=np.float64)
-    if not _finite_placement(pos, scale):
-        return None, None
+    if not finite_placement(pos, scale):
+        return None
     rot = rot_matrix(get_float(refr, 'RotX'),
                       get_float(refr, 'RotY'),
                       get_float(refr, 'RotZ'))
     if not np.all(np.isfinite(rot)):
+        return None
+    return soup, rot, scale, pos
+
+
+def _placed_soup(refr, base_model_by_fid, get_collision):
+    """Return (walkable, blocking) placed arrays for one REFR, or (None, None).
+
+    Either element is None when that class is absent or the ref is unusable.
+    """
+    got = _placement(refr, base_model_by_fid, get_collision)
+    if got is None:
         return None, None
+    soup, rot, scale, pos = got
     return (place(soup.get('w'), rot, scale, pos),
             place(soup.get('b'), rot, scale, pos))
 
 
-def _sort_refr_parts(refr_recs, base_model_by_fid, get_collision, skip_bases):
+def _native_soup(flat):
+    """A cache soup as the float32/float64 buffer the native gather borrows, or None."""
+    if flat is None or len(flat) == 0:
+        return None
+    arr = np.asarray(flat)
+    return np.ascontiguousarray(arr if arr.dtype in (np.float32, np.float64) else arr.astype(np.float64))
+
+
+def placements(refr_recs, base_model_by_fid, get_collision, skip_bases=()):
+    """((R, 14) float64 rows, [(w, b)]) of the refs placing collision, for the native gather.
+
+    A row is [scale, x, y, z, rot_matrix row-major, is skip base].
+    """
+    rows, soups = [], []
+    for refr in refr_recs or ():
+        got = _placement(refr, base_model_by_fid, get_collision)
+        if got is not None:
+            soup, rot, scale, pos = got
+            rows.append([scale, *pos, *rot.ravel(), float(base_fid(refr) in skip_bases)])
+            soups.append((_native_soup(soup.get('w')), _native_soup(soup.get('b'))))
+    return np.asarray(rows, dtype=np.float64).reshape(-1, 14), soups
+
+
+def cell_water_z(cell_rec):
+    """The cell's water height when HasWater (DATA.Flags 0x02) is set and XCLW parses, else None."""
+    if cell_rec is None or not get_int(cell_rec, 'DATA.Flags', 0) & 0x02:
+        return None
+    try:
+        return float(cell_rec.get('XCLW.WaterHeight'))
+    except (TypeError, ValueError):
+        return None
+
+
+def open_water_z(cell_rec, is_exterior):
+    """An exterior's water height; an interior's ceiling may lie under water."""
+    return cell_water_z(cell_rec) if is_exterior else None
+
+
+def _submerged(w, b, water_z):
+    """True when every face of a placed soup lies an agent height or more below the water."""
+    if water_z is None:
+        return False
+    tops = [p[:, :, 2].max() for p in (w, b) if p is not None and len(p)]
+    return bool(tops) and max(tops) < water_z - params.AGENT_HEIGHT
+
+
+def _sort_refr_parts(refr_recs, base_model_by_fid, get_collision, skip_bases, water_z):
     """Return (walk_parts, block_parts, door_walk_parts) for a cell's REFRs.
 
-    A door's faces go to door_walk_parts whatever their cached class.
+    A door's faces go to door_walk_parts whatever their cached class.  A ref
+    wholly under `water_z` by an agent height is left out: swimmers pass over it.
     See: docs/commentary/tes5_import_navmesh.md#door-panels-are-never-blocking
     """
     walk_parts, block_parts, door_walk_parts = [], [], []
     for refr in refr_recs or []:
-        name = refr.get('NAME')
-        try:
-            base_low = int(name, 16) & 0x00FFFFFF if name else None
-        except ValueError:
-            base_low = None
+        base_low = base_fid(refr)
         w, b = _placed_soup(refr, base_model_by_fid, get_collision)
-        if w is None and b is None:
+        if (w is None and b is None) or _submerged(w, b, water_z):
             continue
         if base_low in skip_bases:
             door_walk_parts += [p for p in (w, b) if p is not None and len(p)]
@@ -194,13 +304,17 @@ def _sort_refr_parts(refr_recs, base_model_by_fid, get_collision, skip_bases):
 
 
 def _resplit_placed(walk_parts, block_parts, door_walk_parts):
-    """Reclassify placed REFR faces by their PLACED slope; return walk_parts.
+    """Reclassify placed REFR faces, both classes, by their PLACED slope; return walk_parts.
 
-    Steep door faces are discarded rather than demoted to blocking.
+    block_parts is rewritten in place. Steep door faces are discarded rather
+    than demoted to blocking.
     See: docs/commentary/tes5_import_navmesh.md#placements-are-slope-resplit
     """
-    if walk_parts:
-        rw, rb = _split_by_slope(np.concatenate(walk_parts, axis=0))
+    faces = walk_parts + block_parts
+    walk_parts = []
+    block_parts.clear()
+    if faces:
+        rw, rb = _split_by_slope(np.concatenate(faces, axis=0))
         walk_parts = [rw] if rw is not None and len(rw) else []
         if rb is not None and len(rb):
             block_parts.append(rb)
@@ -226,17 +340,18 @@ def _terrain_parts(land_rec, origin_x, origin_y, block_parts):
 
 def gather_cell_geometry(refr_recs, base_model_by_fid, get_collision,
                          land_rec=None, origin_x=0.0, origin_y=0.0,
-                         split_land=False, skip_bases=None):
+                         split_land=False, skip_bases=None, water_z=None):
     """Return (walkable, blocking) float64 (N,3,3) world-space triangle arrays.
 
     `get_collision` is the cache accessor, injected so workers can bind their
     own module-global cache without this module importing asset_convert.
     `skip_bases` holds low-24 base FormIDs contributing no blocking collision.
+    `water_z` is the cell's open water height (open_water_z), or None.
     `split_land=True` returns (walkable, blocking, land_walkable) instead.
     See: docs/commentary/tes5_import_navmesh.md#land-split-for-the-grid-rasterizer
     """
     walk_parts, block_parts, door_walk_parts = _sort_refr_parts(
-        refr_recs, base_model_by_fid, get_collision, skip_bases or ())
+        refr_recs, base_model_by_fid, get_collision, skip_bases or (), water_z)
     walk_parts = _resplit_placed(walk_parts, block_parts, door_walk_parts)
 
     land_walk = np.zeros((0, 3, 3))

@@ -300,9 +300,16 @@ def _claim_gaits(out: dict, kfs: dict, used: set) -> None:
 
 
 def _claim_single_play(out: dict, kfs: dict, used: set) -> None:
-    """Claim the single-play interrupt clips (recoil, stagger, death)."""
-    for state, (names, _e, _x) in SINGLE_PLAY.items():
-        for n in names:
+    """Claim the single-play interrupt clips (recoil, stagger, death).
+
+    The bare stem wins; a creature that authors only a land-stance recoil or
+    stagger (`handtohandrecoil`, `handtohandstagger`) gets that one.
+    See: docs/commentary/asset_convert_creature.md#single-play-clips
+    """
+    land = [p for p, _stance in ATTACK_STANCE_PREFIXES if not p.startswith('swim')]
+    for state, (stems, _e, _x) in SINGLE_PLAY.items():
+        staged = [p + s for p in land for s in stems] if state != 'Death' else []
+        for n in list(stems) + staged:
             if n in kfs:
                 out['single'][state] = kfs[n]
                 used.add(n)
@@ -349,6 +356,35 @@ def _claim_tables(out: dict, kfs: dict, used: set) -> None:
                     break
 
 
+#: Knockdown-recovery kf stems under idleanims/, every authored spelling -> the role naming its clips.
+GETUP_ROLES = (
+    (('getupfaceup', 'getup_faceup'), 'FaceUp'),
+    (('getupfacedown', 'getup_facedown'), 'FaceDown'),
+    (('getupleft', 'getup_left'), 'Left'),
+    (('getupright', 'getup_right'), 'Right'),
+)
+
+
+def getup_clips(creature_dir: str) -> list:
+    """[(role, kf path)] for the getup clips Oblivion keeps in the folder's idleanims/.
+
+    See: docs/commentary/asset_convert_creature.md#getup-from-ragdoll
+    """
+    sub = next((os.path.join(creature_dir, d) for d in os.listdir(creature_dir)
+                if d.lower() == 'idleanims'
+                and os.path.isdir(os.path.join(creature_dir, d))), None)
+    if not sub:
+        return []
+    kfs = {os.path.splitext(f)[0].lower(): os.path.join(sub, f)
+           for f in os.listdir(sub) if f.lower().endswith('.kf')}
+    out = []
+    for names, role in GETUP_ROLES:
+        kf = next((kfs[n] for n in names if n in kfs), None)
+        if kf:
+            out.append((role, kf))
+    return out
+
+
 def classify_clips(creature_dir: str) -> dict:
     """Scan an Oblivion creature folder into the v1 graph's clip roles.
 
@@ -389,6 +425,7 @@ def classify_clips(creature_dir: str) -> dict:
         else:
             out['extra'].append(path)
     out['attacks'].sort()
+    out['getup'] = getup_clips(creature_dir)
     _promote_water_native(out, kfs)
     out['attack_stance'] = {p: attack_stance(p) for p in out['attacks']}
     return out
@@ -492,6 +529,25 @@ def build_attack_events(clips: dict) -> list:
             for p in clips['attacks']]
 
 
+#: The swim sub-machine's own states take ids 0-4; its attack states follow.
+SWIM_ATTACK_FIRST_ID = 5
+
+
+def swim_attacks(clips: dict) -> list:
+    """The attack clips an amphibian plays only while it swims, in clip order.
+
+    Empty unless the creature keeps a SwimState, has at most one weapon
+    stance and ships land attacks beside its `swim*` ones.
+    See: docs/commentary/asset_convert_creature.md#swim-attacks
+    """
+    if (not clips.get('swim', {}).get('forward')
+            or len(clips.get('equip', {})) > 1):
+        return []
+    swim = [p for p in clips['attacks']
+            if clip_state_name(p).lower().startswith('swim')]
+    return swim if len(swim) < len(clips['attacks']) else []
+
+
 def cast_clip(clips: dict):
     """The one .kf the cast chain plays, or None for a non-caster."""
     for mode in CAST_CLIP_PREFERENCE:
@@ -543,9 +599,10 @@ def state_defs(clips: dict) -> list:
         if st in clips['single']:
             defs.append((st, clips['single'][st], False, enter,
                          'returnToDefault' if st != 'Death' else None))
+    swim = set(swim_attacks(clips))
     for kf, evt in zip(clips['attacks'], build_attack_events(clips)):
         defs.append((f'Attack_{clip_state_name(kf)}', kf, False, evt,
-                     'returnToDefault'))
+                     'attackStop' if kf in swim else 'returnToDefault'))
     _append_equip_states(defs, clips)
     _append_swim_states(defs, clips)
     _append_block_states(defs, clips)
@@ -620,19 +677,44 @@ def cast_anim_stems(clips: dict) -> dict:
     return {st: stem for st, _kf, _p, stem in cast_phase_defs(clips)}
 
 
-def speed_blend_plan(clips: dict, speeds: dict) -> list:
-    """Children of the MoveForward parametric speed blend:
-    [(clip_gen_name, kf_path, playback_rate, anchor u/s)], anchors strictly
-    increasing.  None when the walk clip has no usable root-motion speed.
+#: Largest anchor ratio between neighbouring same-clip children (vanilla wolf/sabrecat ladders step 1.4-1.5x).
+LADDER_STEP = 1.5
+#: The sandbox-creep anchor every gait blend starts at (vanilla WalkSlow children).
+CREEP_SPEED = 5.0
 
+
+def creep_ladder(name: str, kf: str, spd: float) -> list:
+    """Same-clip children from the 5 u/s creep up to the natural clip, neighbours <= LADDER_STEP apart.
+
+    [(clip_gen_name, kf, playback_rate, anchor u/s)], anchors increasing; the
+    natural clip alone when it is no faster than the creep.  Havok's sync
+    blends DURATIONS, so a wide gap plays the legs far slower than the
+    ground speed between the anchors.
+    See: docs/commentary/asset_convert_creature.md#forward-blend-layout
+    """
+    if spd <= CREEP_SPEED * 1.05:
+        return [(name, kf, 1.0, spd)]
+    rungs, rate = [], round(1.0 / LADDER_STEP, 3)
+    while spd * rate >= CREEP_SPEED * 2.0:
+        rungs.append(rate)
+        rate = round(rate / LADDER_STEP, 3)
+    out = [(f'{name}Slow', kf, max(0.02, round(CREEP_SPEED / spd, 3)), CREEP_SPEED)]
+    out += [(f'{name}At{round(spd * r)}', kf, r, round(spd * r, 3)) for r in reversed(rungs)]
+    return out + [(name, kf, 1.0, spd)]
+
+
+def speed_blend_plan(clips: dict, speeds: dict) -> list:
+    """Children of the MoveForward parametric speed blend, a `creep_ladder`.
+
+    None when the walk clip has no usable root-motion speed.
     See: docs/commentary/asset_convert_creature.md#forward-blend-layout
     """
     fwd = clips['locomotion'].get('MoveForward')
     walk = speeds.get('walk')
     if not fwd or not walk:
         return None
-    return [('MoveForwardSlow', fwd, max(0.02, round(5.0 / walk, 3)), 5.0),
-            ('MoveForward', fwd, 1.0, walk)]
+    plan = creep_ladder('MoveForward', fwd, walk)
+    return plan if len(plan) >= 2 else None
 
 
 def run_blend_plan(clips: dict, speeds: dict) -> list:
@@ -668,30 +750,52 @@ def backward_blend_plan(clips: dict, speeds: dict) -> list:
     spd = speeds.get('back')
     if not back or not spd:
         return None
-    return [('MoveBackwardSlow', back, max(0.02, round(5.0 / spd, 3)), 5.0),
-            ('MoveBackward', back, 1.0, spd)]
+    plan = creep_ladder('MoveBackward', back, spd)
+    return plan if len(plan) >= 2 else None
+
+
+def gait_blend_plan(name: str, kf: str, spd) -> list:
+    """`creep_ladder` + clip@2x for one gait; a lone rate-1 clip without a speed.
+
+    See: docs/commentary/asset_convert_creature.md#strafes-are-blends-not-states
+    """
+    if not spd:
+        return [(name, kf, 1.0, None)]
+    return creep_ladder(name, kf, spd) + [(f'{name}Fast', kf, 2.0, round(spd * 2.0, 3))]
+
+
+def direction_children(loco: dict, speeds: dict) -> list:
+    """The strafe/backward children of a Direction blend: [(suffix, kf, anchor, speed)]."""
+    strafes = 'StrafeRight' in loco or 'StrafeLeft' in loco
+    kids = [('StrafeRight', 'StrafeRight', 0.25, 'right'),
+            ('BackwardDir', 'MoveBackward', 0.5, 'back'),
+            ('StrafeLeft', 'StrafeLeft', 0.75, 'left')]
+    return [(sfx, loco[key], anchor, speeds.get(spd)) for sfx, key, anchor, spd in kids
+            if key in loco and strafes]
+
+
+def direction_plans(clips: dict, speeds: dict) -> list:
+    """Every Direction-blend child plan the graph builds, so the cache registers each name.
+
+    See: docs/commentary/asset_convert_creature.md#strafes-are-blends-not-states
+    """
+    loco = clips['locomotion']
+    if 'MoveForward' not in loco:
+        return []
+    families = ['Walk'] + (['Run'] if run_blend_plan(clips, speeds) else [])
+    return [gait_blend_plan(f'{fam}{sfx}', kf, spd) for fam in families
+            for sfx, kf, _anchor, spd in direction_children(loco, speeds)]
 
 
 def swim_blend_plan(clips: dict, speeds: dict) -> list:
-    """SwimMove parametric blend: slow-creep child + swim (+ fast) at their
-    natural anchors, rate 1.0 — the vanilla monolithic layout (chaurus)."""
+    """SwimMove parametric blend: the swim `creep_ladder` (+ the fast clip at
+    its natural anchor) — the vanilla monolithic layout (chaurus)."""
     sw = clips.get('swim', {})
     fwd, spd = sw.get('forward'), speeds.get('swim')
     if not fwd or not spd:
         return None
-    plan = [('SwimMoveSlow', fwd, max(0.02, 5.0 / spd)),
-            ('SwimMove', fwd, 1.0)]
+    plan = creep_ladder('SwimMove', fwd, spd)
     fast_spd = speeds.get('swimfast')
     if sw.get('fast') and fast_spd and fast_spd > spd * 1.05:
-        plan.append(('SwimMoveFast', sw['fast'], 1.0))
-    natural = {id(fwd): spd}
-    if sw.get('fast'):
-        natural[id(sw['fast'])] = fast_spd
-    out, last = [], 0.0
-    for nm, kf, rate in plan:
-        anchor = natural[id(kf)] * rate
-        if anchor <= last * 1.01:
-            continue
-        out.append((nm, kf, rate, anchor))
-        last = anchor
-    return out if len(out) >= 2 else None
+        plan.append(('SwimMoveFast', sw['fast'], 1.0, fast_spd))
+    return plan if len(plan) >= 2 else None

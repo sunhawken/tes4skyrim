@@ -7,8 +7,10 @@ masks, flip-book atlases and the UV-transform controllers that drive them.
 See: docs/commentary/asset_convert_shader.md
 """
 
-from asset_convert.game_paths import current_namespace
+from asset_convert.game_paths import (current_namespace, find_nocase,
+                                      folder_names)
 import os
+import time
 
 from asset_convert.nif.pyffi_monkey_patch import apply_patches
 apply_patches()
@@ -20,8 +22,10 @@ from asset_convert.nif.nif_flags import (TT_SCALE_U, TT_SCALE_V,
                                          TT_TRANSLATE_V)
 from asset_convert.nif.sequences import (MATERIAL_COLOR_EMISSIVE,
                                          TEX_TRANSFORM_VARS)
-from asset_convert.nif.tex_paths import (bs_pp_texture_slots,
-                                         rewrite_tex_path)
+from asset_convert.nif.tex_paths import (bs_pp_texture_slots, full_res_twin,
+                                         path_bytes, path_text,
+                                         rewrite_tex_path, top_level_twin)
+from asset_convert.nif.uv_transform import base_map, expand_harvested
 from asset_convert.sources import base_plugins as _base_plugins
 from asset_convert.texture import landscape_normals, parallax, spec_mask
 
@@ -61,6 +65,9 @@ DEFAULT_GLOSSINESS = 80.0
 #: Uniform for every shape. See: docs/commentary/asset_convert_shader.md#spec-strength-uniform
 SPEC_STRENGTH = 1.0
 
+#: Unfaded-group median. See: docs/commentary/asset_convert_shader.md#refraction-surfaces
+REFRACTION_STRENGTH = 0.25
+
 #: Slot and shader type for a glow map. See: docs/commentary/asset_convert_shader.md#glow-shader
 GLOW_SLOT = 2
 SHADER_TYPE_GLOWMAP = 2
@@ -94,13 +101,37 @@ _PARALLAX_ALPHA_CACHE = {}
 #: Mask verdicts by absolute path. See: docs/commentary/asset_convert_shader.md#texture-classification-caches
 _SPEC_MASK_CACHE = {}
 
+#: Folder listings by path, with the stamp read. See: docs/commentary/asset_convert_shader.md#texture-fallback-roots
+_SOURCE_LISTINGS = {}
+
+#: A folder changed this recently is never remembered: a later change could carry the same mtime.
+_SETTLE_NS = 2_000_000_000
+
+
+def _source_listing(folder):
+    """`folder_names(folder)`, read again whenever the folder's mtime, ctime or inode has moved.
+
+    See: docs/commentary/asset_convert_shader.md#texture-fallback-roots
+    """
+    try:
+        st = os.stat(folder)
+    except OSError:
+        return {}
+    stamp = (st.st_mtime_ns, st.st_ctime_ns, st.st_ino)
+    kept = _SOURCE_LISTINGS.get(folder)
+    if kept is None or kept[0] != stamp:
+        kept = (stamp, folder_names(folder))
+        if kept[1] and time.time_ns() - st.st_mtime_ns > _SETTLE_NS:
+            _SOURCE_LISTINGS[folder] = kept
+    return kept[1]
+
 
 def resolve_source_texture(tex_rel, src_nif_path, fallback_roots=()):
     """The extracted source file behind a rewritten texture path, or None.
 
     Maps textures\\tes4\\fire\\x\\y.dds back to
     export/<esm>/textures/fire/x/y.dds beside the source mesh tree, falling
-    back to the master's roots.
+    back to the master's roots. Each tree is tried exactly, then ignoring case.
     See: docs/commentary/asset_convert_shader.md#texture-fallback-roots
     """
     if not src_nif_path:
@@ -121,10 +152,16 @@ def resolve_source_texture(tex_rel, src_nif_path, fallback_roots=()):
     cand = tex_root + rel.replace('\\', os.sep)
     if os.path.isfile(cand):
         return cand
+    cand = find_nocase(norm[:i + 1], 'textures', rel, listing=_source_listing)
+    if cand:
+        return str(cand)
     for root in (fallback_roots or ()):
         cand = os.path.join(root, rel.replace('\\', os.sep))
         if os.path.isfile(cand):
             return cand
+        cand = find_nocase(root, rel, listing=_source_listing)
+        if cand:
+            return str(cand)
     return None
 
 
@@ -254,8 +291,8 @@ def collect_uv_ctrls(geom):
     return out
 
 
-def _build_float_ctrl(ctrl_type, src_ctrl, fdata, shader, is_effect):
-    """One BS*ShaderPropertyFloatController re-emitting a source UV curve."""
+def _build_float_ctrl(ctrl_type, op, src_ctrl, fdata, shader, is_effect):
+    """One BS*ShaderPropertyFloatController re-emitting a source UV curve as `op`."""
     new = ctrl_type()
     new.flags = _CTRL_FLAGS_ACTIVE_SCALED | (
         int(getattr(src_ctrl, 'flags', 0)) & _CTRL_FLAGS_CYCLE_MASK)
@@ -265,7 +302,7 @@ def _build_float_ctrl(ctrl_type, src_ctrl, fdata, shader, is_effect):
     new.stop_time = src_ctrl.stop_time
     new.target = shader
     new.type_of_controlled_variable = \
-        TEX_TRANSFORM_VARS[src_ctrl.operation][1 if is_effect else 0]
+        TEX_TRANSFORM_VARS[op][1 if is_effect else 0]
 
     interp = NifFormat.NiFloatInterpolator()
     interp.float_value = _USE_DATA_SENTINEL
@@ -274,10 +311,11 @@ def _build_float_ctrl(ctrl_type, src_ctrl, fdata, shader, is_effect):
     return new
 
 
-def attach_tex_transform_ctrls(shader, harvested):
+def attach_tex_transform_ctrls(shader, harvested, desc):
     """Re-emit harvested texture transforms as a Skyrim shader controller chain.
 
-    Anything already on the shader is kept at the end of the chain.
+    `desc` is the base TexDesc the transforms animate, or None.  Anything
+    already on the shader is kept at the end of the chain.
     See: docs/commentary/asset_convert_shader.md#shader-float-controller-flags
     """
     if not harvested:
@@ -288,8 +326,8 @@ def attach_tex_transform_ctrls(shader, harvested):
 
     head = None
     tail = None
-    for src_ctrl, fdata in harvested:
-        new = _build_float_ctrl(ctrl_type, src_ctrl, fdata, shader, is_effect)
+    for op, src_ctrl, fdata in expand_harvested(harvested, desc):
+        new = _build_float_ctrl(ctrl_type, op, src_ctrl, fdata, shader, is_effect)
         if head is None:
             head = new
         else:
@@ -395,22 +433,38 @@ def _normal_exists(normal_rel, stats):
                                   stats.get('_tex_fallback', ())) is not None
 
 
+def resolve_texture(tex, stats):
+    """The path the game finds for rewritten `tex`: itself when its source exists, else a 'lowres' texture's
+    full-res twin, else the same file name at the top of the namespace when that exists (the engine's fallback).
+
+    See: docs/commentary/asset_convert_shader.md#lowres-textures
+    See: docs/commentary/asset_convert_shader.md#top-level-texture-fallback
+    """
+    if stats is None or _normal_exists(tex, stats):
+        return tex
+    twin = full_res_twin(tex)
+    if twin is not None:
+        return twin
+    top = top_level_twin(tex)
+    return top if _normal_exists(top, stats) else tex
+
+
 def _resolve_map_for(diffuse, suffix, stats):
     """The best real `<diffuse base><suffix>.dds` for a diffuse, or None.
 
     Generic in the suffix: Oblivion's base-name rule applies to every derived
-    map, glow included.
+    map, glow included. A 'lowres' diffuse also tries its full-res twin's maps.
     See: docs/commentary/asset_convert_shader.md#normal-base-name-fallback
     """
-    base = diffuse.rsplit('.', 1)[0] if '.' in diffuse else diffuse
-    own = base + suffix + '.dds'
-    if _normal_exists(own, stats):
-        return own
-    head, sep, _tail = base.rpartition('_')
-    if sep and head:
-        shared = head + suffix + '.dds'
-        if _normal_exists(shared, stats):
-            return shared
+    for tex in filter(None, (diffuse, full_res_twin(diffuse))):
+        base = tex.rsplit('.', 1)[0] if '.' in tex else tex
+        head, sep, _tail = base.rpartition('_')
+        candidates = [base + suffix + '.dds']
+        if sep and head:
+            candidates.append(head + suffix + '.dds')
+        for cand in candidates:
+            if _normal_exists(cand, stats):
+                return cand
     return None
 
 
@@ -430,9 +484,7 @@ def has_spec_mask(normal_rel, stats):
     """
     if not normal_rel or stats is None:
         return False
-    rel = normal_rel.decode('utf-8', 'replace') \
-        if isinstance(normal_rel, bytes) else normal_rel
-    src = resolve_source_texture(rel, stats.get('_src_path', ''),
+    src = resolve_source_texture(path_text(normal_rel), stats.get('_src_path', ''),
                                  stats.get('_tex_fallback', ()))
     if src is None:
         stats['spec_missing_normal'] = stats.get('spec_missing_normal', 0) + 1
@@ -463,14 +515,12 @@ def _glow_map_for(glow_path, tex_set, stats):
     Counts a derivation, and counts an authored path that resolves nowhere.
     """
     if glow_path:
-        named = rewrite_tex_path(glow_path)
+        named = resolve_texture(rewrite_tex_path(glow_path), stats)
         if _normal_exists(named, stats):
             return named
-    diffuse = tex_set.textures[0]
-    if isinstance(diffuse, bytes):
-        diffuse = diffuse.decode('utf-8', errors='replace')
+    diffuse = path_text(tex_set.textures[0])
     rel = None
-    if diffuse and diffuse != DEFAULT_DIFFUSE_TEXTURE.decode('utf-8'):
+    if diffuse and diffuse != path_text(DEFAULT_DIFFUSE_TEXTURE):
         rel = _resolve_map_for(diffuse, '_g', stats)
     if rel is not None and not glow_path:
         stats['glow_derived'] = stats.get('glow_derived', 0) + 1
@@ -491,7 +541,7 @@ def apply_glow(shader, tex_set, glow_path, stats):
     if rel is None:
         return False
 
-    tex_set.textures[GLOW_SLOT] = rel.encode('utf-8')
+    tex_set.textures[GLOW_SLOT] = path_bytes(rel)
     shader.skyrim_shader_type = SHADER_TYPE_GLOWMAP
     shader.shader_flags_2.slsf_2_glow_map = 1
     shader.shader_flags_1.slsf_1_environment_mapping = 0
@@ -533,9 +583,7 @@ def _parallax_diffuse(ts, tex_set, stats):
     diffuse_rel = tex_set.textures[0]
     if data is None or not diffuse_rel:
         return None
-    if isinstance(diffuse_rel, bytes):
-        diffuse_rel = diffuse_rel.decode('utf-8', errors='replace')
-    return data, diffuse_rel
+    return data, path_text(diffuse_rel)
 
 
 def apply_parallax(ts, shader, tex_set, tex_apply_mode, stats):
@@ -557,7 +605,7 @@ def apply_parallax(ts, shader, tex_set, tex_apply_mode, stats):
     if height_rel is None:
         return
 
-    tex_set.textures[parallax.HEIGHT_SLOT] = height_rel.encode('utf-8')
+    tex_set.textures[parallax.HEIGHT_SLOT] = path_bytes(height_rel)
     shader.skyrim_shader_type = parallax.SHADER_TYPE_HEIGHTMAP
     shader.shader_flags_1.slsf_1_parallax = 1
     shader.shader_flags_1.slsf_1_environment_mapping = 0
@@ -626,7 +674,7 @@ class _ShaderInputs:
                  'alpha_prop', 'tex_apply_mode', 'emissive_r', 'emissive_g',
                  'emissive_b', 'material_alpha', 'emissive_animated',
                  'vertex_lighting_mode', 'flip_ctrl', 'tex_transforms',
-                 'shader_declared_unlit')
+                 'shader_declared_unlit', 'is_refraction', 'base_map')
 
     def __init__(self, tex_transforms):
         """Start from the no-properties defaults, carrying the UV transforms in."""
@@ -645,6 +693,8 @@ class _ShaderInputs:
         self.flip_ctrl = None
         self.tex_transforms = tex_transforms
         self.shader_declared_unlit = False
+        self.is_refraction = False
+        self.base_map = None
 
 
 def _harvest_texturing(prop, out):
@@ -653,14 +703,21 @@ def _harvest_texturing(prop, out):
     out.glow_path = _glow_texture_path(prop) or out.glow_path
     out.tex_apply_mode = int(prop.apply_mode)
     out.flip_ctrl = find_flip_controller(prop) or out.flip_ctrl
+    out.base_map = base_map([prop]) or out.base_map
+
+
+#: Bethesda's material name on every TES4 refraction surface.
+REFRACTION_MATERIAL = 'refractf'
 
 
 def _harvest_material(prop, out):
-    """Fold one NiMaterialProperty's emissive and alpha in."""
+    """Fold one NiMaterialProperty's emissive, alpha and refraction flag in."""
     color = prop.emissive_color
     out.emissive_r, out.emissive_g, out.emissive_b = color.r, color.g, color.b
     out.material_alpha = prop.alpha
     out.emissive_animated = _has_emissive_animation(prop)
+    name = bytes(prop.name).rstrip(b'\x00').decode('latin-1', 'replace')
+    out.is_refraction = name.lower() == REFRACTION_MATERIAL
 
 
 def collect_shader_inputs(src, uv_transforms):

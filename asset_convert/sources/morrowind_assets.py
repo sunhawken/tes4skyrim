@@ -27,7 +27,11 @@ _ANCHOR_PLUGIN = 'Morrowind.esm'
 #: Archive subfolder every mesh path is stored under.
 _MESHES = 'meshes'
 
+#: Folder Morroblivion moved its reworked Morrowind meshes under.
+_MORRO = 'morro' + chr(92)
+
 _index_cache = {}
+_folded_cache = {}
 
 
 def _archive_index(data_dir: str) -> dict:
@@ -42,6 +46,15 @@ def _archive_index(data_dir: str) -> dict:
                 index[stored] = (path, start, size)
     _index_cache[data_dir] = index
     return index
+
+
+def _cache_entry(cached: Path, entry) -> Path:
+    """Extract an archive `entry` to `cached` atomically, so a concurrent reader never sees half a file."""
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cached.with_name(f'{cached.name}.{os.getpid()}.tmp')
+    tmp.write_bytes(read_entry(*entry))
+    os.replace(tmp, cached)
+    return cached
 
 
 def _normalize(rel: str) -> str:
@@ -63,11 +76,7 @@ def find_vanilla_mesh(export_root, rel: str):
     if cached.is_file():
         return cached
     entry = _archive_index(data_dir).get(_MESHES + chr(92) + rel)
-    if entry is None:
-        return None
-    cached.parent.mkdir(parents=True, exist_ok=True)
-    cached.write_bytes(read_entry(*entry))
-    return cached
+    return None if entry is None else _cache_entry(cached, entry)
 
 
 def find_archived_mesh(export_root, rel: str):
@@ -88,11 +97,34 @@ def find_archived_mesh(export_root, rel: str):
     if cached.is_file():
         return cached
     entry = _archive_index(data_dir).get(_MESHES + chr(92) + rel)
-    if entry is None:
+    return None if entry is None else _cache_entry(cached, entry)
+
+
+def _folded_meshes(data_dir: str) -> dict:
+    """{mesh path with `_` folded to `u`: archived mesh path}; a fold two paths share is left out."""
+    if data_dir not in _folded_cache:
+        prefix = _MESHES + chr(92)
+        seen = {}
+        for key in _archive_index(data_dir):
+            if key.startswith(prefix):
+                rel = key[len(prefix):]
+                seen.setdefault(rel.replace('_', 'u'), []).append(rel)
+        _folded_cache[data_dir] = {k: v[0] for k, v in seen.items() if len(v) == 1}
+    return _folded_cache[data_dir]
+
+
+def find_original_mesh(export_root, rel: str):
+    """The archived Morrowind original of Morroblivion mesh `rel` (under `morro\\`), or None.
+
+    Morroblivion writes each `_` of the original's file name as `U`, so the
+    two match once `_` is folded to `u`.
+    """
+    rel = _normalize(rel)
+    data_dir = source_registry.directory_for(str(export_root), _ANCHOR_PLUGIN)
+    if not rel.startswith(_MORRO) or not data_dir:
         return None
-    cached.parent.mkdir(parents=True, exist_ok=True)
-    cached.write_bytes(read_entry(*entry))
-    return cached
+    original = _folded_meshes(data_dir).get(rel[len(_MORRO):])
+    return find_archived_mesh(export_root, original) if original else None
 
 
 def resolve_mesh(roots, rel: str, export_root):
@@ -103,6 +135,28 @@ def resolve_mesh(roots, rel: str, export_root):
         if path.is_file():
             return path
     return find_vanilla_mesh(export_root, rel)
+
+
+def find_archived_file(export_root, rel: str):
+    """Any vanilla file at `rel` (a stored path like `textures\\x.dds`), else None.
+
+    Prefers the ARCHIVED copy over a loose replacer, as `find_archived_mesh`
+    does. Falls back to loose only when no archive holds the path: vanilla
+    ships `Fonts/` loose, so there is no shipped copy to prefer.
+    See: docs/commentary/tes4_export_morrowind.md#vanilla-assets
+    """
+    data_dir = source_registry.directory_for(str(export_root), _ANCHOR_PLUGIN)
+    if not data_dir:
+        return None
+    rel = _normalize(rel)
+    cached = Path(export_root) / CACHE_DIR / rel
+    if cached.is_file():
+        return cached
+    entry = _archive_index(data_dir).get(rel)
+    if entry is None:
+        loose = Path(data_dir) / rel
+        return loose if loose.is_file() else None
+    return _cache_entry(cached, entry)
 
 
 def source_meshes(source_path: str) -> frozenset:

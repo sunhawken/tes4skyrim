@@ -19,24 +19,33 @@ import struct
 
 import pytest
 
+from tes4_export.record_types.morrowind import MW_ENCHANT_SKILL
 from tes5_import.base.conditions import (
     CTDA_OR,
+    FUNC_GET_IS_ID,
     FUNC_GET_IS_VOICE_TYPE,
     FUNC_GET_QUEST_RUNNING,
+    GET_VM_QUEST_VARIABLE,
     build_ctda,
     build_or_chain,
     convert_ctda,
     convert_ctda_list,
+    convert_ctda_list_with_strings,
     has_positive_getisid,
     needs_origin_gate,
+    order_condition_groups,
     read_getisid_fids,
+    set_whole_day_global,
 )
+from tes5_import.base.owned_records import _source_counts_whole_days
 from tes5_import.dialogue.converter import DIAL_TYPE_COMBAT, DIAL_TYPE_CONVERSATION, DIAL_TYPE_DETECTION, DIAL_TYPE_MISC, DIAL_TYPE_PERSUASION, DIAL_TYPE_SERVICE, DIAL_TYPE_TOPIC, _EDID_SUBTYPE, classify_topic, convert_DIAL, convert_INFO, make_dlbr, make_dlvw, should_skip_dial
 from tes5_import.dialogue.groups import build_dialog_groups
+from tes5_import.dialogue.say_topics import ENGINE_TARGET, build_say_topic_dispositions
 from tes5_import.dialogue.quest import (convert_QUST,
                                         set_assigned_var_names)
 from tes5_import.base.tes5_reader import records
 from tes5_import.base.text_reader import set_formid_index_offset
+from tes5_import.record_types import world_falloutnv
 
 
 # ---------------------------------------------------------------------------
@@ -167,19 +176,93 @@ class TestCTDAConversion:
         assert out is not None
         assert struct.unpack_from('<I', out, 20)[0] == 1
 
+    def test_engine_fired_say_topic_keeps_state_target_tests(self):
+        """'Die, you Orc filth!': the target-race test stays, GetIsID drops."""
+        rec = {'Condition[0].Raw': _tes4_ctda(type_byte=0x02, func=69, p1=0x000191C0).hex(),
+               'Condition[1].Raw': _tes4_ctda(type_byte=0x02, func=72, p1=0x00023F2E).hex()}
+        out = convert_ctda_list_with_strings(rec, offset=1, drop_identity_target=True)
+        assert [struct.unpack_from('<HxxxxxxxxxxI', c, 8) for c, _ in out] == [(69, 1)]
+
+    def test_engine_fired_say_topic_disposition(self):
+        """A plain `Say Attack` must not strip the combat topic's target tests."""
+        by_type = {'DIAL': [{'FormID': '000000DC', 'EditorID': 'Attack'}],
+                   'SCPT': [{'SCTX': 'begin OnStartCombat\n\tSay Attack\nend'}]}
+        assert build_say_topic_dispositions(by_type) == {0xDC: ('drop', None)}
+        assert build_say_topic_dispositions(by_type, frozenset({0xDC})) == {
+            0xDC: ENGINE_TARGET}
+
     def test_identity_is_never_retargeted_onto_a_reference(self):
         """GetIsID must never land on RunOn=Reference (the 667-GREETING
-        regression).  In a 'ref'-disposition Say topic the listener is known
-        and the authored identity is statically satisfied, so the condition
-        is DROPPED — the one thing it must never become is a Reference pin."""
+        regression).  Aimed at the player, it is settled to a constant."""
         raw = _tes4_ctda(type_byte=0x02, func=72, p1=0x00023F2E)
-        assert convert_ctda(raw, offset=1, run_on_target_ref=0x14) is None
+        out = convert_ctda(raw, offset=1, run_on_target_ref=0x14)
+        assert struct.unpack_from('<H', out, 8)[0] == 77
+        assert struct.unpack_from('<II', out, 20) == (0, 0)
+
+    @pytest.mark.parametrize('type_byte, comp, p1, passes', [
+        (0x02, 1.0, 0x00033907, False),   # target is Martin: Oblivion 000ADC6C
+        (0x02, 1.0, 0x00000007, True),    # target is the player
+        (0x02, 0.0, 0x00000007, False),   # target is not the player
+        (0x02, 0.0, 0x00033907, True),    # target is not Martin
+        (0x22, 1.0, 0x00033907, True),    # target != Martin
+    ])
+    def test_player_target_identity_is_settled(self, type_byte, comp, p1, passes):
+        """A greeting aimed at the player answers a target GetIsID at conversion.
+
+        Dropping "target is Martin" let Oblivion's Goodbye blocking line greet
+        the player from every NPC with its voices, so no menu opened.
+        """
+        raw = _tes4_ctda(type_byte=type_byte, comp=struct.unpack('<I', struct.pack('<f', comp))[0],
+                         func=72, p1=p1)
+        out = convert_ctda(raw, offset=1, run_on_target_ref=0x14)
+        op, value, func = out[0] & 0xE0, struct.unpack_from('<f', out, 4)[0], struct.unpack_from('<H', out, 8)[0]
+        assert (func, value) == (77, 0.0)
+        assert op == (0x60 if passes else 0x80)
+
+    def test_settled_identity_keeps_its_or_flag(self):
+        """A settled test stays in its OR group, so a false member only drops out."""
+        raw = _tes4_ctda(type_byte=0x03, func=72, p1=0x00033907)
+        assert convert_ctda(raw, offset=1, run_on_target_ref=0x14)[0] & 0x01
+
+    def test_say_drop_still_drops_a_player_identity(self):
+        """A bare Say has no target: the identity test drops, as before."""
+        raw = _tes4_ctda(type_byte=0x02, func=72, p1=0x00033907)
+        assert convert_ctda(raw, offset=1, run_on_target_ref=0x14, drop_run_on_target=True) is None
 
     def test_use_global_flag_remaps_compvalue(self):
         """Only type bit 0x04 (Use Global) makes CompValue a FormID."""
         out = convert_ctda(_tes4_ctda(type_byte=0x04, comp=0x00001234, func=58,
                                       p1=0x5678), offset=1)
         assert struct.unpack_from('<I', out, 4)[0] == 0x01001234
+
+    @pytest.mark.parametrize('type_byte, func, slot', [
+        (0x84, 58, 4),     # `< GameDaysPassed` as the compared global
+        (0x00, 74, 12),    # GetGlobalValue(GameDaysPassed)
+    ])
+    def test_game_days_passed_reads_the_whole_day_global(self, type_byte,
+                                                          func, slot):
+        """Oblivion's GameDaysPassed counts whole days, Skyrim's carries the
+        day's fraction: `StartDay < GameDaysPassed` passed the moment Jayred
+        Ice-Veins stored the day, handing over the bone arrows at once."""
+        raw = _tes4_ctda(type_byte=type_byte, comp=0x39, func=func, p1=0x39)
+        try:
+            set_whole_day_global(0x01ABCDEF)
+            assert struct.unpack_from(
+                '<I', convert_ctda(raw, offset=1), slot)[0] == 0x01ABCDEF
+            set_whole_day_global(0)
+            assert struct.unpack_from(
+                '<I', convert_ctda(raw, offset=1), slot)[0] == 0x39
+        finally:
+            set_whole_day_global(0)
+
+    @pytest.mark.parametrize('fnam, whole', [('s', True), ('f', False)])
+    def test_whole_day_clock_follows_the_authored_global_type(self, fnam,
+                                                              whole):
+        """Oblivion declares GameDaysPassed Short; FO3/FNV declare it Float
+        and already count fractions like Skyrim, so they get no day clock."""
+        glob = {'Signature': 'GLOB', 'EditorID': 'GameDaysPassed',
+                'FNAM.Type': fnam}
+        assert _source_counts_whole_days({'GLOB': [glob]}, None) is whole
 
     def test_notequal_operator_not_treated_as_use_global(self):
         out = convert_ctda(_tes4_ctda(type_byte=0x20, comp=0x3F800000), offset=1)
@@ -197,6 +280,13 @@ class TestCTDAConversion:
         """Player (0x14) and other low engine FormIDs pass through."""
         out = convert_ctda(_tes4_ctda(p1=0x14), offset=1)
         assert struct.unpack_from('<I', out, 12)[0] == 0x14
+
+    def test_engine_fixed_items_name_skyrim_records(self):
+        """GetItemCount(Gold001) counts the Skyrim gold the player carries."""
+        out = convert_ctda(_tes4_ctda(func=47, p1=0x0F), offset=1)
+        assert struct.unpack_from('<I', out, 12)[0] == 0x0000000F
+        out = convert_ctda(_tes4_ctda(func=47, p1=0x0B), offset=1)
+        assert struct.unpack_from('<I', out, 12)[0] == 0x0003A070
 
     def test_value_params_are_never_remapped(self):
         """A non-FormID param must survive the load-order shift untouched.
@@ -235,34 +325,88 @@ class TestCTDAConversion:
         for tes4_av, tes5_av in ((12, 10),   # Armorer     -> Smithing
                                  (14, 6),    # Blade       -> OneHanded
                                  (16, 6),    # Blunt       -> OneHanded
-                                 (24, 21),   # Mysticism   -> Illusion
+                                 (24, 18),   # Mysticism   -> Alteration
                                  (28, 8),    # Marksman    -> Archery
                                  (29, 17),   # Mercantile  -> Speech
                                  (30, 14),   # Security    -> Lockpicking
-                                 (32, 17)):  # Speechcraft -> Speech
+                                 (32, 17),   # Speechcraft -> Speech
+                                 (MW_ENCHANT_SKILL + 12, 23)):
             for func in (14, 277):
                 out = convert_ctda(_tes4_ctda(func=func, p1=tes4_av), offset=1)
                 assert out is not None
                 assert struct.unpack_from('<I', out, 12)[0] == tes5_av
 
-    def test_attribute_conditions_dropped(self):
-        """SKYRIM HAS NO ATTRIBUTES, so an attribute gate must be dropped.
+    @staticmethod
+    def _split(op: int, or_flag: int = 0) -> list:
+        """(type byte, AV) of each TES5 CTDA a Blade `op 50` condition becomes."""
+        from tes5_import.base.conditions import convert_ctda_list_with_strings
+        raw = _tes4_ctda(type_byte=(op << 5) | or_flag, comp=0x42480000, func=14, p1=14)
+        rec = {'FormID': '01000001', 'Condition[0].Raw': raw.hex()}
+        return [(c[0], struct.unpack_from('<I', c, 12)[0]) for c, _s in
+                convert_ctda_list_with_strings(rec, {}, 0x01000000)]
 
-        Regression: joining the Morroblivion Fighters Guild is gated on
-        `GetActorValue Strength >= 30 AND GetActorValue Endurance >= 30`.
-        Passed through verbatim those became Aggression/Assistance — 0-3 enums
-        that can never reach 30 — so the recruiter always answered "you don't
-        have enough experience" and the guild was unjoinable at any level. The
-        Thieves Guild (Agility/Personality) failed the same way.
+    def test_split_skill_at_least_is_either_half(self):
+        """Blade >= 50 passes on One-Handed OR Two-Handed."""
+        assert self._split(3) == [(0x60 | CTDA_OR, 6), (0x60, 7)]
 
-        Dropping fails OPEN, which is the faithful outcome: a Skyrim character
-        cannot raise an attribute at all, so enforcing the gate would lock the
-        content away permanently rather than merely early.
+    def test_split_skill_below_is_both_halves(self):
+        """Blade < 50 needs One-Handed AND Two-Handed below it."""
+        assert self._split(4) == [(0x80, 6), (0x80, 7)]
+
+    def test_base_read_is_never_split(self):
+        """Nehrim's trainer cap GetBaseAV Blade < 90 gates a write to One-Handed."""
+        from tes5_import.base.split_skill_conditions import split_skill_ctdas
+        cap = _tes4_ctda(type_byte=0x80, func=277, p1=14)
+        assert split_skill_ctdas(cap, b'converted') == [b'converted']
+
+    def test_fallout_splits_melee_weapons_not_critical_chance(self):
+        """FNV's 38 is Melee Weapons and splits; its 14 is Critical Chance and does not."""
+        from tes5_import.base.split_skill_conditions import split_skill_ctdas
+        crit = _tes4_ctda(type_byte=0x60, func=14, p1=14) + b'\0' * 4
+        assert split_skill_ctdas(crit, b'converted') == [b'converted']
+        melee = _tes4_ctda(type_byte=0x60, func=14, p1=38) + b'\0' * 4
+        assert len(split_skill_ctdas(melee, convert_ctda(melee, offset=1))) == 2
+
+    def test_split_skill_below_inside_or_group_keeps_one_test(self):
+        """An AND pair cannot sit inside an OR group, so One-Handed alone remains."""
+        assert self._split(4, CTDA_OR) == [(0x80, 6)]
+
+    def test_player_infamy_reads_the_scripts_global(self, monkeypatch):
+        """Run-on-target Infamy >= 100 reads TES4Infamy; the speaker's own Infamy stays an AV."""
+        from tes5_import.base import owned_records
+        monkeypatch.setitem(owned_records.WELL_KNOWN_PROPERTIES, 'TES4Infamy', 0x01000ABC)
+        player = convert_ctda(_tes4_ctda(type_byte=0x62, comp=0x42C80000, func=14, p1=39), offset=1)
+        assert (player[0], struct.unpack_from('<HxxI', player, 8)) == (0x60, (74, 0x01000ABC))
+        speaker = convert_ctda(_tes4_ctda(type_byte=0x60, comp=0x42480000, func=14, p1=39), offset=1)
+        assert struct.unpack_from('<HxxI', speaker, 8) == (14, 61)
+
+    def test_npc_attribute_conditions_dropped(self):
+        """An NPC's own attribute has no Skyrim value or global, so its gate drops (fails open).
+
+        Passed through verbatim, Strength 0 became Aggression, a 0-3 enum that never reaches 30.
         """
-        for attr in range(8):  # Strength .. Luck
+        for attr in range(8):
             for func in (14, 277):
                 assert convert_ctda(_tes4_ctda(func=func, p1=attr),
                                     offset=1) is None
+
+    def test_player_attribute_reads_its_global(self, monkeypatch):
+        """Run-on-target Strength >= 30 (the Fighters Guild's gate) reads TES4PlayerStrength."""
+        from tes5_import.base import owned_records
+        monkeypatch.setitem(owned_records.WELL_KNOWN_PROPERTIES, 'TES4PlayerStrength', 0x01000A01)
+        player = convert_ctda(_tes4_ctda(type_byte=0x62, comp=0x41F00000, func=14, p1=0), offset=1)
+        assert (player[0], struct.unpack_from('<HxxI', player, 8)) == (0x60, (74, 0x01000A01))
+
+    def test_get_vampire_tests_the_vampirism_effect(self, monkeypatch):
+        """GetVampire becomes HasMagicEffectKeyword on VAMP's family; with no family it drops."""
+        from tes5_import.base import owned_records
+        from tes5_import.base.constants import mgef_family_keyword_name
+        ctda = _tes4_ctda(type_byte=0x02, func=40)
+        assert convert_ctda(ctda, offset=1) is None
+        monkeypatch.setitem(owned_records.WELL_KNOWN_PROPERTIES,
+                            mgef_family_keyword_name('VAMP'), 0x01000B01)
+        out = convert_ctda(ctda, offset=1)
+        assert struct.unpack_from('<HxxIxxxxI', out, 8) == (699, 0x01000B01, 1)
 
     def test_quest_stage_param2_not_remapped(self):
         """59 GetStageDone(ptQuest, ptQuestStage): p1 is a FormID, p2 is the
@@ -651,6 +795,51 @@ class TestINFO:
         assert struct.unpack_from('<H', ctdas[0], 8)[0] == FUNC_GET_IS_VOICE_TYPE
         assert struct.unpack_from('<H', ctdas[1], 8)[0] == 72
 
+    def test_small_injected_gate_precedes_long_converted_or_chain(self):
+        """A 3-way OR group of TES4 GetInCell sorts after the 1-condition gate."""
+        from tes5_import.record_types.common import pack_subrecord
+        injected = pack_subrecord('CTDA', build_ctda(FUNC_GET_IS_ID,
+                                                     param1=0x01000AAA))
+        conds = {'Condition[%d].Raw' % i: _tes4_ctda(
+            type_byte=CTDA_OR if i < 2 else 0, func=67, p1=0x100 + i).hex()
+            for i in range(3)}
+        out = convert_INFO(self._rec(ConditionCount='3', **conds),
+                           injected_ctdas=injected)
+        ctdas = _find_all_subrecords(out, b'CTDA')
+        assert [struct.unpack_from('<H', c, 8)[0] for c in ctdas] == \
+            [FUNC_GET_IS_ID, 67, 67, 67]
+        assert [c[0] & CTDA_OR for c in ctdas] == [0, 1, 1, 0]
+
+
+class TestConditionOrder:
+    """order_condition_groups: whole OR groups, VM reads last, then smallest."""
+
+    @staticmethod
+    def _pair(func, is_or=False, cis2=None):
+        return build_ctda(func, param1=func, is_or=is_or), cis2
+
+    @staticmethod
+    def _funcs(pairs):
+        return [struct.unpack_from('<H', c, 8)[0] for c, _ in pairs]
+
+    def test_groups_sort_by_size_and_vm_reads_go_last(self):
+        """Singles first, the 3-way OR group next, the VM read (with its CIS2) last."""
+        pairs = [self._pair(629, cis2='::convCount_var'),
+                 self._pair(67, is_or=True), self._pair(68, is_or=True),
+                 self._pair(69),
+                 self._pair(72)]
+        out = order_condition_groups(pairs)
+        assert self._funcs(out) == [72, 67, 68, 69, 629]
+        assert out[-1][1] == '::convCount_var'
+
+    def test_or_group_is_never_split_and_order_is_stable(self):
+        """Equal-size groups keep their order; the 2-way OR group moves whole."""
+        pairs = [self._pair(74), self._pair(72, is_or=True), self._pair(426),
+                 self._pair(58)]
+        out = order_condition_groups(pairs)
+        assert self._funcs(out) == [74, 58, 72, 426]
+        assert [c[0] & CTDA_OR for c, _ in out] == [0, 0, 1, 0]
+
 
 # ---------------------------------------------------------------------------
 # QUST
@@ -751,6 +940,58 @@ class TestQUST:
         dnam = _find_subrecord(out, b'DNAM')
         assert struct.unpack_from('<I', dnam, 8)[0] == 0
 
+    def test_morrowind_journal_quest_record(self):
+        """A journal QUST carries an objective per page and keeps its id.
+
+        Both are what kept the journal empty: a QUST with no objectives never
+        displays its name however its stages are set, and `derive_formid`
+        already returns a final id, so remapping it again pushed the record
+        past the plugin's own master index.
+        """
+        from tes5_import.dialogue.quest_morrowind import as_record
+        quest = {'id': 'TR_m3_FG', 'name': 'Cursing Like a Witch',
+                 'stages': {10: ('Sharnoga asked for help.', False),
+                            40: ('I dealt with the witch.', True)}}
+        set_formid_index_offset(1)
+        try:
+            out = as_record(quest, 0x0418E9F6)
+        finally:
+            set_formid_index_offset(0)
+        assert struct.unpack_from('<I', out, 12)[0] == 0x0418E9F6
+        qobj = _find_all_subrecords(out, b'QOBJ')
+        assert [struct.unpack('<H', q)[0] for q in qobj] == [10, 40]
+        assert len(_find_all_subrecords(out, b'NNAM')) == 2
+        assert struct.unpack_from('<I', _find_subrecord(out, b'DNAM'),
+                                  8)[0] == 8
+        assert _find_all_subrecords(out, b'QSDT')[1][0] == 0x01
+
+    def test_morrowind_quest_name_fallbacks(self):
+        """FULL: the QSTN name, else the hand-written table, else UESP's,
+        else the raw id -- Morrowind.esm authors no QSTN at all."""
+        from tes5_import.dialogue.quest_morrowind import quest_name
+        named = {'id': 'A1_1_FindSpymaster', 'name': 'Own Name'}
+        assert quest_name(named) == 'Own Name'
+        assert quest_name({**named, 'name': ''}) == 'Report to Caius Cosades'
+        assert (quest_name({'id': 'TR_m7_Shin_NasarKill', 'name': ''})
+                == 'Enemy of the Nasar')
+        assert (quest_name({'id': 'A_I_TAVERNE', 'name': ''})
+                == 'The Fur Seal Tavern')
+        assert quest_name({'id': 'NoSuch_Journal', 'name': ''}) == 'NoSuch_Journal'
+
+    def test_uesp_quest_id_field_spellings(self):
+        """The `|ID=` field is free text; every spelling the dump uses parses."""
+        from tools.generators.gen_morrowind_quest_names import (
+            display_name, journal_ids)
+        assert journal_ids("IC_8_Nord_alms ''(also IC8_Briring, IC8_Eiruki)''") \
+            == ['IC_8_Nord_alms', 'IC8_Briring', 'IC8_Eiruki']
+        assert journal_ids('MS_BarbarianBook, MS_BarbarianBook_B, and MS_C') \
+            == ['MS_BarbarianBook', 'MS_BarbarianBook_B', 'MS_C']
+        assert journal_ids('CO_8 or CO_8a') == ['CO_8', 'CO_8a']
+        assert journal_ids('B1_Urshilaku Kill') == ['B1_Urshilaku Kill']
+        assert journal_ids("''none''") == []
+        assert journal_ids('MG_Telvanni*') == []
+        assert display_name('Morrowind:Ienas Sarandas (quest)') == 'Ienas Sarandas'
+
     def test_non_sge_quest_not_start_enabled(self):
         out = convert_QUST({'FormID': '00010603', 'RecordFlags': '0',
                             'EditorID': 'LateQuest', 'DATA.Flags': '0',
@@ -760,12 +1001,9 @@ class TestQUST:
 
     def test_quest_targets_become_aliases_and_objective_targets(self):
         """TES4 quest-level targets (REFR + GetStage conditions) -> one
-        forced-ref alias per unique target, plus an UNCONDITIONAL QSTA(alias,
-        flags) on each objective whose stage the TES4 conditions admit.
-
-        Vanilla objective targets carry no CTDAs — the displayed objective is
-        what selects the marker — so Oblivion's GetStage gates are resolved at
-        build time instead of replayed at runtime.
+        forced-ref alias per unique target, plus a QSTA(alias, flags) on each
+        objective whose stage the TES4 conditions admit. The quest's own
+        GetStage gate is settled at build time, so no CTDA remains.
         """
         set_formid_index_offset(1)
         try:
@@ -798,17 +1036,10 @@ class TestQUST:
         order = _sub_order(out)
         assert order.index('QOBJ') < order.index('QSTA') < order.index('ANAM') \
             < order.index('ALST') < order.index('ALED')
-        # Objective targets are unconditional, exactly like vanilla.
         assert not _find_all_subrecords(out, b'CTDA')
 
     def test_target_only_on_the_stages_its_conditions_admit(self):
-        """A target gated `GetStage == 20` marks only objective 20 — not 10.
-
-        Carrying every target onto every objective (with its conditions
-        replayed as CTDAs) leaves the engine with a list whose leading entries
-        are false, and it draws no marker at all: the objective shows in the
-        journal but the compass and map stay empty.
-        """
+        """A target gated `GetStage == 20` marks only objective 20 — not 10."""
         set_formid_index_offset(1)
         try:
             out = convert_QUST({
@@ -849,6 +1080,45 @@ class TestQUST:
 
         assert marks == {10: [0], 20: [1]}, \
             "each objective must mark only the target Oblivion gated to it"
+
+    def test_variable_gated_targets_keep_runtime_conditions(self):
+        """Only the target whose quest variable matches may show a marker.
+
+        The own-quest GetStage is settled at build time; the quest-variable
+        test and another quest's GetStage become the target's CTDAs, run on
+        PlayerRef as Oblivion evaluated them.
+        """
+        own, other = 0x00010609, 0x00010700
+        gate = _tes4_ctda(type_byte=0x60, comp=0x40A00000, func=58, p1=own)
+        pick = [_tes4_ctda(comp=c, func=79, p1=own, p2=26)
+                for c in (0x3F800000, 0x40000000)]
+        foreign = _tes4_ctda(type_byte=0x60, comp=0x41200000, func=58, p1=other)
+        rec = {'FormID': f'{own:08X}', 'RecordFlags': '0', 'EditorID': 'QVar',
+               'DATA.Flags': '0', 'StageCount': '1',
+               'Stage[0].Index': '10', 'Stage[0].LogCount': '1',
+               'Stage[0].Log[0].Flags': '0',
+               'Stage[0].Log[0].Text': 'Kill the Gatekeeper.'}
+        for t, conds in enumerate(([gate, pick[0]], [gate, pick[1], foreign])):
+            rec[f'Target[{t}].FormID'] = f'{0x1656A + t:08X}'
+            rec[f'Target[{t}].Flags'] = '0'
+            for k, raw in enumerate(conds):
+                rec[f'Target[{t}].Condition[{k}].Raw'] = raw.hex()
+        set_formid_index_offset(1)
+        try:
+            out = convert_QUST(rec, script_vars={own: {26: 'Which'}})
+        finally:
+            set_formid_index_offset(0)
+
+        order = _sub_order(out)
+        start = order.index('QOBJ')
+        run = order[start:order.index('ANAM')]
+        assert run == ['QOBJ', 'FNAM', 'NNAM', 'QSTA', 'CTDA', 'CIS2',
+                       'QSTA', 'CTDA', 'CTDA', 'CIS2']
+        ctdas = _find_all_subrecords(out, b'CTDA')
+        by_func = {struct.unpack_from('<H', c, 8)[0]: c for c in ctdas}
+        assert sorted(by_func) == [58, GET_VM_QUEST_VARIABLE]
+        assert struct.unpack_from('<I', by_func[58], 12)[0] == 0x01010700
+        assert all(struct.unpack_from('<II', c, 20) == (2, 0x14) for c in ctdas)
 
     def test_duplicate_stage_objectives_deduped(self):
         """One objective per stage index — the engine keys objectives by
@@ -942,6 +1212,39 @@ class TestAuthoredObjectives:
         dnam = _find_subrecord(convert_QUST(self._rec()), b'DNAM')
         assert struct.unpack_from('<I', dnam, 8)[0] == 8
 
+    def test_package_alias_follows_targets_and_carries_stage_script(self):
+        """A package-only ref takes the next alias id after the targets, and its alias gets the re-check script.
+
+        See: docs/commentary/script_convert.md#setstage-re-evaluates-alias-packages
+        """
+        out = convert_QUST(self._rec(), pack_plan=_OnePackagePlan())
+        assert [struct.unpack('<I', a)[0] for a in _find_all_subrecords(out, b'ALST')] == [0, 1, 2]
+        assert struct.unpack('<I', _find_subrecord(out, b'ALPC'))[0] == _OnePackagePlan.PACK
+        vmad = _find_subrecord(out, b'VMAD')
+        assert b'TES4_StagePackageAlias' in vmad
+        assert struct.pack('<hHhIhhh', 1, 0, 2, 0x000842DD, 5, 2, 1) in vmad
+        order = _sub_order(out)
+        assert order.index('EDID') < order.index('VMAD') < order.index('FULL' if 'FULL' in order else 'DNAM')
+
+    def test_quest_without_packages_gets_no_vmad(self):
+        """No fragments, script or package alias: no VMAD at all."""
+        assert _find_subrecord(convert_QUST(self._rec()), b'VMAD') is None
+
+
+class _OnePackagePlan:
+    """A PackagePlan stand-in owning one package on one ref no objective targets."""
+
+    REF, PACK = 0x000A0001, 0x000B0002
+
+    def assign_aliases(self, qfid, existing):
+        """Add REF after the existing aliases."""
+        existing[self.REF] = max(existing.values()) + 1
+        return [(self.REF, existing[self.REF])]
+
+    def packages_for_alias(self, qfid, ref_fid):
+        """PACK for REF, nothing for the objective targets."""
+        return [self.PACK] if ref_fid == self.REF else []
+
 
 class TestFalloutConditions:
     """A 28-byte CTDA is Fallout's: function remapped, Run On carried.
@@ -971,6 +1274,38 @@ class TestFalloutConditions:
                             '00000000')
         assert struct.unpack_from('<I', convert_ctda(raw), 20)[0] == 1
         assert convert_ctda(raw, drop_run_on_target=True) is None
+
+    def test_actor_values_use_fallouts_table(self):
+        """FNV Speech, Barter, Repair, Guns and Variable01 keep their meaning; Karma drops."""
+        for fnv_av, tes5_av in ((43, 17), (32, 17), (39, 10), (41, 8), (62, 68), (0, 0)):
+            raw = _tes4_ctda(func=14, p1=fnv_av) + b'\0' * 4
+            assert struct.unpack_from('<I', convert_ctda(raw, offset=1), 12)[0] == tes5_av
+        assert convert_ctda(_tes4_ctda(func=14, p1=23) + b'\0' * 4, offset=1) is None
+
+    def test_permanent_actor_value_is_translated(self):
+        """GetPermanentActorValue (FNV 495, Skyrim 494) carries an actor value."""
+        out = convert_ctda(_tes4_ctda(func=495, p1=43) + b'\0' * 4, offset=1)
+        assert struct.unpack_from('<HxxI', out, 8) == (494, 17)
+
+    @pytest.mark.parametrize('size', [20, 24])
+    def test_short_ctda_from_a_fallout_source_is_fallouts(self, size, monkeypatch):
+        """FO3/FNV masters also store 20- and 24-byte CTDAs; the source decides."""
+        monkeypatch.setattr(world_falloutnv, '_IS_FALLOUT_SOURCE', [True])
+        voice = convert_ctda(_tes4_ctda(func=427)[:size], offset=1)
+        assert struct.unpack_from('<H', voice, 8)[0] == 426
+        speech = convert_ctda(_tes4_ctda(func=14, p1=43)[:size], offset=1)
+        assert struct.unpack_from('<I', speech, 12)[0] == 17
+
+    def test_short_fallout_ctda_is_not_split_as_tes4_blade(self, monkeypatch):
+        """FNV 14 is Critical Chance, not TES4 Blade: one CTDA, no Two-Handed twin."""
+        monkeypatch.setattr(world_falloutnv, '_IS_FALLOUT_SOURCE', [True])
+        rec = {'Condition[0].Raw': _tes4_ctda(type_byte=0x60, func=14, p1=14).hex()}
+        out = convert_ctda_list_with_strings(rec, offset=1)
+        assert [struct.unpack_from('<I', c, 12)[0] for c, _ in out] == [33]
+
+    def test_short_ctda_stays_tes4_for_a_tes4_source(self):
+        """Without a Fallout source a 24-byte CTDA is TES4's: 43 is no actor value there."""
+        assert convert_ctda(_tes4_ctda(func=14, p1=43), offset=1) is None
 
 
 # ---------------------------------------------------------------------------
@@ -1222,7 +1557,8 @@ class TestAddTopicUnlocks:
                 # Mention revealer: response text names the gated topic "Rats"
                 {'FormID': '000C0002', 'ParentDIAL': '000B0004',
                  'QSTI.Quest': '000A0001', 'ResponseCount': '1',
-                 'Response[0].ResponseText': 'Ask Azzan about Rats sometime.',
+                 'Response[0].ResponseText':
+                     'Ask Azzan about Rats and his Contract sometime.',
                  'Response[0].EmotionType': '0', 'Response[0].EmotionValue': '0',
                  'Response[0].ResponseNumber': '1',
                  'ChoiceCount': '0', 'ConditionCount': '0', 'DATA.Flags': '0'},
@@ -1288,6 +1624,36 @@ class TestAddTopicUnlocks:
         for gs in plan['info_reveals'].values():
             assert 'TES4Unlock_stageTopic' not in gs
 
+    def test_bark_said_by_another_npc_keeps_the_gate(self):
+        """Sheogorath's greeting adds Haskill's 'Greymarch': the bark only
+        ungates a topic whose every speaker says that bark, or Haskill offers
+        the topic before the greeting ever plays."""
+        from tes5_import.dialogue.unlocks import build_unlock_plan
+        sheo = '000000000000803f48000000010d00000000000000000000'
+        bt = self._by_type()
+        bt['QUST'][0]['Stage[0].Log[0].ResultScript'] = ''
+        bt = self._with_greeting(bt, '000B0004')
+        bt['INFO'][-1].update({'ConditionCount': '1', 'Condition[0].Raw': sheo})
+        assert 0x0B0004 in build_unlock_plan(bt)['gated'], \
+            "a conditionless topic line is not covered by one NPC's bark"
+        stage_line = next(r for r in bt['INFO'] if r['FormID'] == '000C0002')
+        stage_line.update({'ConditionCount': '1', 'Condition[0].Raw': sheo})
+        assert 0x0B0004 not in build_unlock_plan(bt)['gated'], \
+            "topic spoken only by the greeting NPC is ungated"
+
+    def test_mention_reveals_every_topic_sharing_the_name(self):
+        """Several gated topics may share one FULL name (SE04..SE10
+        'Greymarch'); a line naming it reveals all of them."""
+        from tes5_import.dialogue.unlocks import build_unlock_plan
+        bt = self._by_type()
+        bt['DIAL'].append({'FormID': '000B0006', 'EditorID': 'ratsTOPIC2',
+                           'DATA.Type': '0', 'QuestCount': '1',
+                           'Quest[0]': '000A0001', 'FULL': 'Rats'})
+        bt['INFO'][0]['AddTopic[1]'] = '000B0006'
+        plan = build_unlock_plan(bt)
+        assert plan['info_reveals'][0x0C0002] == ['TES4Unlock_ratsTOPIC',
+                                                  'TES4Unlock_ratsTOPIC2']
+
     def test_topic_revealed_by_both_bark_and_conversation_stays_gated(self):
         """A greeting revealer belongs to whichever NPC that greeting is gated
         to, and says nothing about a DIFFERENT NPC whose reveal comes from a
@@ -1349,6 +1715,40 @@ class TestAddTopicUnlocks:
         finally:
             set_formid_index_offset(0)
 
+    def test_never_added_topic_is_unreachable(self):
+        """A regular topic nothing adds, links to or names never lists in
+        Oblivion (Nehrim's SayTo-only NQ00Soldat01); a master's topic is
+        never judged, since the master's adders are not in this export."""
+        from tes5_import.dialogue.unlocks import build_unlock_plan
+        bt = self._by_type()
+        bt['DIAL'].append({'FormID': '000B0007', 'EditorID': 'sayOnly',
+                           'DATA.Type': '0', 'QuestCount': '1',
+                           'Quest[0]': '000A0001', 'FULL': 'sayOnly'})
+        bt['INFO'].append({'FormID': '000C0007', 'ParentDIAL': '000B0007',
+                           'QSTI.Quest': '000A0001', 'ResponseCount': '0',
+                           'ChoiceCount': '0', 'ConditionCount': '0',
+                           'DATA.Flags': '0'})
+        plan = build_unlock_plan(bt)
+        assert plan['unreachable'] == {0x0B0007}, \
+            "added, choice-linked and name-mentioned topics stay reachable"
+        assert build_unlock_plan(bt, own_index=1)['unreachable'] == set()
+
+    def test_greeting_line_credits_its_own_quest(self):
+        """A shared GREETING's line names its speaker for its OWN quest, not
+        the topic's first quest, or a condition-free reply in that quest
+        reaches every NPC (Sentry Morten offering Helene's bottles line)."""
+        from tes5_import.dialogue.groups import _quest_npc_sets
+        helene = '000000000000803f48000000010d00000000000000000000'
+        dial = {'FormID': '000B0001', 'EditorID': 'GREETING',
+                'DATA.Type': '6', 'QuestCount': '2',
+                'Quest[0]': '000A0001', 'Quest[1]': '000A0002'}
+        info = {'FormID': '000C0001', 'ParentDIAL': '000B0001',
+                'QSTI.Quest': '000A0002', 'ConditionCount': '1',
+                'Condition[0].Raw': helene}
+        npcs = _quest_npc_sets([dial], {0x000B0001: [info]})
+        assert npcs.get(0x000A0002) == {0x00000D01}
+        assert not npcs.get(0x000A0001)
+
     def test_infos_sorted_by_quest_priority(self):
         """Oblivion picks the first passing INFO by QUEST PRIORITY (desc);
         Skyrim walks physical order — the converter must sort each topic's
@@ -1386,6 +1786,34 @@ class TestAddTopicUnlocks:
                      if sig == 'INFO']
             assert order.index(0x010C0002) < order.index(0x010C0001), \
                 "priority-60 quest's INFO must precede the priority-11 one"
+        finally:
+            set_formid_index_offset(0)
+
+    def test_a_greeting_line_plays_only_when_talked_to(self):
+        """A TES4 GREETING line (activation only in Oblivion) tests IsInDialogueWithPlayer == 1; a HELLO line does not.
+
+        See: docs/commentary/tes5_import_dialogue.md#problem-1-greeting-lines-are
+        """
+        from tes5_import.base.conditions import FUNC_IS_IN_DIALOGUE_WITH_PLAYER
+        set_formid_index_offset(1)
+        try:
+            quest = {'FormID': '000A0001', 'EditorID': 'Q', 'DATA.Flags': '1', 'DATA.Priority': '50',
+                     'StageCount': '0'}
+            info = {'ParentDIAL': '000B0001', 'QSTI.Quest': '000A0001', 'ResponseCount': '0',
+                    'ChoiceCount': '0', 'ConditionCount': '0', 'DATA.Flags': '0'}
+            bt = {'QUST': [quest],
+                  'DIAL': [{'FormID': '000B0001', 'EditorID': 'GREETING', 'DATA.Type': '6',
+                            'QuestCount': '1', 'Quest[0]': '000A0001'},
+                           {'FormID': '000B0002', 'EditorID': 'HELLO', 'DATA.Type': '1',
+                            'QuestCount': '1', 'Quest[0]': '000A0001'}],
+                  'INFO': [dict(info, FormID='000C0001'),
+                           dict(info, FormID='000C0002', ParentDIAL='000B0002')]}
+            writer = _FakeWriter()
+            build_dialog_groups(bt, writer, npc_to_vtyp={})
+            funcs = {fid: {struct.unpack_from('<H', c, 8)[0] for c in _find_all_subrecords(rb, b'CTDA')}
+                     for sig, fid, rb in _walk_records(writer.groups['DIAL']) if sig == 'INFO'}
+            assert FUNC_IS_IN_DIALOGUE_WITH_PLAYER in funcs[0x010C0001]
+            assert FUNC_IS_IN_DIALOGUE_WITH_PLAYER not in funcs[0x010C0002]
         finally:
             set_formid_index_offset(0)
 
@@ -1442,6 +1870,56 @@ class TestOriginGate:
         return (bytes([type_byte, 0, 0, 0]) + struct.pack('<f', comp)
                 + struct.pack('<H', func) + bytes(2)
                 + struct.pack('<I', param1) + bytes(4)).hex()
+
+    @pytest.mark.parametrize('own_actor', [False, True])
+    def test_an_actorless_addon_gates_on_its_masters_audience(self, own_actor):
+        """A dialogue-only add-on's own faction has no members to speak its lines."""
+        from tes5_import.base.writer import PluginWriter
+        from tes5_import.record_types.actor_common import (
+            create_origin_faction, origin_gate, reset_origin_faction)
+
+        class MasterIndex:
+            def find_all_by_edid(self, sig, edid):
+                return [0x02000010]
+
+        set_formid_index_offset(2)
+        try:
+            reset_origin_faction(MasterIndex())
+            writer = PluginWriter(masters=['Skyrim.esm', 'Oblivion.esm', 'Master.esm'])
+            by_type = {'NPC_': [{'FormID': '01000042' if own_actor else '00000042'}]}
+            own = create_origin_faction(writer, False, by_type)
+            gate = origin_gate({'FormID': '01000200'})
+            expected = own if own_actor else 0x02000010
+            assert struct.pack('<I', expected) in gate
+            assert struct.pack('<I', 0x02000010 if own_actor else own) not in gate
+        finally:
+            set_formid_index_offset(0)
+            reset_origin_faction()
+
+    @pytest.mark.parametrize('master_marker', [0x01000777, 0])
+    def test_a_reply_under_the_masters_barter_topic_is_service_gated(self, master_marker):
+        """Without the gate a dependent's barter reply opened barter on any NPC."""
+        from types import SimpleNamespace
+        from tes5_import.base.writer import PluginWriter
+        from tes5_import.dialogue.converter import DIAL_TYPE_SERVICE
+        from tes5_import.overrides.nested import _nested_info
+        from tes5_import.record_types.actor_common import create_vendor_factions
+
+        class MasterIndex:
+            def find_by_edid(self, sig, edid):
+                return master_marker if edid == 'TES4MerchantFaction' else 0
+
+        create_vendor_factions({}, PluginWriter(masters=['Skyrim.esm']), MasterIndex())
+        ctx = SimpleNamespace(master_export={'0000010F': {
+            'FormID': '0000010F', 'DATA.Type': str(DIAL_TYPE_SERVICE)}})
+        rec = {'FormID': '01000200', 'ParentDIAL': '0000010F', 'DATA.Flags': '0',
+               'ResponseCount': '1', 'Response[0].ResponseNumber': '1',
+               'Response[0].ResponseText': 'Have a look.'}
+        info = _nested_info(rec, ctx)
+        if master_marker:
+            assert struct.pack('<I', master_marker) in info
+        else:
+            assert info == b''
 
     def test_run_on_target_pin_does_not_scope_the_speaker(self):
         """A Target-side test is about the LISTENER, not who is talking.
@@ -1506,6 +1984,38 @@ class TestOriginGate:
                'Condition[1].Raw': self._ctda(72, comp=1.0)}
         assert not needs_origin_gate(rec)
 
+    def test_dependent_group_test_on_a_master_form_is_gated(self):
+        """A dependent's GetIsClass/GetInFaction on a MASTER's form reaches the
+        master's actors (Morroblivion's "invest in my shop" on Oblivion merchants)."""
+        for func in (68, 71, 73):
+            rec = {'FormID': '01F8E5C3',
+                   'Condition[0].Raw': self._ctda(func, param1=0x0000A082)}
+            assert needs_origin_gate(rec, own_index=1), f'func {func}'
+
+    def test_dependent_own_form_or_named_actor_scopes(self):
+        """Its own faction, or any actor it names outright, pins the speaker."""
+        own = {'FormID': '01F8E5C3',
+               'Condition[0].Raw': self._ctda(71, param1=0x0100A082)}
+        named = {'FormID': '01F8E5C3',
+                 'Condition[0].Raw': self._ctda(72, param1=0x0000A082)}
+        assert not needs_origin_gate(own, own_index=1)
+        assert not needs_origin_gate(named, own_index=1)
+
+    def test_or_group_pins_only_if_every_member_pins(self):
+        """GetIsClass(own) OR GetIsClass(master's) lets the master's class in."""
+        mixed = {'FormID': '0101BE90',
+                 'Condition[0].Raw': self._ctda(68, 0x01, param1=0x01240048),
+                 'Condition[1].Raw': self._ctda(68, param1=0x00023E6B)}
+        own = {'FormID': '0101BE90',
+               'Condition[0].Raw': self._ctda(68, 0x01, param1=0x01240048),
+               'Condition[1].Raw': self._ctda(68, param1=0x0124003B)}
+        assert needs_origin_gate(mixed, own_index=1)
+        assert not needs_origin_gate(own, own_index=1)
+
+    def test_override_of_a_master_info_keeps_its_audience(self):
+        """An edited master line is the master's line: never gated on the dependent."""
+        assert not needs_origin_gate({'FormID': '0000A0B1'}, own_index=1)
+
 
 class TestPluginAuthoredRaceConditionsSurvive:
     """A GetIsRace naming a race the PLUGIN adds must not be dropped.
@@ -1553,6 +2063,18 @@ class TestPluginAuthoredRaceConditionsSurvive:
         got = self._params(0x000223C8)           # WoodElf
         assert got == [RACE_MAP['WoodElf']]
         assert got != [DEFAULT_RACE]
+
+    def test_authored_race_becomes_its_marker_faction(self, monkeypatch):
+        """With a marker FACT registered, GetIsRace(Riekling) is GetInFaction on
+        it -- never a vanilla race, which every Imperial (or Nord) would pass."""
+        import struct
+        from tes5_import.base import race_factions
+        from tes5_import.base.conditions import convert_ctda_list_with_strings
+        monkeypatch.setitem(race_factions._faction_by_race, 0x02A804D3, 0x01ABC123)
+        rec = {'FormID': '010628F9', 'ConditionCount': '1',
+               'Condition[0].Raw': self._race_ctda(0x01A804D3)}
+        (ctda, _s), = convert_ctda_list_with_strings(rec, {}, 1)
+        assert struct.unpack_from('<HxxI', ctda, 8) == (71, 0x01ABC123)
 
 
 class TestVmConditionsEvaluateLast:
@@ -1909,58 +2431,116 @@ class TestNpcConversationChains:
         done1 = [l for l in psc.splitlines() if l.strip() == '_done1 = True']
         assert len(done1) == 2      # its own block and chain 0's
 
+    def _speaker_only_head(self, by_type, mid_speakers=None):
+        """`by_type` with a head naming only A plus a player-distance gate, and Mid lines by `mid_speakers`."""
+        by_type['INFO'][0] = self._info(0x000AAA30, self.HELLO_D, 'You are in good spirits today', [
+            _tes4_ctda(func=72, p1=self.A_BASE),
+            _tes4_ctda(func=58, comp=self._f(26.0), p1=self.QUEST),
+            _tes4_ctda(type_byte=0x80, comp=self._f(400.0), func=1, p1=0x14),
+        ], choices=(self.MID_D,))
+        for k, spk in enumerate(mid_speakers or ()):
+            by_type['INFO'].append(self._info(0x000AAA40 + k, self.MID_D, 'Indeed.', [
+                _tes4_ctda(func=72, p1=spk),
+                _tes4_ctda(func=58, comp=self._f(26.0), p1=self.QUEST),
+            ], choices=(self.GBYE_D,)))
+        return by_type
 
-class TestScriptStartedChains:
-    """`StartConversation A B topic` hands a whole chain to Oblivion's
-    scheduler; Skyrim's Say plays ONE line, so the chain must be replayed.
-    See: docs/commentary/tes5_import_dialogue.md#script-started-conversation-chains"""
+    def test_reply_named_listener_is_restored(self):
+        """A head naming only its speaker takes its listener from the reply (TG04 Hlidara/Alessia).
 
-    QUEST, TOPIC = 0x000BBB10, 0x000BBB20
-    A_BASE, B_BASE = 0x000BBB01, 0x000BBB02
+        Its GetDistance(Player) gate is kept and runs on the speaker.
+        See: docs/commentary/tes5_import_dialogue.md#the-npc-to-npc-conversation-scheduler
+        """
+        from tes5_import.dialogue.conversations import build_conversation_plan, generate_driver_psc
+        plan = build_conversation_plan(self._speaker_only_head(self._by_type()), plugin_stem='Test')
+        assert len(plan['chains']) == 1
+        c = plan['chains'][0]
+        assert (c['subj']['ref_edid'], c['tgt']['ref_edid']) == ('ARef', 'BRef')
+        assert [h['speaker'] for h in c['hops']] == ['B', 'A']
+        assert {'kind': 'distance', 'op': '<', 'value': 400.0} in c['gates']
+        assert 'Conv0A.GetDistance(Game.GetPlayer()) < 400' in generate_driver_psc(plan, {})
+
+    def test_reply_naming_two_npcs_names_no_listener(self):
+        """Reply lines spoken by two different NPCs name no single listener: no chain."""
+        from tes5_import.dialogue.conversations import build_conversation_plan
+        by_type = self._speaker_only_head(self._by_type(), mid_speakers=(0x000AAA03,))
+        assert build_conversation_plan(by_type, plugin_stem='Test')['chains'] == []
+
+    def test_follow_up_in_another_quest_continues_the_chain(self):
+        """A reply filed under another quest still continues the chain (MQ15 -> MQConversations).
+
+        As in MQ15, the head itself advances its quest.
+        """
+        by_type = self._by_type()
+        by_type['INFO'][0]['ResultScript'] = 'setstage MyQuest 27'
+        by_type['INFO'][2]['QSTI.Quest'] = '000AAA11'
+        by_type['QUST'].append({'Signature': 'QUST', 'FormID': '000AAA11', 'EditorID': 'Talk'})
+        from tes5_import.dialogue.conversations import build_conversation_plan
+        hops = build_conversation_plan(by_type, plugin_stem='Test')['chains'][0]['hops']
+        assert [h['topic_edid'] for h in hops] == ['MidTopic', 'GOODBYE']
+
+
+class TestStartConversationWalk:
+    """`StartConversation A B topic` continues through each played line's Choice list.
+
+    Modeled on Knights.esp's ND09ProphetSermon01 -> 02 -> 03 (`setstage ND09 25`).
+    See: docs/commentary/tes5_import_dialogue.md#script-started-conversation-chains
+    """
+
+    S1, S2, S3, CHAT, BYE = 0x01000100, 0x01000200, 0x01000300, 0x01000400, 0x01000500
+    QUEST, OTHER_QUEST = 0x01000900, 0x01000901
 
     @staticmethod
-    def _f(v: float) -> int:
-        """`v` as its raw float bits, the CTDA comparison encoding."""
-        return struct.unpack('<I', struct.pack('<f', v))[0]
+    def _dial(fid, edid):
+        """A Type-1 conversation topic."""
+        return {'Signature': 'DIAL', 'FormID': f'{fid:08X}', 'EditorID': edid,
+                'DATA.Type': '1'}
 
-    def _line(self, fid, conv_value, npc_addressed=True):
-        """One INFO gated on `conv == conv_value`."""
-        conds = [_tes4_ctda(func=72, p1=self.A_BASE)]
-        if npc_addressed:
-            conds.append(_tes4_ctda(type_byte=0x02, func=72, p1=self.B_BASE))
-        conds.append(_tes4_ctda(func=79, comp=self._f(float(conv_value)),
-                                p1=self.QUEST, p2=9))
-        rec = {'Signature': 'INFO', 'FormID': f'{fid:08X}',
-               'ParentDIAL': f'{self.TOPIC:08X}', 'DATA.DialogType': '1',
-               'DATA.NextSpeaker': '0',
-               'QSTI.Quest': f'{self.QUEST:08X}',
-               'ConditionCount': str(len(conds))}
-        for i, c in enumerate(conds):
-            rec[f'Condition[{i}].Raw'] = c.hex()
+    @staticmethod
+    def _info(fid, parent, quest, choices=(), ns=1):
+        """A line under `parent` owned by `quest`, naming `choices` next."""
+        rec = {'Signature': 'INFO', 'FormID': f'{fid:08X}', 'ParentDIAL': f'{parent:08X}',
+               'QSTI.Quest': f'{quest:08X}', 'DATA.NextSpeaker': str(ns)}
+        rec.update({f'Choice[{i}]': f'{c:08X}' for i, c in enumerate(choices)})
         return rec
 
-    def _map(self, edid='MyConvo', lines=3, npc_addressed=True):
-        """The chain map for one topic carrying `lines` gated INFOs."""
-        from tes5_import.dialogue.conversations import build_script_chain_map
-        infos = [self._line(0x000BBB30 + n, n, npc_addressed)
-                 for n in range(lines)]
-        return build_script_chain_map({
-            'DIAL': [{'Signature': 'DIAL', 'FormID': f'{self.TOPIC:08X}',
-                      'EditorID': edid, 'DATA.Type': '1'}],
-            'INFO': infos,
-        })
+    def _by_type(self):
+        """Three chained sermon topics, plus off-quest chatter and GOODBYE choices."""
+        return {
+            'DIAL': [self._dial(self.S1, 'Sermon01'), self._dial(self.S2, 'Sermon02'),
+                     self._dial(self.S3, 'Sermon03'), self._dial(self.CHAT, 'Chatter'),
+                     self._dial(self.BYE, 'GOODBYE')],
+            'INFO': [self._info(0x01000101, self.S1, self.QUEST, (self.S2,)),
+                     self._info(0x01000201, self.S2, self.QUEST,
+                                (self.S3, self.CHAT, self.BYE), ns=0),
+                     self._info(0x01000301, self.S3, self.QUEST),
+                     self._info(0x01000401, self.CHAT, self.OTHER_QUEST, (self.S1,)),
+                     self._info(0x01000501, self.BYE, self.QUEST)],
+            'SCPT': [{'SCTX': 'begin GameMode\nstartconversation ProphetRef Sermon01\nend'}],
+        }
 
-    def test_consecutive_counter_run_is_a_chain(self):
-        """A run of conv==0..3 is four lines to replay."""
-        assert self._map(lines=4) == {'myconvo': 4}
+    def test_walk_keeps_continuations_only(self):
+        """Choice-linked topics are reached; another quest's chatter and GOODBYE are not."""
+        from tes5_import.dialogue.conversation_routes import reachable_topics
+        assert set(reachable_topics(self._by_type())) == {self.S1, self.S2, self.S3}
 
-    def test_single_line_topic_is_not_a_chain(self):
-        """One line needs no replay -- it keeps the plain Say."""
-        assert self._map(lines=1) == {}
+    def test_routes_follow_each_line(self):
+        """Each line routes to its own reached next topics; a line with none ends it."""
+        from tes5_import.dialogue.conversation_routes import conversation_routes, routed_starts
+        by_type = self._by_type()
+        routes = conversation_routes(by_type, 'Knights.esp', ['Oblivion.esm'])
+        assert routes == {0x000101: (1, [('Knights.esp', 0x000200)]),
+                          0x000201: (0, [('Knights.esp', 0x000300)])}
+        assert routed_starts(by_type, routes) == {'sermon01'}
 
-    def test_player_facing_topic_is_excluded(self):
-        """No run-on-target identity means no chain: else GREETING loops."""
-        assert self._map(edid='GREETING', npc_addressed=False) == {}
+    def test_route_script_names_topics_by_plugin(self):
+        """The generated script finds each next topic in its own plugin file."""
+        from tes5_import.dialogue.conversation_routes import (conversation_routes,
+                                                              generate_route_psc)
+        psc = generate_route_psc('TES4_ConvRoute_Knights', conversation_routes(
+            self._by_type(), 'Knights.esp', ['Oblivion.esm']))
+        assert 'Game.GetFormFromFile(0x000300, "Knights.esp") as Topic' in psc
+        assert '  If aiInfo == 0x000201\n    Return 1\n' in psc
 
 
 class TestForceGreetOncePerDay:
@@ -2100,6 +2680,109 @@ class TestSaySpeakAsIdentityGate:
         assert scan_speak_as_topics(by_type) == set()
 
 
+class TestSeqListsEveryOwnStartGameQuest:
+    """The .seq lists every start-game QUST this file writes, synthesized ones included.
+
+    A start-game quest missing from it gets no dialogue loaded in a new game:
+    `TES4SpeakAs` was left out and every speak-as scene was silent until a
+    save was loaded (confirmed in game).
+    See: docs/commentary/tes5_import_dialogue.md#speak-as-quest-in-the-seq
+    """
+
+    def test_scans_written_quests(self):
+        """Own-index quests with DNAM bit 0 are listed, compressed ones too."""
+        import zlib
+        from tes5_import.base.writer import pack_record, pack_subrecord
+        from tes5_import.pipeline_finalize import _own_sge_quests
+
+        def quest(fid, dnam_flags, compress=False):
+            """One packed QUST carrying only a DNAM with `dnam_flags`."""
+            body = pack_subrecord('DNAM', struct.pack('<HBBII', dnam_flags, 0, 0, 0, 0))
+            if not compress:
+                return pack_record('QUST', fid, 0, body)
+            packed = struct.pack('<I', len(body)) + zlib.compress(body)
+            return (b'QUST' + struct.pack('<III', len(packed), 0x40000, fid)
+                    + b'\0' * 8 + packed)
+
+        w = _FakeWriter()
+        w._top_groups = {'QUST': [quest(0x0129CBF5, 0x0011),
+                                  quest(0x01000010, 0x0000),
+                                  quest(0x01000020, 0x0011, compress=True),
+                                  quest(0x00000030, 0x0011)]}
+        assert _own_sge_quests(w) == {0x0129CBF5, 0x01000020}
+
+
+class TestSpeakAsScenes:
+    """A speak-as line is a one-action scene of `TES4SpeakAs` on a voiced TACT.
+
+    The engine names a scene line's voice file after the SCENE's quest, so the
+    scene topic must be owned by `TES4SpeakAs` too (confirmed in game: the
+    announcer was silent until it was).
+    See: docs/commentary/tes5_import_dialogue.md#speaker-activator-construction
+    """
+
+    def _by_type(self):
+        return {
+            'DIAL': [{'FormID': '00046652', 'EditorID': 'Announcer'}],
+            'NPC_': [{'FormID': '00046653', 'EditorID': 'ArenaMouth',
+                      'FULL': 'Arena Mouth'}],
+            'REFR': [{'FormID': '0000A000', 'EditorID': 'ArenaMatchPlayerRef',
+                      'NAME': '0000003B'}],
+            'SCPT': [{'SCTX': 'ArenaMatchPlayerRef.Say Announcer 1 ArenaMouth 1'}],
+        }
+
+    def _build(self):
+        """(speak_as module, writer) after building the announcer's speaker and scene."""
+        from tes5_import.dialogue import speak_as
+        speak_as.reset()
+        writer = _FakeWriter()
+        by_type = self._by_type()
+        speak_as.build_speaker_activators(by_type, writer, {0x01046653: 0x01000777}, 1)
+        return speak_as, writer
+
+    def test_scene_speaks_the_topic_at_its_own_index(self):
+        """get_formid already shifts the index; the scene must not shift it again."""
+        from tes5_import.base import tes5_reader as R
+        set_formid_index_offset(1)
+        try:
+            speak_as, writer = self._build()
+            scen = [b for s, b in writer.records if s == 'SCEN']
+            assert len(scen) == 1
+            subs = R.subrecords(scen[0][24:])
+            topics = [struct.unpack('<I', d)[0] for s, d in subs if s == b'DATA']
+            quests = [struct.unpack('<I', d)[0] for s, d in subs if s == b'PNAM']
+            assert topics == [0x01046652]
+            assert quests == [speak_as.scene_quest_fid()] != [0]
+        finally:
+            set_formid_index_offset(0)
+
+    def test_scene_topic_is_owned_by_the_scene_quest(self):
+        """A scene topic's owner is TES4SpeakAs; any other keeps its own quest."""
+        from tes5_import.dialogue import groups
+        set_formid_index_offset(1)
+        try:
+            speak_as, _w = self._build()
+            dial = {'FormID': '00046652', 'Quest[0]': '0001E641', 'QuestCount': '1'}
+            orig, owner = groups._topic_owner(dial, 0x01F0FFFF, True)
+            assert (orig, owner) == (0x0101E641, speak_as.scene_quest_fid())
+            assert groups._topic_owner(dial, 0x01F0FFFF, False)[1] == 0x0101E641
+        finally:
+            set_formid_index_offset(0)
+
+    def test_info_names_its_speaker_and_2d_output(self):
+        """A speak-as INFO gets ANAM = the spoken-as NPC and ONAM = SOMDialogue2D."""
+        set_formid_index_offset(1)
+        try:
+            speak_as, _w = self._build()
+            out = speak_as.speaker_subrecords({'ParentDIAL': '00046652'}, 1)
+            assert out[:6] == b'ANAM\x04\x00'
+            assert struct.unpack('<I', out[6:10])[0] == 0x01046653
+            assert out[10:16] == b'ONAM\x04\x00'
+            assert speak_as.speaker_subrecords({'ParentDIAL': '000000C8'}, 1) == b''
+        finally:
+            set_formid_index_offset(0)
+
+
 class TestDropNonActorSpeakerCtdas:
     """_drop_non_actor_speaker_ctdas re-packs a raw condition BLOCK.
 
@@ -2147,3 +2830,60 @@ class TestDropNonActorSpeakerCtdas:
         blob = pack_subrecord('CTDA',
                               self._ctda(sorted(NON_ACTOR_SPEAKER_DROP)[0]))
         assert _drop_non_actor_speaker_ctdas(blob) == b''
+
+
+class TestResetInteriorMovers:
+    """ResetInterior sends home what scripts moved into the reset cell.
+
+    See: docs/commentary/script_convert.md#resetinterior-sends-moved-refs-home
+    """
+
+    def _by_type(self, result):
+        """An Arena in miniature: a holding cell, a match cell, one combatant."""
+        return {
+            'CELL': [{'FormID': '0018AE56', 'EditorID': 'Holding'},
+                     {'FormID': '00091B46', 'EditorID': 'ArenaMatchCell'}],
+            'REFR': [{'FormID': '00091B7B', 'EditorID': 'OpponentMarkerRef',
+                      'ParentCELL': '00091B46'},
+                     {'FormID': '00091B7C', 'EditorID': 'LocalRef',
+                      'ParentCELL': '00091B46'}],
+            'ACHR': [{'FormID': '0018AE5B', 'EditorID': 'Combatant0ARef',
+                      'ParentCELL': '0018AE56'}],
+            'INFO': [{'ResultScript': result}],
+        }
+
+    def test_moved_in_combatant_is_listed(self):
+        """A ref moved to a marker in a reset cell is that cell's mover."""
+        from tes5_import.dialogue.reset_interior import scan_reset_movers
+        movers = scan_reset_movers(self._by_type(
+            'Combatant0ARef.MoveTo OpponentMarkerRef\r\n'
+            'LocalRef.MoveTo OpponentMarkerRef\r\nResetInterior ArenaMatchCell'))
+        assert movers == {'arenamatchcell': {0x0018AE5B}}
+
+    def test_unreset_cell_has_no_movers(self):
+        """Without a ResetInterior on the cell nothing is listed."""
+        from tes5_import.dialogue.reset_interior import scan_reset_movers
+        movers = scan_reset_movers(self._by_type(
+            'Combatant0ARef.MoveTo OpponentMarkerRef'))
+        assert not movers
+
+
+def test_said_once_greeting_retires_only_at_the_end_of_its_chain():
+    """Kathutet (MQ15): a say-once greeting is retired by the line ending its choice chain, not the first answer."""
+    from tes5_import.dialogue.unlocks import _said_once_reveals, said_once_global
+
+    def info(fid, topic, choices=(), flags=0):
+        """One export INFO with its choices."""
+        rec = {"FormID": fid, "ParentDIAL": topic, "DATA.Flags": str(flags)}
+        rec.update({"Choice[%d]" % i: c for i, c in enumerate(choices)})
+        return rec
+
+    infos = [info("0003C93C", "000000C8", ["0003E8EE"], flags=4),
+             info("0003E8F3", "0003E8EE", ["0003E8ED"]),
+             info("0003E8F4", "0003E8ED", ["0003E8EB"]),
+             info("0003E8F7", "0003E8EB"),
+             info("0003E8F9", "0003E8EB", ["0003E8EE"], flags=1)]
+    dials = {int(t, 16): {"EditorID": "T%s" % t} for t in ("0003E8EE", "0003E8ED", "0003E8EB")}
+    out = _said_once_reveals(infos, dials, lambda d: False, lambda edid, kind: (None, None, None, False))
+    gname = said_once_global(0x03C93C)
+    assert {f for f, gs in out.items() if gname in gs} == {0x03C93C, 0x03E8F7, 0x03E8F9}

@@ -1,0 +1,96 @@
+# Bloodmoon "The Ristaag": Korst Wind-Eye sends the player to hunt with Rolf
+# Long-Tooth; Sattir and Grerid fall on the way, werewolves strike, and the
+# player kills the Spirit Bear and brings its heart back. trackerScript walks
+# the hunters on only while the player keeps within 500 units of Rolf, so the
+# player follows him; it marks each body found only after the player has left
+# him for it. Rolf hunts only at night (21:00-6:00, rolftime; by day his
+# greeting says to come back at nightfall), and the hunt fails at daylight
+# (105), so setting the hour to 21:00 stands in for waiting until nightfall
+# before meeting him. Ref FormIDs carry
+# Bloodmoon.esm's slot 06.
+# Run: python -m tools.live.test_instance mwtest --cases <this folder> --fast --checkpoints --stop-on-fail --from bm_ristaag
+# See docs/commentary/headless_testing.md#quest-runs
+
+case bm_ristaag
+defend
+run
+player->Position -159017 212412 2949 180
+until 600 "korst wind-eye"->GetDistance player < 400
+talk korst wind-eye
+ask please the All-Maker
+expect GetJournalIndex BM_BearHunt1 == 10
+ask Ristaag
+expect GetJournalIndex BM_BearHunt1 == 15
+bye
+run
+set GameHour to 21
+player->Position -172076 196700 990 180
+until 600 "rolf long-tooth"->GetDistance player < 400
+talk rolf long-tooth
+ask Ristaag
+expect GetJournalIndex BM_BearHunt1 == 20
+ask ensure our success
+expect GetJournalIndex BM_BearHunt1 == 25
+bye
+follow rolf long-tooth
+until 1800 GetJournalIndex BM_BearHunt1 == 30
+bye
+follow
+run
+set TestResult to ( "sattir the bold"->GetPos x )
+player->SetPos x TestResult
+set TestResult to ( ( "sattir the bold"->GetPos y ) + 100 )
+player->SetPos y TestResult
+set TestResult to ( ( "sattir the bold"->GetPos z ) + 20 )
+player->SetPos z TestResult
+until 600 GetJournalIndex BM_BearHunt1 == 40
+run
+set TestResult to ( "rolf long-tooth"->GetPos x )
+player->SetPos x TestResult
+set TestResult to ( ( "rolf long-tooth"->GetPos y ) + 150 )
+player->SetPos y TestResult
+set TestResult to ( ( "rolf long-tooth"->GetPos z ) + 20 )
+player->SetPos z TestResult
+until 300 "rolf long-tooth"->GetDistance player < 400
+talk rolf long-tooth
+expect GetJournalIndex BM_BearHunt1 == 45
+bye
+follow rolf long-tooth
+until 1800 GetJournalIndex BM_BearHunt1 == 50
+bye
+follow
+run
+set TestResult to ( "grerid axe-wife"->GetPos x )
+player->SetPos x TestResult
+set TestResult to ( ( "grerid axe-wife"->GetPos y ) + 100 )
+player->SetPos y TestResult
+set TestResult to ( ( "grerid axe-wife"->GetPos z ) + 20 )
+player->SetPos z TestResult
+until 600 GetJournalIndex BM_BearHunt1 == 55
+run
+set TestResult to ( "rolf long-tooth"->GetPos x )
+player->SetPos x TestResult
+set TestResult to ( ( "rolf long-tooth"->GetPos y ) + 150 )
+player->SetPos y TestResult
+set TestResult to ( ( "rolf long-tooth"->GetPos z ) + 20 )
+player->SetPos z TestResult
+until 300 "rolf long-tooth"->GetDistance player < 400
+talk rolf long-tooth
+expect GetJournalIndex BM_BearHunt1 == 60
+bye
+follow rolf long-tooth
+until 3600 GetJournalIndex BM_BearHunt1 >= 70
+follow
+console 0644DCAB.kill
+until 300 GetJournalIndex BM_BearHunt1 >= 75
+run
+player->AddItem BM_bearheart_UNIQUE 1
+until 300 GetJournalIndex BM_BearHunt1 == 80
+run
+player->Position -159017 212412 2949 180
+until 600 "korst wind-eye"->GetDistance player < 400
+talk korst wind-eye
+ask Ristaag
+expect GetJournalIndex BM_BearHunt1 == 100
+bye
+end

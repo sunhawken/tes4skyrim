@@ -80,7 +80,7 @@ def dry_fire_sound(rec: dict) -> str:
 
 
 def gun_profile(rec: dict, plugin: str = '') -> dict:
-    """The graph variables TESRuntime sets for a gun WEAP, the ammo it
+    """The graph variables FalloutRuntime sets for a gun WEAP, the ammo it
     loads (as (local id, file) pairs) and its dry-fire sound, or None.
 
     Indices follow gun_graph_falloutnv: class into GUN_CLASSES, reload into
@@ -110,7 +110,7 @@ DEFAULT_SIGHT_FOV = 65.0
 
 def write_gun_sidecar(records: list, plugin_out_dir: str,
                       plugin_name: str) -> str:
-    """Write every gun WEAP's profile for TESRuntime; the path ('' if none).
+    """Write every gun WEAP's profile for FalloutRuntime; the path ('' if none).
 
     Keyed by the plugin-local FormID with its owning file, resolved through
     the engine's load order at DataLoaded.
@@ -141,7 +141,7 @@ FNV_BIPED_SLOT_MAP = {
     1: 1,    # Hair -> 31-Hair
     2: 2,    # Upper Body -> 32-Body
     3: 3,    # Left Hand -> 33-Hands
-    4: 3,    # Right Hand -> 33-Hands (merged)
+    4: 29,   # Right Hand -> 59-Right hand
     6: 4,    # PipBoy -> 34-Forearms
     7: 16,   # Backpack -> 46-Unnamed
     8: 5,    # Necklace -> 35-Amulet
@@ -155,12 +155,12 @@ FNV_BIPED_SLOT_MAP = {
     16: 13,  # Mouth Object -> 43-Ears
     17: 17,  # Body AddOn 1 -> 47-Unnamed
     18: 18,  # Body AddOn 2 -> 48-Unnamed
-    19: 19,  # Body AddOn 3 -> 49-Unnamed
+    19: 30,  # Body AddOn 3 -> 60-Misc (49 is the lower body)
 }
 
 
-#: FO3/FNV Upper Body is the whole body but the hands: it also claims 37-Feet.
-_FNV_BODY_EXTRA = {2: [7]}
+#: FO3/FNV Upper Body also claims 37-Feet; each hand is its own bit, so Hands claims no right hand.
+_FNV_BODY_EXTRA = {2: [7], 3: []}
 
 
 def biped_slot_tables(oblivion_map: dict, oblivion_extra: dict) -> tuple:

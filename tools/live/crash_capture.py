@@ -24,8 +24,10 @@ See: docs/reference/python_tools.md#crash-capture
 
 import argparse
 import os
+import re
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
@@ -89,6 +91,12 @@ lm
 qd
 """
 
+#: --watch: on a plain process exit, log who exited and let go (no dump).
+_ON_EXIT = 'sxe -c ".echo MARKER_EXIT; kb 60; ~*kb 20; .detach; qd" epr\n'
+
+#: Seconds between --watch scans for a newly started game.
+_WATCH_POLL = 2.0
+
 #: Raises FAST_FAIL, so --selftest exercises the real non-continuable path.
 _VICTIM = '''import ctypes
 
@@ -127,14 +135,15 @@ def _prepare(out_dir: str, tag: str):
     return log, dump
 
 
-def attach(pid: str, out_dir: str, tag: str = 'crash') -> int:
-    """Attach to `pid` and wait for it to fault; returns a process exit code."""
+def attach(pid: str, out_dir: str, tag: str = 'crash', first: str = '') -> int:
+    """Attach to `pid` and wait for it to fault, running `first` before the
+    capture commands; returns a process exit code."""
     log, dump = _prepare(out_dir, tag)
     with open(log, 'w', encoding='utf-8') as handle:
         proc = subprocess.Popen([_CDB, '-p', pid], stdin=subprocess.PIPE,
                                 stdout=handle, stderr=subprocess.STDOUT,
                                 text=True)
-        proc.stdin.write(_CAPTURE.format(dump=dump))
+        proc.stdin.write(first + _CAPTURE.format(dump=dump))
         proc.stdin.flush()
     print('cdb %s attached to pid %s' % (proc.pid, pid), flush=True)
     print('log  %s' % log, flush=True)
@@ -144,12 +153,80 @@ def attach(pid: str, out_dir: str, tag: str = 'crash') -> int:
     return 0
 
 
+#: --snapshot: every thread's stack and a full dump of a process that is already hung, then let go.
+_SNAPSHOT = """.echo MARKER_THREADS
+~*kb 40
+.dump /ma "{dump}"
+.echo MARKER_DUMPED
+qd
+"""
+
+
+def snapshot(pid, out_dir: str = _OUT, tag: str = 'hang') -> str:
+    """One non-invasive stack walk and full dump of a HUNG `pid` (never a running game); the log path."""
+    log, dump = _prepare(out_dir, tag)
+    with open(log, 'w', encoding='utf-8') as handle:
+        subprocess.run([_CDB, '-pv', '-p', str(pid)], input=_SNAPSHOT.format(dump=dump), stdout=handle,
+                       stderr=subprocess.STDOUT, text=True, timeout=900, **POPEN_FLAGS)
+    print('hang snapshot %s / %s' % (log, dump), flush=True)
+    return log
+
+
+def pids_under(image: str, folder: str) -> list:
+    """Pids of running `image` processes whose executable lies under `folder`."""
+    script = ("Get-Process -Name %s -ErrorAction SilentlyContinue | "
+              "ForEach-Object { '{0}|{1}' -f $_.Id, $_.Path }"
+              % os.path.splitext(image)[0])
+    out = subprocess.run(['powershell', '-NoProfile', '-Command', script],
+                         capture_output=True, text=True, **POPEN_FLAGS).stdout
+    root = os.path.normcase(os.path.abspath(folder)) + os.sep
+    rows = (line.partition('|') for line in out.splitlines())
+    return [pid for pid, _bar, path in rows
+            if os.path.normcase(path).startswith(root)]
+
+
+def watch(image: str, folder: str, out_dir: str) -> int:
+    """Attach to every `image` started from `folder` until interrupted; a
+    plain exit logs the exiting thread's stack (`pid<N>.txt`) and detaches."""
+    seen = set()
+    while True:
+        for pid in pids_under(image, folder):
+            if pid not in seen:
+                seen.add(pid)
+                attach(pid, out_dir, 'pid%s' % pid, _ON_EXIT)
+        time.sleep(_WATCH_POLL)
+
+
 def armed(log: str) -> bool:
     """Whether the capture got far enough to resume the target."""
     if not os.path.exists(log):
         return False
     with open(log, 'r', encoding='utf-8', errors='replace') as handle:
         return 'MARKER_ARMED' in handle.read()
+
+
+def break_commands(specs, module: str = 'SkyrimSE') -> str:
+    """cdb lines for `attach(first=...)`: each `RVA[|condition[|commands]]` spec breaks at `module`+RVA and,
+    when the cdb condition holds (always without one), logs MARKER_BREAK, the registers, the commands and the
+    stack, then continues. Exit-process is ignored, so stopping the game writes no dump.
+
+    See: docs/reference/python_tools.md#crash-capture
+    """
+    lines = ['sxi epr']
+    for spec in specs:
+        rva, cond, extra = (spec.split('|') + ['', ''])[:3]
+        body = '.echo MARKER_BREAK; r; %skb 12; gc' % (extra + '; ' if extra else '')
+        lines.append('bp %s+%s ".if (%s) {%s} .else {gc}"' % (module, rva, cond or '1', body))
+    return ''.join(line + '\n' for line in lines)
+
+
+def run_summary(log: str) -> tuple:
+    """(breakpoint hits logged, whether the target faulted) for capture log `log`."""
+    if not os.path.exists(log):
+        return 0, False
+    with open(log, 'r', encoding='utf-8', errors='replace') as handle:
+        text = handle.read()
+    return len(re.findall(r'(?m)^MARKER_BREAK\s*$', text)), bool(re.search(r'Last event: .*code c0', text))
 
 
 def report(log: str, section: str = 'MARKER_CRASH', limit: int = 80) -> None:
@@ -233,6 +310,8 @@ def _parse_args():
                     help='prove the capture works, no game needed')
     ap.add_argument('--game', action='store_true',
                     help='launch Skyrim under SKSE, then attach to it')
+    ap.add_argument('--watch', metavar='DIR',
+                    help='attach to every game started from DIR (test instances)')
     return ap.parse_args()
 
 
@@ -248,6 +327,8 @@ def main() -> int:
         return 0
     if args.game:
         return launch_game(args.out, args.tag)
+    if args.watch:
+        return watch(args.process, args.watch, args.out)
     pid = args.pid or find_pid(args.process)
     if not pid:
         print('%s is not running' % args.process, flush=True)

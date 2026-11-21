@@ -131,10 +131,10 @@ apply to every path — the archive is never trusted to write where it likes.
 
 | Package | Purpose | Install |
 |---|---|---|
-| `tkinterdnd2` | Drag-and-drop onto the GUI. **Optional** — without it the window still opens and **Mods ▸ Import…** still works | `pip install tkinterdnd2` |
+| `tkinterdnd2` | Drag-and-drop onto the GUI. **Optional** — without it the window still opens and **Plugins ▸ Import…** still works | `pip install tkinterdnd2` |
 
 Registered via the existing `_pip` helper ([preflight.py:114](../../preflight.py#L114))
-and `7za.exe` via `_bundled_exe`, so **Tools ▸ Check Dependencies** reports both
+and `7za.exe` via `_bundled_exe`, so **Help ▸ Check Dependencies** reports both
 like everything else. Add the `tkinterdnd2` row to the README's optional table
 ([README.md:78-85](../../README.md#L78-L85)) and its `pip install` line
 ([README.md:70](../../README.md#L70)).
@@ -253,7 +253,7 @@ size and offers "Free space (drop archive copy)".
 
 ### 3.4 Folder import — first class
 
-`Mods ▸ Import Mod Folder…` takes an already-extracted mod directory. Same
+`Plugins ▸ Import Mod Folder…` takes an already-extracted mod directory. Same
 layout rule, same routing, no archive dependency at all. This is the
 `.rar`-without-`unrar` answer and the manual-install answer, so it is a real
 feature, not a fallback. `kind: "folder"` records the source path; there is no
@@ -425,7 +425,7 @@ The drop target is the **entire sidebar** ([gui.py:1099](../../gui.py#L1099)).
 
 `tkinterdnd2` requires `TkinterDnD.Tk()` as the root class — the one change
 touching GUI startup, guarded to fall back to plain `tk.Tk()`. If it is absent
-the window still opens, drag-and-drop is inert, **Mods ▸ Import…** still works,
+the window still opens, drag-and-drop is inert, **Plugins ▸ Import…** still works,
 and a one-line hint names the package.
 
 ### 4.3 Toolbar — `Mods` menu, and re-running imported plugins
@@ -434,7 +434,7 @@ New menubutton beside `Settings` / `Converted`
 ([gui.py:716-732](../../gui.py#L716-L732)):
 
 ```
-Mods ▸ Import Mod Archive…       (.zip / .7z / .rar)
+Plugins ▸ Import Mod Archive…       (.zip / .7z / .rar)
      ▸ Import Mod Folder…
      ▸ Manage Imported Mods…     (list, retained size, re-import, remove)
 ```
@@ -636,6 +636,7 @@ for Oblivion but not for every game:
 | `Knights.esp` | `Knights.bsa` (one archive, smaller DLCs) |
 | `Nehrim.esm` | `N - Meshes/Textures1/Textures2/Sounds/Misc.bsa`, `L - Voices/Misc.bsa` |
 | `FalloutNV.esm` | `Fallout - Meshes/Meshes2/Misc/Sound/Textures/Textures2/Voices1.bsa`, `Update.bsa` |
+| `Fallout3.esm` | `Fallout - Meshes/Textures/Sound/Voices/Misc/MenuVoices.bsa` (a TTW copy in the New Vegas folder also has `Fallout3 - *.bsa`) |
 
 **FO3/FNV name their archives after the GAME, not the plugin.** The stem
 `FalloutNV` matches nothing, so discovery returned **0 of the 47 BSAs** in a
@@ -646,7 +647,64 @@ converted normally.
 
 `_EXTRA_BSA_BASES` is the fix for exactly this shape of problem: it maps a
 plugin stem to the extra prefixes its archives really use, and FalloutNV
-registers `Fallout` the way Nehrim registers `N` and `L`.
+registers `Fallout` the way Nehrim registers `N` and `L`. Fallout3 registers
+`Fallout` too: without it a real Fallout 3 GOTY install matched **0** archives
+(its eight are all `Fallout - *` or `Anchorage - *`), and the only Fallout 3
+assets ever extracted were Tale of Two Wastelands' `Fallout3 - *.bsa` from the
+New Vegas folder, which leave out every file New Vegas already ships.
+
+### <a id="bsa-formats"></a>One reader for every BSA version
+
+**Code:** `read_bsa_directory`, `iter_bsa` and `_open_archive` in
+`asset_convert/sources/bsa_extract.py`
+
+`read_bsa_directory` is the only parser for v103 (Oblivion), v104 (FO3/FNV,
+Skyrim LE) and v105 (Skyrim SE). Extraction, `read_bsa_files` and
+`tools/misc/bsa_list_names.py` all go through it. Morrowind's archive shares no
+structure with these (flat path list, no folders, no compression), so
+`_open_archive` routes it to `bsa_extract_morrowind` by its first four bytes.
+
+There used to be two copies. The extractor's copy only knew v103/104's 16-byte
+folder records, while v105's are 24 bytes (64-bit offset) and compress with LZ4
+rather than zlib. On an SSE-format archive it read garbage file counts and
+walked off the end of the file (`struct.error: unpack_from requires a buffer…`),
+reported for a user's `Tamriel_Data.bsa`. Entries are read by seeking, not by
+loading the whole archive (that one was 1.5 GB).
+
+### <a id="same-named-plugins"></a>Same-named plugins from different Data folders
+
+**Code:** `home_directory`, `claim_home`, `directory_for`, `variant_folder`,
+`copies` in `asset_convert/sources/source_registry.py`; `_announce` and
+`_list_sources` in `convert.py`; `extracted_from` in `bsa_extract.py`
+
+A plugin name is not unique across installs. Tale of Two Wastelands puts its
+own `Fallout3.esm` in the New Vegas Data folder: 347 MB, HEDR 1.34, 792,785
+records, against the real Fallout 3 GOTY file's 289 MB, HEDR 0.94, 808,699
+records. They are different plugins that share a name.
+
+- **Which copy converts** is the selected Data folder (`--data-dir`, else
+  `tes4DataPath`, which the GUI's Source dropdown sets). `convert.py` exports
+  it as `TESCONV_SOURCE_DIR` so every phase process and pool worker resolves the
+  same copy. A master not in the selected folder resolves to its home.
+- **The home** is the first folder a run read the plugin from, pinned in
+  `sources.json` under `homes`. It keeps the plain `export/<plugin>/` and
+  `output/<plugin>/` folders, so pinning never moves an existing tree.
+- **Any other copy** gets `export/<plugin> (<install>)/` and the matching
+  `output/` folder, through `asset_root_name`, so the export, extraction,
+  caches and output of each copy stay apart. Dots are removed from the install
+  label so the folder's `Path.stem` is still the plugin stem, which keeps the
+  asset namespace the same for both copies.
+- **Listing:** each run prints every plugin's Data folder and export folder;
+  `--list-mods` lists each Data folder and every plugin found in more than one,
+  with the folder each copy converts into.
+- **Extraction** records each archive's full path in
+  `.bsa_extract_manifest.json`, prints the folder it reads from, re-extracts an
+  archive of the same name from a different folder, and warns when the target
+  already holds files from another folder. It never deletes them; clearing the
+  folder is left to the user.
+
+A tool run outside `convert.py` has no selected folder, so it resolves every
+plugin to its home copy.
 
 <a id="update-bsa"></a>**`Update.bsa` is FNV's official patch archive** and
 the last entry of the game's `SArchiveList`; its 86 files override the base

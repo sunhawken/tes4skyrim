@@ -5,8 +5,10 @@
 ## Contents
 
 - [Low-core machines: where the time actually goes (measured 2026-08-09)](#low-core-machines-where-time)
+- [Import: each read happens once per run (measured 2026-09-30)](#import-once-per-run)
 - [Parallelism rules (learned 2026-07-16)](#parallelism-rules)
 - [FormID determinism — the save-game contract (rewritten 2026-08-17)](#formid-determinism-save-game-contract)
+- [One heavy job at a time](#one-heavy-job-at-a-time)
 - [Process containment — orphaned workers (learned 2026-07-29)](#process-containment-orphaned-workers)
 - [Navmesh generation (learned 2026-07-25)](#navmesh-generation)
 - [Measured throughput](#measured-throughput)
@@ -476,7 +478,7 @@ properly parallel. Two findings:
   resolving one plugin's cells against another's table reads that coincidence as
   183 overrides and drags Morrowind **interior** clutter into Cyrodiil's distant
   terrain. Guarded by `tests/test_lod_overlay_scope.py`. See
-  [[project_master_index_routing]].
+  [tes5_import_override.md](tes5_import_override.md) (master-index routing).
 
   Scoping removes the 183 phantom refs as a side effect, but the merge itself
   needed the real fix — see below.
@@ -567,6 +569,30 @@ properly parallel. Two findings:
   1,301 of those tiles (82%).** Budget accordingly — and do not put a timeout on
   a real LOD build.
 
+## Import: each read happens once per run (measured 2026-09-30)
+<a id="import-once-per-run"></a>
+
+A cProfile of `TR_Mainland.esm --import-only` (navmesh cached, 4m12s) found
+the same inputs read over and over. The shared readers that replaced them
+live in memory for the run only, and each is dropped after its last use:
+`folder_tables` once the sidecar is staged; `gather` trimmed to `sounds` then,
+and dropped after the runtime sound table. Kept whole for the run they
+measured 246 MB (`gather`) + 63 MB (`folder_tables`) on TR_Mainland; the
+signature index holds only positions and keys.
+
+| Reader | What it replaced |
+|---|---|
+| `dialogue/morrowind_sidecar_source.gather` (one per chain) | The TES3 binaries parsed twice: sidecar `gather` + vendor `read_tables` (8.2 s per pass, 1.7 GB to keep raw, so the chain is FOLDED once and `table_records` keeps only the 8 types `read_tables` needs); the patch's sound table parsed the vanilla chain a third time |
+| `dialogue/morrowind_placements.folder_tables` (one per export folder) | `REFR.txt` (1.24M refs) read four times per folder by markers, instances, placed refs and travel; CELL.txt and the scripted exports twice |
+| `base/master_export.MasterExport.of` (one signature index) | ~40 sites walking every master record (483k-1.6M) to filter by type |
+| `navmesh/pool._records_of` (answers memoized until jobs are gathered) | REFR/CELL/base types merged twice (teleport grid, then job gathering) |
+| `pipeline_records._children_by_cell` | REFR/ACHR/LAND/PGRD bucketed by cell separately in the CELL and WRLD builders |
+
+`index_convertible_records` (FO3/FNV FLST members) is skipped for a plugin
+with no FLST/IPCT/EXPL. Result on TR_Mainland: record conversion 150.7 s ->
+101.2 s, total 4m12s -> 3m21s; the Morrowind chain (7 plugins) rebuilt
+byte-identical (ESMs and every sidecar table).
+
 ## Parallelism rules (learned 2026-07-16)
 <a id="parallelism-rules"></a>
 
@@ -593,8 +619,38 @@ properly parallel. Two findings:
   a pool.
 - **`bytes += big` is quadratic** — accumulate group contents in lists and
   `b''.join` at wrap points (CELL/WRLD builders).
+- **Measured on Oblivion.esm after the pass**: export 47.3 s -> 7.3 s; import
+  203 s -> ~57 s (text parse 99 -> 11 s in chunked pools, phase 0 36 -> 13 s,
+  WRLD builder 15 -> 4.3 s); scripts 33.4 s -> 14.9 s (`CrossRefGraph.load_from_export`
+  15.9 -> 1.1 s, skipping LAND/PGRD/ROAD). Phase 1 stays serial because
+  converters call `writer.alloc_formid`. A record belongs to the parse chunk
+  holding its `---RECORD_BEGIN---` byte offset (`text_reader.parse_file_range`,
+  reused by the cross_ref scan).
 - **Pool tools can exhaust memory**: some load the ~2.1 GB export index PER
   WORKER. Cap `--workers` or run single-process for those.
+- <a id="blas-threads-commit"></a>**One BLAS thread per process (WinError 1450).**
+  numpy's and scipy's OpenBLAS each reserve per-thread buffers at import,
+  sized by core count: on a 32-thread machine one process importing
+  `tes5_import.overrides.nested` commits 1,607 MB before doing any work, and
+  128 MB with `OPENBLAS_NUM_THREADS=1`. With 29 pool workers, that is about 46 GB
+  of commit (RAM plus page file) reserved and never touched. ElsweyrPelletine's
+  import, whose parent also holds four masters' exports, drove available commit
+  to 0 within 2 s of `parse_export_directory` starting its pool, while physical
+  RAM peaked at 90%. The failure surfaced as `OSError: [WinError 1450]
+  Insufficient system resources` from a worker's result `WriteFile` (six runs in
+  a row). Cutting the parse slice from 16 MB to 2 MB changed nothing.
+  `configure_multiprocessing()` therefore defaults `OPENBLAS_NUM_THREADS` to 1
+  before anything imports numpy. The pool gives the parallelism, and 29
+  processes × 32 BLAS threads would only oversubscribe the cores anyway.
+- <a id="venv-pool-workers"></a>**In a venv, workers run the BASE `pythonw.exe`.**
+  A venv's `Scripts\pythonw.exe` is a redirector stub that re-launches the base
+  interpreter as a second process, and the pool's inherited handles do not
+  survive it: every worker died at start, surfacing as `BrokenProcessPool` from
+  `parse_export_directory` on the first `--import-only` under the repo's
+  `.venv` (no worker traceback, as `pythonw` has no stderr). CPython's own
+  spawner bypasses the stub only when the executable IS `sys.executable`, by
+  launching `sys._base_executable` with `__PYVENV_LAUNCHER__` set, so
+  `subprocess_flags._worker_executable` does the same for the console-less one.
 
 ## FormID determinism — the save-game contract (rewritten 2026-08-17)
 <a id="formid-determinism-save-game-contract"></a>
@@ -644,6 +700,25 @@ distances, `IPCT`/`IPDS` on the source SOUN.
 triangle connectivity (derived), so each split sibling keys on the sorted
 **door REFRs its triangles touch** — authored ids that survive
 re-triangulation.
+
+### <a id="added-masters-never-move-a-hash"></a>Added masters never move a hash
+
+**Code:** `tes5_import/base/formid_hash.py`
+
+Many keys hold a FormID after the load-order shift (`get_formid(rec, 'FormID')`),
+so the index byte is part of the hash input. When the importer adds a vanilla
+master, every later index moves up one and every such key hashes to a new id.
+Adding Dragonborn.esm to authored-mode Morrowind.esm, for the ash storm weather,
+moved **10,475** generated ids (outfits, armor addons, navmeshes, locations and
+4 generated quests) before this rule.
+
+`derive_formid` therefore hashes each FormID with the index it would have if
+Update, Dawnguard, HearthFires and Dragonborn were not listed. A FormID inside
+one of those masters is hashed as `(file name, local id)`. No plugin had a
+vanilla master past Skyrim.esm before this rule, so it moved nothing that
+already existed, and a vanilla master added later moves nothing either. The
+rule covers integer keys and tuples of them. A key that spells a shifted FormID
+into a string is not covered, so build string keys from the export's raw hex.
 
 ### Collisions
 
@@ -705,6 +780,77 @@ and — via a subprocess at three `PYTHONHASHSEED` values — that Python's
 randomised `hash()` never reaches an id.
 
 
+## One heavy job at a time
+<a id="one-heavy-job-at-a-time"></a>
+
+**Code:** `core/heavy_lock.py`, called from `convert.py:_run_steps` (and the patch
+build) and `tools/release/create_lod.py:main`.
+
+Two pooled stages at once exhaust RAM on a 32 GB box. On 2026-09-26 a
+Morrowind_ob navmesh pool (29 workers) died as `BrokenProcessPool` beside
+another session's Nehrim import. A TR_Mainland import then lost 33 ENCH
+records to bare `MemoryError`s (an empty message in the log) and its pool died
+the same way. The written rule ("check load first") did not stop agents from
+launching blind, so the check is now mechanical.
+
+`hold_heavy_lock` takes the named mutex `Local\TESConversionHeavyJob` for the
+rest of the process. A second `convert.py` or LOD bake WAITS instead of
+failing. It prints the holder, recorded in `logs/heavy_job.txt`, at once and
+again every 5 minutes. The holder writes that file as
+`{pid, label, work, queued, started}` and deletes it on exit.
+`python -m tools.misc.build_queue` shows the running build and the whole queue
+live.
+
+- **Strict arrival order.** Every job leaves a ticket in
+  `logs/heavy_queue/<pid>.json` naming its work (plugins, steps, `--only` and
+  `--mesh-subdirs` scopes, the settings that change output) and its place in
+  line, `queued`. Only the earliest live, unreplaced ticket may take the mutex;
+  the rest poll. Agents queue dependent builds back to back (Nehrim import,
+  then its scripts), so letting the kernel pick a waiter would run them out of
+  order.
+- **No work queued twice.** A newer job whose work covers a queued or running
+  job's (`covers`) marks that job replaced and takes the EARLIEST place among
+  the jobs it replaces, so it still runs before anything queued after them.
+  It never moves ahead of a job it `needs`: pipeline order (`STEP_FLAGS`)
+  decides, so a new import may jump queued scripts, but new scripts replace
+  only the scripts queued behind the last import, and an unknown step (the
+  Morroblivion patch build) is needed by and needs everything. Only jobs on
+  the run's own plugins or their masters count (`convert.py` lists the
+  transitive masters from the binaries as `masters`): a plugin-blind check
+  let any other plugin's import, queued between a duplicate and its
+  replacement, block the replace. Work without `masters` (`create_lod.py`)
+  still counts every plugin as related. A job that was
+  first in line when a replacement took an earlier place hands the lock back
+  if it gets it.
+  A replaced queued job stops waiting, follows its replacement, and exits with
+  that job's exit code, so its launcher still learns the result. A job
+  replaced in the instant it gets the lock hands the lock on. Dead tickets are
+  swept by the next arrival.
+- **The holder works in a child, so it can be replaced too.** A job with work
+  reruns its own command (`sys.orig_argv`) as a child with
+  `TESCONV_HEAVY_LOCK_SUPERVISED` set, via the GUI's `run_process`, and
+  forwards the child's output. The child prints a marker on reaching the lock;
+  the holder drops everything before it, which repeats its own banner and plan
+  (unless the child exits first). `convert.py` opens no run log in the child;
+  the holder's log records the forwarded lines. When the holder file is marked
+  replaced, the holder kills the child's tree with `kill_process_tree` (the
+  GUI's Cancel), releases the mutex, follows the replacement, and exits with its
+  code. A killed import leaves nothing half-written that a later run trusts:
+  the ESM and navmesh cells are temp-then-rename, the collision/bounds caches
+  fail their decode and rescan, and sidecars are rewritten.
+- **No stale locks.** The kernel releases a mutex whose owner dies, however it
+  dies; the next waiter gets `WAIT_ABANDONED`, which counts as acquired.
+- **No self-deadlock.** The holder sets `TESCONV_HEAVY_LOCK_HELD`, so a child
+  it spawns, such as a nested `convert.py`, skips the wait. Pool workers never
+  run `main`.
+- **Not in `create_pool_job`.** The GUI calls that at import, and would hold
+  the lock for its whole life. The GUI's per-step `convert.py` processes each
+  take it instead.
+- Only runs that convert take it. `--help`, `--list-mods`, the mod commands and
+  `--dry-run` never wait.
+- It is a courtesy, never a failure: off Windows, or if the mutex cannot be
+  made, the run proceeds unlocked.
+
 ## Process containment — orphaned workers (learned 2026-07-29)
 <a id="process-containment-orphaned-workers"></a>
 
@@ -713,8 +859,8 @@ one mechanism:
 
 - `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` — when the parent dies the kernel kills
   every process in the job. This covers the cases no Python cleanup can: a
-  crash, Task Manager "End task", the console window closed. The GUI's
-  `_kill_process_tree` only ever covered the deliberate Cancel button.
+  crash, Task Manager "End task", the console window closed.
+  `kill_process_tree` only covers a deliberate kill (Cancel, a replaced build).
 - `JobMemoryLimit` — a committed-memory ceiling across the whole job.
   **OFF by default**; opt in with `TESCONV_JOB_MEM_GB=<gb>`. See the measured
   trap below before enabling it.
@@ -785,6 +931,40 @@ here, in the order worth checking:
 4. **RAM exhaustion.** Historically real (see the `navm_worker` docstring: a
    heavy worker module cost several GB of RSS per child), which is why that
    module is deliberately light.
+5. **Commit exhaustion from the math library's thread buffers.** See below.
+
+### <a id="one-blas-thread-per-process"></a>One math-library thread per process
+
+**Code:** `core/__init__.py` (`limit_blas_threads`), also called by `tools/validate/safe_run.py`.
+
+numpy and scipy each load their own OpenBLAS, and each copy reserves buffers for
+every CPU thread when it is imported. Measured on a 32-thread PC
+(`temp/import_cost.py`, private commit of one process):
+
+| Import | Commit added |
+|---|---|
+| `numpy` | 743 MB |
+| `scipy.linalg` (reached through `asset_convert.character.body_slots`) | 741 MB |
+| everything a navmesh pool worker imports | 1,608 MB |
+| the same with `OPENBLAS_NUM_THREADS=1` | 129 MB |
+
+A pool of 31 workers therefore asked for about 50 GB of commit against a 66.7 GB
+limit. The buffers are reserved, not touched, so Task Manager shows free RAM
+while workers die with `MemoryError`, "The paging file is too small" on a DLL
+load, or a `BrokenProcessPool`.
+
+The limit costs nothing the converter uses. Every linear-algebra call in the
+pipeline is a 3x3 or 4x4 matrix or a tall, thin fit; 180 character-conversion
+tests ran in 60.36 s / 60.35 s with all threads and 60.38 s / 61.00 s with one.
+The one operation that slows is a bulk point transform (200,000 points by a 3x3,
+50 times: 0.047 s to 0.064 s). A large dense product does need the threads
+(1500 x 1500: 0.015 s to 0.090 s) — nothing in the pipeline does one; a step
+that ever does must lift the limit for itself.
+
+The variable must be set before numpy is first imported in a process, and
+workers inherit it from their parent, so it is set when the `core` package is
+imported: `convert.py` and the GUI both import `core` before anything that
+imports numpy. `setdefault` leaves a value the user exported alone.
 
 ### A native extension that aborts (Nehrim import, fixed 2026-07-29)
 
@@ -858,12 +1038,10 @@ completes — 26,865 records, 197 MB.
 
 Corridor navmesh generation was **9.8x** faster after four fixes, all
 **byte-identical output** (13 cells A/B'd on (verts, tris) hashes; large
-interiors 11-14x, small cells 1.3-2.5x). Profile with
-`python tools/navmesh/perf.py --cells <A,B> --stages` (its stage timers now
-wrap the CORRIDOR path; they used to wrap the deleted voxel/region/spanmesh and
-so reported everything as "(other)"). Sub-stage rows are INDENTED because they
-nest inside `build_union_mesh` — only top-level rows may be subtracted, or
-"(other)" goes negative.
+interiors 11-14x, small cells 1.3-2.5x). Those measurements were taken on the
+Python build with `tools/navmesh/perf.py`, deleted with the Python reference
+([cell-baseline](tes5_import_navmesh.md#cell-baseline)); the build is now one
+native call per cell, timed with `job_trace.py --no-cache`.
 
 - **Never recompute a whole-mesh property inside a per-node loop.**
   `_merge_at_pathgrid_nodes` called `_tri_components` (full-mesh union-find) once

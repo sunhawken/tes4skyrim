@@ -12,8 +12,40 @@ owns it, and what it is linked to. Region decoration (REGN, LSCR, WATR) lives in
 - [ACHR VMAD — scripts relocated onto the placed reference](#achr-vmad-relocated-actor-scripts)
 - [Exclusive LCEC cell ownership](#exclusive-lcec-cell-ownership)
 - [Teleport doors bucketed by worldspace](#teleport-doors-by-worldspace)
+- [TES3 exit-only door locks](#tes3-exit-only-door-locks)
+- [TES3 refs ship Don't Havok Settle](#tes3-dont-havok-settle)
+- [TES3 script-named refs ship persistent](#tes3-script-named-refs-persist)
+- [Exterior persistent refs live in the persistent cell](#exterior-persistent-refs-live-in-the-persistent-cell)
+- [Teleport doors carry XNDP](#door-xndp)
+- [Exterior cell names come from XLCN](#exterior-cell-names)
+- [LAND texture layers and DOOR flags](#land-layers-door-flags)
 - [Nested interiors inherit a location](#nested-interiors-inherit-location)
 - [LAND DATA flags pass through VERBATIM](#land-data-flags-verbatim)
+- [LAND quadrants with alpha layers and no base layer](#land-quadrants-without-a-base-layer)
+- [WRLD land and water defaults](#wrld-land-and-water-defaults)
+
+## <a id="refr-angle-normalize-hang"></a>Placed-reference angles are sanitized (`_safe_angle`)
+
+Skyrim normalizes a placed reference's angles into [0, 2*pi) with an UNCAPPED
+float32 loop (`SkyrimSE 1.6.1170 +0x2d8e43..+0x2d8e6f`: `while (a < 0) a += 2*pi;
+while (a > 2*pi) a -= 2*pi`). Once |a| is large enough that the subtraction is a
+no-op in float32 (7.0958e+28 leaves the value bit-identical) the loop never
+ends; NaN falls through unnormalized. Signature: one thread pegged at a full
+core, private memory perfectly FLAT, `Responding: False`, no CTD, no crash log,
+Papyrus log just stops, every structural audit clean (growing memory would be a
+leak, no CPU a deadlock). `TWMP_Valenwood_Elsweyr.esp` ships 2,610 such REFRs
+(RotZ 7.09e+28, 8.06e+34, 3.6e+12, -4.3e+08) in the ORIGINAL mod; `tes4_export`
+dumps RotZ verbatim and Oblivion's normalizer tolerated it. `_safe_angle` in
+`record_types/world.py` fmod-reduces (a merely large angle keeps its true
+orientation; NaN/Inf -> 0) at all 9 rotation sites (REFR, ACHR/ACRE, XTEL).
+Audit with `tools/validate/refr_rotation_check.py --plugin X`: Valenwood 2,610 -> 0,
+every other plugin 0 except `Nehrim.esm`, whose 22 refs at Y=8.9e+17 are bad
+POSITIONS, a different defect `_safe_angle` does not address (open). To find
+such a hang live, sample the process twice ~1.5 s apart and compare CPU and
+private-memory deltas, then take stacks with `cdb -pv` (non-invasive); the
+running Steam process disassembles (decrypted in memory) at the running build's
+RVAs. On a REFR, position floats sit at +0x70/+0x74/+0x78, rotation at
++0x68/+0x6c, normalized angle stored to +0x50.
 
 ## <a id="xlkr-enable-parent-becomes-linked-ref"></a>XLKR — the enable parent becomes the linked ref
 
@@ -84,6 +116,235 @@ cell (Tamriel's `00023777`), so a single exterior entry hands its location to
 EVERY persistent ref in that worldspace. That was the CK's "Ref is not in its
 persistence location 'TES4SkingradWestGateLocation'" spam across the whole map.
 
+## <a id="tes3-exit-only-door-locks"></a>TES3 exit-only door locks
+
+**Code:** `tes5_import/record_types/world_morrowind.py`
+
+TES3 locks the door face the player activates. OpenMW's `Door::activate` tests
+`ptr.getCellRef().isLocked()` on that reference alone and never consults the
+teleport partner, so a Morrowind pair can be open inward and locked outward.
+
+TES4 and TES5 lock the DOORWAY: one `XLOC` on either face seals both
+directions. Vanilla Skyrim's *With Friends Like These* is the proof — the
+Abandoned Shack pair carries no `XLOC` on the interior ref `00050F28` and lock
+level 255 with key `0002E3F8` on the EXTERIOR ref `00050F1F`, and that single
+exterior lock is what holds the player inside. Across Skyrim.esm no teleport
+pair is locked on both faces; all 239 locked pairs carry exactly one `XLOC`.
+
+So copying a TES3 lock faithfully converts a one-way lock into a sealed
+doorway. In Morrowind.esm the Seyda Neen census office is the visible casualty:
+`00D9C433`, the office's inside face, is locked at level 100 with no key, which
+in Morrowind only stops the player leaving. Converted, it stops them entering,
+and the chargen dock guard repeats "Head on in" at a door that reports Requires
+Key. The ref has no EditorID, so no script can name it — nothing ever unlocks
+it.
+
+`register_tes3_locks` drops a lock when its pair is locked on ONE face, that
+face stands in an interior cell, and it has no key. A keyed lock opens from
+either side, so doorway-wide semantics leave it intact; a keyless lock on the
+exit face can only be picked or scripted.
+
+Of Morrowind.esm's 108 one-sided pairs, 27 lock the interior face and 19 of
+those are keyed. The rule matches 9 references: the census office `00D9C433`,
+plus Chun-Ook Upper Level, Falensarano Upper Level, Murberius Harmevus' House,
+Tel Naga Upper Tower, Vivec Arena Storage, Vivec Office of the Watch, Simine
+Fralinie Bookseller, and St. Olms Haunted Manor.
+
+The gate is `is_tes3_export`. TES4 sources are untouched: Oblivion.esm authors
+680 interior-only locks under doorway semantics already, and the number is an
+editing habit, not a different mechanic.
+
+Morroblivion hit this same wall and solved it by hand, not by a transform. Its
+census-office pair (`0181D2D9` / `0181BCE5`) carries no lock at all, and it
+re-authored locks throughout — 232 locked pairs against Morrowind's 108, with
+the interior/exterior balance inverted. There is no algorithm in its data to
+copy.
+
+## <a id="tes3-dont-havok-settle"></a>TES3 refs ship Don't Havok Settle
+
+**Code:** `tes5_import/record_types/world_morrowind.py:tes3_refr_flags`
+
+The flag goes on every REFR of a TES3-sourced plugin, whatever plugin defines
+the base — a TR ref to a `Morrowind_ob.esm` sword gets it. "TES3-sourced" is
+the `Source=TES3` line the Morrowind exporter writes to `_HEADER.txt`
+(`is_tes3_export`). It used to be the presence of `MWDI.txt`/`MWIN.txt`,
+which missed every dialogue-less plugin: groundcover, `Sky_Main.esm`. The
+Morroblivion gap patch writes no `Source=` line.
+
+Morrowind simulates no physics, so every placed item holds exactly the pose its
+author gave it: books overlapping a shelf, a cup floating a unit above a table.
+Converted items are dynamic Havok clutter, and Skyrim settles dynamic refs when
+their cell loads, so those poses fall, slide and get pushed out of whatever
+they overlap.
+
+Skyrim has an authored, per-reference answer: REFR record flag `0x20000000`,
+*Don't Havok Settle* (xEdit `wbDefinitionsTES5.pas`; the Creation Kit's
+reference dialog carries the checkbox). The CK wiki's Reference page:
+*"This object, if havokable, doesn't initially settle itself when the cell is
+finished loading. Note that if any objects near the object settle, this object
+will settle regardless of this flag. (For Arrows in targets, etc...)"*
+Bethesda's clutter tutorial recommends it for making objects look mounted on
+walls, and the Unofficial Patch fixed a dead goat stuck in Glenmoril Coven's
+table by ticking it.
+
+Vanilla census, Skyrim.esm REFRs carrying it: MISC 724 of 33,570, WEAP 321 of
+2,597, ALCH 245 of 15,941, ARMO 159 of 2,080, AMMO 141 of 468, BOOK 87 of
+4,682 -- a per-ref placement choice, used where the pose matters.
+
+Every TES3 placement is by construction an unsettled pose, so `convert_REFR`
+sets the flag on all of them (`is_tes3_source`). Setting it on every ref also
+removes the caveat above: no neighbor settles to drag a flagged item along. On
+a non-havok base it does nothing. The item stays an ordinary dynamic body; per
+the CK wiki the flag only skips the settle at cell load.
+
+Not verified: the game-side code that reads the bit. A scan of the 1.6.1170
+exe for `test`/`bt`/`shr` of bit 29 at `TESForm+0x10` found no site, so the
+read is compiled some other way; the evidence above is the CK's and the
+community's, not a disassembly.
+
+Morroblivion mode is untouched: `Morrowind_ob.esm` is a TES4 source whose
+placements its authors made under Oblivion's own settling.
+
+## <a id="tes3-script-named-refs-persist"></a>TES3 script-named refs ship persistent
+
+**Code:** `tes5_import/record_types/world_morrowind.py:persist_script_named_refs`
+
+A Morrowind script acts on a placed reference by id (`"caius cosades"->AddItem`,
+`id->Disable`) wherever it stands. OpenMW's `searchPtr` looks through the active
+cells first and then every cell store, so the target never needs to be loaded.
+Skyrim keeps a non-persistent reference in memory only while its cell is loaded.
+Elsewhere `Game.GetForm` answers nothing, and the runtime logs `reference '<id>'
+does not resolve in this load order`. The headless tester showed it on
+`de_p_chest_02_caius`: the chest is authored locked at 75, but `GetLocked` read 0
+from Seyda Neen, and neither `Lock` nor `Unlock` did anything.
+
+TES3 has no per-reference persistence to carry over. Before this pass, all
+10,111 converted NPC placements in Morrowind.esm were temporary, Caius Cosades
+among them.
+
+The pass flags Persistent on the placement each named id resolves to. That is
+the refs table's own placement (`first_placements`, shared with
+`refs_formid.txt`), so the sidecar and the ESM agree on which reference an id
+means. "Named" means a quoted name or bare word in an `SCPT` body (`SCTX`) or an
+`MWIN` result script, outside a `;` comment. That set is a superset of the ids
+the scripts name, and it only ever meets an id that has a placement. In
+Morrowind.esm, 836 of the table's 6,558 ids are named: 390 REFR, 341 ACHR and
+101 ACRE placements were temporary, and 4 were already persistent.
+
+FormIDs do not move: only the record flag and the group the reference sits in
+change. An exterior placement moves into the world's persistent cell; see
+[below](#exterior-persistent-refs-live-in-the-persistent-cell).
+
+Not covered: a dependent plugin's script naming a reference its MASTER places.
+The flag would need an override of the master's record.
+
+## <a id="exterior-persistent-refs-live-in-the-persistent-cell"></a>Exterior persistent refs live in the persistent cell
+
+**Code:** `tes5_import/pipeline_records.py:move_persistent_refs`
+
+Vanilla keeps every persistent exterior reference in its worldspace's
+persistent cell. Not one grid cell carries a persistent children group (type 8):
+Skyrim.esm has 584 such groups under interiors and 36 under world persistent
+cells, Dawnguard.esm 82 and 16, Dragonborn.esm 87 and 4. Before this change the
+converted Morrowind.esm had 22 grid cells with one, holding 177 references.
+
+When a worldspace has exactly one persistent cell, its exterior cells'
+persistent REFR/ACHR records move into that cell's children as the worldspace is
+packed. The navmeshes are already built by then (`precompute_navmeshes`), so
+they still see each reference in its grid cell. A worldspace without a
+persistent cell keeps the old layout.
+
+## <a id="door-xndp"></a>Teleport doors carry XNDP, or no actor can path through them
+
+**Code:** `tes5_import/navmesh/split.py` (`meta['door_xndp']`),
+`tes5_import/pipeline_records.py` (`set_door_navmesh_links`)
+
+A door is bound to the navmesh by THREE structures: NVNM "Door Triangles" and NAVI
+NVMI "Door Links" (both navmesh to door) and the REFR `XNDP` (door to navmesh
+triangle). The engine builds its `BSPathingDoor` from the DOOR REFERENCE an actor
+walks toward, so it needs the door-to-navmesh direction; without `XNDP` a teleport
+door is not a pathing node and an actor whose package destination lies beyond it
+has no route (CharacterGen's Mythic Dawn assassins never left their cell, with
+packages, aliases and conditions all correct). The `XLOC` lock 100 on the cell
+door is by design: Oblivion NPCs ignore locks when pathing.
+
+Vanilla: 1,705 of 1,722 Skyrim.esm teleport-door REFRs (99.0%) carry XNDP, and
+1,705 of the file's 1,706 XNDP records are teleport doors. Layout (xEdit
+`wbStruct(XNDP, 'Navmesh Door Link')`): Navmesh FormID u32 + Triangle s16 + 2
+unused bytes (uninitialised in vanilla; write zero) = 8 bytes, written LAST,
+immediately before `DATA`, after XLOC/XOWN/XLRT/XSCL. `pgrd_to_navm` computes
+`door_tris` for the NVNM and exports `meta['door_xndp']`; it is merged after
+`build_edge_links` (triangle indices are final only then) and before any REFR is
+converted, and `convert_worker.init_worker` replays it into pool children. Result
+on Oblivion: 4,135 of 4,397 teleport doors; the 262 without are cells that
+produced no door triangle (the XNDP count equals the NAVI door-link count, 6,247).
+The navmesh checker used to validate only navmesh to door, which is how this gap
+survived; its `DOOR_NO_XNDP` check reported exactly 17 on vanilla Skyrim.esm (that
+checker file no longer exists in the tree).
+
+## <a id="exterior-cell-names"></a>Exterior cell names come from XLCN, never FULL
+
+**Code:** `tes5_import/base/locations.py` (`_worldspace_name`, `_is_dev_name`)
+
+Skyrim reads an exterior cell's displayed name (load-door prompt, discovery popup)
+off its XLCN Location: 0 of 16,978 vanilla exterior cells carry a FULL. A cell with
+no XLCN shows "Wilderness" (in a child worldspace, that worldspace's FULL), so raw
+Oblivion cells inherited "Wilderness" and Bethesda's dev name "TestEndGame" for
+`AnvilCastleCourtyardWorld`. The converter makes one LCTN (EDID + FULL only, like
+vanilla `TamrielLocation`) per named worldspace; marker LCTNs take that location as
+`PNAM` parent and record their LCEC grid squares; `convert_CELL` sets XLCN to the
+grid location when a marker covers the square, else the worldspace location. The
+worldspace name is its WRLD FULL; a missing or dev name (unspaced CamelCase
+`Test*`/`Zz*`; real spaced names like "Test of Resolve" stay) falls back to the
+sole map marker inside it (no hardcoded table), and Tamriel (no FULL, 422 markers)
+is the one special case, "Cyrodiil". A comparison of `get_formid()` output with a
+raw TES4 FormID constant never matches (the load-order offset is already applied):
+mask with `& 0x00FFFFFF`, and reproduce world logic with
+`set_formid_index_offset(1)`.
+
+## <a id="nameless-doors"></a>A door with no name cannot be used
+
+**Code:** `tes5_import/record_types/items.py` `convert_DOOR`, `_named`. NOT yet confirmed in game by
+the user (found by the headless main-quest runs 29l-29n, 2026-11-14).
+
+Skyrim does nothing when a door whose base has no `FULL` is activated: not for an actor's AI, not
+for a console `activate` by the player, locked or not. Oblivion uses such doors normally. Sancre
+Tor's fourth ghost Blade walks to the hidden load door `MQ09GhostDoorBase` (no name, no sounds,
+Hidden) and stood there for good, so MQ09 never left stage 53. Measured on the test instance's
+plugin copy: clearing the Hidden flag changed nothing; pointing the two door references at a named
+base with the same model let the ghost through and the case passed. Vanilla agrees: of 15 nameless
+`DOOR` bases in Skyrim.esm only `PrisonMarker` has teleport references, and those are arrival
+markers nothing activates.
+
+A nameless TES4 door is written with a one-space `FULL`, so it is usable and still shows no label,
+as in Oblivion. Oblivion.esm has 10 such bases of 501, Nehrim.esm 18 of 433.
+
+The engine's own `PrisonMarker` (FormID 00000004 in both games) is left nameless, as vanilla Skyrim
+leaves it. Named, its teleport pairs joined the door graph: on the way from Bruma Castle to the
+chapel the Countess took the jail's exterior marker into `BrumaCastleDungeon` and stood behind the
+cell doors (run 29w, MQ13 stuck at 20). A source FormID below 0x800 marks an engine form.
+
+## <a id="land-layers-door-flags"></a>LAND texture layers and DOOR flags
+
+**Code:** `tes5_import/record_types/world.py` (LAND layer run),
+`tes5_import/record_types/items.py` (`convert_DOOR`)
+
+- `BTXT` and `ATXT` are 8 bytes: FormID(4), Quadrant(1), pad, then pad(2) for BTXT
+  or Layer(2) for ATXT; the `VTXT` run is 8-byte entries (pos u16, pad u16,
+  opacity f32). `VTEX` does not exist in TES5, and `VNML`/`VHGT`/`VCLR` pass
+  through.
+- Layers are renumbered 0, 1, 2... per quadrant, never the TES4 values. A
+  zero-texture ALPHA layer is skipped (it renders artifacts). Alpha layers with the
+  same texture in a quadrant merge by max opacity per vertex, and each quadrant
+  keeps its 6 highest-coverage layers (sum of opacities), written in that order.
+- DOOR `FNAM`: TES4 bit 0 ("Oblivion gate") has no TES5 equivalent and is cleared;
+  bits 1-3 (Automatic, Hidden, Minimal Use) map straight across. A door without
+  `XTEL` legitimately shows Open/Close.
+- Root-NiNode rotation, LTEX/TXST landscape specular and exterior block grouping
+  are covered in [asset_convert_nif.md](asset_convert_nif.md),
+  [asset_convert_texture.md](asset_convert_texture.md) and
+  [tes5_import_override.md](tes5_import_override.md).
+
 ## <a id="nested-interiors-inherit-location"></a>Nested interiors inherit a location
 
 A basement, upper floor, or back room reached ONLY from another interior
@@ -112,3 +373,136 @@ value `TWMP_ValenwoodImproved` uses.
 
 Rewriting the flags-12 pair to 28 looked like a fix only because a PARTIAL
 census missed it. `convert_LAND` writes `DATA.Flags` through unchanged.
+
+## <a id="land-quadrants-without-a-base-layer"></a>LAND quadrants with alpha layers and no base layer
+
+**Code:** `build_land_layers` in `tes5_import/record_types/world.py`; the
+override path reaches it through `_rebuild_land_layers` in
+`tes5_import/overrides/builder.py`.
+
+A LAND paints each quadrant with one base texture (BTXT) and a list of alpha
+layers (ATXT, each followed by its VTXT opacities). The base is optional: a
+quadrant can carry alpha layers and no BTXT. `build_land_layers` walked only
+the quadrants that had a BASE, so a quadrant without one was written empty and
+every alpha layer in it was lost. It now walks every quadrant that has a BASE
+or an alpha layer, and writes such a quadrant with no BTXT and the alpha
+layers it would get under one. The same-texture merge, the coverage order and
+the six-layer cap are untouched.
+
+**Verified vanilla-legal.** Skyrim.esm ships **4,237** quadrants with ATXT and
+no BTXT, in 2,368 of its 15,564 LAND, carrying 10,286 alpha layers (one to six
+per quadrant). In every vanilla LAND the quadrants are in ascending order, a
+quadrant's layer indices run 0..n-1 and each ATXT is followed by its VTXT.
+
+Measured over `export/Oblivion.esm/LAND.txt`: 31,823 LAND, 85,166 painted
+quadrants, 82,749 of them with a BASE. A quadrant is counted below when it has
+at least one ALPHA layer with a texture and no BASE layer.
+
+| | Oblivion.esm | of which Tamriel |
+|---|---|---|
+| quadrants with alpha layers and no BASE | 2,417 | 1,463 |
+| LAND holding at least one | 1,221 | 666 |
+| alpha layers authored in those quadrants | 3,612 | 1,885 |
+| ...written before | 0 | 0 |
+| ...written now | 3,548 | 1,864 |
+
+554 of the 1,221 LAND have no BASE in any quadrant, so they were written with
+no layer run at all. The 64 layers still not written are the seventh and
+eighth of 40 quadrants, dropped by the existing cap.
+
+**Nothing else moves.** Converting every Oblivion.esm LAND with the code before
+and after: 30,602 records are byte-identical and 1,221 differ, exactly the
+ones holding such a quadrant. In those 1,221 the 1,199 quadrants that have a
+BTXT are byte-identical, as is every other subrecord; taking the added
+quadrants out of the new run gives back the old run. Knights.esp (61 LAND) and
+DLCFrostcrag.esp (6 LAND) hold no such quadrant and convert byte-identical.
+Morrowind's exporter writes a quadrant's first texture as its BASE
+(`layer_lines`), so it produces none. No Nehrim, Fallout NV or Morroblivion
+export was measured.
+
+The Oblivion numbers come from reading each exported block with
+`parse_file_range` and comparing `convert_LAND` before and after. This counts
+the quadrants in any plugin, vanilla or converted (run it with the repo root
+on `PYTHONPATH` and the plugin's path as its argument; Skyrim.esm prints 4237):
+
+```python
+import sys
+from asset_convert.lod.terrain_lod_textures import decode_land_layers
+from tools.validate.land_record_check import iter_records
+
+data = open(sys.argv[1], 'rb').read()
+runs = [decode_land_layers(body)
+        for sig, _fid, body, *_rest in iter_records(data) if sig == b'LAND']
+print(sum(len(set(run['alpha']) - set(run['base'])) for run in runs))
+```
+
+Terrain LOD is composited from the converted LAND (`decode_land_layers`,
+`composite_cell`), which draws a quadrant's alpha layers over the default land
+texture when it has no BTXT. Seeing the change needs an import rebuild, and a
+terrain LOD rebake for the distant tiles. Not checked in game, and no LOD was
+rebaked for this change.
+
+## <a id="wrld-land-and-water-defaults"></a>WRLD land and water defaults
+
+`DNAM` (Default Land Height, Default Water Height) and `NAM4` (LOD Water
+Height) are the planes the engine draws for a cell that has **no LAND record
+of its own**. Only FO3/FNV author them; TES4 WRLD has neither field —
+measured over `export/Oblivion.esm/WRLD.txt`: **0 `DNAM` lines, 0 `NAM4`
+lines** in 84 worldspaces.
+
+Reading them unconditionally therefore gave every TES4 worldspace
+`land=-2048, water=0`, because only the land read carried an explicit
+fallback. That inverts the two planes: water ended up **2048 units above**
+the fallback land, so every LAND-less cell rendered as open sea. It showed up
+first in the small Imperial City worldspaces, where most of the grid has no
+LAND — `ICImperialPalace` ships 47 LAND records over a footprint spanning
+(-2,-2)..(8,17) — while Tamriel hid it by having real LAND nearly everywhere.
+
+Vanilla always puts water at or below land: Skyrim's worldspaces run
+`DefaultLandHeight` -27000..9399 against `DefaultWaterHeight`
+-500000..9999999, and **no vanilla worldspace floats water above its land
+plane** the way the converted output did.
+
+`_world_water_and_planes()` writes both planes with
+`_TES4_DEFAULT_PLANE_HEIGHT` (-2048) as the fallback for EACH, so an absent
+field can never leave water above land, and writes this run together with the
+water types.
+**NAM2** honours the authored TES4 pointer — 14 of Oblivion.esm's 84
+worldspaces point it at lava, and hardcoding `0x18` made every Oblivion realm
+render as ordinary blue water regardless of its WATR. Worldspaces with no
+authored water fall back to Skyrim.esm's DefaultWater (`0x18`, master index
+0), as vanilla Tamriel does. **NAM3** stays on DefaultWater in all cases: it
+is the water drawn on distant terrain LOD, which vanilla always renders as
+ordinary water, and a null NAM3 makes the terrain-LOD water codepath deref a
+null WATR pointer and CTD as soon as a `.btr` contains a WATER
+`BSMultiBoundNode`.
+
+
+## <a id="every-interior-gets-an-xcll"></a>Every interior CELL gets an XCLL
+
+**Code:** `build_cell_xcll` in `tes5_import/record_types/world.py`
+
+`build_cell_xcll` used to return `None` when the source authored no ambient
+color, so the CELL shipped with no lighting block at all. **All 590 of
+Skyrim.esm's interior cells carry an XCLL** — there is no vanilla precedent
+for omitting it, and a converted cell without one does not render like a
+vanilla cell.
+
+**Exteriors are the opposite: 0 of Skyrim.esm's 16,978 exterior cells carry
+an XCLL**, so an exterior that authored none still gets none. Writing the
+fallback on every cell put it on all 5,333 Arktwend exteriors, which then
+rendered extremely bright.
+
+That bites hardest on a Morrowind quasi exterior
+([Show Sky](tes4_export_morrowind.md#quasi-exterior-interiors)): those cells
+carry no `AMBI`, so they reached the engine with no XCLL, and their water did
+not appear even with Has Water and a valid height set.
+
+The fallback is a real vanilla block rather than zeros — the most common XCLL
+among Skyrim's own Show Sky interiors, shared verbatim by 61 of them: ambient
+`1E1E28`, black directional and fog colors, fog near/far 0, fog power, scale
+and fog max 1.0, the six directional-ambient colors it ships with, and
+inherit flags `0x9F`. An earlier constant was a different block that only 2
+vanilla cells use, with pale blue `B0DCF7` fog from 340 to 14,000 units; it
+did not match this description. An authored source still overrides every field it
+states; the block only fills in what TES3/TES4 never authored.

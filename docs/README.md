@@ -30,10 +30,15 @@ What a format or contract IS. Stable; no dates, no status.
 
 | Doc | Covers |
 |---|---|
+| [address_library_formats.md](reference/address_library_formats.md) | Address Library database formats 1/2/5, and why VR resolves by signature |
 | [creature_bug_reports.md](reference/creature_bug_reports.md) | User-filed creature bug reports, verbatim |
 | [creature_race_equivalence.md](reference/creature_race_equivalence.md) | Skyrim ↔ Oblivion Creature Equivalence Map |
 | [dialogue_engine_contracts.md](reference/dialogue_engine_contracts.md) | Dialogue contracts read out of SkyrimSE.exe |
+| [engine_hooking.md](reference/engine_hooking.md) | Finding SkyrimSE functions through RTTI, which prologues a detour can move, and the console dispatcher's target argument |
+| [havok_contact_hook.md](reference/havok_contact_hook.md) | The engine's contact callback: classes, slot 8, stable IDs |
 | [item_swap_table.md](reference/item_swap_table.md) | Oblivion → Skyrim Item Swap Table (MISC + Ingredients/Food) |
+| [morrowind_dialogue_format.md](reference/morrowind_dialogue_format.md) | TES3 DIAL/INFO export vocabulary the Morrowind runtime reads |
+| [navmesh_engine_contracts.md](reference/navmesh_engine_contracts.md) | How the pathfinder reads NVNM: neighbour slots, point lookup, lookup grid, clearance |
 | [package_ai_contracts.md](reference/package_ai_contracts.md) | PACK / AI Package & CTDA Engine Contracts |
 | [pipeline.md](reference/pipeline.md) | Pipeline Reference — orchestration, caching, layout, export format |
 | [prior_art_php_scriptconverter.md](reference/prior_art_php_scriptconverter.md) | PHP ScriptConverter (Skyblivion) — Comprehensive Analysis |
@@ -42,10 +47,11 @@ What a format or contract IS. Stable; no dates, no status.
 | [script_convert_architecture.md](reference/script_convert_architecture.md) | `script_convert/` architecture — read this BEFORE writing any code here |
 | [skyrim_commands.md](reference/skyrim_commands.md) |  |
 | [skyrim_mountable_actor.md](reference/skyrim_mountable_actor.md) | What makes a Skyrim actor mountable |
+| [swf_as2_bytecode.md](reference/swf_as2_bytecode.md) | SWF tag stream and AVM1 actions; how to trace a UI data path |
 | [tes4_record_definitions.md](reference/tes4_record_definitions.md) | TES4 (Oblivion) Complete Binary Record Definitions |
 | [tes5_import_architecture.md](reference/tes5_import_architecture.md) | `tes5_import/` architecture — read this BEFORE writing any code here |
 | [tes5_binary_format.md](reference/tes5_binary_format.md) | Skyrim SE (TES5/SSE) Binary File Format — Exact Layout |
-| [tes_runtime_fragments.md](reference/tes_runtime_fragments.md) | TESRuntime animation cache fragments — the schema any mod emits |
+| [tes_runtime_fragments.md](reference/tes_runtime_fragments.md) | CreatureRuntime animation cache fragments — the schema any mod emits |
 | [xedit_scripting.md](reference/xedit_scripting.md) | xEdit Scripting Reference (historical) |
 
 ## `commentary/`
@@ -62,6 +68,7 @@ Why the SHIPPED code is the way it is. Named after the code it explains; opens w
 | [asset_convert_creature.md](commentary/asset_convert_creature.md) | asset_convert/havok/creature_pipeline.py - creature conversion |
 | [asset_convert_facegen.md](commentary/asset_convert_facegen.md) | asset_convert/character/facegen_tri.py - faces, skin tone and tints |
 | [asset_convert_falloutnv.md](commentary/asset_convert_falloutnv.md) | asset_convert/collision/collision_material_falloutnv.py — FO3/FNV meshes |
+| [asset_convert_magic_art.md](commentary/asset_convert_magic_art.md) | asset_convert/nif/magic_art.py - spell effect meshes per phase and hand loops |
 | [asset_convert_mod_ingest.md](commentary/asset_convert_mod_ingest.md) | asset_convert/sources/mod_ingest.py - mod archive ingest |
 | [asset_convert_nif.md](commentary/asset_convert_nif.md) | asset_convert/nif/nif_converter.py — NIF conversion |
 | [asset_convert_shader.md](commentary/asset_convert_shader.md) | asset_convert/nif/nif_converter.py - shader values |
@@ -75,12 +82,16 @@ Why the SHIPPED code is the way it is. Named after the code it explains; opens w
 | [ck_vs_game_missing_objects.md](commentary/ck_vs_game_missing_objects.md) | tes5_import/ - objects in the CK, missing in game |
 | [ck_warnings.md](commentary/ck_warnings.md) | tes5_import/ - what the CK complains about |
 | [core_run_log.md](commentary/core_run_log.md) | core/run_log.py - per-run logs and their profiling timestamps |
+| [core_setup_check.md](commentary/core_setup_check.md) | TES Auto-Convert.cmd, core/setup_check.py - the launcher and its install checks |
+| [headless_testing.md](commentary/headless_testing.md) | tools/live/test_instance.py, game_bridge/sandbox/ - isolated, hidden, muted Skyrim for automated tests |
 | [ingame_testing.md](commentary/ingame_testing.md) | tools/dialog/ - in-game test methodology |
+| [morrowind_runtime.md](commentary/morrowind_runtime.md) | tes_runtime/morrowind/, external/openmw/ - Morrowind dialogue and MWScript in-engine |
 | [performance.md](commentary/performance.md) | the whole pipeline - performance and parallelism |
 | [script_convert.md](commentary/script_convert.md) | script_convert/ - TES4 script to Papyrus |
 | [script_convert_morrowind.md](commentary/script_convert_morrowind.md) | script_convert/ - what TES3 scripts do differently |
 | [tes4_export_falloutnv.md](commentary/tes4_export_falloutnv.md) | tes4_export/record_types/falloutnv.py - FO3/FNV export deltas |
 | [tes4_export_morrowind.md](commentary/tes4_export_morrowind.md) | tes4_export/tes3_reader.py, export_morrowind.py - TES3 export and Morroblivion compatibility |
+| [tes4_export_text_encoding.md](commentary/tes4_export_text_encoding.md) | tes4_export/text_encoding.py, core/skyrim_language.py - source code page per plugin, Skyrim output code page |
 | [tes5_import_conditions.md](commentary/tes5_import_conditions.md) | tes5_import/base/conditions.py - CTDA translation |
 | [tes5_import_dialogue.md](commentary/tes5_import_dialogue.md) | tes5_import/dialogue/converter.py - dialogue and voice |
 | [tes5_import_actors.md](commentary/tes5_import_actors.md) | tes5_import/record_types/actor_common.py, npc.py, creature.py - actor conversion |
@@ -96,7 +107,12 @@ Why the SHIPPED code is the way it is. Named after the code it explains; opens w
 | [tes5_import_sound.md](commentary/tes5_import_sound.md) | tes5_import/record_types/sound.py - SOUN, SNDR and SOPM |
 | [tes5_import_world.md](commentary/tes5_import_world.md) | tes5_import/record_types/world.py - CELL, WRLD and placed references |
 | [tes5_import_weather.md](commentary/tes5_import_weather.md) | tes5_import/record_types/world.py - weather and climate |
-| [tes_runtime_guns.md](commentary/tes_runtime_guns.md) | tes_runtime/plugin/fire.cpp - the gun shot, reload key and ammo restriction in the SKSE plugin |
+| [tesgameselect.md](commentary/tesgameselect.md) | tools/release/make_game_select_esp.py, TESGameSelect/ - the new-game menu, held openings, starting gear and the Elder Scroll travel item |
+| [tes_runtime_alchemy.md](commentary/tes_runtime_alchemy.md) | tes_runtime/tes/alchemy*.cpp, tes_runtime/tes/crafting.cpp, tes5_import/record_types/apparatus.py - alchemy apparatus open Skyrim's menu and scale the potion; the shared crafting bench |
+| [tes_runtime_anim.md](commentary/tes_runtime_anim.md) | tes_runtime/tes/anim_playing.cpp - TES4 IsAnimPlaying answered from an object's own NIF sequences |
+| [tes_runtime_crime.md](commentary/tes_runtime_crime.md) | tes_runtime/tes/crime.cpp, tes5_import/record_types/crime.py - bounty realms, jails and the arrest |
+| [tes_runtime_guns.md](commentary/tes_runtime_guns.md) | tes_runtime/fallout/fire.cpp - the gun shot, reload key and ammo restriction in FalloutRuntime |
+| [tes_runtime_journal.md](commentary/tes_runtime_journal.md) | tes_runtime/tes/journal_objectives.cpp, asset_convert/ui/journal_patch.py - a clicked quest objective shows its stage's text |
 | [version_upgrade_planning.md](commentary/version_upgrade_planning.md) | version.py - which steps a new release owes |
 
 ## `plans/`
@@ -105,7 +121,12 @@ Designed, NOT yet built. Opens with `Status: PLAN`. Becomes commentary when buil
 
 | Doc | Covers |
 |---|---|
+| [character_sheet.md](plans/character_sheet.md) | Character sheet in TESRuntime: attributes, legacy skills, Nehrim leveling takeover; converter bugs found on the way |
 | [horse_rideability.md](plans/horse_rideability.md) | Rideable Horse Conversion: Oblivion CREA → Skyrim Mountable Actor |
+| [navmesh_native_rewrite.md](plans/navmesh_native_rewrite.md) | Navmesh generator as one C++ process on a thread pool, bit-identical to the Python reference |
+| [navmesh_lattice.md](plans/navmesh_lattice.md) | Lattice navmesh generator: collision columns grown from the pathgrid (experimental, opt-in via `--navmesh-generator lattice`) |
+| [oblivion_native_scripts.md](plans/oblivion_native_scripts.md) | Run TES4 scripts on MorrowindRuntime's tick and the vendored interpreter, one ported command at a time |
+| [morrowind_object_scripts.md](plans/morrowind_object_scripts.md) | Move TES3 object scripts off the lossy Papyrus path onto the vendored interpreter |
 | [in_app_update.md](plans/in_app_update.md) | In-app update: download only what changed — design plan |
 | [vanilla_creature_swap.md](plans/vanilla_creature_swap.md) | Plan — "Vanilla Creature Swap" ESP generator + GUI |
 | [vanilla_item_swap.md](plans/vanilla_item_swap.md) | Plan — "Vanilla Item Swap" (ingredients, food, clutter) + preview renderer |
@@ -118,8 +139,23 @@ A dated sweep over a corpus, with counts. Frozen once written; a re-audit is a N
 |---|---|
 | [aggression_faction.md](audits/aggression_faction.md) | Aggression / Ally / Enemy Conversion Audit |
 | [ck_warnings.md](audits/ck_warnings.md) | CK Warnings Audit — Oblivion.esm |
+| [edit_gate_refusals.md](audits/edit_gate_refusals.md) | What agents hit at the code-rules and shell gates, the four shell holes closed, and a replay of the fix |
+| [diagnosis_sources.md](audits/diagnosis_sources.md) | Which sources actually solved bugs, from 46 fixes across 35 sessions — the evidence for CLAUDE.md's source order |
+| [headless_quest_runs.md](audits/headless_quest_runs.md) | Every fix from the headless Morrowind and Arktwend quest runs, by quest, and the findings left open |
 | [fallout_nv_mesh_conversion.md](audits/fallout_nv_mesh_conversion.md) | Fallout NV / FO3 mesh conversion — what already works, and the particle-NIF defect |
-| [morroblivion_mesh_axis_rotation.md](audits/morroblivion_mesh_axis_rotation.md) | Morroblivion meshes authored along +Y; 45 meshes, 2,578 refs carry a compensating pitch |
+| [morroblivion_mesh_axis_rotation.md](audits/morroblivion_mesh_axis_rotation.md) | Morroblivion's hand-authored pitch and Z re-seat fixes, and which a dependent plugin must re-apply |
+| [morrowind_opcode_testplan.md](audits/morrowind_opcode_testplan.md) | The fewest TR_Mainland quests that exercise every MWScript opcode, with quest giver and `coc` target |
+| [morrowind_opcode_testplan_morrowind.md](audits/morrowind_opcode_testplan_morrowind.md) | The same opcode test plan over Morrowind.esm's journal quests |
+| [morrowind_opcode_testplan_merged.md](audits/morrowind_opcode_testplan_merged.md) | One opcode test plan over Morrowind.esm and TR_Mainland.esm's quests together |
+| [mwscript_full_runs.md](audits/mwscript_full_runs.md) | The mwscript full-run worklog: standing rules, generic mechanisms, every quest's status and failed attempts |
+| [mwscript_full_runs_archive_1.md](audits/mwscript_full_runs_archive_1.md) | Superseded detail from the mwscript worklog, 10-31 .. 11-04 |
+| [mwscript_full_runs_archive_2.md](audits/mwscript_full_runs_archive_2.md) | The mwscript worklog before its 11-11 compaction: pin coordinates, probe names, disasm chains, batch results |
+| [oblivion_quest_runs.md](audits/oblivion_quest_runs.md) | The Oblivion (.tes4test) quest-run worklog: TES4-specific lessons, launch, run ledger, every quest's status |
+| [navmesh_since_0.686.md](audits/navmesh_since_0.686.md) | Navmesh release chart: area, cracks, islands, time and memory, 0.686 against the current build on six plugins |
+| [mwscript_opcodes.md](audits/mwscript_opcodes.md) | Which of MWScript's 298 commands MorrowindRuntime implements, by call-site cost |
+| [wiring.md](audits/wiring.md) | Script-to-record wiring in converted plugins: unbound/dangling/mistyped properties, hosts, conditions, coverage, verified findings |
+| [script_command_fidelity.md](audits/script_command_fidelity.md) | How each TES4 command converts to Papyrus (native, inline, polyfill, partial, dropped), by call site, from real converter runs |
+| [oblivion_native_script_runtime.md](audits/oblivion_native_script_runtime.md) | TES4 commands a native script runtime would need beyond MorrowindRuntime, by call-site cost |
 | [package_conversion.md](audits/package_conversion.md) | PACK Conversion Audit — 2026-08-17 |
 | [quest.md](audits/quest.md) | Quest Completability Audit — Oblivion.esm conversion |
 | [quest_script_conversion.md](audits/quest_script_conversion.md) | Quest Script Conversion Audit |

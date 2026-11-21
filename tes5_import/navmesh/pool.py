@@ -10,24 +10,41 @@ See: docs/commentary/tes5_import_navmesh.md#pool-orchestration
 
 from asset_convert.game_paths import current_namespace
 from output_layout import asset_cache_chain
+import gc
 import glob
 import hashlib
+import math
+import operator
 import os
 import struct
 import sys
 import time
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 
+from core.navmesh_options import CORRIDOR, navmesh_generator
 from core.worker_budget import worker_count
-from . import cache_audit as navm_verify, worker as navm_worker
+from . import cache_audit as navm_verify, native_loader, worker as navm_worker
+from .door_reach import door_seeds, landing_of_door, landings_by_cell
+from .edge_links import exterior_views
+from .seeding import drop_unplayable, grow_into_empty, master_views, seeded_record
+from .spawn_nodes import ACTOR_SIGS, is_airborne, spawn_point
+from .world import base_fid
 from ..overrides.nested import DELETED_FLAG
 from ..record_types.navm_falloutnv import precompute_fallout_navmeshes
+from ..record_types.items import tree_nif_stem
+from ..record_types.world import build_cell_xclw, cell_water_height
+from ..record_types.world_falloutnv import parent_use_flags
+from ..record_types.world_morrowind import is_tes3_source
+from ..base.master_export import records_of, values_of
+from ..base.mesh_bounds import get_mesh_obnd
+from ..base.obstacles import OBSTACLE_SIGS, is_obstacle
 from ..base.text_reader import (get_float, get_formid, get_formid_index_offset,
                            get_injected_formids, get_int, get_str)
 
 #: Base record types whose placed footprint carves holes in a navmesh.
-_BLOCKING_BASE_TYPES = frozenset({'STAT', 'CONT', 'FURN', 'ACTI', 'TREE'})
+_BLOCKING_BASE_TYPES = frozenset({'STAT', 'CONT', 'FURN', 'ACTI', 'TREE', 'FLOR'})
 
 #: Side of one exterior cell, in game units.
 _CELL_SIZE = 4096.0
@@ -35,11 +52,14 @@ _CELL_SIZE = 4096.0
 #: RecordFlags bit marking a worldspace's persistent (dummy) cell.
 _PERSISTENT_FLAG = 0x400
 
+#: CELL DATA flag: the cell has water.
+_HAS_WATER = 0x02
+
+#: TES5 WRLD PNAM bit: the child worldspace draws its parent's land.
+_PNAM_USE_LAND = 0x01
+
 #: Jobs pickled and queued at once, as a multiple of workers * chunksize.
 _BUFFER_FACTOR = 4
-
-#: Tasks a pool worker runs before it is recycled.
-_TASKS_PER_CHILD = 500
 
 
 # ---------------------------------------------------------------------------
@@ -72,45 +92,86 @@ def ensure_cell_grid(cell: dict) -> None:
     cell['XCLC.Y'] = '0'
 
 
-def _model_key(model: str) -> str:
-    """Normalize a TES4 model path to the mesh_bounds cache key.
+def model_key(model: str) -> str:
+    """Normalize an AUTHORED TES4 model path to the mesh_bounds cache key.
 
-    Lowercase, forward slashes, game-namespace prefix, '.nif' suffix --
+    Lowercase, forward slashes, game-namespace prefix (always), '.nif' suffix --
     e.g. 'Furniture\\ChairNoble01.NIF' -> 'tes4/furniture/chairnoble01.nif'.
     """
     p = model.lower().replace('\\', '/').lstrip('/')
     if p.startswith('textures/'):
         p = p[len('textures/'):]
-    ns = current_namespace() + '/'
-    if not p.startswith(ns):
-        p = ns + p
     if not p.endswith('.nif'):
         p += '.nif'
-    return p
+    return current_namespace() + '/' + p
+
+
+def base_model_key(rec: dict):
+    """A base record's collision-cache key, or None when it has no model.
+
+    A TREE resolves to the NIF the speedtree stage writes for THAT record
+    (`tree_nif_stem`), never to its shared `.spt`.
+    See: docs/commentary/tes5_import_navmesh.md#speedtree-model-keys
+    """
+    model = get_str(rec, 'Model.MODL') or get_str(rec, 'MODL')
+    if not model:
+        return None
+    if rec.get('Signature') == 'TREE':
+        return '%s/speedtrees/%s.nif' % (current_namespace(), tree_nif_stem(rec))
+    return model_key(model)
+
+
+#: This run's `_records_of` answers by signatures: (by_type, master_export, own lists, lengths, answer).
+_MERGED = {}
 
 
 def _records_of(by_type: dict, master_export: dict, sigs) -> list:
-    """This plugin's records of *sigs*, with the MASTERS' listed FIRST.
+    """(fid, record) of *sigs*: the masters' plus this plugin's, one per FormID.
 
-    Masters first so an override in this plugin wins the key.
+    Merged once per run: asked again with the same inputs, the same list comes
+    back, so callers never mutate it.  `precompute_navmeshes` forgets them.
     """
-    out = []
-    if master_export:
-        out.append(r for r in master_export.values()
-                   if r.get('Signature') in sigs)
-    out.append(r for sig in sigs for r in by_type.get(sig, []))
-    return [r for src in out for r in src]
+    key = tuple(sigs)
+    lists = tuple(by_type.get(sig, ()) for sig in key)
+    lengths = tuple(map(len, lists))
+    hit = _MERGED.get(key)
+    if (hit and hit[0] is by_type and hit[1] is master_export
+            and all(map(operator.is_, hit[2], lists)) and hit[3] == lengths):
+        return hit[4]
+    out = _merge_records(by_type, master_export, key)
+    _MERGED[key] = (by_type, master_export, lists, lengths, out)
+    return out
 
 
-def _low_fid(rec: dict):
-    """A record's low-24 FormID, or None when it has none / is unparsable."""
-    fid_str = rec.get('FormID')
-    if not fid_str:
-        return None
+def _merge_records(by_type: dict, master_export: dict, sigs: tuple) -> list:
+    """`_records_of`'s answer, computed.
+
+    `master_export` keys by the raw TES4 slot while `get_formid` shifts every id
+    by the load-order offset, so a master's key is shifted to match.  The
+    plugin's override replaces the master's record; one it flags deleted drops
+    out entirely.  Masters come first, then the plugin's own.
+
+    See: docs/commentary/tes5_import_navmesh.md#master-owned-cells
+    """
+    own = [(get_formid(r, 'FormID'), r)
+           for sig in sigs for r in by_type.get(sig, [])]
+    own_fids = {fid for fid, _r in own}
+    offset = get_formid_index_offset()
+    masters = [(_shift_index(key, offset), r)
+               for key, r in records_of(master_export, *sigs)]
+    out = [(fid, r) for fid, r in masters if fid and fid not in own_fids]
+    out.extend((fid, r) for fid, r in own
+               if not get_int(r, 'RecordFlags') & DELETED_FLAG)
+    return out
+
+
+def _shift_index(fid_str: str, offset: int):
+    """A master-export key moved into the index space references use."""
     try:
-        return int(fid_str, 16) & 0x00FFFFFF
-    except ValueError:
+        raw = int(fid_str, 16)
+    except (TypeError, ValueError):
         return None
+    return ((((raw >> 24) & 0xFF) + offset) << 24) | (raw & 0x00FFFFFF)
 
 
 # ---------------------------------------------------------------------------
@@ -119,25 +180,52 @@ def _low_fid(rec: dict):
 
 
 def build_base_model_index(by_type: dict, master_export: dict = None) -> dict:
-    """Map raw low-24 base-object FormID -> normalized model key.
+    """Map base-object FormID (index byte included) -> normalized model key.
 
     Only blocking base types are indexed, so carving never removes triangles
-    under doors, lights, markers or actors.  `master_export` is REQUIRED for a
-    plugin with masters.
+    under doors, lights, markers or actors -- nor under an obstacle, which the
+    engine cuts at runtime.  `master_export` is REQUIRED for a plugin with masters.
 
-    See: docs/commentary/tes5_import_navmesh.md#pool-orchestration
+    See: docs/commentary/tes5_import_navmesh.md#base-ids-carry-their-plugin-index
+    See: docs/commentary/tes5_import_navmesh.md#scripted-blockers-are-obstacles
     """
     index = {}
-    for rec in _records_of(by_type, master_export, _BLOCKING_BASE_TYPES):
-        model = get_str(rec, 'Model.MODL') or get_str(rec, 'MODL')
-        low = _low_fid(rec) if model else None
-        if low is not None:
-            index[low] = _model_key(model)
+    for sig in _BLOCKING_BASE_TYPES:
+        for fid, rec in _records_of(by_type, master_export, (sig,)):
+            key = None if is_obstacle(rec, sig) else base_model_key(rec)
+            if key:
+                index[fid] = key
     return index
 
 
+def build_base_radius_index(by_type: dict, master_export: dict = None) -> dict:
+    """Map base FormID (index byte included) -> bounding radius.
+
+    The radius is MODB, else the converted mesh's measured bounds (a TES3 base
+    has no MODB).  Only bases that carve are indexed, so the overhang index
+    never widens a cell's gather for a marker or a light.  `master_export` is
+    REQUIRED for a plugin with masters, exactly as for `build_base_model_index`.
+    See: docs/commentary/tes5_import_navmesh.md#refs-overhang-their-cell
+    """
+    index = {}
+    for fid, rec in _records_of(by_type, master_export, _BLOCKING_BASE_TYPES):
+        radius = get_float(rec, 'Model.MODB', 0.0) or _bounds_radius(rec)
+        if radius > 0.0:
+            index[fid] = radius
+    return index
+
+
+def _bounds_radius(rec: dict) -> float:
+    """Radius of the sphere about the model origin holding its mesh bounds, or 0.0."""
+    key = base_model_key(rec)
+    box = get_mesh_obnd(key) if key else None
+    if not box:
+        return 0.0
+    return math.sqrt(sum(max(abs(box[i]), abs(box[i + 3])) ** 2 for i in range(3)))
+
+
 def build_door_fid_set(by_type: dict, master_export: dict = None) -> dict:
-    """Map raw low-24 DOOR base FormID -> normalized model key (or None).
+    """Map DOOR base FormID (index byte included) -> model key (or None).
 
     The key matches door_centers_cache so `_collect_doors` can panel-center each
     door.  Membership of the map doubles as the "is this a DOOR base" test, so
@@ -146,13 +234,15 @@ def build_door_fid_set(by_type: dict, master_export: dict = None) -> dict:
     See: docs/commentary/tes5_import_navmesh.md#pool-orchestration
     """
     out = {}
-    for rec in _records_of(by_type, master_export, ('DOOR',)):
-        base = _low_fid(rec)
-        if base is None:
-            continue
+    for fid, rec in _records_of(by_type, master_export, ('DOOR',)):
         model = rec.get('Model.MODL') or rec.get('MODL')
-        out[base] = _model_key(model) if model else None
+        out[fid] = model_key(model) if model else None
     return out
+
+
+def build_activator_fid_set(by_type: dict, master_export: dict = None) -> frozenset:
+    """ACTI base FormIDs (index byte included), masters' too: moving parts."""
+    return frozenset(fid for fid, _rec in _records_of(by_type, master_export, ('ACTI',)))
 
 
 def build_teleport_grid(by_type: dict, master_export: dict = None):
@@ -164,14 +254,14 @@ def build_teleport_grid(by_type: dict, master_export: dict = None):
     left alone, so master blindness would silently disable the check.
     """
     grid_cells = set()
-    for cell in _records_of(by_type, master_export, ('CELL',)):
+    for _fid, cell in _records_of(by_type, master_export, ('CELL',)):
         wrld = get_formid(cell, 'ParentWRLD')
         if wrld and not get_int(cell, 'RecordFlags') & _PERSISTENT_FLAG:
             grid_cells.add((wrld, get_int(cell, 'XCLC.X'),
                             get_int(cell, 'XCLC.Y')))
 
     placement = {}
-    for ref in _records_of(by_type, master_export, ('REFR',)):
+    for _fid, ref in _records_of(by_type, master_export, ('REFR',)):
         if ref.get('XTEL.Door'):
             placement[get_formid(ref, 'FormID')] = (
                 get_formid(ref, 'ParentWRLD'),
@@ -193,39 +283,16 @@ def _by_parent_cell(recs) -> dict:
     return out
 
 
-def _merge_master_cell_records(by_type: dict, master_export: dict,
-                               sig: str) -> list:
-    """`sig` records the plugin navmeshes with: the masters' plus its own.
-
-    A child plugin re-states only the references it edits, so navmeshing from
-    `by_type` alone carves a cell the masters furnished as if it were bare.
-    The masters' records are the baseline; the plugin's own override them by
-    FormID, and one the plugin flags deleted drops out entirely.
-
-    See: docs/commentary/tes5_import_navmesh.md#master-owned-cells
-    """
-    own = by_type.get(sig, [])
-    if not master_export:
-        return own
-    own_fids = {get_formid(rec, 'FormID') for rec in own}
-    merged = [rec for key, rec in master_export.items()
-              if rec.get('Signature') == sig and int(key, 16) not in own_fids]
-    merged.extend(rec for rec in own
-                  if not (get_int(rec, 'RecordFlags') & DELETED_FLAG))
-    return merged
+def _merged(by_type: dict, master_export: dict, sig: str) -> list:
+    """The `sig` records `_records_of` keeps, without their FormIDs."""
+    return [rec for _fid, rec in _records_of(by_type, master_export, (sig,))]
 
 
 def _is_door_ref(rec: dict, door_fids) -> bool:
     """Is this REFR a teleport door, or a placement of a DOOR base?"""
     if rec.get('XTEL.Door'):
         return True
-    name = rec.get('NAME')
-    if not name:
-        return False
-    try:
-        return (int(name, 16) & 0xFFFFFF) in door_fids
-    except ValueError:
-        return False
+    return base_fid(rec) in door_fids
 
 
 def _persistent_doors_by_grid(cells, refr_by_cell, door_fids) -> dict:
@@ -273,25 +340,207 @@ def _exterior_blocks(cells) -> dict:
     return blocks
 
 
-def _emit_jobs(jobs, cell_rec, land_rec, refr_by_cell, pgrd_by_cell,
-               extra_door_refrs=None) -> None:
-    """Append one job per PGRD in this cell."""
+def _refr_reach(rec, radius_by_base) -> float:
+    """How far this placement's geometry extends from its own position.
+
+    The base model's bounding radius, scaled by the REFR.  0.0 when the base
+    has no radius, which drops the ref from the overhang index entirely.
+    """
+    radius = radius_by_base.get(base_fid(rec), 0.0)
+    if not radius:
+        return 0.0
+    return radius * (get_float(rec, 'XSCL.Scale', 1.0) or 1.0)
+
+
+def _foreign_squares(rec, gx, gy, radius_by_base):
+    """Grid squares this ref's geometry covers, EXCLUDING its own (gx, gy)."""
+    reach = _refr_reach(rec, radius_by_base)
+    if reach <= 0.0:
+        return ()
+    try:
+        x, y = float(rec['PosX']), float(rec['PosY'])
+    except (KeyError, TypeError, ValueError):
+        return ()
+    return [(nx, ny)
+            for nx in range(int((x - reach) // _CELL_SIZE),
+                            int((x + reach) // _CELL_SIZE) + 1)
+            for ny in range(int((y - reach) // _CELL_SIZE),
+                            int((y + reach) // _CELL_SIZE) + 1)
+            if nx != gx or ny != gy]
+
+
+def _overhang_index(cells, refr_by_cell, radius_by_base) -> dict:
+    """Map (wrld, gx, gy) -> refs from OTHER cells whose geometry reaches in.
+
+    27% of Oblivion's exterior placements extend past their own cell square,
+    and a cell gathered from its ParentCELL list alone sees none of them -- a
+    pier, wall or rock owned next door carves nothing and renders as a hole.
+
+    See: docs/commentary/tes5_import_navmesh.md#refs-overhang-their-cell
+    """
+    out = defaultdict(list)
+    for cell in cells:
+        wrld = get_formid(cell, 'ParentWRLD')
+        if not wrld or (get_int(cell, 'RecordFlags') & _PERSISTENT_FLAG):
+            continue
+        gx, gy = get_int(cell, 'XCLC.X'), get_int(cell, 'XCLC.Y')
+        for rec in refr_by_cell.get(get_formid(cell, 'FormID'), []):
+            for square in _foreign_squares(rec, gx, gy, radius_by_base):
+                out[(wrld,) + square].append(rec)
+    return out
+
+
+def _spawns_by_cell(by_type: dict, master_export: dict) -> dict:
+    """{cell FormID: sorted actor spawn points} for a Morrowind source (spawn_nodes), else {}."""
+    if not is_tes3_source():
+        return {}
+    airborne = {fid for fid, crea in _records_of(by_type, master_export, ('CREA',))
+                if is_airborne(crea)}
+    out = defaultdict(set)
+    for sig in ACTOR_SIGS:
+        for rec in _merged(by_type, master_export, sig):
+            point = spawn_point(rec)
+            if point is not None and base_fid(rec) not in airborne:
+                out[get_formid(rec, 'ParentCELL')].add(point)
+    return {cell: sorted(points) for cell, points in out.items()}
+
+
+def _obstacles_by_cell(by_type: dict, master_export: dict, refr_by_cell: dict) -> dict:
+    """{cell FormID: [(placement, model key)]} for each placed obstacle with a model.
+
+    See: docs/commentary/tes5_import_navmesh.md#a-removed-obstacle-is-bridged
+    """
+    keys = {fid: base_model_key(rec) for sig in OBSTACLE_SIGS
+            for fid, rec in _records_of(by_type, master_export, (sig,)) if is_obstacle(rec, sig)}
+    keys = {fid: key for fid, key in keys.items() if key}
+    if not keys:
+        return {}
+    out = {}
+    for cell, refrs in refr_by_cell.items():
+        placed = [(r, keys[base_fid(r)]) for r in refrs if base_fid(r) in keys]
+        if placed:
+            out[cell] = sorted(placed, key=lambda p: get_formid(p[0], 'FormID'))
+    return out
+
+
+def _job(pgrd_rec, cell_rec, land_rec, indexes, extra_door_refrs, extra_refrs) -> dict:
+    """One navmesh job: a pathgrid and everything its cell's carving reads."""
+    refr_by_cell, _, _, spawns_by_cell, obstacles_by_cell = indexes
     cell_fid = get_formid(cell_rec, 'FormID')
     cell_refrs = refr_by_cell.get(cell_fid, [])
-    for pgrd_rec in pgrd_by_cell.get(cell_fid, []):
-        jobs.append({
-            'key': (cell_fid, get_formid(pgrd_rec, 'FormID')),
-            'pgrd_rec': pgrd_rec,
-            'land_rec': land_rec,
-            'cell_rec': cell_rec,
-            'refr_recs': cell_refrs,
-            'extra_door_refrs': extra_door_refrs or [],
-        })
+    if extra_refrs:
+        cell_refrs = cell_refrs + list(extra_refrs)
+    return {
+        'key': (cell_fid, get_formid(pgrd_rec, 'FormID')),
+        'pgrd_rec': pgrd_rec,
+        'land_rec': land_rec,
+        'cell_rec': cell_rec,
+        'refr_recs': cell_refrs,
+        'extra_door_refrs': extra_door_refrs or [],
+        'spawns': spawns_by_cell.get(cell_fid, []),
+        'obstacles': obstacles_by_cell.get(cell_fid, []),
+    }
 
 
-def _gather_exteriors(jobs, by_type, cells, indexes, pers_doors) -> None:
-    """Append exterior jobs, per worldspace, in _build_world_groups order."""
-    refr_by_cell, land_by_cell, pgrd_by_cell = indexes
+def _emit_jobs(jobs, cell_rec, land_rec, indexes,
+               extra_door_refrs=None, extra_refrs=None) -> int:
+    """Append one job per PGRD in this cell; return how many."""
+    pgrds = indexes[2].get(get_formid(cell_rec, 'FormID'), [])
+    for pgrd_rec in pgrds:
+        jobs.append(_job(pgrd_rec, cell_rec, land_rec, indexes,
+                         extra_door_refrs, extra_refrs))
+    return len(pgrds)
+
+
+def _uses_parent_land(wrld_rec: dict) -> bool:
+    """Does this child draw its parent's land?  No PNAM (TES4) means yes."""
+    flags = parent_use_flags(wrld_rec)
+    return flags is None or bool(flags & _PNAM_USE_LAND)
+
+
+def _land_world_of(worlds: dict) -> dict:
+    """Map WRLD FormID -> the worldspace whose LAND the engine draws in it."""
+    out = {}
+    for fid in worlds:
+        cur, seen = fid, {fid}
+        parent = get_formid(worlds[cur], 'WNAM.Parent')
+        while parent in worlds and parent not in seen \
+                and _uses_parent_land(worlds[cur]):
+            cur = parent
+            seen.add(cur)
+            parent = get_formid(worlds[cur], 'WNAM.Parent')
+        out[fid] = cur
+    return out
+
+
+def _land_by_grid(cells, land_by_cell) -> dict:
+    """Map (wrld, gx, gy) -> the LAND of that worldspace's exterior cell there."""
+    out = {}
+    for cell in cells:
+        wrld = get_formid(cell, 'ParentWRLD')
+        lands = land_by_cell.get(get_formid(cell, 'FormID'))
+        if wrld and lands and not get_int(cell, 'RecordFlags') & _PERSISTENT_FLAG:
+            out[(wrld, get_int(cell, 'XCLC.X'), get_int(cell, 'XCLC.Y'))] = lands[0]
+    return out
+
+
+def navmesh_land_at(by_type: dict, master_export: dict = None):
+    """(wrld, gx, gy) -> the LAND the game walks on at that square, else None.
+
+    A child worldspace that borrows its parent's land resolves to the
+    PARENT's LAND (what the engine draws); its own LAND is only the fallback
+    where the parent has none.  Masters are included.
+    """
+    worlds = dict(_records_of(by_type, master_export, ('WRLD',)))
+    land_world = _land_world_of(worlds)
+    grid = _land_by_grid(
+        _merged(by_type, master_export, 'CELL'),
+        _by_parent_cell(_merged(by_type, master_export, 'LAND')))
+
+    def land_at(square):
+        wrld, gx, gy = square
+        return (grid.get((land_world.get(wrld, wrld), gx, gy))
+                or grid.get(square))
+    return land_at
+
+
+def with_water(cell_rec, wrld_rec) -> dict:
+    """The cell for its navmesh: a watered cell with no height takes its world's.
+
+    See: docs/commentary/tes5_import_navmesh.md#exterior-water-height
+    """
+    if not get_int(cell_rec, 'DATA.Flags', 0) & _HAS_WATER or build_cell_xclw(cell_rec):
+        return cell_rec
+    return dict(cell_rec, **{'XCLW.WaterHeight': repr(cell_water_height(cell_rec, wrld_rec))})
+
+
+def _gather_cell(jobs, seedable, cell_rec, wrld_rec, indexes, extras) -> None:
+    """One exterior cell's jobs; a land cell with no pathgrid becomes a seedable template, one with a
+    single pathgrid has its job in extras[2] (regrow) too."""
+    wrld_fid = get_formid(wrld_rec, 'FormID')
+    square = (wrld_fid, get_int(cell_rec, 'XCLC.X'), get_int(cell_rec, 'XCLC.Y'))
+    cell_rec = with_water(cell_rec, wrld_rec)
+    land_rec = indexes[1](square)
+    here = (extras[0].get(square, []), extras[1].get(square, []))
+    count = _emit_jobs(jobs, cell_rec, land_rec, indexes, *here)
+    if not land_rec:
+        return
+    if not count:
+        seedable[square] = _job(seeded_record(cell_rec), cell_rec, land_rec, indexes, *here)
+    elif count == 1:
+        extras[2][square] = jobs[-1]
+
+
+def _gather_exteriors(jobs, by_type, cells, indexes, pers_doors,
+                      overhang=None, seedable=None, regrow=None) -> None:
+    """Append exterior jobs, per worldspace, in _build_world_groups order.
+
+    A land cell with no pathgrid goes to `seedable` as a job template keyed
+    (wrld, gx, gy), one with a pathgrid to `regrow` as its job, for grow_into_empty.
+    """
+    if seedable is None:
+        seedable = {}
+    extras = (pers_doors, overhang or {}, {} if regrow is None else regrow)
     ext_by_wrld = defaultdict(list)
     for cell in cells:
         wrld_fid = get_formid(cell, 'ParentWRLD')
@@ -313,43 +562,129 @@ def _gather_exteriors(jobs, by_type, cells, indexes, pers_doors) -> None:
                         blocks[block][sub],
                         key=lambda c: (get_int(c, 'XCLC.Y'),
                                        get_int(c, 'XCLC.X'))):
-                    lands = land_by_cell.get(get_formid(cell_rec, 'FormID'), [])
-                    _emit_jobs(jobs, cell_rec, lands[0] if lands else None,
-                               refr_by_cell, pgrd_by_cell,
-                               pers_doors.get(
-                                   (wrld_fid, get_int(cell_rec, 'XCLC.X'),
-                                    get_int(cell_rec, 'XCLC.Y')), []))
+                    _gather_cell(jobs, seedable, cell_rec, wrld_rec, indexes, extras)
+
+
+def drop_leveled_placements(by_type: dict, ctx_master_export=None) -> int:
+    """Remove REFRs that place a leveled creature; return how many went.
+
+    `leveled_actors` rewrites these into ACHR before the group builders run, so
+    a navmesh gathered from the raw REFR list carves placements the import
+    never carves.  Callers that only need geometry (the cache checker) run this
+    instead of minting shells, so both paths gather the same refs.
+
+    See: docs/commentary/tes5_import_navmesh.md#leveled-placements-never-carve
+    """
+    from ..actors.leveled_actors import is_leveled_creature_base, register_from
+    register_from(by_type, ctx_master_export)
+    refrs = by_type.get('REFR')
+    if not refrs:
+        return 0
+    keep = [r for r in refrs if not is_leveled_creature_base(r)]
+    dropped = len(refrs) - len(keep)
+    if dropped:
+        by_type['REFR'] = keep
+    return dropped
 
 
 def gather_navm_jobs(by_type: dict, door_fids: set = None,
-                     master_export: dict = None) -> list:
+                     master_export: dict = None, seedable: dict = None, regrow: dict = None) -> list:
     """Enumerate PGRD->NAVM jobs in the order the group builders visit them.
 
     Interiors first (block/sub-block), then exteriors per worldspace, matching
     the builders so allocated FormIDs match the serial path.  Geometry inputs
     merge the masters in; the jobs themselves stay driven by the plugin's OWN
-    pathgrids, so no id moves.
+    pathgrids, so no id moves.  `seedable` collects the land cells with none,
+    `regrow` the land cells' pathgrid jobs.
 
     See: docs/commentary/tes5_import_navmesh.md#pool-orchestration
     """
     cells = by_type.get('CELL', [])
-    refr_by_cell = _by_parent_cell(
-        _merge_master_cell_records(by_type, master_export, 'REFR'))
-    land_by_cell = _by_parent_cell(
-        _merge_master_cell_records(by_type, master_export, 'LAND'))
+    if not by_type.get('PGRD'):
+        _gather_exteriors([], by_type, cells, ({}, lambda _square: None, {}, {}, {}), {})
+        return []
+    refr_by_cell = _by_parent_cell(_merged(by_type, master_export, 'REFR'))
     pgrd_by_cell = _by_parent_cell(by_type.get('PGRD', []))
-    indexes = (refr_by_cell, land_by_cell, pgrd_by_cell)
+    indexes = (refr_by_cell, navmesh_land_at(by_type, master_export),
+               pgrd_by_cell, _spawns_by_cell(by_type, master_export),
+               _obstacles_by_cell(by_type, master_export, refr_by_cell))
     pers_doors = _persistent_doors_by_grid(cells, refr_by_cell,
                                            door_fids or set())
+    overhang = _overhang_index(
+        cells, refr_by_cell, build_base_radius_index(by_type, master_export))
 
     jobs = []
     blocks = _interior_blocks(cells)
+    all_refrs = _merged(by_type, master_export, 'REFR')
+    landings = landings_by_cell(all_refrs)
+    master_cells = {get_formid(c, 'FormID') for c in values_of(master_export, 'CELL')}
     for block in sorted(blocks):
         for sub in sorted(blocks[block]):
             for cell_rec in blocks[block][sub]:
-                _emit_jobs(jobs, cell_rec, None, refr_by_cell, pgrd_by_cell)
-    _gather_exteriors(jobs, by_type, cells, indexes, pers_doors)
+                _emit_interior(jobs, by_type, cell_rec, indexes, landings, master_cells)
+    if seedable is None:
+        seedable = {}
+    _gather_exteriors(jobs, by_type, cells, indexes, pers_doors, overhang, seedable, regrow)
+    every_job = jobs + list(seedable.values())
+    _attach_landings(every_job, landings,
+                     {get_formid(c, 'FormID'): get_formid(c, 'ParentWRLD') for c in cells if get_formid(c, 'ParentWRLD')})
+    _attach_door_landings(every_job, landing_of_door(all_refrs))
     return jobs
+
+
+def _attach_door_landings(jobs, by_door) -> None:
+    """Give each job `door_landings`: {door ref: landing} for the teleport doors it places.
+    See: docs/commentary/tes5_import_navmesh.md#door-triangle-on-the-landing-side
+    """
+    for job in jobs:
+        refrs = list(job.get('refr_recs') or ()) + list(job.get('extra_door_refrs') or ())
+        own = (get_formid(r, 'FormID') for r in refrs if r.get('XTEL.Door'))
+        job['door_landings'] = {fid: by_door[fid] for fid in own if fid in by_door}
+
+
+def _attach_landings(jobs, landings, world_of) -> None:
+    """Give each job the door landings in its cell: an interior's by cell, an exterior's by worldspace and grid
+    square, since a persistent door's landings are filed under the worldspace's persistent cell.  `jobs`
+    includes the seeded cells' templates: a door there whose origin hangs above its floor links at its landing
+    too.  `world_of` maps each exterior cell to its worldspace.
+    See: docs/commentary/tes5_import_navmesh.md#door-reach
+    """
+    by_square = defaultdict(list)
+    for cell_fid, points in landings.items():
+        wrld = world_of.get(cell_fid)
+        if not wrld:
+            continue
+        for p in points:
+            by_square[(wrld, int(p[0] // _CELL_SIZE), int(p[1] // _CELL_SIZE))].append(p)
+    for job in jobs:
+        cell = job['cell_rec']
+        wrld = get_formid(cell, 'ParentWRLD')
+        if wrld:
+            job['landings'] = list(by_square.get((wrld, get_int(cell, 'XCLC.X'), get_int(cell, 'XCLC.Y')), ()))
+        else:
+            job['landings'] = list(landings.get(get_formid(cell, 'FormID'), ()))
+
+
+def _emit_interior(jobs, by_type, cell_rec, indexes, landings, master_cells) -> None:
+    """One interior's jobs; a pathgrid-less one of this plugin's with doors gets a synthetic
+    pathgrid (joining by_type['PGRD']) whose jobs carry the door seeds. An authored pathgrid is
+    never extended.
+
+    See: docs/commentary/tes5_import_navmesh.md#door-reach
+    """
+    cell_fid = get_formid(cell_rec, 'FormID')
+    if _emit_jobs(jobs, cell_rec, None, indexes) or cell_fid in master_cells:
+        return
+    seeds = door_seeds(indexes[0].get(cell_fid, []), landings.get(cell_fid, ()))
+    if not seeds:
+        return
+    pgrd = seeded_record(cell_rec)
+    by_type.setdefault('PGRD', []).append(pgrd)
+    indexes[2][cell_fid] = [pgrd]
+    first = len(jobs)
+    _emit_jobs(jobs, cell_rec, None, indexes)
+    for job in jobs[first:]:
+        job['door_seeds'] = seeds
 
 
 # ---------------------------------------------------------------------------
@@ -357,8 +692,38 @@ def gather_navm_jobs(by_type: dict, door_fids: set = None,
 # ---------------------------------------------------------------------------
 
 
-#: Runs AFTER geometry leaves the cache, so it cannot invalidate an entry.
-_TAG_EXCLUDE = frozenset({'edge_links.py'})
+#: Cannot reach the cached payload; see #the-tag-hashes-geometry-only.
+_TAG_EXCLUDE = frozenset({
+    'edge_links.py', 'navi.py', 'split.py', 'cache_audit.py', 'pool.py',
+    'worker.py', '__init__.py', 'lookup_grid.py', 'seeding.py', 'phase.py',
+})
+
+#: Native source directory deciding cell geometry; its .cpp/.h are hashed with the Python, never the .pyd.
+_TAG_NATIVE = 'navgrow'
+
+
+def _native_tag_sources() -> list:
+    """Each `_TAG_NATIVE` .cpp/.h file's bytes, by name, newline-normalized.
+
+    Anchored on the REPO, not on this module's `__file__`: the tag tests copy
+    the navmesh package to a temp dir, and a path derived from the copy would
+    find no native tree and void the whole tag.
+
+    See: docs/commentary/tes5_import_navmesh.md#the-tag-covers-the-native-march
+    """
+    src = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))), 'native', 'src', _TAG_NATIVE)
+    names = (sorted(f for f in os.listdir(src) if f.endswith(('.cpp', '.h')))
+             if os.path.isdir(src) else [])
+    out = []
+    for name in names:
+        path = os.path.join(src, name)
+        try:
+            with open(path, 'rb') as fh:
+                out.append(fh.read().replace(b'\r\n', b'\n'))
+        except OSError:
+            continue
+    return out
 
 
 def master_navm_grid(master_export: dict, master_index) -> dict:
@@ -375,9 +740,7 @@ def master_navm_grid(master_export: dict, master_index) -> dict:
         return {}
     out = {}
     ext = no_navm = 0
-    for rec in master_export.values():
-        if rec.get('Signature') != 'CELL':
-            continue
+    for _key, rec in records_of(master_export, 'CELL'):
         wrld = get_formid(rec, 'ParentWRLD')
         if not wrld or get_int(rec, 'RecordFlags') & _PERSISTENT_FLAG:
             continue
@@ -401,31 +764,45 @@ def collision_cache_chain(export_dir: str) -> tuple:
     return asset_cache_chain(export_dir, 'collision_cache.bin')
 
 
+def tag_sources() -> list:
+    """The Python sources the current generator's tag hashes.
+
+    The corridor's (the published cache, gated on push) are the top-level
+    navmesh modules only; the lattice adds its own package, which never
+    moves the corridor's tag.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    srcs = glob.glob(os.path.join(here, '*.py'))
+    if navmesh_generator() != CORRIDOR:
+        srcs += glob.glob(os.path.join(here, 'lattice', '*.py'))
+    return sorted(s for s in srcs if os.path.basename(s) not in _TAG_EXCLUDE)
+
+
 def navmesh_geom_cache(collision_cache: str):
     """(cache_dir, tag) for the on-disk navmesh geometry cache, or None.
 
-    The tag hashes the navmesh generator SOURCES only, so editing any navmesh
-    code (params included) invalidates every entry automatically.  Collision
-    enters per-cell via `from_pgrd._geom_hash`, never here.  Newlines are
-    normalized to LF so the tag is a property of the CONTENT, not of the
-    checkout's line-ending mode.
+    The tag hashes `tag_sources` and the native march, so editing navmesh
+    code misses every entry.  Each generator has its own folder (the
+    corridor's is the published one), so switching never overwrites the
+    other's entries.  Collision enters per-cell via `from_pgrd._geom_hash`.
+    Sources are hashed with LF newlines.
 
     See: docs/commentary/tes5_import_navmesh.md#pool-orchestration
     """
     if not collision_cache or not os.path.exists(collision_cache):
         return None
-    h = hashlib.sha1()
-    here = os.path.dirname(os.path.abspath(__file__))
-    srcs = sorted(s for s in glob.glob(os.path.join(here, '*.py'))
-                  if os.path.basename(s) not in _TAG_EXCLUDE)
-    for src in srcs:
+    lattice = navmesh_generator() != CORRIDOR
+    h = hashlib.sha1(b'lattice' if lattice else b'')
+    for src in tag_sources():
         try:
             with open(src, 'rb') as fh:
                 h.update(fh.read().replace(b'\r\n', b'\n'))
         except OSError:
             return None
-    cache_dir = os.path.join(os.path.dirname(collision_cache),
-                             'navmesh_geom_cache')
+    for body in _native_tag_sources():
+        h.update(body)
+    folder = 'navmesh_geom_cache' + ('_lattice' if lattice else '')
+    cache_dir = os.path.join(os.path.dirname(collision_cache), folder)
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir, h.hexdigest()
 
@@ -488,29 +865,48 @@ def _map_kwargs(n_jobs, n_workers) -> dict:
     return kwargs
 
 
-def _pool(initargs, n_workers) -> ProcessPoolExecutor:
-    """A run_job pool whose workers carry this plugin's context."""
-    return ProcessPoolExecutor(max_workers=n_workers,
-                               initializer=navm_worker.init_worker,
-                               initargs=initargs,
-                               max_tasks_per_child=_TASKS_PER_CHILD)
+@contextmanager
+def _pool(n_workers):
+    """A run_job pool: threads sharing this process's context.
+
+    The native build runs with the GIL released, so threads share one copy of
+    the collision; the collector pauses for the run, as it is off in a worker.
+    `init_context` MUST have run first.
+    See: docs/plans/navmesh_native_rewrite.md#one-process-many-threads
+    """
+    native_loader.native_core()
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix='navmesh') as ex:
+            yield ex
+    finally:
+        if collecting:
+            gc.enable()
 
 
-def _run_pooled(jobs, initargs, n_workers) -> dict:
-    """Convert every job across a process pool."""
+def _run_jobs(jobs, ex, n_workers) -> dict:
+    """Convert every job on the open pool `ex`, or in this process when there is none."""
+    if ex is None or len(jobs) == 1:
+        return _run_inline(jobs)
     cache = {}
     total, every, t0 = len(jobs), _progress_every(len(jobs)), time.time()
-    with _pool(initargs, n_workers) as ex:
-        for done, (key, result) in enumerate(
-                ex.map(navm_worker.run_job, jobs,
-                       **_map_kwargs(len(jobs), n_workers)), 1):
-            cache[key] = result
-            if done % every == 0 or done == total:
-                _progress(done, total, t0)
+    for done, (key, result) in enumerate(
+            ex.map(navm_worker.run_job, jobs,
+                   **_map_kwargs(len(jobs), n_workers)), 1):
+        cache[key] = result
+        if done % every == 0 or done == total:
+            _progress(done, total, t0)
     return cache
 
 
-def pooled_prover(initargs, n_workers):
+def run_pooled(jobs, n_workers) -> dict:
+    """{key: result} for `jobs` on a pool of `n_workers`, as the import runs them."""
+    with _pool(n_workers) as ex:
+        return _run_jobs(jobs, ex, n_workers)
+
+
+def pooled_prover(n_workers):
     """A `rebuild` callable for cache_audit.prove_cache, backed by the pool.
 
     Yields `(key, meta)` in SUBMISSION order, so the first mismatch a caller
@@ -525,7 +921,7 @@ def pooled_prover(initargs, n_workers):
                 yield navm_worker.run_job(job)
             return
         workers = min(n_workers, len(jobs))
-        with _pool(initargs, workers) as ex:
+        with _pool(workers) as ex:
             yield from ex.map(navm_worker.run_job, jobs,
                               **_map_kwargs(len(jobs), workers))
     return _rebuild
@@ -558,16 +954,63 @@ def _adopt_master_navm_fids(jobs: list, master_index) -> int:
     return adopted
 
 
+def _seed_empty_cells(by_type, writer, masters, cache, seedable, run) -> None:
+    """Grow navmesh into the land cells with no pathgrid (their pathgrids join by_type['PGRD']) and into
+    the pathgrid cells' gaps; `seedable` is (seedable, regrow) for grow_into_empty.
+
+    `masters` is (master_index, master_navms): a cell its master navmeshed is left to it.
+    See: docs/commentary/tes5_import_navmesh.md#seeded-cells
+    """
+    master_index, master_navms = masters
+    seedable, regrow = seedable
+    for square in [s for s in seedable if s in (master_navms or {})]:
+        del seedable[square]
+    if not seedable and not regrow:
+        return
+    sources = exterior_views(cache)[0]
+    sources.update(master_views(master_index, master_navms, seedable))
+    built = grow_into_empty(cache, seedable, sources,
+                            lambda key: writer.derive_formid('NAVM', key), run, regrow)
+    by_type.setdefault('PGRD', []).extend(built)
+
+
+def playable_seedable(seedable, by_type, master_export) -> None:
+    """Drop the seedable cells outside the authored playable area."""
+    drop_unplayable(seedable, _merged(by_type, master_export, 'WRLD'), _merged(by_type, master_export, 'REGN'))
+    _MERGED.clear()
+
+
+def _generate(jobs, seedable, n_workers, seeding) -> dict:
+    """Build the pathgrid jobs, then the seeded cells, on one pool; return {key: result}.
+
+    `seeding` is (by_type, writer, masters) for _seed_empty_cells; `seedable` is (seedable, regrow).
+    """
+    print(f"  Generating {len(jobs)} navmeshes (PGRD->NAVM, {navmesh_generator()} "
+          f"generator) across {n_workers} threads...")
+    t0 = time.time()
+    with _pool(n_workers) if n_workers > 1 else nullcontext() as ex:
+        cache = _run_jobs(jobs, ex, n_workers)
+        hits = sum(1 for (_b, m) in cache.values() if m and m.get('geom_cached'))
+        print(f"    Navmesh generation: {len(jobs)} cells in "
+              f"{time.time() - t0:.2f}s ({n_workers} workers, "
+              f"{hits} geometry-cache hits)")
+        _seed_empty_cells(*seeding, cache, seedable,
+                          lambda more: _run_jobs(more, ex, n_workers))
+    return cache
+
+
 def precompute_navmeshes(by_type: dict, writer, base_model_by_fid: dict,
                          door_fids: set, collision_cache: str = '',
-                         master_index=None, master_export: dict = None) -> dict:
+                         master_index=None, master_export: dict = None,
+                         activator_fids: frozenset = frozenset(),
+                         master_navms: dict = None, stamp: bool = True) -> dict:
     """Run every PGRD->NAVM conversion in parallel; return {key: (bytes, meta)}.
 
-    FormIDs are pre-allocated serially in builder-visit order, so results are
-    byte-identical to the single-threaded path.  The worker context is
-    initialized HERE because `navm_verify.prepare` re-keys entries from it.
-    `collision_cache` is a path or a masters-first chain whose LAST entry is
-    this plugin's own and sites the derived geom/door caches.
+    Results are byte-identical to the single-threaded path.  The worker
+    context is initialized HERE because `navm_verify.prepare` re-keys entries
+    from it.  `collision_cache` is a path or a masters-first chain whose LAST
+    entry is this plugin's own.  `master_navms` is master_navm_grid's map.
+    `stamp` False (a partial build) leaves the cache tag unstamped.
 
     See: docs/commentary/tes5_import_navmesh.md#pool-orchestration
     """
@@ -575,7 +1018,9 @@ def precompute_navmeshes(by_type: dict, writer, base_model_by_fid: dict,
     if fallout is not None:
         return fallout
 
-    jobs = gather_navm_jobs(by_type, door_fids, master_export)
+    seedable, regrow = {}, {}
+    jobs = gather_navm_jobs(by_type, door_fids, master_export, seedable, regrow)
+    playable_seedable(seedable, by_type, master_export)
     if not jobs:
         return {}
 
@@ -587,33 +1032,23 @@ def precompute_navmeshes(by_type: dict, writer, base_model_by_fid: dict,
         print(f"    {adopted} navmeshes override a master's own "
               f"(of {len(jobs)})")
 
-    n_workers = navm_worker_count(len(jobs))
+    n_workers = navm_worker_count(len(jobs) + len(seedable))
     own_cache = (collision_cache if isinstance(collision_cache, str)
                  else (collision_cache[-1] if collision_cache else ''))
     geom_cache = navmesh_geom_cache(own_cache)
     door_centers = navm_verify.door_centers_cache_path(collision_cache)
-    initargs = (base_model_by_fid, door_fids, collision_cache, formid_offset,
-                geom_cache, get_injected_formids(), True, door_centers)
     navm_verify.init_context(base_model_by_fid, door_fids, collision_cache,
                              formid_offset, geom_cache,
-                             get_injected_formids(), door_centers)
+                             get_injected_formids(), door_centers, activator_fids)
     navm_verify.prepare(jobs, geom_cache,
-                        pooled_prover(initargs, n_workers))
+                        pooled_prover(n_workers))
 
-    print(f"  Generating {len(jobs)} navmeshes (PGRD->NAVM) "
-          f"across {n_workers} processes...")
-    t0 = time.time()
-    if len(jobs) == 1 or n_workers == 1:
-        cache = _run_inline(jobs)
-    else:
-        cache = _run_pooled(jobs, initargs, n_workers)
-
-    hits = sum(1 for (_b, m) in cache.values() if m and m.get('geom_cached'))
-    print(f"    Navmesh generation: {len(jobs)} cells in "
-          f"{time.time() - t0:.2f}s ({n_workers} workers, "
-          f"{hits} geometry-cache hits)")
+    cache = _generate(jobs, (seedable, regrow), n_workers,
+                      (by_type, writer, (master_index, master_navms)))
 
     navm_verify.report_verification(cache, geom_cache)
-    if not navm_verify.report_failures(cache):
+    if navm_verify.report_failures(cache):
+        navm_verify.uncertify(geom_cache)
+    elif stamp:
         stamp_navmesh_cache_tag(geom_cache)
     return cache

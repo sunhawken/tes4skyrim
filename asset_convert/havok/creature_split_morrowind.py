@@ -12,6 +12,8 @@ See: docs/commentary/tes4_export_morrowind.md#creatures
 """
 
 import os
+import re
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -32,9 +34,14 @@ from asset_convert.havok.hkx_skeleton import find_skeleton_root
 from asset_convert.havok.kf_decode import (CYCLE_CLAMP, CYCLE_LOOP, DEFAULT_FPS,
                                            BoneTrack, DecodedClip)
 from asset_convert.havok.kf_writer import write_skyrim_kf
+from asset_convert.nif.particles_morrowind import LEGACY_EMITTERS
+from asset_convert.nif.timeline_morrowind import (chain, clip_range, groups,
+                                                   interp, key_arrays,
+                                                   text_keys)
 from asset_convert.nif.sse_nif import read_nif
 from asset_convert.sources import base_plugins
 from asset_convert.sources.morrowind_assets import resolve_mesh
+from core.worker_budget import worker_count
 from tes5_import.base.text_reader import parse_export_file
 
 #: Morrowind animation group -> the Oblivion clip stem the claim tables read.
@@ -43,11 +50,36 @@ GROUP_STEMS = {
     'walkleft': 'left', 'walkright': 'right', 'runforward': 'runforward',
     'runback': 'fastbackward', 'turnleft': 'turnleft', 'turnright': 'turnright',
     'swimwalkforward': 'swimforward', 'swimrunforward': 'swimfastforward',
-    'swimwalkback': 'swimbackward', 'swimidle': 'swimidle',
+    'swimwalkback': 'swimbackward', 'swimidle': 'swimidle', 'idleswim': 'swimidle',
     'swimturnleft': 'swimturnleft', 'swimturnright': 'swimturnright',
     'hit1': 'recoil', 'knockdown': 'stagger', 'death1': 'death',
-    'spellcast': 'casttarget',
+    'spellcast': 'casttarget', 'idlehh': 'handtohandidle',
+    'idle1h': 'onehandidle', 'idle2c': 'twohandidle', 'idle2w': 'twohandidle',
 }
+
+#: Weapon group -> the clip-stem prefix of its equip, unequip and attack segments.
+_STANCE_PREFIXES = {'handtohand': 'handtohand', 'weapononehand': 'onehand',
+                    'weapontwohand': 'twohand', 'weapontwowide': 'twohand',
+                    'bowandarrow': 'bow'}
+
+#: Segment -> (start event or None for a one-frame hold, stop event, hit event) in a multi-action group.
+_SEGMENTS = {
+    'equip': ('equip start', 'equip stop', None),
+    'unequip': ('unequip start', 'unequip stop', None),
+    **{a: (f'{a} start', f'{a} large follow stop', f'{a} hit')
+       for a in ('chop', 'slash', 'thrust')},
+    'shoot': ('shoot start', 'shoot follow stop', 'shoot release'),
+    **{d: (f'{d} start', f'{d} stop', f'{d} release')
+       for d in ('self', 'target', 'touch')},
+    'blockidle': (None, 'block hit', None),
+    'blockhit': ('block hit', 'block stop', None),
+}
+
+#: The shared humanoid animation a bipedal creature plays under its own.
+BASE_ANIM = 'xbase_anim.kf'
+
+#: TES4 ACBS creature flag: animated from BASE_ANIM, as NPCs are.
+_BIPEDAL = 0x01
 
 #: `SoundGen:` cue -> the Oblivion footfall text key.
 _FOOTFALLS = {'left': 'Enum: Left', 'right': 'Enum: Right'}
@@ -68,26 +100,8 @@ _ANIMATED_PREFIX = 'x'
 _NONACCUM_SUFFIX = ' NonAccum'
 
 
-def _chain(first, link: str):
-    """Every block on a singly linked NIF chain starting at `first`."""
-    block = first
-    while block is not None:
-        yield block
-        block = getattr(block, link, None)
-
-
-def _text_keys(data) -> list:
-    """(time, text) for every text key in the file."""
-    out = []
-    for block in data.blocks:
-        if isinstance(block, NifFormat.NiTextKeyExtraData):
-            out.extend((float(k.time), k.value.decode('cp1252', 'replace'))
-                       for k in block.text_keys)
-    return out
-
-
 def _tracks(data, root_name: str) -> list:
-    """(node name, NiKeyframeData) per animated node, from a model or a .kf.
+    """(node name, `_key_arrays`) per animated node, from a model or a .kf.
 
     The root bone's track is named for its NonAccum child, where its
     transform now lives.
@@ -95,9 +109,9 @@ def _tracks(data, root_name: str) -> list:
     root = data.roots[0]
     if isinstance(root, NifFormat.NiSequenceStreamHelper):
         names = [e.string_data.decode('cp1252', 'replace')
-                 for e in _chain(root.extra_data, 'next_extra_data')
+                 for e in chain(root.extra_data, 'next_extra_data')
                  if isinstance(e, NifFormat.NiStringExtraData)]
-        controllers = [c for c in _chain(root.controller, 'next_controller')
+        controllers = [c for c in chain(root.controller, 'next_controller')
                        if isinstance(c, NifFormat.NiKeyframeController)]
         found = [(n, c.data) for n, c in zip(names, controllers) if c.data]
     else:
@@ -105,75 +119,85 @@ def _tracks(data, root_name: str) -> list:
         for node in root.tree():
             if not isinstance(node, NifFormat.NiNode):
                 continue
-            for c in _chain(node.controller, 'next_controller'):
+            for c in chain(node.controller, 'next_controller'):
                 if isinstance(c, NifFormat.NiKeyframeController) and c.data:
                     found.append((get_block_name(node), c.data))
-    return [(n + _NONACCUM_SUFFIX if n == root_name else n, kd)
+    return [(n + _NONACCUM_SUFFIX if n == root_name else n, key_arrays(kd))
             for n, kd in found]
 
 
-def _groups(keys: list) -> tuple:
-    """({group: {event: time}}, [(time, cue kind, cue value)]) from the text keys.
+def _segment_stem(group: str, segment: str) -> str:
+    """The clip stem one segment of a multi-action group becomes, or '' when none."""
+    if group == 'spellcast' and segment in ('self', 'target', 'touch'):
+        return 'cast' + segment
+    if group == 'shield' and segment.startswith('block'):
+        return segment
+    prefix = _STANCE_PREFIXES.get(group)
+    if prefix is None or segment.startswith('block'):
+        return ''
+    if segment in ('equip', 'unequip'):
+        return prefix + segment
+    return prefix + 'attack' + segment
 
-    A key may carry several lines; each is `Group: Event` or a cue
-    (`SoundGen: Left`, `Sound: SwishL`).
+
+def _segment_events(events: dict, start, stop: str, hit) -> dict:
+    """A segment's events renamed to the start/stop/hit a single-action group carries."""
+    end = events[stop]
+    out = {'start': end - 1.0 / DEFAULT_FPS if start is None else events[start],
+           'stop': end}
+    if hit in events:
+        out['hit'] = events[hit]
+    return out
+
+
+def _plan(groups: dict, known_only: bool) -> dict:
+    """{clip stem: (span, events)} for every clip the groups yield; the first group per stem wins.
+
+    A multi-action group (weapon stances, spellcast, shield) packs several
+    clips on one span; each segment becomes its own clip. `known_only` drops
+    groups no claim table reads.
     """
-    groups, cues = {}, []
-    for time, text in keys:
-        for line in text.replace(chr(13), chr(10)).split(chr(10)):
-            head, sep, tail = line.partition(':')
-            if not sep:
-                continue
-            head, tail = head.strip().lower(), tail.strip()
-            if head in ('soundgen', 'sound'):
-                cues.append((time, head, tail))
-            else:
-                groups.setdefault(head, {}).setdefault(tail.lower(), time)
-    return groups, cues
+    plan = {}
+    for group, events in groups.items():
+        stem = GROUP_STEMS.get(group) or (
+            '' if known_only else ''.join(ch for ch in group if ch.isalnum()))
+        found = [(stem, events)] if stem else []
+        for segment, (start, stop, hit) in _SEGMENTS.items():
+            seg_stem = _segment_stem(group, segment)
+            if seg_stem and stop in events and (start is None or start in events):
+                found.append((seg_stem, _segment_events(events, start, stop, hit)))
+        for clip_stem, clip_events in found:
+            span = clip_range(clip_events) or _held_idle_span(clip_stem, clip_events)
+            if span is not None:
+                plan.setdefault(clip_stem, (span, clip_events))
+    return plan
 
 
-def _clip_range(events: dict):
-    """(start, stop, loops) for one group, or None when it has no span.
+def _held_idle_span(stem: str, events: dict):
+    """A looping span for an `Idle` that holds one instant (start == stop), else None.
 
-    A group with a real loop segment ships only that segment, because Skyrim
-    loops whole clips; a one-shot ships Start..Stop.
+    TES3 accepts such a pose; `clip_range` stays strict because its other
+    callers need motion.
     """
-    start, stop = events.get('start'), events.get('stop')
-    if start is None or stop is None or stop <= start:
+    start = events.get('start')
+    if stem != 'idle' or start is None or start != events.get('stop'):
         return None
-    loop_start, loop_stop = events.get('loop start'), events.get('loop stop')
-    if loop_start is not None and loop_stop is not None and loop_stop > loop_start:
-        return loop_start, loop_stop, True
-    return start, stop, False
+    return (start, start, True)
 
 
-def _interp(times: np.ndarray, keys, values: np.ndarray) -> np.ndarray:
-    """Linear interpolation of `values` (one row per key) at `times`."""
-    key_times = np.array([float(k.time) for k in keys], dtype=np.float64)
-    return np.stack([np.interp(times, key_times, values[:, i])
-                     for i in range(values.shape[1])], axis=1)
-
-
-def _sample(kd, times: np.ndarray) -> BoneTrack:
-    """One node's keyframe data sampled at `times`; euler tracks are skipped."""
+def _sample(arrays: tuple, times: np.ndarray) -> BoneTrack:
+    """One node's `_key_arrays` sampled at `times`."""
+    rotation, translation, scale = arrays
     track = BoneTrack(bone='')
-    if kd.rotation_type != 4 and kd.num_rotation_keys:
-        quats = np.array([[k.value.w, k.value.x, k.value.y, k.value.z]
-                          for k in kd.quaternion_keys], dtype=np.float64)
-        for i in range(1, len(quats)):
-            if np.dot(quats[i], quats[i - 1]) < 0:
-                quats[i] = -quats[i]
-        rots = _interp(times, kd.quaternion_keys, quats)
+    if rotation is not None:
+        rots = interp(times, rotation)
         norm = np.linalg.norm(rots, axis=1, keepdims=True)
         norm[norm == 0] = 1.0
         track.rotations = rots / norm
-    if kd.translations.num_keys:
-        values = np.array([[k.value.x, k.value.y, k.value.z]
-                           for k in kd.translations.keys], dtype=np.float64)
-        track.translations = _interp(times, kd.translations.keys, values)
-    if kd.scales.num_keys:
-        values = np.array([[k.value] for k in kd.scales.keys], dtype=np.float64)
-        track.scales = _interp(times, kd.scales.keys, values)[:, 0]
+    if translation is not None:
+        track.translations = interp(times, translation)
+    if scale is not None:
+        track.scales = interp(times, scale)[:, 0]
     return track
 
 
@@ -198,16 +222,22 @@ def _clip(stem: str, span: tuple, tracks: list, events: dict, cues: list,
           fps: float) -> DecodedClip:
     """One group sampled into a DecodedClip the KF writer serialises."""
     start, stop, loops = span
-    duration = stop - start
+    held = stop == start
+    duration = 1.0 / fps if held else stop - start
     count = max(int(round(duration * fps)), 1) + 1
-    times = start + np.arange(count, dtype=np.float64) / fps
-    times[-1] = stop
+    sample_times = start + np.arange(count, dtype=np.float64) / fps
+    sample_times[-1] = stop
+    times = sample_times - start
+    if held:
+        times = np.array([0.0, duration], dtype=np.float64)
+        sample_times = np.full(count, start)
     clip = DecodedClip(name=stem, duration=duration,
                        cycle_type=CYCLE_LOOP if loops else CYCLE_CLAMP,
-                       frequency=1.0, times=times - start,
-                       text_keys=_clip_text_keys(events, cues, start, stop))
+                       frequency=1.0, times=times,
+                       text_keys=([(0.0, 'start'), (duration, 'end')] if held else
+                                  _clip_text_keys(events, cues, start, stop)))
     for node_name, kd in tracks:
-        track = _sample(kd, times)
+        track = _sample(kd, sample_times)
         track.bone = node_name
         if track.rotations is not None or track.translations is not None \
                 or track.scales is not None:
@@ -216,11 +246,18 @@ def _clip(stem: str, span: tuple, tracks: list, events: dict, cues: list,
 
 
 def _strip(data, keep_geometry: bool) -> None:
-    """Drop controllers and text keys from every node; optionally the geometry."""
+    """Drop controllers and text keys from every node; optionally the geometry.
+
+    A legacy particle emitter keeps its controller: that is the authored
+    emission, not an animation track, and the Morrowind pre-pass reads it to
+    build the NiParticleSystem once the file is at a version that can hold one.
+    See: docs/commentary/tes4_export_morrowind.md#creature-particle-emitters
+    """
     for block in data.roots[0].tree():
         if isinstance(block, NifFormat.NiObjectNET):
-            block.controller = None
-            extras = [e for e in _chain(block.extra_data, 'next_extra_data')
+            if type(block).__name__ not in LEGACY_EMITTERS:
+                block.controller = None
+            extras = [e for e in chain(block.extra_data, 'next_extra_data')
                       if not isinstance(e, NifFormat.NiTextKeyExtraData)]
             block.extra_data = extras[0] if extras else None
             for a, b in zip(extras, extras[1:] + [None]):
@@ -315,48 +352,115 @@ def _write_nif(path, data) -> None:
         data.write(fh)
 
 
-def split_creature(model_path, out_dir: str, fps: float = DEFAULT_FPS) -> list:
-    """Write skeleton.nif, the body NIF and one .kf per group; the stems written."""
-    model_path = Path(model_path)
-    stem = model_path.stem.lower()
-    animated = model_path.with_name(_ANIMATED_PREFIX + model_path.stem + '.kf')
-    animated_model = model_path.with_name(_ANIMATED_PREFIX + model_path.name)
-    if animated.is_file():
-        anim = read_nif(str(animated))
-        mesh_source = animated_model if animated_model.is_file() else model_path
-    else:
-        anim = read_nif(str(model_path))
-        mesh_source = model_path
-    groups, cues = _groups(_text_keys(anim))
+def _animation_kf(model_path: Path) -> Path:
+    """The `x<name>.kf` animation paired with a model."""
+    return model_path.with_name(_ANIMATED_PREFIX + model_path.stem + '.kf')
 
+
+def _anim_sources(model_path: Path) -> tuple:
+    """(animation file, mesh file): the `x` pair when its .kf exists, else the model itself."""
+    animated = _animation_kf(model_path)
+    if not animated.is_file():
+        return model_path, model_path
+    animated_model = model_path.with_name(_ANIMATED_PREFIX + model_path.name)
+    return animated, animated_model if animated_model.is_file() else model_path
+
+
+def write_skeleton(mesh_source, out_dir: str) -> tuple:
+    """Write a model's bones as `skeleton.nif` with a NonAccum root child; (path, root bone name)."""
     skeleton = read_nif(str(mesh_source))
     root_name = _insert_nonaccum(skeleton)
     _strip(skeleton, keep_geometry=False)
-    _write_nif(os.path.join(out_dir, SKELETON_NIF), skeleton)
+    path = os.path.join(out_dir, SKELETON_NIF)
+    _write_nif(path, skeleton)
+    return path, root_name
+
+
+def group_clips(kf_path, root_name: str, wanted, unless: str = '',
+                fps: float = DEFAULT_FPS) -> dict:
+    """{group: DecodedClip} for each of `wanted` the animation defines; {} when it defines `unless`.
+
+    Every clip is the group's whole Start..Stop span and loops, which is how
+    the TES3 engine replays an idle group back to back; a group whose Stop
+    is its Start is a held pose and ships as one frame's worth.
+    See: docs/commentary/asset_convert_animation.md#morrowind-npc-animation-files
+    """
+    anim = read_nif(str(kf_path))
+    found, cues = groups(text_keys(anim))
+    tracks = _tracks(anim, root_name)
+    out = {}
+    if unless in found:
+        return out
+    for group in wanted:
+        events = found.get(group, {})
+        start, stop = events.get('start'), events.get('stop')
+        if tracks and start is not None and stop is not None and stop >= start:
+            span = (start, max(stop, start + 1.0 / fps), True)
+            out[group] = _clip(group, span, tracks, events, cues, fps)
+    return out
+
+
+def split_creature(model_path, out_dir: str, body_name: str, base_anim=None,
+                   fps: float = DEFAULT_FPS) -> list:
+    """Write skeleton.nif, the body NIF and one .kf per clip; the stems written.
+
+    A bipedal creature passes `base_anim`: its known clips play first and the
+    creature's own groups override them, as the TES3 engine layers them.
+    See: docs/commentary/tes4_export_morrowind.md#bipedal-creatures
+    """
+    anim_path, mesh_source = _anim_sources(Path(model_path))
+    root_name = write_skeleton(mesh_source, out_dir)[1]
     body = read_nif(str(mesh_source))
     _insert_nonaccum(body)
     _strip(body, keep_geometry=True)
     _skin_rigid_parts(body)
-    tracks = _tracks(anim, root_name)
-    _write_nif(os.path.join(out_dir, stem + '.nif'), body)
+    _write_nif(os.path.join(out_dir, body_name), body)
 
-    written = []
-    for group, events in groups.items():
-        span = _clip_range(events)
-        if span is None or not tracks:
-            continue
-        clip_stem = GROUP_STEMS.get(group, ''.join(
-            ch for ch in group if ch.isalnum()))
-        if not clip_stem or clip_stem in written:
-            continue
-        clip = _clip(clip_stem, span, tracks, events, cues, fps)
-        write_skyrim_kf(clip, os.path.join(out_dir, clip_stem + '.kf'))
-        written.append(clip_stem)
-    return written
+    layers = [(base_anim, True)] if base_anim else []
+    clips = {}
+    for path, known_only in layers + [(anim_path, False)]:
+        anim = read_nif(str(path))
+        found, cues = groups(text_keys(anim))
+        tracks = _tracks(anim, root_name)
+        if tracks:
+            clips.update({stem: (span, events, tracks, cues) for stem, (span, events)
+                          in _plan(found, known_only).items()})
+    _supply_base_idle(clips, fps)
+    for stem, (span, events, tracks, cues) in clips.items():
+        clip = _clip(stem, span, tracks, events, cues, fps)
+        write_skyrim_kf(clip, os.path.join(out_dir, stem + '.kf'))
+    return list(clips)
+
+
+def _supply_base_idle(clips: dict, fps: float) -> None:
+    """Keep a numbered idle's authored loop, or hold the rig's reference pose.
+
+    Numbered one-shots remain separate source clips, never a perpetual gesture.
+    Empty tracks deliberately let hkx_anim fill every bone from the skeleton's
+    reference pose. A creature with no idle group at all still reports an error.
+    """
+    if 'idle' in clips or 'swimidle' in clips:
+        return
+    numbered = sorted((s for s in clips if re.fullmatch(r'idle[1-9][0-9]*', s)),
+                      key=lambda s: int(s[4:]))
+    if not numbered:
+        return
+    looping = next((s for s in numbered if clips[s][0][2]), None)
+    clips['idle'] = (clips[looping] if looping else
+                     ((0.0, 1.0 / fps, True), {}, [], []))
+
+
+def slashed(path: str) -> str:
+    """An exported path with its escaped backslashes folded to forward slashes."""
+    return path.replace(chr(92) * 2, chr(92)).replace(chr(92), '/')
 
 
 def _sources(rec_dir) -> dict:
-    """{source model: folder relative to the meshes root} for every Morrowind CREA."""
+    """{source model: (folder, body NIF, bipedal)} for every Morrowind CREA.
+
+    The folder is relative to the meshes root; a model is bipedal when any
+    record using it is.
+    """
     crea_path = os.path.join(str(rec_dir), 'CREA.txt')
     if not os.path.exists(crea_path):
         return {}
@@ -365,54 +469,84 @@ def _sources(rec_dir) -> dict:
         source = (rec.get(SOURCE_KEY) or '').strip()
         model = (rec.get('Model.MODL') or '').strip()
         if source and model:
-            out[source] = os.path.dirname(
-                model.replace(chr(92) * 2, chr(92)).replace(chr(92), '/'))
+            biped = bool(int(rec.get('ACBS.Flags') or 0) & _BIPEDAL)
+            known = out.get(source, (None, None, False))
+            out[source] = (os.path.dirname(slashed(model)),
+                           rec.get('NIFZ[0]', '').strip(), biped or known[2])
     return out
 
 
-def _up_to_date(model_path: Path, out_dir: str) -> bool:
-    """Whether the folder's skeleton postdates the source model, its animation and this splitter."""
+def source_dirs(rec_dir) -> set:
+    """Lowercase backslashed meshes-relative folders holding a source model."""
+    return {os.path.dirname(slashed(s)).lower().replace('/', chr(92))
+            for s in _sources(rec_dir)}
+
+
+def _up_to_date(model_path: Path, out_dir: str, base_anim) -> bool:
+    """Whether the folder's skeleton postdates the source model, its animations and the code that writes the folder."""
     skeleton = os.path.join(out_dir, SKELETON_NIF)
     if not os.path.isfile(skeleton):
         return False
     stamp = os.path.getmtime(skeleton)
     inputs = [model_path, Path(__file__),
-              model_path.with_name(_ANIMATED_PREFIX + model_path.stem + '.kf')]
+              Path(find_skeleton_root.__code__.co_filename),
+              Path(write_skyrim_kf.__code__.co_filename),
+              _animation_kf(model_path)] + ([Path(base_anim)] if base_anim else [])
     return all(p.stat().st_mtime <= stamp for p in inputs if p.is_file())
 
 
-def split_creatures(rec_dir, meshes_root, log=print) -> int:
+def _split_pool(todo: list, workers: int, log) -> int:
+    """Split every (source, folder, model path, out dir, body, base anim) in a process pool; how many failed."""
+    failed = 0
+    with ProcessPoolExecutor(max_workers=min(workers, len(todo))) as pool:
+        futs = {pool.submit(split_creature, path, out_dir, body, base): (source, folder)
+                for source, folder, path, out_dir, body, base in todo}
+        for fut in as_completed(futs):
+            source, folder = futs[fut]
+            try:
+                log(f'  {folder}: {len(fut.result())} clips')
+            except (OSError, ValueError, AttributeError) as exc:
+                failed += 1
+                log(f'  [skip] {source}: {type(exc).__name__}: {exc}')
+    return failed
+
+
+def split_creatures(rec_dir, meshes_root, log=print, workers: int = None,
+                    names: list = None) -> int:
     """Split every Morrowind creature the export names; how many folders were written.
 
     Runs at the head of the creature stage so the folders exist when it scans.
     Source meshes resolve through this plugin's mesh tree, its masters', then
     the vanilla Morrowind install; a folder already newer than its inputs is
-    kept.
+    kept. An explicit `names` selection rebuilds those sources even if an old
+    running converter wrote a newer skeleton after the code was updated.
     """
     sources = _sources(rec_dir)
+    if names is not None:
+        wanted = {n.lower() for n in names}
+        sources = {src: row for src, row in sources.items()
+                   if os.path.basename(row[0]).lower() in wanted}
     if not sources:
         return 0
     roots = [Path(meshes_root)] + [Path(d) / 'meshes'
                                    for d in base_plugins.export_dirs(rec_dir)]
-    done, failed, kept = 0, 0, 0
-    for source, folder in sorted(sources.items()):
+    base = None
+    if any(biped for _f, _b, biped in sources.values()):
+        base = resolve_mesh(roots, BASE_ANIM, paths.EXPORT)
+    todo, failed, kept = [], 0, 0
+    for source, (folder, body, biped) in sorted(sources.items()):
         path = resolve_mesh(roots, source, paths.EXPORT)
         out_dir = os.path.join(str(meshes_root), folder)
+        layered = base if biped else None
         if path is None:
             failed += 1
             log(f'  [skip] {source}: not found')
-            continue
-        if _up_to_date(path, out_dir):
+        elif names is None and _up_to_date(path, out_dir, layered):
             kept += 1
-            continue
-        try:
-            clips = split_creature(path, out_dir)
-        except (OSError, ValueError, AttributeError) as exc:
-            failed += 1
-            log(f'  [skip] {source}: {type(exc).__name__}: {exc}')
-            continue
-        done += 1
-        log(f'  {folder}: {len(clips)} clips')
+        else:
+            todo.append((source, folder, path, out_dir, body, layered))
+    unsplit = _split_pool(todo, workers or worker_count(), log) if todo else 0
+    done, failed = len(todo) - unsplit, failed + unsplit
     log(f'  Morrowind creatures: {done} split, {kept} up to date'
         + (f', {failed} failed' if failed else ''))
     return done

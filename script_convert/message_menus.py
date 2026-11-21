@@ -45,6 +45,8 @@ See: docs/commentary/script_convert.md#fnv-showmessage-menus
 
 import re
 
+from tes4_export.record_types.common import escape_value
+
 # ---------------------------------------------------------------------------
 # Button MessageBox sites (TES4) and authored button MESGs (FO3/FNV)
 # ---------------------------------------------------------------------------
@@ -58,6 +60,11 @@ _QUOTED = re.compile(r'"([^"]*)"')
 # line, and a leading `;` comment never matches). Oblivion tolerates a comma
 # straight after the command name.
 _MSGBOX_LINE = re.compile(r'(?im)^[ \t]*messagebox\b(,?[^\n]*)')
+_MSGBOXEX_LINE = re.compile(r'(?im)^[ \t]*messageboxex\b(,?[^\n]*)')
+#: `set <var> to sv_Construct "<literal>"`: a string_var given a fixed text.
+_SV_SET = re.compile(r'(?im)^[ \t]*set[ \t]+([A-Za-z0-9_]+)[ \t]+to[ \t]+sv_construct[ \t,]+"([^"]*)"')
+#: An OBSE format specifier: flags, width, precision, then the letter (or `%%`).
+_SPEC = re.compile(r'%[-+ #0]*\d*(?:\.\d+)?([a-zA-Z%])')
 _SHOWMESSAGE_LINE = re.compile(r'(?im)^[ \t]*showmessage\b[ \t,]+([A-Za-z0-9_]+)')
 
 
@@ -76,6 +83,50 @@ def parse_button_box(args_str):
     if len(quoted) < 2:
         return None
     return quoted[0], quoted[1:1 + MAX_BUTTONS]
+
+
+def _string_literals(source: str, line: int) -> dict:
+    """{var_lower: literal, None if formatted} from the sv_Constructs above `line`."""
+    above = ''.join((source or '').splitlines(keepends=True)[:max(line - 1, 0)])
+    return {m.group(1).lower(): None if '%' in m.group(2) else m.group(2)
+            for m in _SV_SET.finditer(above)}
+
+
+def _fill_strings(fmt: str, names: list, literals: dict):
+    """`fmt` with each `%z` replaced by its variable's literal and `%r` by a newline, or None."""
+    names, out, at = iter(names), [], 0
+    for m in _SPEC.finditer(fmt):
+        out.append(fmt[at:m.start()])
+        kind, at = m.group(1), m.end()
+        if kind == 'z':
+            literal = literals.get(next(names, '').lower())
+            if literal is None:
+                return None
+            out.append(literal)
+        else:
+            out.append({'r': '\n', '%': '%'}.get(kind, m.group(0)))
+            if kind not in 'r%':
+                next(names, None)
+    return ''.join(out) + fmt[at:]
+
+
+def resolve_pipe_box(args_str: str, source: str = '', line: int = 0):
+    """(text, [buttons]) from OBSE MessageBoxEX's `"text|button|..."`, or None.
+
+    A `%z` takes the literal its string variable was last `sv_Construct`ed to
+    above `line` in `source`; a box still dynamic after that (a string from
+    anything else, a number in a button) is None, since a MESG's text is fixed.
+    See: docs/commentary/script_convert.md#messageboxex-buttons
+    """
+    quoted = _QUOTED.findall(args_str or '')
+    if not quoted:
+        return None
+    names = re.findall(r'[A-Za-z_][A-Za-z0-9_.]*', (args_str or '').split('"', 2)[-1])
+    filled = _fill_strings(quoted[0], names, _string_literals(source, line))
+    parts = filled.split('|') if filled is not None else []
+    if len(parts) < 2 or any('%' in b for b in parts[1:]):
+        return None
+    return parts[0], parts[1:1 + MAX_BUTTONS]
 
 
 def mesg_edid(script_edid: str, index: int) -> str:
@@ -100,11 +151,13 @@ def sites_for_source(script_edid: str, source: str, authored: dict = None) -> li
     """Ordered [(mesg_edid, text, buttons)] for one script source (real
     newlines, i.e. the SCTX value parse_export_file produces); `authored` is
     `button_messages`, whose MESGs the source shows enter with text None."""
+    source = source or ''
+    boxes = [parse_button_box(m.group(1)) for m in _MSGBOX_LINE.finditer(source)]
+    boxes += [resolve_pipe_box(m.group(1), source, source.count('\n', 0, m.start()) + 1)
+              for m in _MSGBOXEX_LINE.finditer(source)]
     sites = []
-    for m in _MSGBOX_LINE.finditer(source or ''):
-        parsed = parse_button_box(m.group(1))
-        if parsed:
-            sites.append((mesg_edid(script_edid, len(sites) + 1),) + parsed)
+    for parsed in filter(None, boxes):
+        sites.append((mesg_edid(script_edid, len(sites) + 1),) + parsed)
     for m in _SHOWMESSAGE_LINE.finditer(source or ''):
         hit = (authored or {}).get(m.group(1).lower())
         if hit and all(s[0] != hit[0] for s in sites):
@@ -188,77 +241,154 @@ def _paged(edid_fmt: str, title: str, labels: list) -> list:
     return pages
 
 
-def build_chargen_menus(bsgn_records: list, clas_records: list,
-                        spel_edid_by_fid24: dict) -> dict:
-    """Shared birthsign/class menu plan.
+#: The file-name prefixes each game's birthsign pictures carry, and Morrowind's two shortened names.
+_SIGN_PREFIXES = ('tx_birth_', 'birthsign_the ', 'birthsign_', 'small_the_')
+_SIGN_ALIASES = {'apprent': 'apprentice', 'atron': 'atronach'}
 
-    The importer authors one MESG per page; the converter emits the Show()
-    chain plus, for birthsigns, the chosen sign's AddSpell calls (TES4
-    ShowBirthsignMenu granted the sign's spells — BSGN lists them, and the
-    spells themselves are converted SPEL records referenced here by
-    EditorID).  Classes have no expressible effect in Skyrim (skills and
-    attributes are gone), so the class menu is choice-and-pacing only.
 
-    Both sides MUST derive identical page EDIDs and button order, so
-    everything is sorted by display name.
-    """
-    plan = {}
-    signs = []
+def birthsign_key(path: str) -> str:
+    """The sign a birthsign picture shows, from its file name: Morrowind's
+    `tx_birth_apprent` and Oblivion's `birthsign_the apprentice` are both
+    `apprentice`. The movie names its pictures by it and the sidecar its rows."""
+    stem = re.split(r'[\\/]', path or '')[-1].rsplit('.', 1)[0].lower()
+    for prefix in _SIGN_PREFIXES:
+        if stem.startswith(prefix):
+            stem = stem[len(prefix):]
+            break
+    stem = _SIGN_ALIASES.get(stem, stem)
+    return re.sub(r'[^a-z0-9]+', '_', stem).strip('_')
+
+
+def _int(rec: dict, key: str, default: int = 0) -> int:
+    """An export field as an int, `default` when absent or not a number."""
+    try:
+        return int(rec.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _fid24(rec: dict) -> int:
+    """A record's FormID without its index byte."""
+    try:
+        return int(rec.get('FormID', '0'), 16) & 0xFFFFFF
+    except ValueError:
+        return 0
+
+
+def _spell_id(rec: dict, i: int, fid: int) -> str:
+    """How the runtime grants a BSGN's `i`th spell: its TES3 id, else
+    `Owner.esm@FormID` read off the sign's own masters ('' when unknown)."""
+    tes3 = rec.get(f'SpellId[{i}]', '')
+    if tes3:
+        return tes3
+    masters, slot = rec.get('_masters') or [], fid >> 24
+    owner = masters[slot] if slot < len(masters) else rec.get('_plugin', '')
+    return f'{owner}@{fid & 0xFFFFFF:08X}' if owner else ''
+
+
+def _sign_spells(rec: dict, spells: dict) -> tuple:
+    """(EditorIDs, display names, runtime ids) of a BSGN's spells that convert."""
+    edids, names, ids = [], [], []
+    for i in range(_int(rec, 'SpellCount', 99)):
+        fid = rec.get(f'Spell[{i}]')
+        if fid is None:
+            break
+        spell = spells.get(int(fid or '0', 16) & 0xFFFFFF)
+        if spell:
+            edids.append(spell.get('EditorID'))
+            names.append(spell.get('FULL') or spell.get('EditorID'))
+            ids.append(_spell_id(rec, i, int(fid or '0', 16)))
+    return edids, names, ids
+
+
+def _birthsign_plan(bsgn_records: list, spells: dict) -> dict:
+    """The birthsign menu: signs by display name, each granting its spells; two
+    records sharing a name share the slot, the later one's data winning (the
+    Morroblivion patch's Morrowind signs over Oblivion's)."""
+    signs, fids = {}, []
     for rec in bsgn_records:
         full = rec.get('FULL') or rec.get('EditorID') or ''
-        if not full:
-            continue
-        spells = []
-        i = 0
-        while True:
-            fid = rec.get(f'Spell[{i}]')
-            if fid is None:
-                break
-            edid = spel_edid_by_fid24.get(int(fid, 16) & 0xFFFFFF)
-            if edid:
-                spells.append(edid)
-            i += 1
-        try:
-            fid24 = int(rec.get('FormID', '0'), 16) & 0xFFFFFF
-        except ValueError:
-            fid24 = 0
-        signs.append((full, spells, fid24))
-    signs.sort(key=lambda s: s[0].lower())
-    if signs:
-        plan['birthsign'] = {
-            'pages': _paged(CHARGEN_BIRTHSIGN_EDID,
-                            'Under which sign were you born?',
-                            [s[0] for s in signs]),
-            'actions': [s[1] for s in signs],
-            # BSGN fid24 -> menu index, for GetIsPlayerBirthsign conditions.
-            'fid_to_index': {s[2]: i for i, s in enumerate(signs) if s[2]},
+        if full:
+            edids, names, ids = _sign_spells(rec, spells)
+            signs[full.lower()] = (edids, {
+                'name': full, 'desc': rec.get('DESC', ''), 'image': birthsign_key(rec.get('ICON')),
+                'spells': names, 'ids': ids})
+            fids.append((full.lower(), _fid24(rec)))
+    names = sorted(signs)
+    index_of = {n: i for i, n in enumerate(names)}
+    return {'pages': _paged(CHARGEN_BIRTHSIGN_EDID, 'Under which sign were you born?',
+                            [signs[n][1]['name'] for n in names]),
+            'actions': [signs[n][0] for n in names],
+            'fid_to_index': {fid: index_of[n] for n, fid in fids if fid},
             'choice_global': CHARGEN_BIRTHSIGN_GLOBAL,
-        }
+            'rows': [signs[n][1] for n in names]} if signs else {}
 
-    classes = []
+
+def _class_plan(clas_records: list) -> dict:
+    """The class menu: playable classes by display name; two records sharing a
+    name share the slot, the later one's data winning. `edid_to_index` is each
+    record's slot by lowercase EditorID."""
+    rows, fids = {}, []
     for rec in clas_records:
-        # TES4 CLAS DATA.Flags bit 0 = Playable; only those ever appear in
-        # ShowClassMenu.
-        try:
-            playable = int(rec.get('DATA.Flags', '0')) & 0x1
-        except ValueError:
-            playable = 0
         full = rec.get('FULL') or ''
-        if playable and full:
-            try:
-                fid24 = int(rec.get('FormID', '0'), 16) & 0xFFFFFF
-            except ValueError:
-                fid24 = 0
-            classes.append((full, fid24))
-    names = sorted({c[0] for c in classes}, key=str.lower)
-    if classes:
-        index_of = {n.lower(): i for i, n in enumerate(names)}
-        plan['class'] = {
-            'pages': _paged(CHARGEN_CLASS_EDID, 'Choose your class.', names),
+        if not (_int(rec, 'DATA.Flags') & 0x1 and full):
+            continue
+        rows[full.lower()] = {
+            'name': full, 'desc': rec.get('DESC', ''),
+            'spec': _int(rec, 'DATA.Specialization'),
+            'attributes': (_int(rec, 'DATA.PrimaryAttribute1', -1),
+                           _int(rec, 'DATA.PrimaryAttribute2', -1))}
+        fids.append((full.lower(), _fid24(rec), (rec.get('EditorID') or '').lower()))
+    names = sorted(rows, key=lambda n: rows[n]['name'].lower())
+    index_of = {n: i for i, n in enumerate(names)}
+    return {'pages': _paged(CHARGEN_CLASS_EDID, 'Choose your class.',
+                            [rows[n]['name'] for n in names]),
             'actions': [[] for _ in names],
-            # Two CLAS records sharing a display name share the menu slot.
-            'fid_to_index': {fid: index_of[full.lower()]
-                             for full, fid in classes if fid},
+            'fid_to_index': {fid: index_of[n] for n, fid, _e in fids if fid},
+            'edid_to_index': {edid: index_of[n] for n, _f, edid in fids if edid},
             'choice_global': CHARGEN_CLASS_GLOBAL,
-        }
-    return plan
+            'rows': [rows[n] for n in names]} if rows else {}
+
+
+def build_chargen_menus(bsgn_records: list, clas_records: list, spel_records: list) -> dict:
+    """Shared birthsign/class menu plan.
+
+    The importer authors one MESG per page and stages each menu's `rows` for
+    MorrowindRuntime's own menus; the converter asks the runtime for the menu
+    and falls back to the Show() chain, granting a chosen sign's spells (BSGN
+    lists them; the spells are converted SPEL records named by EditorID).
+    Both sides MUST derive identical page EDIDs and order, so everything is
+    sorted by display name.
+    See: docs/commentary/morrowind_runtime.md#chargen-menus
+    """
+    spells = {_fid24(r): r for r in spel_records if r.get('EditorID')}
+    plan = {'birthsign': _birthsign_plan(bsgn_records, spells),
+            'class': _class_plan(clas_records)}
+    return {key: menu for key, menu in plan.items() if menu}
+
+
+# ---------------------------------------------------------------------------
+# The runtime's chargen table rows
+# ---------------------------------------------------------------------------
+
+def table_field(text) -> str:
+    """One `|`-separated field: export-escaped, with no separator of its own."""
+    return escape_value(str(text or '')).replace('|', '/').replace(';', ',')
+
+
+def class_line(i: int, row: dict) -> str:
+    """`class.<i>=name|spec|a1,a2|desc`."""
+    first, second = row['attributes']
+    return (f"class.{i}={table_field(row['name'])}|{row['spec']}|{first},{second}|"
+            f"{table_field(row['desc'])}")
+
+
+def sign_line(i: int, row: dict) -> str:
+    """`sign.<i>=name|picture|desc|spell;spell|id;id|line;line`, each display line
+    (`row['display']`: kind, icon key, text) as `kind~key~text`."""
+    spells = ';'.join(table_field(name) for name in row['spells'])
+    ids = ';'.join(table_field(spell) for spell in row['ids'])
+    lines = ';'.join(f'{kind}~{key}~{table_field(text)}'
+                     for kind, key, text in row.get('display', ()))
+    return (f"sign.{i}={table_field(row['name'])}|{row['image']}|{table_field(row['desc'])}|"
+            f"{spells}|{ids}|{lines}")

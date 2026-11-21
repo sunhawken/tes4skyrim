@@ -8,13 +8,14 @@ the same level, so finding the four files that actually ship meant knowing which
 of a dozen entries were products and which were scaffolding.
 
 Everything installable is collected here instead: every mod zip
-(`<plugin>.zip`, `TESGameSelect.zip`, `AutoConvertLOD.zip`) and the standalone
-`Slot44 Patch.esp`, which ships as a loose plugin rather than an archive.
+(`<plugin>.zip`, `TESGameSelect.zip`, `AutoConvertLOD.zip`, and
+`Body Slots Patch.zip`, the Skyrim load-order patch with its split skin meshes).
 
-Deliberately its own tiny module: four independent producers write here —
-convert.py's zip and body-patch phases, tools/release/package_start_mod.py and
-tools/release/pack_lod.py — and the tools must not import the whole pipeline to learn
-one folder name.
+Deliberately its own tiny module: independent producers write here —
+convert.py's zip and body-patch phases, the tools/release packagers,
+tools/misc/convert_ui.py and the GUI's journal patch — all through
+`write_mod_zip`, and they must not import the whole pipeline to learn one
+folder name.
 
 The name has a SPACE in it and is user-facing, so it is spelled exactly once,
 here. Note for scanners: nothing in here is a converted plugin. `output/` is
@@ -26,9 +27,14 @@ and a loose .esp but no manifest, so it still satisfies neither test and is
 never mistaken for a converted plugin.
 """
 
+import os
+import zipfile
 from pathlib import Path
 
 FINISHED_DIR_NAME = "Finished Mods"
+
+#: The Skyrim body-slot patch: its plugin, and the zip shipping it with the split skin meshes.
+BODY_SLOTS_PATCH = "Body Slots Patch"
 
 # Marks the export ROOT. Used to tell `export/<mod>/<plugin>/`
 # (records nested inside a mod) from a plain `export/<plugin>/`.
@@ -44,6 +50,44 @@ def finished_dir(out_root) -> Path:
     d = Path(out_root) / FINISHED_DIR_NAME
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+# ---------------------------------------------------------------------------
+#  Writing a mod zip
+# ---------------------------------------------------------------------------
+
+def tree_members(root) -> list:
+    """[(archive name, file)] for every file under `root`, relative to it."""
+    root = Path(root)
+    return [(str(p.relative_to(root)), p)
+            for p in sorted(root.rglob("*")) if p.is_file()]
+
+
+def write_mod_zip(zip_path, members, on_file=None) -> int:
+    """Zip `members` -- (archive name, file path or bytes) -- to `zip_path`.
+
+    Written under a temporary name and swapped in, so an interrupted run never
+    leaves a truncated archive where the GUI looks for a finished one.
+    `on_file(count, archive name)` runs after each member. Returns the count.
+    """
+    zip_path = Path(zip_path)
+    tmp = zip_path.with_name(zip_path.name + ".part")
+    count = 0
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            for arcname, source in members:
+                if isinstance(source, bytes):
+                    zf.writestr(arcname, source)
+                else:
+                    zf.write(source, arcname=arcname)
+                count += 1
+                if on_file is not None:
+                    on_file(count, arcname)
+        tmp.replace(zip_path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return count
 
 
 # --- Shared-folder resolution ----------------------------------------------
@@ -121,6 +165,27 @@ DEFAULT_EXPORT = REPO_ROOT / "export"
 DEFAULT_OUTPUT = REPO_ROOT / "output"
 
 
+def configured_output(saved) -> Path:
+    """The output root a saved `outputDir` names; a relative one is in this install.
+
+    See: docs/reference/pipeline.md#the-config-file-is-per-install
+    """
+    return REPO_ROOT / saved if saved else DEFAULT_OUTPUT
+
+
+def output_setting(out_root) -> str:
+    """`out_root` as the config saves it: relative when inside this install, else in full.
+
+    A relative path follows the install when the config is copied into a new one.
+    See: docs/reference/pipeline.md#the-config-file-is-per-install
+    """
+    path = configured_output(out_root)
+    try:
+        return str(path.resolve().relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
 class PluginPaths:
     """Every path belonging to one plugin. Read attributes, never build paths.
 
@@ -180,6 +245,36 @@ def paths(plugin: str, export_root=None, out_root=None) -> PluginPaths:
     return PluginPaths(plugin, export_root, out_root)
 
 
+def record_dirs_for_assets(asset_dir) -> list:
+    """The RECORD folders whose plugins keep their assets in `asset_dir`.
+
+    The inverse of `asset_root`: a registered mod folder answers the record dir
+    of each plugin whose `asset_root` it is and that was exported, in name
+    order; any other folder (a flat plugin, a record dir) answers itself. The
+    folder above a nested mod's `meshes/` holds no `STAT.txt` of its own.
+    See: docs/commentary/asset_convert_nif.md#flame-stats-from-the-masters
+    """
+    d = Path(os.path.normpath(str(asset_dir)))
+    reg = _registry()
+    out = []
+    if reg is not None and (d.parent / REGISTRY_FILENAME).is_file():
+        for name in reg.plugins(d.parent):
+            if not _same_dir(reg.asset_root(d.parent, name), d):
+                continue
+            rec = Path(reg.record_dir(d.parent, name))
+            if rec.is_dir():
+                out.append(rec)
+    return out or [d]
+
+
+def _same_dir(a, b) -> bool:
+    """True when `a` and `b` name one folder (normalised, platform case rule)."""
+    def norm(p):
+        """`p` absolute, normalised and case-folded as the platform folds it."""
+        return os.path.normcase(os.path.abspath(str(p)))
+    return norm(a) == norm(b)
+
+
 def asset_cache_chain(export_subdir, filename: str) -> tuple:
     """Every copy of asset cache `filename` this plugin needs, MASTERS FIRST.
 
@@ -189,15 +284,13 @@ def asset_cache_chain(export_subdir, filename: str) -> tuple:
     own last lets an override win a shared key.  A masterless plugin yields
     a one-element chain.
 
+    The import is local: `core.plugin_masters` imports this module.
     See: docs/commentary/tes5_import_navmesh.md#master-owned-cells
     """
-    from tes5_import.overrides.nested import (export_master_names,
-                                              export_root,
-                                              master_export_dir)
-    root = export_root(str(export_subdir))
+    from core.plugin_masters import master_dir, masters_from_export_header
     chain = []
-    for name in export_master_names(str(export_subdir)):
-        path = str(assets_for(master_export_dir(root, name)) / filename)
+    for name in masters_from_export_header(str(export_subdir)):
+        path = str(assets_for(master_dir(export_subdir, name)) / filename)
         if path not in chain:
             chain.append(path)
     own = str(assets_for(export_subdir) / filename)

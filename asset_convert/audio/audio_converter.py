@@ -43,7 +43,7 @@ from core.worker_budget import worker_count
 
 from output_layout import (asset_root as _asset_root, plugin_out_root,
                            record_dir)
-from asset_convert.game_paths import namespace_for
+from asset_convert.game_paths import find_nocase, namespace_for
 from asset_convert import paths
 
 #: Assumed when a caller omits extract_dir; the source registry lives here.
@@ -722,12 +722,13 @@ def _find_voice_tools(convert_audio, voice_root, ffmpeg_path,
     """
     if not convert_audio:
         return None, None, None
-    ffmpeg = find_ffmpeg(ffmpeg_path, need_decoder=_voice_decoder(voice_root))
+    decoder = _voice_decoder(voice_root)
+    ffmpeg = find_ffmpeg(ffmpeg_path, need_decoder=decoder)
     if not ffmpeg:
         raise RuntimeError(
-            'ffmpeg not found but convert_audio=True.  '
-            'Install ffmpeg and make sure it is on PATH, or pass '
-            'ffmpeg_path= explicitly.')
+            f'no ffmpeg with the {decoder or "mp3"} decoder: '
+            'external/ffmpeg/ffmpeg.exe is missing or stale -- rebuild it '
+            'with python tools/generators/build_ffmpeg.py')
     xwmaencode = xwmaencode_path or find_xwmaencode()
     if xwmaencode:
         print('  ffmpeg + xWMAEncode found -- converting MP3 -> WAV -> XWM '
@@ -823,6 +824,31 @@ def _run_conversion_jobs(conversion_jobs, stats, tools, copy):
             shutil.rmtree(lip_pool_dir, ignore_errors=True)
 
 
+def _voice_root(source_dir: Path) -> Path:
+    """`source_dir`'s `sound/voice` folder, in whatever case the tree spells it.
+
+    See: docs/commentary/asset_convert_texture.md#case-blind-lookups
+    """
+    return (find_nocase(source_dir, 'sound', 'voice', kind=os.path.isdir)
+            or source_dir / 'sound' / 'voice')
+
+
+def _own_voice_dirs(voice_root: Path, plugin_name) -> list:
+    """The `sound/Voice/<plugin>` folders `plugin_name`'s lines are in: its own
+    (any case), as the game looks them up; every folder when no plugin is named.
+
+    See: docs/commentary/asset_convert_audio.md#own-voice-folder
+    """
+    dirs = [d for d in voice_root.iterdir() if d.is_dir()]
+    if not plugin_name:
+        return dirs
+    own = [d for d in dirs if d.name.casefold() == plugin_name.casefold()]
+    if len(own) < len(dirs):
+        print(f'  Voice folders of other plugins left out: '
+              f'{", ".join(sorted(d.name for d in dirs if d not in own))}')
+    return own
+
+
 def organize_voice_files(
     source_dir,
     dest_dir,
@@ -870,10 +896,7 @@ def organize_voice_files(
     if isinstance(lip_text, (str, Path)):
         lip_text = load_lip_text(lip_text)
 
-    # BSA archives store every internal path lowercase (Windows' case-
-    # insensitive filesystem never surfaced this); bsa_extract.py preserves
-    # that casing verbatim, so the extracted folder is 'voice', not 'Voice'.
-    voice_root = source_dir / 'sound' / 'voice'
+    voice_root = _voice_root(source_dir)
     if not voice_root.exists():
         print(f'  Voice directory not found: {voice_root}')
         return {'organized': 0, 'skipped': 0, 'no_match': 0, 'errors': 0,
@@ -897,9 +920,7 @@ def organize_voice_files(
     # prune so a VTYP relocation cannot strand the emptied source-race folder.
     plugin_roots: set = set()
 
-    for plugin_dir in voice_root.iterdir():
-        if not plugin_dir.is_dir():
-            continue
+    for plugin_dir in _own_voice_dirs(voice_root, plugin_name):
         effective_plugin = plugin_name or plugin_dir.name
         fallout = is_fallout_voice_root(plugin_dir)
         fnv_edids = load_voice_type_edids(source_dir) if fallout else {}

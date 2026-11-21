@@ -17,7 +17,7 @@ holds the same facts directly:
 
 It also carries the six values the pipeline currently injects as MUTABLE
 CLASS ATTRIBUTES on ScriptConverter (`say_durations`, `say_topics`,
-`topic_unlock_globals`, `message_menus`, `chargen_menus`, `music_cues`) --
+`topic_reveals`, `message_menus`, `chargen_menus`, `music_cues`) --
 a hidden global channel that appears in no function signature and forces a
 unit test to do global setup before it can convert a single line.
 
@@ -31,26 +31,25 @@ from script_convert.tes4 import nodes as N
 from dataclasses import dataclass, field
 
 from script_convert.constants import (
-    AXIS_COMMANDS, KNOWN_GLOBALS, NUMERIC_RANK, RETURN_TYPES,
+    AXIS_COMMANDS, KNOWN_GLOBALS, NUMERIC_RANK, RETURN_TYPES, TRACEABLE_SOURCES,
     _BASE_OBJECT_PAPYRUS, is_generated_script_type,
     _FORM_RETURNING,
 )
+from script_convert.static_scripts import static_script_files
 from script_convert.command_rows import (
     ACTOR, ACTOR_ARG_FUNCTIONS, ACTOR_ONLY_FUNCTIONS, AV, COMMAND_ROWS, MAP,
     OBJREF_SHARED_FUNCTIONS,
 )
 
-# Names a generated script may use without declaring them: Papyrus globals,
-# script-scope keywords, and the event parameters fragments are handed.
-# `pipeline._comment_dangling` imports this one; it does not keep a copy.
+#: Names a script uses undeclared: Papyrus globals, event parameters, every static script (whatever the prefix).
 IMPLICIT_NAMES = frozenset({
     'game', 'debug', 'utility', 'self', 'parent', 'math', 'input',
     # `weather` is the CLASS in `Weather.ReleaseOverride()`, not a variable.
     'weather',
     'akspeakerref', 'akactionref', 'aktarget', 'akcaster', 'akaggressor',
     'akkiller', 'akactor', 'akitem', 'aksource', 'akrefself',
-    'tes4polyfill', 'form', 'true', 'false', 'none',
-})
+    'form', 'true', 'false', 'none',
+}) | frozenset(name[:-4].lower() for name in static_script_files())
 
 
 #: Numeric types, widest first.  Arithmetic over a mixed expression takes the
@@ -232,6 +231,34 @@ def scan_var_usage(stmts, names, lookup):
     return usage
 
 
+def assignment_sources(usage) -> dict:
+    """`{lowercase name: command}` for each variable assigned ONE traceable command.
+
+    A variable with any other assignment -- a second command, a name, a
+    literal -- is left out: nothing then says which value a later use sees.
+    """
+    out = {}
+    for low, use in usage.items():
+        sources = {_source_command(value) for value in use.assigned}
+        only = sources.pop() if len(sources) == 1 else ''
+        if only:
+            out[low] = only
+    return out
+
+
+def foreach_iterators(stmts) -> set:
+    """Lowercased names an OBSE `forEach <it> <- ...` header assigns."""
+    return {st.expr.args[0].name.lower() for st in stmts
+            if isinstance(st, N.ForEach) and isinstance(st.expr, N.Call)
+            and st.expr.args and isinstance(st.expr.args[0], N.Ident)}
+
+
+def _source_command(value) -> str:
+    """The traceable command this value is a BARE call of (an `Ident`), or ''."""
+    low = value.name.lower() if isinstance(value, N.Ident) else ''
+    return low if low in TRACEABLE_SOURCES else ''
+
+
 def _names_a_typed_call(value) -> bool:
     """Is this value a CALL to one of the narrow-return commands?
 
@@ -318,7 +345,7 @@ def _bare(node) -> str:
     return ''
 
 
-def resolve_ref_types(stmts, ref_vars, lookup, record_type_of):
+def resolve_ref_types(stmts, ref_vars, lookup, record_type_of, usage=None):
     """Final Papyrus type for every TES4 `ref` variable, decided BEFORE emission.
 
     TES4 has one `ref` type covering placed references, base records and plain
@@ -338,7 +365,7 @@ def resolve_ref_types(stmts, ref_vars, lookup, record_type_of):
     """
 
     out = {}
-    for low, use in scan_var_usage(stmts, ref_vars, lookup).items():
+    for low, use in (usage or scan_var_usage(stmts, ref_vars, lookup)).items():
         # A `ref` only ever assigned integers and never used as a reference is
         # the TES4 flag idiom, not a reference at all.
         if use.is_int_flag:
@@ -487,3 +514,21 @@ def property_declarations(property_refs, declared) -> list:
         declared.add(safe.lower())
         out.append('%s Property %s Auto' % (ptype, safe))
     return out
+
+
+#: EditorID of the import's FormList of references a script has just activated by its own call.
+SCRIPTED_USES = 'TES4ScriptedUses'
+#: EditorID of the import's FormList of actors a script has restrained.
+RESTRAINED = 'TES4Restrained'
+
+
+def owned_formlist(conv, name: str) -> str:
+    """Declare the import-owned FormList `name` on this script; its name."""
+    conv.sc.property_refs[name] = 'FormList'
+    return name
+
+
+def owned_global(conv, name: str) -> str:
+    """Declare the import-owned GlobalVariable `name` on this script; its name."""
+    conv.sc.property_refs[name] = 'GlobalVariable'
+    return name

@@ -10,6 +10,7 @@ import pytest
 
 from tes5_import.base.conditions import (
     GET_VM_SCRIPT_VARIABLE,
+    UNRESOLVED_VAR_SENTINEL,
     convert_ctda_list_with_strings,
     papyrus_var_name,
 )
@@ -19,6 +20,7 @@ from tes5_import.packages.converter import (
     SPEED_RUN,
     T5_MUST_COMPLETE,
     T5_OFFERS_SERVICES,
+    T5_UNLOCK_DOORS_START,
     T5_WEAPON_DRAWN,
     build_psdt,
     convert_PACK,
@@ -162,6 +164,12 @@ def test_flags_are_remapped_not_copied():
     assert flags & T5_MUST_COMPLETE
 
 
+def test_unlock_doors_at_location_opens_the_shop():
+    """TES4 unlock-at-location (0x100) becomes TES5 unlock-at-start."""
+    flags, _ = convert_flags(0x311, 6)
+    assert flags == T5_OFFERS_SERVICES | T5_UNLOCK_DOORS_START | 0x200
+
+
 def test_always_run_becomes_preferred_speed_field():
     """TES4 'always run' is a FLAG; TES5 speed is a FIELD. The old brainstorm
     proposed mapping it onto an 'Unknown' bit, which would set random behaviour."""
@@ -213,7 +221,6 @@ def test_unresolvable_script_variable_reads_zero_like_tes4():
     authored outcome. Dropping the condition failed OPEN: SE08's five
     Xedilian victims (base SE08XeddefenNPC01 has no SCRI) force-greeted and
     fled unconditionally."""
-    from tes5_import.base.conditions import _UNRESOLVED_VAR_SENTINEL
     rec = {
         'ConditionCount': '1',
         'Condition[0].Raw':
@@ -222,7 +229,7 @@ def test_unresolvable_script_variable_reads_zero_like_tes4():
     out = convert_ctda_list_with_strings(rec, {})
     assert len(out) == 1
     ctda, cis2 = out[0]
-    assert cis2 == _UNRESOLVED_VAR_SENTINEL
+    assert cis2 == UNRESOLVED_VAR_SENTINEL
     assert struct.unpack_from('<H', ctda, 8)[0] == 630   # GetVMScriptVariable
     assert struct.unpack_from('<I', ctda, 12)[0] & 0xFFFFFF == 0xBC72
     assert struct.unpack_from('<f', ctda, 4)[0] == 1.0    # authored compare
@@ -341,20 +348,10 @@ def _reloc_setup(monkeypatch, placements):
     return os_, by_type
 
 
-def test_actor_script_relocated_to_placed_ref(monkeypatch):
-    os_, by_type = _reloc_setup(monkeypatch, placements=1)
-    moved = os_._relocate_actor_scripts_to_refs(by_type, 0)
-    assert moved == 1
-    # Script now lives on the placed ACHR ...
-    assert os_._OBJECT_VMAD.get(0x0000BC72) == b'VMAD\x04\x00base'
-    # ... and ONLY there (single placement -> moved off the base).
-    assert 0x0000A29D not in os_._OBJECT_VMAD
-
-
-def test_shared_base_keeps_script_and_adds_ref(monkeypatch):
-    """A base placed more than once keeps its script (siblings need it) and the
-    read ref gains its own copy."""
-    os_, by_type = _reloc_setup(monkeypatch, placements=3)
+@pytest.mark.parametrize('placements', [1, 3])
+def test_actor_script_copied_to_placed_ref_and_kept_on_base(monkeypatch, placements):
+    """The read ref gains the script, and the base keeps it for runtime spawns."""
+    os_, by_type = _reloc_setup(monkeypatch, placements=placements)
     moved = os_._relocate_actor_scripts_to_refs(by_type, 0)
     assert moved == 1
     assert os_._OBJECT_VMAD.get(0x0000BC72) == b'VMAD\x04\x00base'
@@ -412,6 +409,29 @@ def test_addscriptpackage_reaches_the_actors_quest_alias():
     assert 0x000011CA in plan.needed_aliases[0x00000811]
 
 
+def test_every_placed_copy_gets_its_quest_package():
+    """A base placed three times carries its quest package on all three aliases (Nehrim's exit trolls).
+
+    See: docs/commentary/tes5_import_package.md#every-placed-copy-gets-its-quest-package
+    """
+    getstage = struct.pack('<BBBBfIIIiI', 0x60, 0, 0, 0, 35.0,
+                           58, 0x00000811, 0, 0, 0xFFFFFFFF)
+    refs = ('00001E9D', '00001E9F', '001F3562')
+    by_type = {
+        'PACK': [{'FormID': '001AAEEC', 'EditorID': 'MQ00TrollTravel',
+                  'Condition[0].Raw': getstage.hex()}],
+        'QUST': [{'FormID': '00000811', 'EditorID': 'MQ00'}],
+        'CREA': [{'FormID': '00001E9C', 'EditorID': 'MQ00troll01Ausgang',
+                  'AIPackageCount': '1', 'AIPackage[0]': '001AAEEC'}],
+        'ACRE': [{'FormID': r, 'NAME': '00001E9C'} for r in refs],
+    }
+    plan = PackagePlan()
+    plan.build(by_type, {0x00000811}, {}, None, {})
+    for ref in refs:
+        assert plan.quest_packages[0x00000811][int(ref, 16)] == [0x001AAEEC], ref
+        assert int(ref, 16) in plan.needed_aliases[0x00000811]
+
+
 def test_commented_out_addscriptpackage_is_not_resurrected():
     """A disabled call must stay disabled.
 
@@ -442,11 +462,11 @@ def test_commented_out_addscriptpackage_is_not_resurrected():
 def test_cross_cell_follow_stays_follow_not_escort():
     """A TES4 Follow whose PLDT is in ANOTHER cell must stay Follow.
 
-    A Follow carrying a destination is rerouted to Skyrim's Escort so the
+    A Follow carrying a destination becomes Skyrim's FollowTo so the
     package can ARRIVE and fire OnPackageEnd (CGEmperorToMarkerB ends
-    CharacterGen stage 16). But Escort makes the DESTINATION the goal, and
-    there is no navmesh route between two interiors — so a cross-cell
-    destination leaves the actor with no path and he never moves at all.
+    CharacterGen stage 16) while still trailing its target. But the
+    destination is a goal, and there is no navmesh route between two
+    interiors — so a cross-cell one leaves the actor unable to move.
 
     Verified live on Nehrim MQ00 (2026-08-17): Celebro stands in StartCelle,
     MQ00CelebroPosition01 is in SchattenrufMinePart01, and he moved 5 units in
@@ -458,7 +478,7 @@ def test_cross_cell_follow_stays_follow_not_escort():
     (MQ16MartinFollowPCToPalace, MG01ErthorFollowPlayer, FGD07AjumFollow).
     """
     from tes5_import.packages.converter import _choose, PackContext, T4_FOLLOW
-    from tes5_import.packages.templates import ESCORT, FOLLOW
+    from tes5_import.packages.templates import ESCORT, FOLLOW, FOLLOW_TO
 
     rec = {'Signature': 'PACK', 'FormID': '00000E9D',
            'EditorID': 'MQ00CalebroPackage02', 'PKDT.Type': str(T4_FOLLOW),
@@ -474,10 +494,12 @@ def test_cross_cell_follow_stays_follow_not_escort():
     # Same cell keeps the arrival behaviour the reroute exists for.
     same = PackContext(ref_cell={0x0010D1: 0x000B9B},
                        pack_runner_cells={0x000E9D: {0x000B9B}})
-    assert _choose(rec, same, 0x00000E9D).t is ESCORT
-
-    # An unknown cell must NOT silently downgrade a package that was fine.
-    assert _choose(rec, PackContext(), 0x00000E9D).t is ESCORT
+    assert _choose(rec, same, 0x00000E9D).t is FOLLOW_TO
+    assert _choose(rec, PackContext(), 0x00000E9D).t is FOLLOW_TO, \
+        'an unknown cell must not downgrade a package that was fine'
+    horse = dict(rec, **{'PKDT.Flags': str(8192 | 0x800000)})
+    assert _choose(horse, same, 0x00000E9D).t is ESCORT, \
+        'FollowTo cannot ride; a Use Horse follow keeps the riding Escort'
 
 
 def test_hunt_at_actor_base_becomes_a_follow_chain_nearest_first():
@@ -576,3 +598,38 @@ def test_hunt_chain_runs_ahead_of_its_source_on_alias_and_pkid_lists():
             [0x0100E001, 0x0100DDDD, 0x0100DDDE]
     finally:
         set_package_chains({})
+
+
+def test_quest_only_actor_holds_in_place():
+    """An NPC whose every package is quest-owned stands where it is; others keep the sandbox list.
+
+    See: docs/commentary/tes5_import_package.md#quest-only-actors-hold-in-place
+    """
+    from tes5_import.packages.actor_wiring import (DPLT_NPC_LIST, default_package_list,
+                                                   set_quest_packages, set_stand_still_list)
+    set_quest_packages({0x011EF2D5, 0x010011DD})
+    set_stand_still_list(0x01ABCDEF)
+    try:
+        assert default_package_list([0x011EF2D5], DPLT_NPC_LIST) == 0x01ABCDEF
+        assert default_package_list([0x011EF2D5, 0x01000D95], DPLT_NPC_LIST) == DPLT_NPC_LIST
+        assert default_package_list([], DPLT_NPC_LIST) == DPLT_NPC_LIST
+    finally:
+        set_quest_packages(())
+        set_stand_still_list(0)
+
+
+def _pkdt_flags(rec: dict, ctx) -> int:
+    """The PKDT flags convert_PACK writes for `rec`."""
+    return struct.unpack_from('<I', _first(_subrecords(convert_PACK(rec, ctx)), 'PKDT'))[0]
+
+
+def test_an_armed_force_greet_drops_once_per_day():
+    """Ocato's MQ16OcatoToTempleEND: its armed faction gates it, so Once Per Day is not written.
+
+    See: docs/commentary/tes5_import_package.md#a-completion-gate-replaces-once-per-day
+    """
+    rec = _pack(0, **{'PKDT.Flags': 0x2404, 'PTDT.Type': 0, 'PTDT.Target': '00000014', 'PTDT.Count': 150})
+    armed = PackContext()
+    armed.done_latches[0x00001000] = (b'', b'CTDA')
+    assert _pkdt_flags(rec, PackContext()) & 0x400
+    assert not _pkdt_flags(rec, armed) & 0x400

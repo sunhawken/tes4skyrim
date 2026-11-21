@@ -23,11 +23,13 @@ Re-expression in Skyrim terms:
 Gating is limited to topics that appear in an explicit Add-Topics data list or
 AddTopic command: those are the designer-controlled reveals. Topics only ever
 revealed by name-mention stay ungated (visible when conditions pass) — gating
-them would risk dead content on any name-match miss. Topics revealed by BARK
-lines (GREETING/HELLO) are also ungated: the revealing bark fires the moment
-the player contacts the NPC, so in Oblivion they are effectively visible on
-first talk (e.g. Azzan's "Join the Fighters Guild" via his FG-ad greeting) —
-a gate would only add fragment-vs-menu timing risk. Choice (TCLT) targets
+them would risk dead content on any name-match miss. Topics revealed only by
+BARK lines (GREETING/HELLO) that every one of the topic's speakers says are
+also ungated: the revealing bark fires the moment the player contacts the NPC,
+so in Oblivion they are effectively visible on first talk (e.g. Azzan's "Join
+the Fighters Guild" via his FG-ad greeting). A bark said by a different NPC
+reveals nothing on first talk with the topic's speaker, so that topic stays
+gated (Sheogorath's greeting adds Haskill's "Greymarch"). Choice (TCLT) targets
 that are explicitly added are gated like any other, with their TCLT-parent
 INFOs as additional revealers (choosing the path unlocks and persists, like
 Oblivion); choice targets never explicitly added are handled by the branch
@@ -40,9 +42,14 @@ FormIDs so the plan is identical regardless of the load-order offset.
 
 import re
 from collections import defaultdict
+from ..base.conditions import read_getisid_fids
 from ..base.text_reader import info_result_script
+from ..overrides.adoption import generated_formid
 
 _RE_ADDTOPIC = re.compile(r'\baddtopic[\s,]+(\w+)', re.IGNORECASE)
+
+#: EditorID prefix of the per-INFO said-once completion globals (see _said_once_reveals).
+SAID_ONCE_PREFIX = 'TES4SaidOnce_'
 
 
 def _low24(fid_str: str) -> int:
@@ -63,15 +70,32 @@ def _global_name(edid: str, fid24: int, taken: set) -> str:
     return name
 
 
-def _ungate_bark_only_topics(gated: dict, bark_revealed: set,
-                             convo_revealed: set) -> dict:
-    """Drop the gate on topics revealed ONLY by a bark, never by a conversation.
+def _speakers(rec: dict) -> set:
+    """Raw GetIsID NPC FormIDs an INFO is gated to; {None} when anyone may say it."""
+    return read_getisid_fids(rec, offset=0) or {None}
+
+
+def _topic_speakers(infos: list, gated: dict) -> dict:
+    """{global -> union of _speakers over the gated topic's own INFOs}."""
+    out = defaultdict(set)
+    for rec in infos:
+        gname = gated.get(_low24(rec.get('ParentDIAL', '')))
+        if gname:
+            out[gname] |= _speakers(rec)
+    return out
+
+
+def _ungate_bark_only_topics(gated: dict, bark_speakers: dict,
+                             convo_revealed: set, topic_speakers: dict) -> dict:
+    """Drop the gate on topics revealed ONLY by barks their own speakers say.
+
+    A topic stays gated when any NPC who speaks it never says a revealing bark.
 
     See: docs/commentary/tes5_import_dialogue.md#the-bark-ungating-exception
     """
-    if not bark_revealed:
-        return gated
-    bark_only = bark_revealed - convo_revealed
+    bark_only = {g for g, spk in bark_speakers.items()
+                 if g not in convo_revealed
+                 and (None in spk or topic_speakers.get(g, set()) <= spk)}
     return {f: g for f, g in gated.items() if g not in bark_only}
 
 
@@ -194,15 +218,15 @@ def _build_gate_set(explicit_targets: set, dial_by_fid24: dict,
 
 
 def _mention_regex(gated: dict, dial_by_fid24: dict) -> tuple:
-    """({lowercase FULL name -> global}, compiled whole-word regex or None).
+    """({lowercase FULL name -> {global, ...}}, whole-word regex or None).
 
-    Oblivion auto-adds a topic whose FULL name a spoken line mentions.
+    Oblivion auto-adds every topic whose FULL name a spoken line mentions.
     """
-    names_to_global = {}
+    names_to_global = defaultdict(set)
     for fid24, gname in gated.items():
         full = dial_by_fid24[fid24].get('FULL', '').strip()
         if len(full) >= 4:
-            names_to_global[full.lower()] = gname
+            names_to_global[full.lower()].add(gname)
     if not names_to_global:
         return names_to_global, None
     alts = sorted((re.escape(n) for n in names_to_global), key=len,
@@ -239,20 +263,20 @@ def _info_mention_globals(rec: dict, mention_re, names_to_global: dict) -> set:
             break
         i += 1
         for m in mention_re.findall(text):
-            found.add(names_to_global[m.lower()])
+            found |= names_to_global[m.lower()]
     return found
 
 
 def _build_info_reveals(infos: list, gated: dict, edid_to_fid24: dict,
                         dial_by_fid24: dict, mention_re,
                         names_to_global: dict, classify_topic) -> tuple:
-    """({info fid24 -> globals}, bark-revealed globals, convo-revealed).
+    """({info fid24 -> globals}, {bark-revealed global -> speakers}, convo-revealed).
 
-    A topic revealed only by a bark is ungated afterwards.
+    A topic revealed only by its own speakers' barks is ungated afterwards.
 
     See: docs/commentary/tes5_import_dialogue.md#the-bark-ungating-exception
     """
-    info_reveals, bark_revealed, convo_revealed = {}, set(), set()
+    info_reveals, bark_speakers, convo_revealed = {}, defaultdict(set), set()
     bark_cache = {}
     for rec in infos:
         info_fid24 = _low24(rec.get('FormID', ''))
@@ -270,10 +294,11 @@ def _build_info_reveals(infos: list, gated: dict, edid_to_fid24: dict,
             bark_cache[own_topic] = _is_bark_topic(
                 dial_by_fid24.get(own_topic), classify_topic)
         if bark_cache[own_topic]:
-            bark_revealed |= explicit_set
+            for gname in explicit_set:
+                bark_speakers[gname] |= _speakers(rec)
         else:
             convo_revealed |= explicit_set
-    return info_reveals, bark_revealed, convo_revealed
+    return info_reveals, bark_speakers, convo_revealed
 
 
 def _fragment_stages(qusts: list, quest_stage_fragments) -> dict:
@@ -338,15 +363,135 @@ def _drop_orphan_gates(gated: dict, info_reveals: dict,
     return {f: g for f, g in gated.items() if g in revealed}
 
 
-def build_unlock_plan(by_type: dict) -> dict:
-    """Analyze the export and return the unlock plan:
+def _info_choices(rec: dict) -> set:
+    """Low-24 FormIDs of the topics one INFO's choices link to."""
+    out = {_low24(v) for v in _indexed_values(rec, 'Choice')}
+    out.add(_low24(rec.get('TCLT.Choice', '')))
+    out.discard(0)
+    return out
 
-    {
-      'gated':         {topic_fid24: global_name},
-      'info_reveals':  {info_fid24: sorted [global_name, ...]},
-      'stage_reveals': {(quest_edid_lower, stage_index): sorted [global_name]},
-      'script_added':  {topic_fid24, ...}  -- visibility only, never gated
-    }
+
+def _choice_targets(infos: list) -> set:
+    """Low-24 FormIDs of every topic an INFO choice links to."""
+    return {fid for rec in infos for fid in _info_choices(rec)}
+
+
+def said_once_global(fid24: int) -> str:
+    """The completion global of a say-once INFO with choices."""
+    return f'{SAID_ONCE_PREFIX}{fid24:06X}'
+
+
+def _kept_choices(rec: dict, infos_by_topic: dict, dial_by_fid24: dict,
+                  should_skip_dial, classify_topic) -> set:
+    """The choice topics an INFO offers that are spoken, kept and not barks."""
+    return {t for t in _info_choices(rec)
+            if infos_by_topic.get(t) and dial_by_fid24.get(t) is not None
+            and not should_skip_dial(dial_by_fid24[t])
+            and not _is_bark_topic(dial_by_fid24[t], classify_topic)}
+
+
+def _chain_ends(start: set, infos_by_topic: dict, rec_by_fid24: dict, offers) -> set:
+    """INFOs ending the choice chain below the topics `start`: no further choices, or a Goodbye line."""
+    ends, seen, todo = set(), set(), list(start)
+    while todo:
+        topic = todo.pop()
+        if topic in seen:
+            continue
+        seen.add(topic)
+        for fid24 in infos_by_topic[topic]:
+            rec = rec_by_fid24.get(fid24, {})
+            more = set() if int(rec.get('DATA.Flags') or 0) & 0x01 else offers(rec)
+            if more:
+                todo += more
+            else:
+                ends.add(fid24)
+    return ends
+
+
+def _said_once_reveals(infos: list, dial_by_fid24: dict, should_skip_dial,
+                       classify_topic) -> dict:
+    """{INFO fid24 -> said-once globals its Begin fragment writes}.
+
+    A say-once INFO with choices loses the engine's Say Once: its own global
+    goes 0 -> 1 when it begins, and a line ENDING its choice chain moves it
+    1 -> 2. Only 2 retires the line, so a conversation left anywhere in the
+    chain offers it again.
+    See: docs/commentary/tes5_import_dialogue.md#said-once-retires-at-the-chain-end
+    """
+    infos_by_topic, rec_by_fid24 = defaultdict(list), {}
+    for rec in infos:
+        fid24 = _low24(rec.get('FormID', ''))
+        infos_by_topic[_low24(rec.get('ParentDIAL', ''))].append(fid24)
+        rec_by_fid24[fid24] = rec
+
+    def offers(rec):
+        """The kept choice topics of one INFO."""
+        return _kept_choices(rec, infos_by_topic, dial_by_fid24, should_skip_dial, classify_topic)
+
+    out = defaultdict(set)
+    for fid24, rec in rec_by_fid24.items():
+        topics = offers(rec) if int(rec.get('DATA.Flags') or 0) & 0x04 else set()
+        if not fid24 or not topics:
+            continue
+        gname = said_once_global(fid24)
+        out[fid24].add(gname)
+        for end in _chain_ends(topics, infos_by_topic, rec_by_fid24, offers) - {fid24, 0}:
+            out[end].add(gname)
+    return out
+
+
+def _merge_said_once(info_reveals: dict, said_once: dict) -> dict:
+    """info_reveals with each INFO's said-once globals added, names sorted."""
+    merged = dict(info_reveals)
+    for fid24, gnames in said_once.items():
+        merged[fid24] = sorted(set(merged.get(fid24, ())) | gnames)
+    return merged
+
+
+def _unreachable_topics(dials: list, added: set, infos: list, own_index: int,
+                        classify_topic) -> set:
+    """This plugin's regular topics that nothing adds, links to or names.
+
+    Oblivion lists a regular topic only once something adds it, so these
+    never reach the player's menu; a script `Say` still plays them.
+
+    See: docs/commentary/tes5_import_dialogue.md#addtopic-unlock-gates
+    """
+    spoken = {_low24(rec.get('ParentDIAL', '')) for rec in infos}
+    names = {}
+    for d in dials:
+        fid24 = _low24(d.get('FormID', ''))
+        if (fid24 in spoken and fid24 not in added
+                and (int(d['FormID'], 16) >> 24) >= own_index
+                and d.get('DATA.Type', '0') == '0'
+                and not _is_bark_topic(d, classify_topic)):
+            full = d.get('FULL', '').strip().lower()
+            names[fid24] = tuple(re.findall(r'\w+', full)) if len(full) >= 4 else ()
+    mentioned = _mentioned_phrases(infos, names.values())
+    return {f for f, n in names.items() if n not in mentioned}
+
+
+def _mentioned_phrases(infos: list, phrases) -> set:
+    """The word tuples among `phrases` that some response text contains."""
+    longest = defaultdict(int)
+    for p in phrases:
+        if p:
+            longest[p[0]] = max(longest[p[0]], len(p))
+    words = re.findall(r'\w+', ' '.join(
+        v for rec in infos for k, v in rec.items()
+        if k.endswith('.ResponseText')).lower())
+    return {tuple(words[i:i + n]) for i, w in enumerate(words)
+            if w in longest for n in range(1, longest[w] + 1)}
+
+
+def build_unlock_plan(by_type: dict, own_index: int = 0) -> dict:
+    """The unlock plan of an export:
+
+    gated {topic: global}; info_reveals {info: sorted globals, said-once
+    ones included}; stage_reveals {(quest_edid_lower, stage): sorted
+    globals}; script_added {topic} (visible, never gated); unreachable
+    {topic} (never listed; own_index = first own raw index); said_once
+    {info: global} (see _said_once_reveals). Keys are low-24 FormIDs.
     """
     from .converter import should_skip_dial, classify_topic
     from .quest import quest_stage_fragments
@@ -364,11 +509,12 @@ def build_unlock_plan(by_type: dict) -> dict:
     gated = _build_gate_set(explicit, dial_by_fid24, should_skip_dial,
                             classify_topic)
     names_to_global, mention_re = _mention_regex(gated, dial_by_fid24)
-    info_reveals, bark_revealed, convo_revealed = _build_info_reveals(
+    info_reveals, bark_speakers, convo_revealed = _build_info_reveals(
         infos, gated, edid_to_fid24, dial_by_fid24, mention_re,
         names_to_global, classify_topic)
 
-    gated = _ungate_bark_only_topics(gated, bark_revealed, convo_revealed)
+    gated = _ungate_bark_only_topics(gated, bark_speakers, convo_revealed,
+                                     _topic_speakers(infos, gated))
     kept = set(gated.values())
     info_reveals = {fid: sorted(gs & kept)
                     for fid, gs in info_reveals.items() if gs & kept}
@@ -376,18 +522,28 @@ def build_unlock_plan(by_type: dict) -> dict:
     stage_reveals = _build_stage_reveals(qusts, infos, gated, stage_addtopics,
                                          info_reveals, quest_stage_fragments)
     gated = _drop_orphan_gates(gated, info_reveals, stage_reveals)
-    return {'gated': gated, 'info_reveals': info_reveals,
-            'stage_reveals': stage_reveals, 'script_added': script_added}
+    unreachable = _unreachable_topics(
+        by_type.get('DIAL', []), explicit | script_added | _choice_targets(infos),
+        infos, own_index, classify_topic)
+    said_once = _said_once_reveals(infos, dial_by_fid24, should_skip_dial,
+                                   classify_topic)
+    return {'gated': gated,
+            'info_reveals': _merge_said_once(info_reveals, said_once),
+            'stage_reveals': stage_reveals, 'script_added': script_added,
+            'unreachable': unreachable,
+            'said_once': {f: said_once_global(f) for f, gs in said_once.items()
+                          if said_once_global(f) in gs}}
 
 
 def create_unlock_globals(writer, plan: dict) -> dict:
-    """Create one GLOB (float, 0.0) per gated topic. Returns {name: formid}."""
+    """One GLOB (float, 0.0) per gated topic and said-once INFO. Returns {name: formid}."""
     import struct as _struct
     from ..record_types.common import (pack_record, pack_string_subrecord,
                                       pack_subrecord)
     name_to_fid = {}
-    for name in sorted(set(plan['gated'].values())):
-        fid = writer.derive_formid('UNLOCK_GLOB', name)
+    for name in sorted(set(plan['gated'].values())
+                       | set(plan.get('said_once', {}).values())):
+        fid = generated_formid(writer, 'GLOB', name, 'UNLOCK_GLOB', name)
         subs = pack_string_subrecord('EDID', name)
         subs += pack_subrecord('FNAM', b'f')
         subs += pack_subrecord('FLTV', _struct.pack('<f', 0.0))

@@ -17,11 +17,15 @@ TYPE_MAP = {}
 #: TES4 signatures deliberately not converted.
 SKIP_TYPES = set()
 
+#: NOT records: runtime data keyed by TES3 string id, never read by the importer.
+RUNTIME_ONLY_TYPES = frozenset({'MWDI', 'MWIN', 'MWSS', 'MWQZ'})
+
 def _init_dispatch() -> None:
     """Populate the three tables from the converter modules.
 
     See: docs/reference/record_mapping.md#dispatch-table-membership
     """
+    from .actors.combat_style import convert_CSTY
     from .record_types.actor_common import (convert_CLAS, convert_FACT)
     from .record_types.common import (convert_GLOB, convert_GMST)
     from .record_types.creature import convert_CREA
@@ -50,7 +54,8 @@ def _init_dispatch() -> None:
     from .record_types.magic import convert_MGEF
     from .record_types.message_falloutnv import convert_MESG
     from .record_types.projectile_falloutnv import convert_PROJ
-    from .record_types.impact_falloutnv import convert_IPCT, convert_IPDS
+    from .record_types.impact_falloutnv import (convert_ADDN, convert_EXPL,
+                                                convert_IPCT, convert_IPDS)
     from .record_types.music_falloutnv import convert_MUSC
     from .record_types.reference_falloutnv import (
         convert_ECZN,
@@ -92,17 +97,19 @@ def _init_dispatch() -> None:
 
     IMPORT_DISPATCH.update({sig: (convert_STAT if kind == 'STAT' else convert_ACTI)
                             for sig, kind in FALLOUT_BASE_TYPES.items()})
-    IMPORT_DISPATCH['MESG'] = convert_MESG
-    IMPORT_DISPATCH['PROJ'] = convert_PROJ
-    IMPORT_DISPATCH['IPCT'] = convert_IPCT
-    IMPORT_DISPATCH['IPDS'] = convert_IPDS
-    IMPORT_DISPATCH['FLST'] = convert_FLST
-    IMPORT_DISPATCH['TXST'] = convert_TXST
-    IMPORT_DISPATCH['IMGS'] = convert_IMGS
-    IMPORT_DISPATCH['LGTM'] = convert_LGTM
-    IMPORT_DISPATCH['ECZN'] = convert_ECZN
-    IMPORT_DISPATCH['MUSC'] = convert_MUSC
     IMPORT_DISPATCH.update({
+        'MESG': convert_MESG,
+        'PROJ': convert_PROJ,
+        'IPCT': convert_IPCT,
+        'IPDS': convert_IPDS,
+        'EXPL': convert_EXPL,
+        'ADDN': convert_ADDN,
+        'FLST': convert_FLST,
+        'TXST': convert_TXST,
+        'IMGS': convert_IMGS,
+        'LGTM': convert_LGTM,
+        'ECZN': convert_ECZN,
+        'MUSC': convert_MUSC,
         'STAT': convert_STAT,
         'ACTI': convert_ACTI,
         'MISC': convert_MISC,
@@ -131,6 +138,7 @@ def _init_dispatch() -> None:
         'APPA': convert_APPA,
         'NPC_': convert_NPC_,
         'CREA': convert_CREA,
+        'CSTY': convert_CSTY,
         'FACT': convert_FACT,
         'EYES': convert_EYES,
         'HAIR': convert_HAIR,
@@ -175,7 +183,6 @@ def _init_dispatch() -> None:
         'SKIL',   # Hardcoded in TES5
         'BSGN',   # Birthsigns → no equivalent
         'RACE',   # NPCs map to Skyrim races
-        'CSTY',   # Combat Style -> Completely restructured
         'IDLE',   # Animation system different
         'GMST',   # Game settings differ between TES4/TES5
         'EYES',   # Do not convert — NPCs map to Skyrim head parts

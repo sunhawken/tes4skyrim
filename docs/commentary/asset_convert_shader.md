@@ -30,10 +30,16 @@ clutter elsewhere in the tree.
 | `stars.nif`, `stars_oblivion.nif`, `sestars.nif` | `SKY_STARS` (5) |
 | `clouds.nif`, `clouds_oblivion.nif` | `SKY_CLOUDS` (3) |
 | `atmosphere.nif`, `sky.nif` | `SKY_BASE` (2) |
-| `sunbeam01-03.nif` | `SKY_SUNGLARE` (1) |
 
-`SKY_TEXTURE` (0) and `SKY_MOON_STARS_MASK` (7) complete the engine's enum; no
-Oblivion mesh maps onto either.
+`SKY_TEXTURE` (0), `SKY_SUNGLARE` (1) and `SKY_MOON_STARS_MASK` (7) complete the
+engine's enum; no Oblivion mesh maps onto any of them.
+
+**`sky\sunbeam01-03.nif` are NOT sky geometry**, despite the folder. No CLMT or
+WTHR record references them (0 in Oblivion.esm and Nehrim.esm); their only users
+are the placed `SkySunBeam01-03` activators, set inside caves and mines. Routed
+through the sky shader they lost their alpha, z-buffer and double-sided
+properties and showed through walls; they take the ordinary FX path instead
+(effect shader, z-test on, z-write off, double-sided).
 
 ## Lit or unlit: choosing the Effect shader
 <a id="fx-shader-discriminator"></a>
@@ -93,6 +99,12 @@ keys. The frames are composed into a horizontal-strip DDS (the job runs in
 game AND in NifSkope, whose EffectFloatController is supported where NiPSys
 chains are not. When the frames cannot be resolved the shape falls back to a
 static first-frame texture.
+
+The atlas is written under the plugin's lowercase `textures` folder whatever
+case the shader path's first folder has (`_texture_out_path`; the parallax
+height maps go through it too): the texture copy writes that folder and
+`bsa_pack` packs only it, so on a case-sensitive filesystem a `Textures\`
+path joined as spelled opened a second folder that no archive took.
 
 pyffi defaults UV Scale to (0,0), which collapses every UV to the texture's
 top-left texel — usually transparent on a flame texture — and renders the
@@ -197,6 +209,60 @@ The material alpha rides in the emissive ALPHA channel, because that is what the
 engine multiplies the sampled texel by. `emissive_multiple` is held at 1.0:
 vanilla's value on **852 of 1164** blended FX shapes.
 
+### <a id="rest-emissive"></a>A sequence-animated emissive rests at its time-0 value
+
+**Code:** `apply_rest_emissive` in `asset_convert/nif/sequences.py`
+
+Before a script plays a sequence, the engine draws the shader's STATIC color.
+The white fallback above then turned an Oblivion surface that is black
+(invisible, if additive) until its sequence runs into a fully lit one. On
+`se01waitingroomwalls` the three LightBeam shapes author emissive (0,0,0) plus
+a SELF_ILLUM curve 0 → 0.56 → 0 in `Forward`. They showed as static lit beams
+from cell load on. So the static color of every shader with a sequence emissive
+entry is that entry's value at t=0, the same rule `apply_rest_visibility`
+applies to visibility.
+
+The morph bake (`morphs._emit_flipbook`) gives each baked frame copy its own
+copy of every shader entry that drives the base shape. The copies own their
+shaders, so without that the fade stopped when the base shape swapped out, and
+the last frame stayed lit forever.
+
+### <a id="texture-transform"></a>The base map's texture transform
+
+**Code:** `asset_convert/nif/uv_transform.py`
+
+Oblivion's `TexDesc` carries a static transform, and `NiTextureTransformController`
+animates it. In the MAX method (nif.xml, OpenMW and NifSkope all agree) the
+scale pivots about the center: `uv' = S·(uv + T − C) + C`. Skyrim's shaders
+compute `uv·scale + offset`, so:
+
+- static: scale = S, offset = S·(T − C) + C;
+- an animated translate is remapped by `a = S, b = C·(1 − S)`;
+- an animated scale keeps its keys and gains a companion offset curve,
+  `a = T − C, b = C`.
+
+The channel that isn't animated holds its authored value. Rotation isn't
+carried. The authored clamp mode is carried too (the low byte of
+`texture_clamp_mode`). A squeezed map that Oblivion clamps would otherwise tile.
+
+Before this was carried, no static transform was read at all, and scales pivoted
+at the corner. In `se01waitingroomwalls` each butterfly particle system selects
+one butterfly from `SEButterflies01.dds` (V tiling 0.18–0.27 with a V offset).
+It flaps by animating U scale 0.88 → 3.7 about the center, with S clamped. The
+result was the whole sheet, tiled and sliding. A census of 1,595 Oblivion.esm
+meshes found **142** base-map transforms, all MAX, **21** of them
+non-identity: `magiceffects\shockshield` (2×2), `oblivion\gate\flashglow01`,
+the Citadel fire column, `se07ardensulalter`, `se09poollid`, and others.
+
+A freshly built QUADRATIC `NiFloatData` needs each key's `arg` set by hand, or
+pyffi writes it in the LINEAR layout and the file can't be read back.
+
+The always-running path (`attach_tex_transform_ctrls`) is handed the TexDesc by
+its caller. It can't read it off `controller.target`, because pyffi keeps that
+Ptr only as a WEAK reference. Once the geometry pass empties the shape's
+property list, the NiTexturingProperty is collected and the target reads `None`.
+The sequence path runs before that pass, so it can still use the target.
+
 ### <a id="flame-brightness-is-authored"></a>Flame brightness: the authored emissive, never the filename
 
 An earlier revision matched `fire`/`flame`/`torch` in the diffuse path (minus a
@@ -257,11 +323,31 @@ file, so testing only for `textures\` let a forward-slash
 `Textures\tes4\textures/lowres/foo.dds` — a path that resolves to nothing, and
 the LOD tiles then reference 100 textures that do not exist.
 
-**`textures\lowres\` is dropped.** It is an Oblivion `_far.nif` authoring
-convention for low-resolution LOD copies; pyffi ships a spell that writes exactly
-this prefix, documented "used mainly for making _far.nifs". We ship no lowres
-tree — the converted textures live at the normal path — so dropping the segment
-makes the reference resolve to the real texture.
+<a id="lowres-textures"></a>
+**`textures\lowres\` is kept, falling back to its full-res twin.** It is an
+Oblivion `_far.nif` authoring convention for low-resolution LOD copies; pyffi
+ships a spell that writes exactly this prefix, documented "used mainly for making
+_far.nifs". The texture copy ships the `lowres` tree like any other, and the BSA
+prune no longer cuts it.
+
+Neither "always drop" nor "always keep" is correct: both happen in real data.
+A census of every `lowres` reference in the source meshes, checked against the
+plugin's own texture tree plus Oblivion.esm's:
+
+| plugin | lowres refs | lowres file exists | only the full-res twin exists | neither |
+|---|---|---|---|---|
+| Unique Landscapes v2.2.0 | 21 | 16 | 5 | 0 |
+| Nehrim | 115 | 105 | 8 | 2 |
+| Oblivion, Knights, Elsweyr Anequina | 0 | — | — | — |
+
+A user's build of Unique Landscapes 0.663 hit the reverse case: `_far` meshes
+naming `LowRes\xullc\Rockbeach05.dds` and `LowRes\xulJerallGlacier\…`, which the
+mod ships ONLY under `lowres`. Dropping the segment pointed them at nothing.
+
+So the shape's diffuse and authored normal keep the authored `lowres` path when
+`resolve_source_texture` finds its source, and otherwise take the full-res twin
+(`resolve_texture` in `shaders.py`); when neither exists the twin is kept. A
+derived `_n`/`_g` map for a `lowres` diffuse also tries the twin's.
 
 **A leading `data\` is stripped.** It is an authoring slip Oblivion tolerates (it
 resolves paths from the Data folder either way) and Skyrim does not. Measured
@@ -270,10 +356,31 @@ among them `dwarven\rock02.dds` in **7**. Left in, the reference came out as
 `Textures\tes4\data\textures\…` — nothing there, AND the prune then deleted the
 real texture, because the manifest key never matched the shipped path.
 
+### <a id="top-level-texture-fallback"></a>A missing texture falls back to `textures\<file name>`
+
+**Code:** `tex_paths.texture_rel_path`, `tex_paths.top_level_twin`,
+`shaders.resolve_texture`.
+
+Morrowind finds a texture its mesh names in a folder the mod never shipped:
+OpenMW `Misc::ResourceHelpers::correctResourcePath` (1) cuts the path at its
+first whole `textures\` folder wherever it sits, then (2) when no file is
+there, tries the same file name directly under `textures\`. Arktwend's city
+guard chain armor names `Textures\RN\CM\Chainmail3.dds` (also `Chain_boot`,
+`Chain_sm`) but ships them in plain `Textures\`; we kept the dead path and the
+guards rendered flat lavender in game. Both steps are now applied to every
+rewritten diffuse, authored normal and glow, after the `lowres` twin.
+
+Measured on the shipped meshes: Arktwend 34 of 10,895 meshes rescued (11
+paths: the guard chain set, squirrels, a hair, `\..\Textures\` lollipops).
+Oblivion 0 of 10,511 and Nehrim 0 of 13,548 change through step (2). Step (1)
+also changes Nehrim's 10 meshes with absolute authoring paths
+(`c:\programme\bethesda softworks\oblivion\data\textures\dwarven\rock01.dds`),
+which pointed nowhere before; Oblivion has none.
+
 ## Resolving a source texture through the master's tree
 <a id="texture-fallback-roots"></a>
 
-**Code:** `resolve_source_texture`, `master_texture_roots` in
+**Code:** `resolve_source_texture`, `_source_listing`, `master_texture_roots` in
 `asset_convert/nif/shaders.py`
 
 [Master-export blindness](../../CLAUDE.md#master-blindness), the asset half. An
@@ -283,6 +390,30 @@ never reach. Measured on the author's parallax mod: of the **3357** distinct
 texture paths its **8665** meshes reference, **1464** were in the mod and **1602**
 ONLY in `Nehrim.esm`. Unreachable means no height map and no specular verdict, so
 the resolver falls back through the master roots in order.
+
+Each tree is tried exactly, then [ignoring case](asset_convert_texture.md#case-blind-lookups):
+a mesh keeps its author's `textures\dungeons\ayleidruins\ARStone02.dds` while
+the extracted file is `textures/dungeons/ayleidruins/arstone02.dds`. The own
+tree's case-blind pass comes before the first fallback root, so a mod's own
+copy under another spelling is found before its master's, as on a filesystem
+that ignores case.
+
+The resolver runs about three times for every textured shape, so the folder
+listings behind that second pass are remembered (`_source_listing`), each with
+its folder's modification time, change time and inode. When any of the three
+has moved the folder is listed again. A folder changed within the last two
+seconds is not remembered at all, because a later change could carry the same
+time, and neither is a listing that came back empty; so a tree written a
+moment ago is listed fresh until it has been still for two seconds. The care
+is needed because creature workers also resolve textures against a tree under
+`output/`, which the run is writing.
+
+Over Oblivion.esm's 40,984 textured shapes, the derived normal map was not
+found for 36,022 before and for 942 after (the pipeline's own count of
+defaulted normals). Its 124,399 lookups take 1.8 s where the exact probes took
+0.19 s, and 8.3 s with no memory at all. In a flat folder of 10,000 names,
+with every lookup a miss, a shape costs 0.15 ms with the memory and 29 ms
+without.
 
 ## Material defaults come from vanilla, not from Oblivion
 <a id="shader-material-defaults"></a>
@@ -308,6 +439,62 @@ than a chosen value — and 10 in Skyrim is what HAIR uses: a very wide highligh
 Specular strength is uniform on purpose: the modulation belongs in the normal
 map's alpha, not here. The spec-mask check still runs, because its per-category
 counters are what tell the texture stage how much it had to synthesise.
+
+## Refraction surfaces
+<a id="refraction-surfaces"></a>
+
+**Code:** `_make_refractive` in `asset_convert/nif/geometry_shader.py`
+
+TES4 marks a refraction surface with the material NAME `refractF` — Bethesda's
+own convention, authored, not a filename guess. Census of `export/Oblivion.esm`
+`meshes/oblivion`: **17** shapes carry a refraction diffuse and **all 17** are
+named `refractF`/`RefractF` (Oblivion gates, sigil stones, the siege crawler);
+Morroblivion's ancestor ghost and dwarven spectre use the same name.
+
+Without the refraction bits these ship as ordinary lit geometry, so a
+refraction texture — a dark distortion map — draws as a solid dark surface. The
+ancestor ghost's `RefractiveSphere` is a **90-unit radius** sphere, reported in
+game as a large black ball covering the actor.
+
+Vanilla census of `meshes/magic`: **93** shapes set `slsf_1_refraction`.
+
+**Split them by vertex alpha — it decides every other flag.** A refraction
+surface fades at the silhouette either by per-vertex alpha or by the shader.
+The 80 shapes WITH vertex colors are split on every flag (fire 37/43, cast
+42/38, zwrite 72/8, median strength **0.0**) because the vertex ramp does the
+work — `boundswordencheffects`'s `RefrectHit01` ramps alpha 0.0→1.0. The **13
+WITHOUT** vertex colors are unanimous: fire refraction **13/13**, cast shadows
+**13/13**, receive shadows **13/13**, z-write 10/13, median strength **0.25**.
+`slowtimehiteffect`'s `GeoSphere01` is that case exactly — a refraction sphere
+with no vertex data.
+
+**TES4 belongs in the unfaded group.** Of 20 `refractF` shapes across
+`Oblivion.esm` and Morroblivion's creatures, 13 carry no vertex colors and the
+other 7 carry alpha that is flat **1.0** (distinct=1) — no gradient anywhere,
+so there is no rim fade to port and setting `slsf_1_vertex_alpha` would only
+risk erasing the shape. Hence the single unfaded path.
+
+Copying `RefrectHit01` instead — shadows off, z-write off, strength 0.6, no
+fire bit — was the FIRST attempt and was reported in game as the sphere
+refracting but showing a hard visible outline. That shape has a vertex ramp;
+ours does not, so it was the wrong comparison group.
+
+**The distortion lives in the NORMAL map, not the diffuse.** nif.xml calls bit
+15 "Use normal map for refraction effect", and all **93** vanilla refraction
+shapes bind a real normal map — none uses a flat default. Oblivion's
+`magic/refract.dds` is a **1x1** 132-byte placeholder while `refract_n.dds` is
+a real **128x128 DXT1**, so binding the flat default threw the effect away
+entirely. The creature pipeline now passes `master_texture_roots` as
+`tex_fallback`, without which a Morroblivion creature cannot resolve a texture
+that lives in Oblivion.esm's tree (Morroblivion ships no `textures/magic/`).
+
+**Strength is not authored in TES4.** `Refraction Strength` is `#BSVER# #GT# 14`
+(FO3 and later), so Oblivion stores none and the value comes from vanilla's
+unfaded group: median **0.25** (range 0.15–0.6 over 13). The whole-corpus
+median of 0.6 is the wrong number — it is dominated by vertex-faded shapes.
+
+Note the shape keeps `BSLightingShaderProperty` and needs no `NiAlphaProperty`:
+vanilla's refraction shapes carry neither an effect shader nor alpha blending.
 
 ## The emissive color, and when `own_emit` is cleared
 <a id="emissive-own-emit"></a>

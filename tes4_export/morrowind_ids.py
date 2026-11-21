@@ -17,6 +17,10 @@ See: docs/commentary/tes4_export_morrowind.md#morroblivion-editorid-escape
 """
 
 import os
+import re
+
+#: Everything a region name may differ by between the two games.
+_REGION_NOISE = re.compile(r'[^a-z0-9]')
 
 #: Non-alphanumeric -> the letter Morroblivion substitutes for it.
 _ESCAPES = {
@@ -29,7 +33,7 @@ BASE_TYPES = (
     'STAT', 'ACTI', 'DOOR', 'CONT', 'LIGH', 'MISC', 'WEAP', 'ARMO',
     'BOOK', 'ALCH', 'INGR', 'CLOT', 'KEYM', 'FURN', 'FLOR', 'SLGM',
     'AMMO', 'APPA', 'NPC_', 'CREA', 'LVLI', 'LVLC', 'SOUN', 'GLOB',
-    'FACT', 'CLAS', 'SCPT', 'WRLD', 'CELL', 'LAND',
+    'FACT', 'CLAS', 'SCPT', 'SPEL', 'ENCH', 'MGEF', 'WRLD', 'CELL', 'LAND',
 )
 
 #: Export text delimiters the index scans between.
@@ -38,7 +42,7 @@ _RECORD_END = '---RECORD_END---'
 
 #: Lines the scan keeps from each record.
 _INDEXED_KEYS = ('FormID', 'EditorID', 'XCLC.X', 'XCLC.Y', 'ParentCELL',
-                 'ParentWRLD', 'RecordFlags')
+                 'ParentWRLD', 'RecordFlags', 'FULL')
 
 #: CELL RecordFlags bit marking a worldspace's persistent-reference cell.
 _PERSISTENT_FLAG = 0x400
@@ -90,6 +94,7 @@ class IdIndex:
         """Start empty; records are added as export dumps are scanned."""
         self._by_key = {}
         self._sig_by_key = {}
+        self._by_norm = {}
 
     def __len__(self):
         """How many converted records this index can resolve."""
@@ -105,6 +110,8 @@ class IdIndex:
         if key not in self._by_key:
             self._by_key[key] = form_id
             self._sig_by_key[key] = signature
+        if signature == 'REGN':
+            self._by_norm.setdefault(_REGION_NOISE.sub('', key), form_id)
 
     def _key_for(self, record_id: str):
         """The stored key a Morrowind ID answers under, or None."""
@@ -133,10 +140,33 @@ class IdIndex:
         """
         return self._by_key.get(editor_id.lower())
 
+    def lookup_region(self, name: str):
+        """A converted region's FormID, matched on letters and digits only.
+
+        See: docs/commentary/tes4_export_morrowind.md#region-weather
+        """
+        stem = _REGION_NOISE.sub('', name.lower())
+        bare = stem.removesuffix('region')
+        for key in (stem, stem + 'region', stem + 'regions', bare,
+                    bare + 'regions'):
+            found = self._by_norm.get(key)
+            if found:
+                return found
+        return None
+
     def lookup_interior(self, name: str):
-        """The FormID of a master's interior cell, by name or escaped name."""
-        return (self._by_key.get(interior_key(name))
-                or self._by_key.get(interior_key(encode_editor_id(name))))
+        """The FormID of a master's interior cell, by name or escaped name.
+
+        Morroblivion escapes a cell's name WITHOUT the leading `0` its base
+        objects carry, and keeps some cells only under their display name.
+        See: docs/commentary/tes4_export_morrowind.md#interior-cells-by-name
+        """
+        escaped = encode_editor_id(name)
+        for key in (name, escaped, escaped[1:]):
+            found = self._by_key.get(interior_key(key))
+            if found:
+                return found
+        return None
 
     def lookup_exterior(self, grid: tuple):
         """The FormID of a master's exterior cell at this TES4 grid."""
@@ -147,7 +177,7 @@ class IdIndex:
 
         See: docs/commentary/tes4_export_morrowind.md#teleport-doors
         """
-        return self._by_key.get(persistent_key(wrld_form_id))
+        return self.lookup_editor_id(persistent_key(wrld_form_id))
 
     def form_ids(self):
         """Every FormID this index hands out, so derivation can avoid them."""
@@ -157,18 +187,21 @@ class IdIndex:
         """Fold another index in; existing entries keep priority."""
         for key, form_id in other._by_key.items():
             self.add(key, form_id, other._sig_by_key.get(key, ''))
+        for key, form_id in other._by_norm.items():
+            self._by_norm.setdefault(key, form_id)
 
 
-def load_index(export_dir: str, types=BASE_TYPES, remap: dict = None) -> IdIndex:
+#: Weather-chain types: indexed for reference, never filled by the gap patch.
+WORLD_TYPES = ('REGN', 'CLMT', 'WTHR')
+
+
+def load_index(export_dir: str, types=BASE_TYPES + WORLD_TYPES,
+               remap: dict = None, skip=()) -> IdIndex:
     """Index an existing export dump so its records can be referenced.
 
-    Reads only the id lines of each record, so indexing Morroblivion's 421 MB
-    dump costs a scan and not a parse. An absent directory yields an empty
-    index, which is what makes the Morroblivion tier optional.
-
-    `remap` translates each FormID's load-order byte into the borrowing
-    plugin's master list; a record whose byte it does not map names a file the
-    borrower does not load and is left out.
+    Reads only the id lines, so indexing Morroblivion's 421 MB dump costs a
+    scan, not a parse. `remap` re-keys each FormID's load-order byte into the
+    borrower's master list; `skip` holds ids this master must NOT supply.
     See: docs/commentary/tes4_export_morrowind.md#masters
     """
     index = IdIndex()
@@ -177,7 +210,7 @@ def load_index(export_dir: str, types=BASE_TYPES, remap: dict = None) -> IdIndex
     for sig in types:
         path = os.path.join(export_dir, f'{sig}.txt')
         if os.path.exists(path):
-            _index_file(path, index, sig, remap)
+            _index_file(path, index, sig, remap, skip)
     return index
 
 
@@ -234,7 +267,8 @@ def remap_form_id(form_id: str, remap: dict):
     return '%08X' % ((mapped << 24) | (raw & 0x00FFFFFF))
 
 
-def _index_file(path: str, index: IdIndex, signature: str, remap) -> None:
+def _index_file(path: str, index: IdIndex, signature: str, remap,
+                skip=()) -> None:
     """Register every record of one export file under its key."""
     fields = {}
     with open(path, encoding='utf-8', errors='replace') as fh:
@@ -242,7 +276,7 @@ def _index_file(path: str, index: IdIndex, signature: str, remap) -> None:
             if line.startswith(_RECORD_BEGIN):
                 fields = {}
             elif line.startswith(_RECORD_END):
-                _add_record(fields, index, signature, remap)
+                _add_record(fields, index, signature, remap, skip)
             else:
                 _keep_field(fields, line)
 
@@ -254,6 +288,11 @@ def _keep_field(fields: dict, line: str, keys=_INDEXED_KEYS) -> None:
         fields[key] = value.strip()
 
 
+def _is_persistent(fields: dict) -> bool:
+    """Whether a scanned CELL is its worldspace's persistent-reference cell."""
+    return bool(int(fields.get('RecordFlags', '0')) & _PERSISTENT_FLAG)
+
+
 def _add_cell(fields: dict, form_id: str, index: IdIndex, remap) -> None:
     """Index one exterior CELL, by worldspace when it is the persistent one.
 
@@ -262,7 +301,7 @@ def _add_cell(fields: dict, form_id: str, index: IdIndex, remap) -> None:
     a dependent plugin can reuse.
     See: docs/commentary/tes4_export_morrowind.md#teleport-doors
     """
-    if int(fields.get('RecordFlags', '0')) & _PERSISTENT_FLAG:
+    if _is_persistent(fields):
         wrld = remap_form_id(fields.get('ParentWRLD', ''), remap)
         if wrld:
             index.add(persistent_key(wrld), form_id, 'CELL')
@@ -271,8 +310,14 @@ def _add_cell(fields: dict, form_id: str, index: IdIndex, remap) -> None:
     index.add(exterior_key(grid), form_id, 'CELL')
 
 
-def _add_record(fields: dict, index: IdIndex, signature: str, remap) -> None:
-    """Add one scanned record: by EditorID, or by cell grid / parent cell."""
+def _add_record(fields: dict, index: IdIndex, signature: str, remap,
+                skip=()) -> None:
+    """Add one scanned record: by EditorID, or by cell grid / parent cell.
+
+    An interior cell is also filed under its display name, the one name
+    Morroblivion carries over verbatim.
+    See: docs/commentary/tes4_export_morrowind.md#interior-cells-by-name
+    """
     form_id = remap_form_id(fields.get('FormID', ''), remap)
     if form_id is None:
         return
@@ -281,16 +326,30 @@ def _add_record(fields: dict, index: IdIndex, signature: str, remap) -> None:
         if parent:
             index.add(land_key(parent), form_id, signature)
         return
-    if signature == 'CELL' and 'XCLC.X' in fields:
+    if signature == 'CELL' and ('XCLC.X' in fields or _is_persistent(fields)):
         _add_cell(fields, form_id, index, remap)
         return
     edid = fields.get('EditorID')
-    if not edid:
+    if not edid or (skip and _unmangled(edid) in skip):
         return
-    if signature == 'CELL':
-        edid = interior_key(edid)
-    index.add(edid, form_id, signature)
+    if signature != 'CELL':
+        index.add(edid, form_id, signature)
+        return
+    index.add(interior_key(edid), form_id, signature)
+    if fields.get('FULL'):
+        index.add(interior_key(fields['FULL']), form_id, signature)
 
+
+def _unmangled(editor_id: str) -> str:
+    """A Morroblivion EditorID reduced to the Morrowind id behind it.
+
+    See: docs/audits/morroblivion_mesh_axis_rotation.md#pairing-the-bases
+    """
+    return _EDID_SEP.sub('', editor_id.lower()).lstrip('0')
+
+
+#: Morroblivion writes '_' as 'U' and prefixes '0'; both drop out.
+_EDID_SEP = re.compile(r'[_u]')
 
 #: Morrowind marker name -> the TES4 FormID for the same engine marker.
 ENGINE_MARKERS = {
@@ -299,7 +358,7 @@ ENGINE_MARKERS = {
     'northmarker': 0x00000003,
     'divinemarker': 0x00000005,
     'templemarker': 0x00000006,
-    'prisonmarker': 0x0000003B,
+    'prisonmarker': 0x00000004,
 }
 
 

@@ -179,7 +179,7 @@ The whole chain is implemented and wired as pipeline **Phase 4b: Creatures**
   behavior project (`hkx_behavior.generate_creature_project`) + skeleton.nif/
   body-NIF conversion (`nif_converter creature=True`) + animation cache
   registration (`animation_data.write_fragment`, composed at runtime by
-  `TESRuntime.dll` — see [runtime composition](#runtime-animation-cache-composition))
+  `CreatureRuntime.dll` — see [runtime composition](#runtime-animation-cache-composition))
   + the `export/<plugin>/creature_projects.json` contract for the importer.
   32/32 real Oblivion.esm creatures convert (boxtest/endgame excluded: test
   asset / KFM cinematic).
@@ -750,9 +750,9 @@ present under every experiment of that period.
 
 <a id="animdata-plugin-collision"></a>
 <a id="runtime-animation-cache-composition"></a>
-### Runtime animation-cache composition (TESRuntime.dll)
+### Runtime animation-cache composition (CreatureRuntime.dll)
 
-**Code:** `tes_runtime/plugin/`, `asset_convert/havok/animation_data.py`
+**Code:** `tes_runtime/creature/`, `asset_convert/havok/animation_data.py`
 (`write_fragment`, `compose_animationdata`, `compose_animationsetdata`).
 Fragment schema: [tes_runtime_fragments.md](../reference/tes_runtime_fragments.md).
 
@@ -776,7 +776,7 @@ file. That single-owner design failed in three measured ways:
   register a brand-new project.
 
 The converter now writes **only its own** projects to one fragment per
-plugin (`SKSE\Plugins\TESRuntime\animation\<plugin>.json`), and `TESRuntime.dll`
+plugin (`SKSE\Plugins\CreatureRuntime\animation\<plugin>.json`), and `CreatureRuntime.dll`
 composes `vanilla base + every fragment in Data` in memory at the moment the
 engine parses each file. Load order and install order stop mattering, and a
 Nemesis/Pandora-generated loose singlefile becomes the base the fragments are
@@ -972,6 +972,21 @@ never children inside a mesh file.
 The attachment node still matters for REST visibility: the authored hidden bit
 is carried onto the shape (the shrink blob must not show on a living ghost)
 without moving it.
+
+### <a id="vis-gated-effect-shapes"></a>The merge drops parent `NiVisController`s
+
+The merge lifts shapes to the root and drops every parent, so a
+`NiVisController` sitting on a shape's PARENT node does not survive.
+
+**This is NOT what made the ancestor ghost's black sphere** — that was the
+missing refraction shader
+([asset_convert_shader.md](asset_convert_shader.md#refraction-surfaces)).
+Carrying the controller onto the shape was tried and REVERTED: it changed
+nothing on screen, because nothing binds the interpolator. Neither the source
+NIF nor the `.kf` files contain a `NiControllerManager` or any visibility
+track, so the blend interpolator stays unbound (`bool_value 2`) forever.
+Vanilla drives these from an embedded `NiControllerManager` we have no source
+for. Do not re-try this without first finding what would bind it.
 
 **The 80-bone cap runs after grafting.** SSE renders a skinned shape by
 memcpy'ing one 3x4 matrix per skin bone into a fixed 80-matrix buffer (shadow
@@ -1870,8 +1885,11 @@ creature is fully proven.
   0009BB4E → RagdollInstant); build_behavior_xml adds the two wrapper states
   (hkbPoweredRagdollControlsModifier maxForce 200 COMPUTE / 0 RAGDOLL, pose-matching
   bones picked from ragdoll part depths, idle-clip pose holders) gated on
-  `hkx_ragdoll.ragdoll_info()`. No getup states yet (Oblivion creatures lack getup
-  clips) — a knocked-down-but-alive actor stays down; death is unaffected.
+  `hkx_ragdoll.ragdoll_info()`. No getup states yet, so a knocked-down-but-alive
+  actor stays down; death is unaffected. The clips DO exist, contrary to an earlier
+  note here: 35 of Oblivion.esm's 44 creature folders ship
+  `idleanims/getupfaceup.kf` + `getupfacedown.kf` (a few also `getupleft`/`getupright`),
+  the Gatekeeper's included (counted 2026-09-25).
 - **Blend-collision body rot/trans = the body's BIND-POSE WORLD transform, not a
   bone-local offset (2026-07-16, the mangled-ragdoll root cause)**: on every Oblivion
   creature skeleton, a ragdoll bhkRigidBody's translation×7 equals its bone's world
@@ -2037,7 +2055,8 @@ creature is fully proven.
     mid-swing.  Single-play clips fire `returnToDefault` at clip end (NOT attackStop);
     the completion events the engine waits for (attackStop/recoilStop/staggerStop) are
     state exitNotifyEvents.  Attack clips also emit `weaponSwing` (~0.3s before the
-    hit) like every vanilla attack clip.
+    hit) like every vanilla attack clip.  (An amphibian's swim attacks sit inside the
+    swim machine and end on `attackStop` instead: #swim-attacks.)
   * DefaultState → DefaultBehavior SM {StandingState(0) ↔ LocomotionState(1)} via
     local moveStart/moveStop transitions.
   * StandingState → StandingBehavior SM {StandingIdle(0), LoopingTurnRight(1),
@@ -2061,7 +2080,8 @@ creature is fully proven.
   is dropped (anchors must increase, MOVT run falls back to walk).
   iState/iState_*Default/iState_*Run use the vanilla 30/31 tag values.
 - Remaining refinements: specialidle/random-idle IDLE wiring (DogIdleRoot/DogIdles
-  pattern), foot IK/look-at, getup-after-knockdown (needs getup clips Oblivion lacks —
+  pattern), foot IK/look-at, getup-after-knockdown (the `idleanims/getupface*.kf`
+  clips exist for 35 of 44 creature types but no getup state is generated yet —
   knocked-down live actors stay down; death unaffected), canned 90/180° turns
   (impossible from Oblivion data: turnleft/turnright.kf are looping shuffles with NO
   root-motion rotation — vanilla canned turns are authored root-motion clips; looping
@@ -2239,6 +2259,28 @@ wanting to cast and the actor stands there. Ours holds both hands' readiness
 over the whole `DefaultState` (`CombatIdle_MG`) — ready whenever not
 attacking/casting/staggering/blocking/swimming, each a sibling state.
 
+**Engine side of the handshake (measured live 2026-08-26, GOG 1.6.659 RVAs):**
+the AI calls `ActorMagicCaster` slot 3 (`0x563030`): `CheckCast` then `SetWantCast`
+(`0x641e30`, which only writes the graph variable `bWantCastLeft`), puts the
+caster in state 1 and RETURNS. State 1 to 2 happens ONLY in
+`LeftHandSpellCastHandler::executeHandler` (`0x75d950`): `GetMagicCaster(0)`, and
+if the state is 1 it runs `0x571820` and slot 4 (`0x5630e0`), which calls
+`PerformAction(DefaultObject 45 = ActionLeftAttack)` and walks the IDLE tree to
+the ENAM `Spell_FireForget_LH`. The exe has no literal for any `Spell_*` or
+`BeginCast*` event; the only cast tag it knows by name is `MLh_SpellFire_Event`.
+The event-to-handler binding is a per-actor `BSResponse<BSFixedStringCI, Actor>`
+map at `MiddleHighProcess+0xF8` (see `tools/live/anim_event_handlers.py`); for the
+scamp `BeginCastLeft` binds to `LeftHandSpellCastHandler`.
+
+The deadlock seen live: caster state 1, `bWantCastLeft=1`, `bMLh_Ready=1`,
+`IsCasting=0` for minutes. `BeginCast_EEM` was `SEND_ON_FALSE_TO_TRUE` and the
+engine never rewrites the flag while it waits, so no second edge fired
+("scamps only cast when the graph is hit just right"). The fix is `SEND_ON_TRUE`
+(the handler is a no-op outside state 1 and `IsCasting=1` silences it);
+unconfirmed in game. Never `hook` the handlers (ids 42819/42820): the game
+crashed on first firing, and `sae <event>` does not reach them (they fire on
+graph-raised events only).
+
 **What ships (2026-08-22):**
 
 - `hkx_behavior.py`: ONE `Mag_FF_In/Loop/Out` chain per caster graph
@@ -2348,6 +2390,19 @@ said the scamp "has a hard time casting / throws fewer flares", and an
 animation-driven actor cannot turn by itself while the AI faces its target
 before releasing — falmerbehavior keeps `bAllowRotation` on for ranged
 (hand type 7), as does our own attack modifier. *Unconfirmed.*
+
+<a id="attack-pin"></a>
+**Melee attacks are pinned the same way (2026-10-08, pending in-game
+confirmation).** `IsAttacking` stops the combat controller's steering but
+not the velocity the actor already has: the Skyblivion land dreugh "slides a
+bit after or before an attack and then starts moving". The chaurus wraps its
+bites in `bAnimationDriven_IsActive` (above), so
+`BSIsActiveModifier_IsAttacking` now also binds `bIsActive3 →
+bAnimationDriven`. Oblivion instead walks while swiping: the land dreugh's
+side swipes key legs, pelvis and root at priority 25, below the walk's 30,
+and the upper body at 55 (its forward power attack keys everything at 55).
+Layering such swipes over locomotion with bone weights is the faithful
+alternative if pinned attacks look wrong.
 
 <a id="strafe-direction-blend"></a>
 **Strafing is a `Direction` blend, never an event-entered state
@@ -2510,10 +2565,11 @@ both measured:
    Census: slaughterfish (Oblivion, Nehrim) and dreugh (Morrowind_ob) are
    the water natives.
 
-Known gap, untouched: an AMPHIBIAN (baliwog, horker, mudcrab…) still cannot
-attack while in its SwimState for the same reason — its attack transitions
-live on DefaultState. *Fish promotion shipped 2026-08-26, awaiting in-game
-confirmation.*
+An AMPHIBIAN had the same gap — its attack transitions lived on DefaultState,
+so it could not attack while in its SwimState. One that ships swim attack
+clips and has at most one weapon stance now plays them there: see
+[Swim attacks live in the swim state](#swim-attacks). *Fish promotion shipped
+2026-08-26, awaiting in-game confirmation.*
 
 ### 7d. Blocking (implemented 2026-08-22)
 
@@ -2793,55 +2849,28 @@ into the shipped clips instead (`hkx_anim.timescale_clip` in
 final and rate 1.0 is correct by construction. See
 [§8](#8-ground-speed-baked-not).
 
-**The run blend is its own state**, never mixed with the walk clip. Vanilla
-sabrecat `forwardlocomotion`: `ForwardRunBlend` = `RunSlow@0.75` / `Run@1.15` —
-the SAME clip at two rates — in a `ForwardRunState` separate from the walk/trot
-family, switched by `runStart`/`walkStart`.
-
-**REVERTED — the 3-child single blend.** The first layout (2026-08-22) put the
-stalking walk clip (2.9 s cycle) directly beside the gallop (0.75 s) as its only
-neighbour. Every dip of `SpeedSampled` below the run anchor SYNC-blended a
-phase-warped walk pose into the gallop — the lion's "briefly breaks into a
-sprint then slows again".
-
-### <a id="state-defs-end-events"></a>Clip-end events in `state_defs`
-
-`end_evt` is the clip-END trigger registered in both the graph and the
-animationdata cache. Single-play clips fire `returnToDefault` (vanilla
-convention — the root state machine's global wildcard routes it back to
-`DefaultState`). The completion events the ENGINE listens for —
-`attackStop`/`recoilStop`/`staggerStop` — are state `exitNotify` events, not
-clip triggers.
-
-`CombatStance` is the looping combat-idle clip nested under the standing idle
-switch (`combatStanceStart`/`Stop` local transitions, routed from the engine's
-`ActionDraw`). The `weaponDraw` reply the combat controller waits for is sent by
-the root-level `StartCombat`/`StopCombat` expression-modifier pair (vanilla
-quadruped layout), not by a state.
-
-### <a id="forward-blend-layout"></a>The MoveForward and Run blend layouts
-
-**Code:** `asset_convert/havok/behavior_clips.py` — `speed_blend_plan`,
-`run_blend_plan`, `state_defs`.
-
-**The walk blend** is the vanilla MONOLITHIC-creature layout, verbatim from
-`chaurusbehavior`'s `Forward_Blend` (a single-file project like ours): a
-slow-creep child at anchor 5 u/s (the engine's sandbox creep) plus the walk and
-run clips at their NATURAL anchors, all at `playbackSpeed` 1.0. Every vanilla
-top anchor equals the clip's real root-motion speed AND the MOVT commanded
-speed — chaurus 350.267, wolf 555, sabrecat 563.
-
-The slow child keeps its rate-scaled form (chaurus `WalkSlow@0.058` → 5): that
-pair IS how vanilla stops sandbox-creep gliding.
-
-**REVERTED — the rate-scaled ladder.** A 2026-07 attempt used walk@1.4 and
-run@0.75/1.5/2.0 to stretch slow Oblivion gaits up to the attribute-formula
-speed at runtime. It had no vanilla precedent at the top anchor and the lion
-still ran in slow motion in game. Oblivion's higher ground speed is now BAKED
-into the shipped clips instead (`hkx_anim.timescale_clip` in
-`generate_creature_project`), so the speeds reaching these planners are already
-final and rate 1.0 is correct by construction. See
-[§8](#8-ground-speed-baked-not).
+**The creep ladder (confirmed in game 2026-10-10, Skyblivion land dreugh).**
+Reported: "creature attacks, slides forward slightly, finally starts walking",
+and a slide at every animation switch. The 60 s live trace
+(`tools/live/graph_trace.py`) showed the engine ramping `Speed` from 5 to
+199 u/s at ~580 u/s^2 after every `moveStart` (RACE accel 1.0, same as
+vanilla) and commanding 49/62/88/127 u/s while closing in. A Havok sync blend
+averages its children's DURATIONS, so between two anchors the clip's rate is
+the harmonic, not linear, interpolation: with only creep@5 and walk@155 the
+legs cycled at 23 u/s while the body moved at 127. Vanilla fills the range:
+wolf `ForwardWalkBlend` walk@1.0 / walk@1.4 / trot@0.7 / trot@1.0 / trot@1.5
+(anchors 74.5, 104, 201, 287, 425), sabrecat trot@1.0 / trot@2.0, horse
+trot@0.704 / trot@1.0 — neighbours 1.4-1.5x apart. `creep_ladder` does the
+same: the gait clip at rates stepping `LADDER_STEP` (1.5) down from natural
+until the anchor would drop under twice the creep, then the creep child.
+Dreugh walk: 5 / 13.6 / 20.5 / 30.7 / 46 / 69 / 103 / 155; worst leg/ground
+ratio at a gap midpoint 0.12 -> 0.96 (the 5 -> 13.6 creep gap stays at 0.79,
+vanilla's is 15x wide). The run-family start state now switches at the same
+`runStart` threshold instead of a literal 100. Ruled out on the way:
+transition-effect motion flags (changed nothing in game), `bAnimationDriven`
+on locomotion (stopped walking), vanilla foot IK (`lockFeetWhenPlanted` is
+false on every vanilla creature; dog/troll/mudcrab ship none), and
+`FLAG_USE_VELOCITY_SYNCHRONIZATION` (no code in 1.6.1170 tests bit 0x100).
 
 **The run blend is its own state**, never mixed with the walk clip. Vanilla
 sabrecat `forwardlocomotion`: `ForwardRunBlend` = `RunSlow@0.75` / `Run@1.15` —
@@ -2862,6 +2891,12 @@ convention — the root state machine's global wildcard routes it back to
 `DefaultState`). The completion events the ENGINE listens for —
 `attackStop`/`recoilStop`/`staggerStop` — are state `exitNotify` events, not
 clip triggers.
+
+One exception: an amphibian's swim attack clip ends on `attackStop`.
+`returnToDefault` would take the graph out of `SwimState`, so the clip's end
+has to be an event the swim machine can answer by itself
+([Swim attacks live in the swim state](#swim-attacks)). Its state still sends
+`attackStop` on exit like every other attack state.
 
 `CombatStance` is the looping combat-idle clip nested under the standing idle
 switch (`combatStanceStart`/`Stop` local transitions, routed from the engine's
@@ -2916,6 +2951,22 @@ Generic names come first, then the stance-prefixed variants — census across al
 exports: `blockhit` 39, `handtohandblockhit` 31, `onehandblockhit` 26. Creatures
 block in ONE stance, so the first authored guard wins.
 
+### <a id="resume-locomotion"></a>Returning to a stride, not to standing
+
+**Code:** `behavior_locomotion.build_default`.
+
+Reported: converted creatures "sometimes slide forward without walking" (land
+dreugh, others). `DefaultBehavior` entered Locomotion only on `moveStart`,
+and every action (attack, recoil, stagger, equip, cast) leaves through the
+root and comes back via `returnToDefault`, restarting `DefaultBehavior` at
+Standing. The engine sends `moveStart` once when movement begins, so an
+actor that attacked or flinched mid-stride came back standing and slid at
+its commanded speed. Vanilla's graphs declare `iSyncIdleLocomotion` (wolf)
+and bind the idle/locomotion machine's `startStateId` to it (the 1HM graphs
+the gun patch extends do the same); a bound start state is written back as
+the machine changes state, so re-entry resumes the stride. Pending in-game
+confirmation.
+
 ### <a id="single-play-clips"></a>Single-play interrupts
 
 The clip fires `returnToDefault` at its end (vanilla-verbatim; the transition
@@ -2925,6 +2976,35 @@ stop event on exit, so the engine's combat/stagger controllers see completion.
 `Death` is the exception: no exit notify and no end trigger, because the clip
 holds its last pose (dead on the ground). Ragdoll death is handled by the outer
 wrapper state machine.
+
+Recoil and stagger are claimed by the bare stem first, then by a land-stance
+copy (`handtohandrecoil`, `onehandstagger`, ...). Oblivion's land dreugh
+authors only `handtohandrecoil.kf` / `handtohandstagger.kf` (AnimGroups
+`Recoil` / `Stagger`), so the bare-stem table alone left it with no hit
+reaction and no stagger state at all. Death takes no stance copy: it would
+swap a creature's ragdoll death for an animated one.
+
+#### <a id="hit-window-attacks-only"></a>Only an attack clip carries a hit window
+
+**Code:** `_ClipSet._meta` in `asset_convert/havok/hkx_behavior.py`.
+
+Oblivion's recoil and stagger kfs can carry a `Hit` text key, and the
+`weaponSwing`/`preHitFrame`/`HitFrame` triple used to be derived for every clip
+that had one. The engine binds those events to its swing handlers per actor
+(`weaponSwing -> WeaponRightSwingHandler`, `HitFrame`, `preHitFrame ->
+AnticipateAttackHandler`), whatever state the graph is in, and only `attackStop`
+clears the attack. A recoil or stagger state exits with `recoilStop`/`staggerStop`,
+so after the first recoil the actor stayed "mid-attack" for good: it moved and
+chased but never started another attack. Vanilla never does this: of 155 recoil
+and 299 stagger clips in the LE `animationdatasinglefile.txt`, none carries any of
+the three.
+
+Found on Nehrim's intro black troll (`SchattenrufAlptraumTroll01`): Celebro blocks
+its first swing (contact, no damage), the engine sends the troll `recoilStart`, and
+its `recoil` clip fired `weaponSwing@0.2`/`HitFrame@0.5`. The earlier trolls
+fight the player, who rarely blocks. Casts, recoils, staggers and every other
+non-attack clip now get no hit window; a keyless attack still gets one 40% in.
+Confirmed in game: the troll attacks repeatedly.
 
 ### <a id="equip-clips"></a>Weapon draw and sheathe
 
@@ -2938,6 +3018,54 @@ the bare-handed ones do not (`wolfbehavior` 7 KB, `chaurusbehavior` 98 KB). Our
 generated graph had `weaponDraw`/`weaponSheathe` EVENTS but no equip STATE, so
 nothing ever reparented the weapon: it stayed on the sheath node — or, before
 those nodes existed, on the actor root, sliding around at the creature's feet.
+
+### <a id="equip-node-synthesis"></a>The sheath nodes are synthesised, at the anchor's origin
+
+**Code:** `add_creature_equip_nodes` / `strip_creature_bone_controllers` in
+`asset_convert/character/equipment_rig.py`, both run by `prepare_creature_rig`.
+
+Skyrim looks these nodes up by hard-coded name. A vanilla weapon-using rig
+places them as the Draugr skeleton does: `WeaponAxe`/`Sword`/`Mace` by the
+pelvis, `WeaponBack`/`Bow`/`QUIVER` after the left pauldron on the upper spine,
+`WEAPON` under the right hand, `SHIELD` under the left.
+
+Oblivion rigs have only three attachment points — Weapon, Torch, Quiver — which
+the `BONE_RENAMES` pass turns into WEAPON/SHIELD/QUIVER. The per-type SHEATH
+nodes have no Oblivion counterpart, so the converted rig simply lacked them: a
+converted weapon carries `Prn=WeaponMace`, the engine found no node by that
+name, and the mesh fell back to the actor root — the weapon visibly slid around
+at the creature's feet and no draw animation could reparent it.
+
+Each entry names the anchor to hang under (first that exists on this rig wins)
+and the node whose LOCAL transform is copied, so the new node lands somewhere
+sensible for a rig of any size rather than at a hardcoded human offset.
+
+**The nodes are empty by design.** Oblivion creatures do not sheathe: all 41
+armed creature folders ship equip/unequip clips whose text keys are
+`attach`/`detach` (the AnimObject mechanism) — the weapon is created in the hand
+and destroyed, never parked on the body — and 38 of those 41 rigs carry no
+Quiver/Shield/BackWeapon node at all. The SHEATH nodes therefore exist only to
+give the engine a node of the name it looks up. An earlier pass synthesised
+"proportionate" offsets from vanilla Skyrim ratios; that was wrong twice over —
+the placements disagreed with vanilla anyway (axe and mace hang on the RIGHT hip
+in Skyrim, the guessed offset put them on the left) and no Oblivion creature has
+anything to place there. The node is created at the anchor's origin, which is
+what a node nothing renders at should be.
+
+### <a id="dead-bone-controllers"></a>Oblivion's runtime bone controllers are stripped
+
+Oblivion creature skeletons carry an active (flags=12) but DATALESS
+`NiTransformController` on every bone, a `bhkBlendController` on every ragdoll
+bone, and a `NiBSBoneLODController` on Bip01 — all driven by Oblivion's engine
+at runtime. Vanilla Skyrim creature skeletons ship none of these
+(`bhkBlendController`: 0 across all vanilla actor meshes; their only
+`NiTransformController`s carry a real interpolator and data, such as the dog's
+jaw and tongue idle). Skyrim drives bones from the behaviour graph, so these
+leftovers are at best dead weight and at worst engine hazards — an active
+controller with a null interpolator on every bone.
+
+A `NiTransformController` that HAS an interpolator is real embedded animation
+and is kept.
 
 ### <a id="combat-idle-clips"></a>The combat-ready idle
 
@@ -3038,11 +3166,110 @@ Promotion CLEARS the swim dict, and that is the point: no swim dict means no
 SwimState, no Swim MOVT and no `iState` switch — the Default movement type
 carries the swim speeds directly, exactly as vanilla slaughterfish does.
 
-Amphibians (baliwog, horker, grummite: land + swim sets) are untouched and keep
-the land graph + SwimState split. Telling the two apart needs a stem test that
-ignores spelling — grummite spells its land gait `forwardwalk`, horker
-`walkforward` — so `_LAND_GAIT_MARKERS` matches ANY spelling containing the
-marker.
+Amphibians (baliwog, horker, grummite: land + swim sets) keep the land graph +
+SwimState split. Telling the two apart needs a stem test that ignores spelling
+— grummite spells its land gait `forwardwalk`, horker `walkforward` — so
+`_LAND_GAIT_MARKERS` matches ANY spelling containing the marker.
+
+### <a id="swim-attacks"></a>Swim attacks live in the swim state
+
+**Code:** `behavior_clips.swim_attacks`, `behavior_attacks.swim_attack_states`,
+`behavior_actions.build_swim`
+
+Oblivion ships a second attack set for a creature that fights in water:
+`swimhandtohandattackleft.kf` beside `handtohandattackleft.kf`. The attack
+sweep takes both sets as attacks, RACE lists one event per clip, and the combat
+AI picks among all of them wherever the actor stands. With every attack a root
+state reached from `DefaultState`, such a creature played a swim attack on dry
+land about every second time (the murkdweller: 6 of its 13 attacks) and had no
+attack at all in water — `SwimState` is a root sibling that no attack
+transition leaves.
+
+Vanilla's horker is the same animal and the model. Its RACE lists
+`attackStart_HorkerSwim` beside five land events, and its graph
+(`quadrupedbehavior.hkx`) splits them by state:
+
+- the land events are local transitions out of `DefaultState`, as here;
+- `HorkerSwimBehavior`, the machine inside `HorkerSwimState`, holds a
+  `SwimAttack` state. The swim idle and the swim locomotion states each carry
+  `attackStart_HorkerSwim -> SwimAttack`, with the same to-animation-driven
+  effect the land attacks use;
+- the swim attack clip's END trigger is `attackStop`, and `SwimAttack` carries
+  `attackStop -> swim idle` with the from-animation-driven effect. It has no
+  exit notify, where the land attack states send `attackStop` on exit and end
+  their clips on `returnToDefault`.
+
+An event the active state has no transition for is not taken, so the land
+events do nothing in water and the swim event nothing on land. RACE still
+lists all of them: the horker's race gives its swim event chance 1.00 beside
+land events at 0.40, 0.40 and 0.20. What a refused pick costs in attack rate
+was not measured. Neither the horker's race nor a converted
+swimmer's carries the `No Combat In Water` flag (0x800) that 95 of
+Skyrim.esm's 99 races do.
+
+Two things differ from the horker on purpose:
+
+- **The state sends `attackStop` on exit as well.** The horker's does not.
+  Here the swim attack clips carry the hit triggers, and only `attackStop`
+  clears an attack the engine has seen swing
+  ([Only an attack clip carries a hit window](#hit-window-attacks-only)): a
+  swim attack cut short by a stagger, or by leaving the water, could
+  otherwise leave the actor mid-attack. On a normal end the event is
+  sent twice, the second time into the swim idle, which has no transition
+  for it. Vanilla's giant builds its nested attack state the same way: the
+  clip's end trigger, the local transition and the exit notify are all
+  `attackStop` (so do the atronachs and six more graphs). A cut-short leaves
+  through the ROOT, so the notify is heard only if Havok sends a nested
+  state's exit notify when its parent state is left; the giant's graph
+  relies on the same thing.
+- **The clip keeps the attack wrapper** (`AttackModifierList`: `IsAttacking`,
+  rotation, head tracking, `bAnimationDriven`). The horker's swim attack
+  plays its clip bare. Whether animation-driven motion suits an attack in
+  water was not measured.
+
+`swim_attacks` picks the clips: the `swim*` attacks of a creature that keeps a
+SwimState, has at most one weapon stance and ships a land attack too. Each
+becomes a state of `SwimBehavior` (ids from `SWIM_ATTACK_FIRST_ID`, after the
+five gait ids), every swim gait state carries the transitions into them, and
+`_attack_specs` leaves them out of the root. `state_defs` gives those clips the
+`attackStop` end event, so the animation cache names the trigger the graph
+fires. The events, the RACE list and the clip files are unchanged.
+
+Oblivion.esm, by this rule: baliwog (5 land + 5 swim), dog (5 + 3),
+murkdweller (7 + 6), rat (2 + 2). Built for the 45 animated folders of its
+export, the graph XML of the other 41 is identical with and without it.
+
+**Left as they were:**
+
+- **A creature with weapon stances** (grummite: four stances, swim attacks for
+  two). Its swim attacks stay inside the stance machines, reachable on land
+  and not in water. Nesting them by stance inside the swim machine is the
+  missing piece.
+- **A creature with swim attacks and no land attack** keeps them at the root:
+  with nothing else to play on land, the old wiring is the safer guess. No
+  folder of the official files is like that.
+- **A swimmer with no swim attack clips** (bear, deer, horse, mudcrab) still
+  cannot attack while swimming.
+
+**Open:**
+
+- **Root wildcards leave `SwimState` and none leads back.** For these four
+  creatures there are seven: `recoilStart`, `recoilLargeStart`,
+  `staggerStart`, the equip and unequip events, the aware vocal and
+  `returnToDefault`. All end in `DefaultState`; only `swimStart` enters
+  `SwimState`. The equip pair's dispatch never fires
+  ([Attacks are gated by NESTING](#attacks-are-gated-by-nesting)), which
+  leaves five. If the engine sends `swimStart` on the change only (not
+  measured), a creature that is hit or calls out while swimming stays on its
+  land states in the water, and there it answers its land attack events.
+  That was so before this rule. A look at a creature fighting in water
+  therefore has to note WHICH clip it attacks with.
+- The graphs were checked as the builder's XML; a packed `.hkx` of this
+  wiring was not read back here.
+
+*In game, on a build of our fork: a converted scalon (`murkdweller`) attacks
+on land without the swimming pose it showed before, and one was seen to
+attack a player in the water; which clip it played there was not seen.*
 
 ## FO3/FNV creature clip naming
 
@@ -3231,6 +3458,69 @@ the nearest armed stance, else H2H: a converted actor can be handed a weapon
 class Oblivion never animated for it, and playing the wrong swing beats
 standing inert.
 
+### <a id="morrowind-synthetic-ragdolls"></a>Morrowind rigs get SYNTHESIZED ragdoll bodies
+
+**Code:** `asset_convert/havok/hkx_ragdoll_morrowind.py`
+
+Morrowind predates Havok. Its creature skeletons are NIF `0x4000002` (4.0.0.2)
+and carry **zero** collision objects, bodies and constraints — measured across
+all 51 rigs under `export/Morrowind.esm/meshes/r/*/skeleton.nif`. So
+`plan_ragdoll_tree` sees fewer than two bodies, `extract_ragdoll` returns
+`None`, and the creature never reaches the AnimateToRagdoll / Fully Ragdoll
+wrapper. Measured with `tools/creature/ragdoll_mass_census.py`: all 50 built
+Morrowind `skeleton.hkx` report `ragdoll bones: 0  bodies found: 0`, against
+the Oblivion bear's 107/18 and clannfear's 143/22.
+
+The symptom is the corpse holding its death clip's last frame with the
+character controller still under it, so it is never activatable — the
+"Morrowind creatures aren't lootable on death" report.
+
+The fix synthesizes the bodies rather than special-casing the death state,
+because everything downstream of "a body with a capsule and a mass" already
+works: joint templates, `capsule_inertia`, the DFS ordering, and the engine
+attach contract. With no authored constraint anywhere, every joint takes the
+case-3 synthetic vanilla-template branch at `_SYNTH_FRICTION = 0.0`.
+
+**The bodies go into BOTH files.** The engine attaches a ragdoll by pairing
+each hkx body with the same-named collision body in the shipped
+`skeleton.nif` (see `plan_ragdoll_tree`). `attach_synthetic_bodies` is
+therefore called from `hkx_ragdoll._read_rig` AND from
+`nif_converter_morrowind.run_morrowind_fixups`. A first version only fed the
+hkx: the vermai shipped a 39-part hkx ragdoll over a skeleton.nif with 0
+collision blocks (the Oblivion bear ships 18 bodies + 17 joints), and in game
+the corpse had no ragdoll, no collision and could not be looted. After the
+fix the converted vermai skeleton.nif carries 35 bodies + 34 joints against
+35 hkx parts.
+
+**Bodies are written as Oblivion authors them**: Havok units (the readers
+multiply by `OB_TO_GAME` = 7) and a body frame equal to the bone's bind WORLD
+transform, rotation included. The first version wrote game units and summed
+translations without rotations, so every capsule came out 7x oversized and
+displaced. Measured after the fix: each capsule starts at its joint and ends
+on the child bone to within 3e-5 units.
+
+**Which nodes get a body is AUTHORED: the bones the creature's own body mesh
+skins to**, plus their common ancestor as the shared trunk root. Unskinned
+nodes are exactly the non-anatomy (vermai: `Bip01`, `Bip01 NonAccum`,
+`Bip01 Pelvis`, `Bounding Box`; guar: 15 `Dummy*`; cliffracer: 18 `*Cap`;
+storm atronach: `FootHold`/`Gravity01`/`PArray01`). A body on the ground-level
+rig root is a tall bar the corpse cannot fall over, the same failure as
+[the bone-1 dead end](#ragdoll-root-bone1-dead-end).
+
+**Only pre-Havok NIFs (version <= 4.0.0.2) are touched.** An Oblivion rig with
+no collision is a ghost that must keep its dissolve; measured untouched: bear
+18 parts, rat 21, ghost none.
+
+Capsule proportions are measured off 176 authored bodies on 7 Morroblivion
+rigs of the same creatures (`temp/probe_capsule_ratios.py`), in game units:
+radius/length median 0.30, radius/extent p10 0.0084 and p90 0.047, source mass
+per cubic unit median 0.0066. The total is clamped into the vanilla band
+(wolf 29 .. dragon 4852) because these rigs are authored at scales spanning
+400x, and each body is floored at 10% of the mean to keep joint mass ratios
+solvable.
+
+NOT yet confirmed in game.
+
 ### <a id="ragdoll-less-creatures"></a>Ragdoll-less creatures keep their death animation
 
 A ghost, wraith or spectre has no bhk bodies in its source skeleton, so
@@ -3269,6 +3559,19 @@ records, exactly like vanilla WolfIdleHowl / WolfIdleWarn. Embedding the sound
 in the looping Idle/CombatStance clips instead made it fire every cycle, in
 life and in the ragdoll wrapper states after death.
 
+Only the **Aware (CSDT 5)** slot is delivered, through the `AwareVocal` state
+entered by ActionIdleWarn. The **Idle (CSDT 4)** slot is delivered nowhere for
+now, because both candidate channels are disqualified:
+
+* an annotation on the looping base idle fires every cycle (the confirmed
+  squeak-spam bug; vanilla does this only for cow/goat cud-chewing, and
+  predators' mt_idle carries no SoundPlay at all);
+* an IDLE record under ActionIdle sent the actor into an engine-tracked dynamic
+  idle over and over (authored chance 75+ per idle poll), and creatures stopped
+  walking and floated in their idle. Vanilla routes ActionIdle through deep
+  per-creature NonCombatIdle chains whose lifecycle our minimal graph does not
+  implement. Restoring idle chatter needs that full chain first.
+
 `IdleStop` is LOCAL to these states and **never a root wildcard**. Vanilla
 routes idleStop only out of its idle states (atronach CombatIdleSpecial →
 CombatIdle, MT_Idle specials → MT_Idle; sabrecat and draugr likewise). A cast
@@ -3278,6 +3581,53 @@ wildcard killed every FireForget/Attack state the moment the AI wanted to
 move: the actor snapped back to Default while the engine stayed in its casting
 state waiting for a SpellFire / Spell_Stop that could no longer come (the
 2026-08-23 "IsCasting=1, graph in DefaultState, never casts" readback).
+
+### <a id="getup-from-ragdoll"></a>Getting up from a knockdown (2026-09-25, unconfirmed in game)
+
+**The clips exist.** 35 of Oblivion.esm's 44 creature folders ship
+`idleanims/getupfaceup.kf` + `getupfacedown.kf` (some `getupleft`/`getupright`,
+spelled with or without an underscore). An earlier note here said they did not.
+`behavior_clips.getup_clips` claims them. The folders without any are boar, dog,
+the floaters (ghost, wraith, will-o'-the-wisp), slaughterfish, and three
+scripted/test folders.
+
+**Keep NonAccum, reset only Bip01.** Across every getup clip measured, `Bip01`
+carries a horizontal slide (16-58 units) and `Bip01 NonAccum` carries the RISE
+from lying to standing (Gatekeeper z 15→80, idle 82; rat 11.5→23.9, idle 22.3;
+skeleton 7→60, idle 67). `split_root_motion` flattens whichever accum bone
+moves most, which for the Gatekeeper is NonAccum, so a normally decoded getup
+stands the creature up at ground height. Getup clips decode with
+`extract_motion=False` plus `kf_decode.reset_accum_roots` (bone 0 stays
+identity). Like vanilla's GetUp clips (absent from `anims_dogproject.txt`),
+they register no bound motion.
+
+**The graph is vanilla dogbehavior states 4 and 5.** State 2 'Fully Ragdoll'
+plays the `PoseMatching MSG` selector (bound to `iGetUpType`) instead of the
+frozen idle, exactly as vanilla state 4 does. Its two
+`hkbPoseMatchingGenerator`s, Reanimate and GetUp, each hold every getup clip.
+They start matching on `Ragdoll` and start playing on `GetUpStart`, so the clip
+closest to the landed pose wins. The engine never sends `GetUpBegin` by name
+(the string is absent from every exe): it fires `ActionGetUp` (AACT 0xD1FDD),
+and a per-graph IDLE under it supplies the event, vanilla `DogGetup` (ENAM
+`GetUpBegin`, DATA `000000720000`), mirrored by `creature_idles` as
+`TES4<folder>GetUp`. Without that IDLE the creature stays down for good (the
+first build did not have it). `GetUpBegin` switches the limp
+ragdoll off and `TurnOnMatchingRagdoll` on: a 200-force COMPUTE powered ragdoll
+plus a 0.5 s `hkbTimerModifier` that raises `GetUpStart`. That enters state 3
+'GetUpFromRagdoll': `hkbGetUpModifier` (1.0 s blend, 0.25 s ground align),
+the live keyframe/drive pair, and `BSIsActiveModifier` holding
+`bAnimationDriven`. `GetUpEnd` (clip end) blends back to Root.
+
+**When the controller comes back.** Vanilla fires `Getup`/`Reanimated` and
+`AddCharacterControllerToWorld` at the clip's first footfall (`GetUpLeft`
+`FootFront:0.4`, `GetUpRight` `FootBack:0.866667`). Oblivion's getup clips
+author their footfalls (`Enum: Left/Right/BackLeft`), so the same moment is
+`behavior_getup.landing_time`: the first footfall, else the clip end. Graph
+triggers and animationdata blocks come from one `getup_clip_meta` row.
+
+**A ragdolling creature with no getup clip** (boar, dog) rises through its
+annotation-free `ragdollpose` idle copy under the same selector, so it
+blend-stands over the modifier's 1.0 s instead of lying there for good.
 
 ### <a id="the-death-pose-source"></a>The death pose source
 

@@ -32,11 +32,16 @@ import os
 import struct
 import sys
 import time
+import zlib
 from collections import defaultdict
 
+from .base.tes5_reader import subrecords
+from .base.object_scripts import write_udf_host_quests
 from .overrides.manifest import write_manifest
 from .overrides.nested import (build_nested_overrides)
+from .dialogue.arrest import morrowind_arrest_topic
 from .dialogue.groups import build_dialog_groups
+from .runtime_sidecars import sweep_stale_sidecars
 from .base.owned_records import (
     WELL_KNOWN_PROPERTIES,
 )
@@ -93,7 +98,7 @@ def _build_dialogue(st, voice_map: dict) -> set:
         master_index=st.ctx.master_index)
 
 
-def _patch_sounds(st) -> None:
+def _patch_sounds(st, export_dir: str = '') -> None:
     """Point every sound slot at an SNDR, not the TES4 SOUN id Phase 1 wrote.
 
     See: docs/commentary/tes5_import_pipeline.md#sound-slot-patching
@@ -104,37 +109,16 @@ def _patch_sounds(st) -> None:
         print(f"  Actor sound entries bound/flattened: {n_snd} actors")
     _own_souns = {get_formid(r, 'FormID') & 0x00FFFFFF
                   for r in st.by_type.get('SOUN', [])}
-
-    def _master_sound_descriptor(soun_fid: int) -> int:
-        """MASTER-owned TES4 SOUN id -> the SNDR the master's conversion made.
-
-        Read out of the master's converted SOUN (whose SDSC names the
-        companion) rather than re-derived, which would mint an id in THIS
-        plugin's index space.  Required, not optional: Morrowind_ob's containers
-        and torches point at Oblivion.esm sounds it never overrides, so the
-        master manifest carries no entry for them and every one of those ~2,400
-        slots would otherwise be left wrong-typed.
-        """
-        if not st.ctx or not getattr(st.ctx, 'master_index', None):
-            return 0
-        blob = st.ctx.master_index.record(soun_fid)
-        if not blob or blob[:4] != b'SOUN':
-            return 0
-        pos = 24
-        while pos + 6 <= len(blob):
-            sig = blob[pos:pos + 4]
-            size = struct.unpack_from('<H', blob, pos + 4)[0]
-            if sig == b'SDSC' and size == 4:
-                return struct.unpack_from('<I', blob, pos + 6)[0]
-            pos += 6 + size
-        return 0
+    master_index = getattr(st.ctx, 'master_index', None) if st.ctx else None
 
     from .record_types.items import patch_sound_descriptor_slots
+    from .record_types.sound import master_sound_descriptor
     bound = []
     for _sig, _label in (('ACTI', 'activators'), ('CONT', 'containers'),
                          ('DOOR', 'doors'), ('LIGH', 'lights')):
         _n = patch_sound_descriptor_slots(
-            st.writer, _sig, _own_souns, _master_sound_descriptor)
+            st.writer, _sig, _own_souns,
+            lambda soun: master_sound_descriptor(master_index, soun))
         if _n:
             bound.append(f"{_n} {_label}")
     if bound:
@@ -143,6 +127,29 @@ def _patch_sounds(st) -> None:
     n_wsnd = patch_weather_sounds(st.writer, _own_souns)
     if n_wsnd:
         print(f"  Weather sound descriptors bound: {n_wsnd} weathers")
+    _stage_sound_table(st, export_dir)
+
+
+def _stage_sound_table(st, export_dir: str) -> None:
+    """Stage the runtime's sound table, for a TES3 source only.
+
+    Here rather than in the sidecar pass: the SNDR ids only exist once Phase 3
+    has run, and this is where every other sound slot is bound.
+
+    Measured on TR_Mainland: of the 99 sound ids its scripts name, 2 are its
+    own and 97 belong to masters, so a table of only this plugin's SOUNs is
+    empty of what the scripts actually ask for.
+    See: docs/commentary/tes5_import_sound.md#the-runtime-sound-table
+    """
+    from .dialogue.morrowind_sidecar import stage_sound_table
+    from .record_types.sound import get_sndr_for_soun
+    plugin = os.path.basename(st.output_path)
+    own = {(rec.get('EditorID') or '').strip():
+           get_sndr_for_soun(get_formid(rec, 'FormID'))
+           for rec in st.by_type.get('SOUN', [])}
+    named = stage_sound_table(export_dir, st.output_path, plugin, own)
+    if named:
+        print(f"  Runtime sound table: {named} sound(s)")
 
 
 def _patch_late_bindings(st, export_dir: str) -> None:
@@ -155,16 +162,16 @@ def _patch_late_bindings(st, export_dir: str) -> None:
     See: docs/commentary/tes5_import_pipeline.md#patch-pass-runs-last
     """
     from .dialogue.converter import make_player_script_quest
-    player_quest_fid = make_player_script_quest(
+    make_player_script_quest(
         st.writer, master_index=(st.ctx.master_index if st.ctx else None))
-    if player_quest_fid and not (st.ctx and st.ctx.master_index is not None
-                                 and player_quest_fid in st.ctx.master_index):
-        st.sge_quest_fids.add(player_quest_fid)
+    n_udf = write_udf_host_quests(st.writer)
+    if n_udf:
+        print(f"  OBSE function scripts hosted on quests: {n_udf}")
     from .packages.converter import patch_forcegreet_topics
     n_fg = patch_forcegreet_topics(st.writer)
     if n_fg:
         print(f"  ForceGreet packages bound to a greeting topic: {n_fg}")
-    _patch_sounds(st)
+    _patch_sounds(st, export_dir)
     _patch_creature_chains(st, export_dir)
 
 
@@ -205,6 +212,17 @@ def _patch_creature_chains(st, export_dir: str) -> None:
               f"{n_bpp} races bound")
 
 
+def _finalize_adoption(writer) -> None:
+    """Ship adopted master records carrying this plugin's text; add the renamed copies.
+
+    See: docs/commentary/tes5_import_override.md#generated-records-reuse-the-masters
+    """
+    kept, added = writer.adoption.finalize(writer)
+    print(f"  Generated records shared with the masters: "
+          f"{len(writer.adoption.adopted)} adopted, {kept} with new text, "
+          f"{added} renamed copies")
+
+
 def run_finalize_phases(st, export_dir: str, phase_done,
                         is_esm: bool, masters: list) -> tuple:
     """Phase 5 onward: dialogue, side files, and the write.
@@ -213,7 +231,8 @@ def run_finalize_phases(st, export_dir: str, phase_done,
     is read by an earlier phase.
     """
     voice_map = {}
-    st.sge_quest_fids |= _build_dialogue(st, voice_map)
+    st.sge_quest_fids |= _build_dialogue(st, voice_map) | morrowind_arrest_topic(
+        st.by_type, st.writer, st.ctx.master_index if st.ctx else None)
 
     _patch_late_bindings(st, export_dir)
 
@@ -224,6 +243,7 @@ def run_finalize_phases(st, export_dir: str, phase_done,
 
     if st.ctx:
         st.ctx.report()
+        _finalize_adoption(st.writer)
 
     t3 = time.time()
     print(f"\nConverted {st.converted} records ({st.errors} errors) in {t3-st.t2:.2f}s")
@@ -249,7 +269,10 @@ def run_finalize_phases(st, export_dir: str, phase_done,
     file_size = os.path.getsize(st.output_path)
     print(f"Wrote {st.output_path} ({file_size:,} bytes)")
 
-    _write_seq_file(st.output_path, st.sge_quest_fids)
+    _write_seq_file(st.output_path, st.sge_quest_fids | _own_sge_quests(st.writer))
+    stale = sweep_stale_sidecars(st.output_path)
+    if stale:
+        print(f"  Removed {stale} stale runtime sidecar file(s)")
 
     set_formid_index_offset(0)
 
@@ -299,6 +322,28 @@ def _write_lip_text(output_path: str, lip_texts: dict):
                     .replace('\r', '\\r').replace('\t', '\\t'))
             f.write(f'{fid:06X}_{num}={text}\n')
     print(f"  Wrote {map_path} ({len(lip_texts)} response transcripts)")
+
+
+def _own_sge_quests(writer) -> set:
+    """FormIDs of every QUST this file defines whose written DNAM is Start Game Enabled.
+
+    A start-game quest missing from the .seq gets no dialogue loaded in a new
+    game, so its scene topics stay empty until a save is loaded.
+
+    See: docs/commentary/tes5_import_dialogue.md#speak-as-quest-in-the-seq
+    """
+    out = set()
+    for raw in writer._top_groups.get('QUST') or []:
+        flags, fid = struct.unpack_from('<II', raw, 8)
+        if fid >> 24 != writer.own_index:
+            continue
+        body = raw[24:]
+        if flags & 0x40000:
+            body = zlib.decompress(body[4:])
+        dnam = next((v for k, v in subrecords(body) if k == b'DNAM'), b'')
+        if dnam and dnam[0] & 0x01:
+            out.add(fid)
+    return out
 
 
 def _write_seq_file(output_path: str, sge_quest_fids: set):
@@ -388,7 +433,7 @@ def _creature_sound_slots(export_dir: str) -> dict:
     so a missing/unimportable pipeline is simply "no footsteps".
     """
     try:
-        from asset_convert.havok.creature_pipeline import sound_slots_by_folder
+        from asset_convert.havok.creature_sounds import sound_slots_by_folder
     except ImportError:
         return {}
     try:

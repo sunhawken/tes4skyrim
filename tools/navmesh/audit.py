@@ -19,7 +19,6 @@ can be judged on the population rather than on one favourite room:
 import argparse
 import math
 import os
-import pickle
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -29,52 +28,30 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from asset_convert.collision import collision_extract as ce
+from asset_convert.game_paths import namespace_for, set_namespace
 from tes5_import.navmesh import build, params
+from tes5_import.base.obstacles import index_obstacles
+from tes5_import.navmesh.pool import build_base_model_index, model_key
 from tes5_import.navmesh.from_pgrd import (collect_doors,
-                                      load_door_centroids)
+                                      load_door_centroids, record_graph)
+from tools.navmesh import cell_index as cell_index_mod
+from core.plugin_masters import master_dir, masters_from_export_header
 from tes5_import.base.text_reader import (
-    parse_export_directory, group_records_by_type, get_float, get_int, get_str,
+    parse_export_directory, group_records_by_type, get_formid,
+    get_int, get_str,
 )
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
 from output_layout import assets_for
 
-_TYPES = {'CELL', 'REFR', 'PGRD', 'LAND', 'STAT', 'CONT', 'FURN', 'ACTI',
-          'TREE', 'DOOR', 'WRLD'}
-_BASES = ('STAT', 'CONT', 'FURN', 'ACTI', 'TREE', 'DOOR')
+#: Every base type the import's `build_base_model_index` may carve with.
+_BASE_TYPES = {'STAT', 'CONT', 'FURN', 'ACTI', 'TREE', 'FLOR'}
+#: The base types plus the scripts that make one of them an obstacle.
+_BASE_PARSE = _BASE_TYPES | {'SCPT'}
+_TYPES = {'CELL', 'REFR', 'PGRD', 'LAND', 'DOOR', 'WRLD'} | _BASE_PARSE
 
 
-def _model_key(model):
-    k = 'tes4/' + model.lower().replace('\\', '/').lstrip('/')
-    return k if k.endswith('.nif') else k + '.nif'
-
-
-def _pgrd_nodes(pgrd):
-    nodes, edges = [], []
-    n = get_int(pgrd, 'DATA.PointCount', 0)
-    for i in range(n):
-        if pgrd.get('Point[%d].X' % i) is None:
-            break
-        nodes.append((get_float(pgrd, 'Point[%d].X' % i),
-                      get_float(pgrd, 'Point[%d].Y' % i),
-                      get_float(pgrd, 'Point[%d].Z' % i)))
-    seen = set()
-    for i in range(len(nodes)):
-        for j in range(get_int(pgrd, 'Point[%d].Connections' % i, 0)):
-            t = pgrd.get('Point[%d].Edge[%d]' % (i, j))
-            if t is None:
-                break
-            try:
-                t = int(t)
-            except ValueError:
-                continue
-            if 0 <= t < len(nodes) and t != i:
-                k = (min(i, t), max(i, t))
-                if k not in seen:
-                    seen.add(k)
-                    edges.append(k)
-    return nodes, edges
 
 
 def _tri_z(px, py, va, vb, vc):
@@ -260,21 +237,139 @@ def _run_cell(job):
 
 
 def _door_model_map(by_type):
-    """Return a MAP of low-24 DOOR FormID -> model key, never a bare set.
+    """Return a MAP of DOOR FormID -> model key, never a bare set.
 
-    Matches import_main._build_door_fid_set.  A bare set makes _collect_doors
-    take its legacy membership-only path, which skips panel centering AND the
-    per-model threshold axis/width -- so every debug tool measured doors with
-    width 0 and the default orientation while the real pipeline used the
-    measured ones.
+    Keyed by the FULL FormID, as `pool.build_base_model_index` keys the
+    pipeline's.  A bare set makes _collect_doors take its legacy
+    membership-only path, which skips panel centering AND the per-model
+    threshold axis/width -- so every debug tool measured doors with width 0
+    and the default orientation while the real pipeline used the measured ones.
+
+    See: docs/commentary/tes5_import_navmesh.md#base-ids-carry-their-plugin-index
     """
     out = {}
     for d in by_type.get('DOOR', []):
-        f = d.get('FormID')
+        f = get_formid(d, 'FormID')
         m = get_str(d, 'Model.MODL') or get_str(d, 'MODL')
         if f and m:
-            out[int(f, 16) & 0xFFFFFF] = _model_key(m)
+            out[f] = model_key(m)
     return out
+
+
+def index_path(export):
+    """Where `export`'s cached navmesh index lives."""
+    return os.path.join(export, 'audit_index3.pkl')
+
+
+#: Unpickled tables per export; a 2 GB re-read costs 6.2s every time.
+_TABLES = {}
+
+
+def _parse_tables(export):
+    """Parse one export into the six index tables -- its OWN records only.
+
+    Masters are chained at lookup time, never copied in: a child that merged
+    them stored Morrowind_ob's 37,742 LAND records a second time.
+
+    `model_key` prefixes each path with the ACTIVE namespace, so the namespace
+    is set from `export` first: a default-`tes4` index stores keys no
+    non-Oblivion collision cache holds, and every lookup misses.
+
+    See: docs/commentary/tes5_import_navmesh.md#cellview-cell-index
+    """
+    set_namespace(namespace_for(export))
+    recs = parse_export_directory(export, type_filter=_TYPES)
+    by_type = group_records_by_type(recs)
+    base_model = _carving_bases(by_type)
+    refr_by_cell = {}
+    for r in by_type.get('REFR', []):
+        refr_by_cell.setdefault((r.get('ParentCELL') or '').upper(), []).append(r)
+    return (base_model, refr_by_cell,
+            {(p.get('ParentCELL') or '').upper(): p
+             for p in by_type.get('PGRD', [])},
+            {(ld.get('ParentCELL') or '').upper(): ld
+             for ld in by_type.get('LAND', [])},
+            _door_model_map(by_type), by_type.get('CELL', []))
+
+
+def _base_model_table(export):
+    """`export`'s own carving base-model table, parsed from its base records alone."""
+    set_namespace(namespace_for(export))
+    return _carving_bases(group_records_by_type(
+        parse_export_directory(export, type_filter=_BASE_PARSE)))
+
+
+def _carving_bases(by_type):
+    """The import's base-model table: obstacles indexed first, so they carve nothing.
+
+    See: docs/commentary/tes5_import_navmesh.md#scripted-blockers-are-obstacles
+    """
+    index_obstacles(by_type, None)
+    return build_base_model_index(by_type)
+
+
+def _ensure_store(export, reindex=False):
+    """Build `export`'s own index if missing or stale; refresh only a stale base-model table.
+
+    See: docs/commentary/tes5_import_navmesh.md#frozen-corner-takes-the-vertex
+    """
+    if reindex or not cell_index_mod.is_current(export):
+        cell_index_mod.write(export, _parse_tables(export))
+    elif not cell_index_mod.bases_current(export):
+        cell_index_mod.write_base_model(export, _base_model_table(export))
+    else:
+        return
+    if os.path.exists(index_path(export)):
+        os.remove(index_path(export))
+
+
+def master_dirs(export):
+    """Every master export dir `export` depends on, nearest first.
+
+    Recursive: TR_Mainland -> Morrowind_ob -> Oblivion. A master with no
+    export on disk is skipped rather than failing the open.
+    """
+    out = []
+    for name in masters_from_export_header(export):
+        d = master_dir(export, name)
+        if not os.path.isdir(d) or d in out:
+            continue
+        out.append(d)
+        for deeper in master_dirs(d):
+            if deeper not in out:
+                out.append(deeper)
+    return out
+
+
+def cell_index(export, reindex=False):
+    """The per-cell index for `export`, with its master chain attached.
+
+    See: docs/commentary/tes5_import_navmesh.md#cellview-cell-index
+    """
+    _ensure_store(export, reindex)
+    masters = master_dirs(export)
+    for d in masters:
+        if os.path.isfile(os.path.join(d, 'CELL.txt')):
+            _ensure_store(d)
+    return cell_index_mod.CellIndex(export, masters)
+
+
+def build_index(export, reindex=False):
+    """Every index table for `export`; builds or migrates on first use.
+
+    Whole-plugin callers only. A tool that wants ONE cell should use
+    `cell_index`, which does not materialize the other 21,000.
+
+    See: docs/commentary/tes5_import_navmesh.md#cellview-cell-index
+    """
+    key = os.path.normcase(os.path.normpath(export))
+    if key in _TABLES and not reindex:
+        return _TABLES[key]
+    idx = cell_index(export, reindex)
+    tables = idx.tables()
+    idx.close()
+    _TABLES[key] = tables
+    return tables
 
 
 def main():
@@ -299,38 +394,11 @@ def main():
     load_door_centroids(os.path.join(a.export, 'door_centers_cache.json'),
                         quiet=True)
 
-    cache = os.path.join(a.export, 'audit_index3.pkl')
-    if os.path.exists(cache) and not a.reindex:
-        with open(cache, 'rb') as fh:
-            (base_model, refr_by_cell, pgrd_by_cell, land_by_cell,
-             door_fids, cells) = pickle.load(fh)
-    else:
-        t0 = time.time()
-        recs = parse_export_directory(a.export, type_filter=_TYPES)
-        by_type = group_records_by_type(recs)
-
-        base_model = {}
-        for t in _BASES:
-            for rec in by_type.get(t, []):
-                f = rec.get('FormID')
-                m = get_str(rec, 'Model.MODL') or get_str(rec, 'MODL')
-                if f and m:
-                    base_model[int(f, 16) & 0xFFFFFF] = _model_key(m)
-
-        refr_by_cell = {}
-        for r in by_type.get('REFR', []):
-            refr_by_cell.setdefault((r.get('ParentCELL') or '').upper(), []).append(r)
-        pgrd_by_cell = {(p.get('ParentCELL') or '').upper(): p
-                        for p in by_type.get('PGRD', [])}
-        land_by_cell = {(ld.get('ParentCELL') or '').upper(): ld
-                        for ld in by_type.get('LAND', [])}
-        door_fids = _door_model_map(by_type)
-        cells = by_type.get('CELL', [])
-
-        with open(cache, 'wb') as fh:
-            pickle.dump((base_model, refr_by_cell, pgrd_by_cell, land_by_cell,
-                         door_fids, cells), fh, pickle.HIGHEST_PROTOCOL)
-        print('indexed export in %.0fs -> %s' % (time.time() - t0, cache))
+    t0 = time.time()
+    (base_model, refr_by_cell, pgrd_by_cell, land_by_cell,
+     door_fids, cells) = build_index(a.export, a.reindex)
+    if not os.path.exists(index_path(a.export)) or a.reindex:
+        print('indexed export in %.0fs' % (time.time() - t0))
 
     def _is_exterior(c):
         return bool(c.get('ParentWRLD') and c.get('ParentWRLD') != '00000000')
@@ -357,7 +425,7 @@ def main():
         pgrd = pgrd_by_cell.get(fid)
         if pgrd is None:
             continue
-        nodes, edges = _pgrd_nodes(pgrd)
+        nodes, edges = record_graph(pgrd)
         if not nodes:
             continue
         land = land_by_cell.get(fid) if _is_exterior(c) else None

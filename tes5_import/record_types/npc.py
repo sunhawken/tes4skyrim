@@ -7,14 +7,28 @@ See: docs/commentary/tes5_import_actors.md
 
 import struct
 
+from asset_convert.character.hair_plan import (mesh_name_family, output_model_path,
+                                               output_tri_path, variant_edid,
+                                               variant_tag)
+from ..base.master_export import values_of
+from ..actors import hair_variants
+from ..actors.combat_style import actor_combat_style
+from ..actors.confidence import flee_memberships, flee_spells
+from ..actors.stat_factions import stat_memberships
 from ..base.constants import TES5_SKILL_ORDER
-from ..actors.creature_races import TES5_HEALTH_LEVEL_BONUS
+from ..actors.creature_races import TES5_HEALTH_LEVEL_BONUS, spell_record
+from ..actors.disease_contact import HUMANOID_ATTACKS, actor_diseases, attack_subs
+from ..actors import npc_face_morrowind as morrowind_faces
 from ..actors.npc_face_mapper import build_face_tail_subs, build_pnam_subs
 from ..actors.outfits import split_inventory
-from ..packages.actor_wiring import CSTY_DEFAULT, DPLT_NPC_LIST, npc_packages
+from ..actors.vampirism_morrowind import carrier_bloods
+from ..packages.actor_wiring import (CSTY_DEFAULT, DPLT_NPC_LIST, authored_packages,
+                                     default_package_list, npc_packages, stand_still_list)
 from ..base.equivalents import map_hair_color
+from ..base.race_factions import race_faction
 from .actor_common import (GOLD001_FID, NAM5_UNKNOWN, SOUND_LEVEL_NORMAL,
-                           build_aidt, build_outfit, get_origin_faction_fid,
+                           attacks_player_on_sight, disposition_ranks, in_evil_faction,
+                           build_aidt, build_outfit, origin_memberships,
                            get_trainer_class_fid, get_trainer_faction_fid,
                            get_vendor_faction_fids_for_actor, read_items,
                            resolve_actor_voice, resolve_npc_race)
@@ -31,9 +45,9 @@ from .common import (
     pack_uint32_subrecord,
     prefix_path,
 )
-
-#: Starting Health on all 11 RACE_MAP target races in Skyrim.esm.
-TES5_RACE_BASE_HEALTH = 50
+from .crime import IS_GUARD_FACTION, crime_faction, is_guard_class
+from .spell_tomes import tome_items
+from .npc_morrowind import TES5_RACE_BASE_HEALTH, is_morrowind_npc, tes3_pools
 
 #: TES4 NPC_ ACBS bits that mean the same thing in TES5, Female included.
 _NPC_COMPATIBLE_FLAGS = 0x4C9B
@@ -41,68 +55,75 @@ _NPC_COMPATIBLE_FLAGS = 0x4C9B
 #: TES4 NPC_ ACBS bit 7, PC Level Offset.
 _T4N_PC_LEVEL_OFFSET = 0x80
 
+#: ACBS bit 4, Auto calc stats: the only NPCs the engine gives a per-level health bonus.
+_AUTO_CALC_STATS = 0x10
+
 
 # ---------------------------------------------------------------------------
 #   Stats
 # ---------------------------------------------------------------------------
 
 
+#: TES4 NPC_ DATA skill -> the TES5 skills it feeds (the higher value wins). See: docs/plans/character_sheet.md#folding
+_TES4_SKILL_TO_TES5 = {
+    "Armorer": ("Smithing",), "Blade": ("OneHanded", "TwoHanded"), "Block": ("Block",),
+    "Blunt": ("OneHanded", "TwoHanded"), "HandToHand": ("OneHanded",),
+    "HeavyArmor": ("HeavyArmor",), "Alchemy": ("Alchemy",),
+    "Alteration": ("Alteration",), "Conjuration": ("Conjuration",),
+    "Destruction": ("Destruction",), "Illusion": ("Illusion",),
+    "Mysticism": ("Alteration",), "Restoration": ("Restoration",),
+    "LightArmor": ("LightArmor",), "Marksman": ("Marksman",),
+    "Mercantile": ("Speechcraft",), "Security": ("Lockpicking",),
+    "Sneak": ("Sneak", "Pickpocket"), "Speechcraft": ("Speechcraft",),
+    "Enchant": ("Enchanting",),
+}
+
+
+def _pools(rec: dict) -> tuple:
+    """(health, magicka, fatigue): authored, else a TES3 autocalc NPC's derived ones.
+
+    See: docs/commentary/tes5_import_actors.md#morrowind-health-is-absolute
+    """
+    derived = tes3_pools(get_str(rec, 'EditorID'))
+    return (get_int(rec, 'DATA.Health', derived.get('health', 50)),
+            get_int(rec, 'ACBS.SpellPoints', derived.get('magicka', 0)),
+            get_int(rec, 'ACBS.Fatigue', derived.get('fatigue', 100)))
+
+
 def npc_skills_dnam(rec: dict) -> bytes:
     """Build TES5 NPC_ DNAM subrecord (52 bytes, skills + stats)."""
     dnam = bytearray(52)
     skill_vals = {}
-    skill_names_tes4 = [
-        "Armorer", "Athletics", "Blade", "Block", "Blunt",
-        "HandToHand", "HeavyArmor", "Alchemy", "Alteration",
-        "Conjuration", "Destruction", "Illusion", "Mysticism",
-        "Restoration", "Acrobatics", "LightArmor", "Marksman",
-        "Mercantile", "Security", "Sneak", "Speechcraft"
-    ]
-    tes4_to_tes5_skill = {
-        "Armorer": "Smithing", "Blade": "OneHanded", "Block": "Block",
-        "Blunt": "OneHanded", "HandToHand": "OneHanded",
-        "HeavyArmor": "HeavyArmor", "Alchemy": "Alchemy",
-        "Alteration": "Alteration", "Conjuration": "Conjuration",
-        "Destruction": "Destruction", "Illusion": "Illusion",
-        "Mysticism": "Illusion", "Restoration": "Restoration",
-        "LightArmor": "LightArmor", "Marksman": "Marksman",
-        "Mercantile": "Pickpocket", "Security": "Lockpicking",
-        "Sneak": "Sneak", "Speechcraft": "Speechcraft",
-    }
-    for tes4_name in skill_names_tes4:
+    for tes4_name, tes5_names in _TES4_SKILL_TO_TES5.items():
         val = get_int(rec, f'DATA.{tes4_name}')
-        tes5_name = tes4_to_tes5_skill.get(tes4_name)
-        if tes5_name and val:
+        for tes5_name in tes5_names if val else ():
             skill_vals[tes5_name] = max(skill_vals.get(tes5_name, 0), val)
     for i, skill_name in enumerate(TES5_SKILL_ORDER):
         dnam[i] = min(skill_vals.get(skill_name, 15), 255)
-    health = get_int(rec, 'DATA.Health', 50)
-    struct.pack_into('<H', dnam, 36, max(0, min(health, 65535)))
-    magicka = get_int(rec, 'ACBS.SpellPoints', 0)
-    struct.pack_into('<H', dnam, 38, max(0, min(magicka, 65535)))
-    stamina = get_int(rec, 'ACBS.Fatigue', 100)
-    struct.pack_into('<H', dnam, 40, max(0, min(stamina, 65535)))
+    struct.pack_into('<3H', dnam, 36, *(max(0, min(pool, 65535)) for pool in _pools(rec)))
     return bytes(dnam)
 
 
-def _health_and_level(tes4_health: int, tes4_level: int, is_pc_level_mult: bool
-                      ) -> tuple:
-    """TES4 final health pool -> (ACBS.HealthOffset, ACBS.Level) for an NPC.
+def _health_and_level(tes4_health: int, tes4_level: int, tes5_flags: int) -> tuple:
+    """Final health pool -> (ACBS.HealthOffset, ACBS.Level) for an NPC.
 
-    Chosen so the engine's own calculation reproduces the TES4 total exactly.
-    A pool past the int16 offset is spent through the Level term instead of
-    being clamped, which would make an intended-invulnerable actor killable.
-    A PC-Level-Mult actor keeps only the race-base subtraction, since its level
-    term tracks the player and is unknown at author time.
+    Chosen so the engine's own calculation reproduces the source total exactly.
+    Only an Auto-calc-stats actor gets a level term from the engine; a manual
+    one is race base plus offset. An auto-calc pool past the int16 offset is
+    spent through the Level term instead of being clamped. A PC-Level-Mult
+    actor keeps only the race-base subtraction, since its level term tracks the
+    player and is unknown at author time.
 
     See: docs/commentary/tes5_import_actors.md#health-offset
     """
-    if is_pc_level_mult:
-        offset = tes4_health - TES5_RACE_BASE_HEALTH
+    offset = tes4_health - TES5_RACE_BASE_HEALTH
+    if tes5_flags & _T4N_PC_LEVEL_OFFSET:
         return max(-32768, min(offset, 32767)), 1000
 
     level = max(1, min(tes4_level, 65535))
-    offset = tes4_health - TES5_RACE_BASE_HEALTH - (level - 1) * TES5_HEALTH_LEVEL_BONUS
+    if not tes5_flags & _AUTO_CALC_STATS:
+        return max(-32768, min(offset, 32767)), level
+    offset -= (level - 1) * TES5_HEALTH_LEVEL_BONUS
     if offset > 32767:
         need = tes4_health - TES5_RACE_BASE_HEALTH - 32767
         level = max(level, min(65535, -(-need // TES5_HEALTH_LEVEL_BONUS) + 1))
@@ -117,23 +138,19 @@ def npc_acbs(rec: dict) -> bytes:
     authored ACBS/attribute change patches the exact bytes conversion writes.
 
     Layout per xEdit wbDefinitionsTES5. Magicka and Stamina offsets are deltas
-    from the race base, taken from Oblivion's real pools (SpellPoints and
-    Fatigue). A PC-levelled actor defaults to the 1.0x PCLevelMult.
+    from the race base (SpellPoints, Fatigue).
 
     See: docs/commentary/tes5_import_actors.md#health-offset
     """
     tes4_flags = get_int(rec, 'ACBS.Flags')
-    level = get_int(rec, 'ACBS.Level', 1)
     calc_min = get_int(rec, 'ACBS.CalcMin', 1)
     calc_max = get_int(rec, 'ACBS.CalcMax', 100)
     tes5_acbs_flags = tes4_flags & _NPC_COMPATIBLE_FLAGS
-    is_pc_level = bool(tes4_flags & _T4N_PC_LEVEL_OFFSET)
+    health, magicka, fatigue = _pools(rec)
     health_offset, tes5_level = _health_and_level(
-        get_int(rec, 'DATA.Health', 50), level, is_pc_level)
-    magicka_offset = max(-32768, min(
-        get_int(rec, 'ACBS.SpellPoints', 0) - TES5_RACE_BASE_HEALTH, 32767))
-    stamina_offset = max(-32768, min(
-        get_int(rec, 'ACBS.Fatigue', 100) - TES5_RACE_BASE_HEALTH, 32767))
+        health, get_int(rec, 'ACBS.Level', 1), tes5_acbs_flags)
+    magicka_offset = max(-32768, min(magicka - TES5_RACE_BASE_HEALTH, 32767))
+    stamina_offset = max(-32768, min(fatigue - TES5_RACE_BASE_HEALTH, 32767))
     return struct.pack('<IhhHHHHhHhH',
                        tes5_acbs_flags, magicka_offset, stamina_offset, tes5_level,
                        min(calc_min, 65535), min(calc_max, 65535),
@@ -151,7 +168,7 @@ def _npc_snams(rec: dict, vendor_fids: list, trainer_clas_fid: int) -> bytes:
     merchant, the dedicated one whose VENC stocks the menu -- then the trainer
     faction that gates the generated Training topic, then the plugin-origin
     marker, which keeps this file's unscoped dialogue off another converted
-    plugin's actors.
+    plugin's actors, then the flee, race and stat factions, then crime.
 
     See: docs/commentary/tes5_import_actors.md#vendor-factions
     """
@@ -163,8 +180,37 @@ def _npc_snams(rec: dict, vendor_fids: list, trainer_clas_fid: int) -> bytes:
         subs += _pack_snam(vfid)
     if trainer_clas_fid and get_trainer_faction_fid():
         subs += _pack_snam(get_trainer_faction_fid())
-    if get_origin_faction_fid():
-        subs += _pack_snam(get_origin_faction_fid())
+    for origin_fid in origin_memberships():
+        subs += _pack_snam(origin_fid)
+    for flee_fid, rank in flee_memberships(rec):
+        subs += _pack_snam(flee_fid, rank)
+    race_fact = race_faction(get_formid(rec, 'RNAM.Race'))
+    if race_fact:
+        subs += _pack_snam(race_fact)
+    for stat_fid, rank in stat_memberships(rec) + disposition_ranks(rec):
+        subs += _pack_snam(stat_fid, rank)
+    return subs + _crime_snams(rec)
+
+
+def _crime_faction_of(rec: dict) -> int:
+    """The crime faction this NPC reports to; 0 for one that hunts the player or is Evil.
+
+    See: docs/commentary/tes5_import_actors.md#evil-factions
+    """
+    if (attacks_player_on_sight(rec) or in_evil_faction(rec)) and \
+            not is_guard_class(get_formid(rec, 'CNAM.Class')):
+        return 0
+    return crime_faction(get_formid(rec, 'FormID'))
+
+
+def _crime_snams(rec: dict) -> bytes:
+    """Membership in the NPC's crime faction, and IsGuardFaction for a guard."""
+    subs = b''
+    crime = _crime_faction_of(rec)
+    if crime:
+        subs += _pack_snam(crime)
+    if is_guard_class(get_formid(rec, 'CNAM.Class')):
+        subs += _pack_snam(IS_GUARD_FACTION)
     return subs
 
 
@@ -172,6 +218,7 @@ def _spell_subs(rec: dict) -> bytes:
     """SPCT + SPLO for the actor's spell list (b'' when it has none)."""
     fids = [get_formid(rec, f'Spell[{i}]')
             for i in range(get_int(rec, 'SpellCount'))]
+    fids += flee_spells(rec)
     fids = [f for f in fids if f]
     if not fids:
         return b''
@@ -200,29 +247,42 @@ def _inventory_subs(carried: list, barter_gold: int) -> bytes:
     return subs
 
 
-def _appearance_subs(rec: dict, race_edid: str, gender: str, writer) -> bytes:
+def _hair_color_fid(rec: dict, writer) -> int:
+    """HCLF: a Morrowind hair texture's nearest vanilla color, else the authored HCLR's CLFM."""
+    mw_rgb = morrowind_faces.hair_color(rec)
+    if mw_rgb:
+        return map_hair_color(*mw_rgb)
+    rgb = (get_int(rec, 'HCLR.R', 100), get_int(rec, 'HCLR.G', 80),
+           get_int(rec, 'HCLR.B', 60))
+    return hair_color_formid(writer, *rgb) if writer is not None else map_hair_color(*rgb)
+
+
+def _appearance_subs(rec: dict, race_edid: str, gender: str, writer,
+                     skyrim_race: int) -> bytes:
     """Head parts, hair color, combat style and the four required NAM slots.
 
-    ZNAM is forced to the vanilla default combat style: CSTY is skipped, so
-    the TES4 reference would dangle. NAM6/NAM7 are neutral 1.0 so the race's
-    own scale applies.
+    ZNAM is the converted combat style; a source whose styles are not
+    converted keeps the vanilla default for an authored one. NAM6/NAM7 are
+    neutral 1.0 so the race's own scale applies, except a Morrowind NPC's
+    weight, which takes its race's vanilla weight.
 
     See: docs/commentary/tes5_import_actors.md#required-nam-subrecords
     """
+    female = gender == 'Female'
     subs = build_pnam_subs(rec, race_edid, gender, writer)
+    if morrowind_faces.is_morrowind_face(rec):
+        subs += morrowind_faces.head_part_subs(rec, skyrim_race, female)
+    subs += pack_formid_subrecord('HCLF', _hair_color_fid(rec, writer))
 
-    rgb = (get_int(rec, 'HCLR.R', 100), get_int(rec, 'HCLR.G', 80),
-           get_int(rec, 'HCLR.B', 60))
-    hclf = (hair_color_formid(writer, *rgb) if writer is not None
-            else map_hair_color(*rgb))
-    subs += pack_formid_subrecord('HCLF', hclf)
-
-    if get_formid(rec, 'ZNAM.CombatStyle'):
-        subs += pack_formid_subrecord('ZNAM', CSTY_DEFAULT)
+    style = actor_combat_style(rec) or (CSTY_DEFAULT if get_formid(rec, 'ZNAM.CombatStyle') else 0)
+    if style:
+        subs += pack_formid_subrecord('ZNAM', style)
 
     subs += pack_subrecord('NAM5', NAM5_UNKNOWN)
     subs += pack_subrecord('NAM6', struct.pack('<f', 1.0))
-    subs += pack_subrecord('NAM7', struct.pack('<f', 1.0))
+    weight = (morrowind_faces.weight(rec, skyrim_race, female)
+              if morrowind_faces.is_morrowind_face(rec) else None)
+    subs += pack_subrecord('NAM7', struct.pack('<f', 1.0 if weight is None else weight))
     subs += pack_uint32_subrecord('NAM8', SOUND_LEVEL_NORMAL)
     return subs
 
@@ -247,13 +307,13 @@ def _identity_subs(rec: dict, skyrim_race: int, gender: str, carried: list,
 
     subs += pack_formid_subrecord('RNAM', skyrim_race)
     subs += _spell_subs(rec)
+    subs += attack_subs(skyrim_race, HUMANOID_ATTACKS,
+                        carrier_bloods(rec) + actor_diseases(rec, spell_record))
     subs += _inventory_subs(carried,
                             get_int(rec, 'ACBS.BarterGold') if vendor_fid else 0)
     subs += pack_subrecord('AIDT', build_aidt(rec))
 
-    pack_fids = [get_formid(rec, f'AIPackage[{i}]')
-                 for i in range(get_int(rec, 'AIPackageCount'))]
-    for pfid in npc_packages(pack_fids):
+    for pfid in npc_packages(authored_packages(rec)):
         subs += pack_formid_subrecord('PKID', pfid)
 
     cnam = trainer_clas_fid or get_formid(rec, 'CNAM.Class')
@@ -267,6 +327,16 @@ def _identity_subs(rec: dict, skyrim_race: int, gender: str, carried: list,
     subs += pack_subrecord('DATA', b'')
     subs += pack_subrecord('DNAM', npc_skills_dnam(rec))
     return subs
+
+
+def _face_tail(rec: dict, race_edid: str, gender: str, skyrim_race: int) -> bytes:
+    """FTST..TIAS, with a Morrowind NPC's measured sliders and head-texture skin."""
+    if not morrowind_faces.is_morrowind_face(rec):
+        return build_face_tail_subs(rec, race_edid, gender)
+    return build_face_tail_subs(
+        rec, race_edid, gender,
+        morrowind_faces.face_morphs(rec, skyrim_race, gender == 'Female'),
+        morrowind_faces.skin_color(rec))
 
 
 def convert_NPC_(rec: dict, writer=None) -> bytes:
@@ -302,18 +372,23 @@ def convert_NPC_(rec: dict, writer=None) -> bytes:
     vendor_fid = vendor_fids[0] if vendor_fids else 0
 
     outfit_fids, carried = split_inventory(read_items(rec))
+    carried += tome_items(get_formid(rec, 'FormID'))
     subs += _identity_subs(rec, skyrim_race, gender, carried,
                            vendor_fid, trainer_clas_fid)
 
-    subs += _appearance_subs(rec, race_edid, gender, writer)
+    subs += _appearance_subs(rec, race_edid, gender, writer, skyrim_race)
 
     if writer is not None and outfit_fids:
         subs += pack_formid_subrecord(
             'DOFT', build_outfit(writer, (edid or 'NPC') + '_Outfit',
                                   outfit_fids, get_formid(rec, 'FormID')))
 
-    subs += pack_formid_subrecord('DPLT', DPLT_NPC_LIST)
-    subs += build_face_tail_subs(rec, race_edid, gender)
+    standing = stand_still_list() if is_morrowind_npc(rec) else DPLT_NPC_LIST
+    subs += pack_formid_subrecord('DPLT', default_package_list(authored_packages(rec), standing))
+    crime = _crime_faction_of(rec)
+    if crime:
+        subs += pack_formid_subrecord('CRIF', crime)
+    subs += _face_tail(rec, race_edid, gender, skyrim_race)
 
     return pack_record('NPC_', get_formid(rec, 'FormID'), get_int(rec, 'RecordFlags'), subs)
 
@@ -386,13 +461,10 @@ def _hdpt_valid_races(edid: str) -> int:
 #: Human-named styles Oblivion did not tag with a race token.
 _HUMAN_HAIR_TOKENS = ('nord', 'imperial', 'breton')
 
-#: Generic hair, once per scalp group: (formid key, mesh group, RNAM FLST).
-HDPT_GROUPS = (
-    ('',  None,     HDPT_RNAM_HUMANS),
-    ('D', None,     HDPT_RNAM_DREMORA),
-    ('E', 'elves',  HDPT_RNAM_ELVES),
-    ('O', 'orc',    HDPT_RNAM_ORC),
-)
+#: Hair head family -> the Valid Races FLST its variants carry (see hair_plan).
+FAMILY_RNAM = {'human': HDPT_RNAM_HUMANS, 'dremora': HDPT_RNAM_DREMORA,
+               'elves': HDPT_RNAM_ELVES, 'orc': HDPT_RNAM_ORC,
+               'khajiit': HDPT_RNAM_KHAJIIT, 'argonian': HDPT_RNAM_ARGONIAN}
 
 #: CLFM.FNAM 'Playable' -- vanilla hair colors are all playable.
 _CLFM_PLAYABLE = 1
@@ -431,13 +503,13 @@ def hair_color_formid(writer, r: int, g: int, b: int) -> int:
 def hair_variant_formid(writer, source_fid: int, bucket: int,
                         female: bool, base_female: bool,
                         group: str = '') -> int:
-    """The HDPT FormID for one (hair, bucket, gender, race group) variant.
+    """The HDPT FormID for one (hair, length step, gender, family) variant.
 
-    The BASE variant -- bucket 0 of the hair's base gender in the human
-    group -- keeps the SOURCE FormID, so an NPC whose LNAM is 0 resolves
+    The BASE variant -- step 0 of the hair's base gender in its home family
+    (tag '') -- keeps the SOURCE FormID, so an NPC whose LNAM is 0 resolves
     straight through its HNAM.  Every other variant derives from authored
-    data only: the masked source id, the LNAM bucket, the gender ('F') and
-    the race group tag ('D'/'E'/'O') -- see HDPT_GROUPS.
+    data only: the masked source id, the step, the gender ('F') and the
+    family tag (hair_plan.FAMILY_TAG).
     """
     if bucket <= 0 and female == base_female and not group:
         return source_fid
@@ -450,62 +522,50 @@ def hair_variant_formid(writer, source_fid: int, bucket: int,
 
 
 def convert_HAIR(rec: dict, *, writer=None) -> bytes:
-    """HAIR -> HDPT (Type 3 / Hair), one per (length, gender) variant.
+    """HAIR -> HDPT (Type 3 / Hair): the base record, side-emitting every planned variant.
 
-    Returns the base record (unmorphed mesh, base gender, source FormID) and
-    side-emits an HDPT for every other variant the plugin's NPCs ask for:
-
-    LENGTH is baked into the mesh per quantized bucket, and each allowed
-    GENDER gets its own fitted mesh and HDPT, as vanilla genders every
-    hairstyle. Generic hair is emitted once per race GROUP (HDPT_GROUPS).
-
-    See: docs/commentary/tes5_import_actors.md#hdpt-valid-races
+    See: docs/commentary/asset_convert_armor.md#hair-variants-follow-the-wearer
     """
-    from asset_convert.character.hair_pipeline import (fit_group_lock, hair_genders,
-                                             output_model_path,
-                                             output_tri_path, variant_edid)
-    from asset_convert.character.head_fit import fit_race_for_hair
-    from ..actors.hair_variants import hair_buckets_for, hair_has_tri
+    e = hair_variants.entry_for(rec)
+    if writer is not None:
+        emit_hair_variants(rec, e, writer)
+    return _hair_hdpt(rec, e, e['base'], 0)
 
-    model = get_str(rec, 'Model.MODL')
-    source_fid = get_formid(rec, 'FormID')
-    edid = get_str(rec, 'EditorID')
-    want_tri = bool(model) and hair_has_tri(source_fid)
-    generic = (fit_race_for_hair(edid) is None
-               and fit_group_lock(edid) is None)
-    groups = HDPT_GROUPS if generic else (('', None, 0),)
 
-    genders = hair_genders(get_int(rec, 'DATA.Flags'))
-    base_female = genders[0]
+def emit_hair_variants(rec: dict, e: dict, writer) -> int:
+    """Add an HDPT for each planned variant of a hair but its base; returns how many."""
+    fid = get_formid(rec, 'FormID')
+    extra = sorted(v for v in e['variants'] if v != e['base'])
+    for v in extra:
+        vid = hair_variant_formid(writer, fid, v.bucket, v.female,
+                                  e['base'].female, variant_tag(v, e))
+        writer.add_record('HDPT', _hair_hdpt(rec, e, v, vid))
+    return len(extra)
 
-    def build(bucket, female, tag, name_grp, rnam, fid_override=0):
-        """Pack one variant's HDPT for this hair."""
-        edid_grp = {'E': 'elves', 'O': 'orc', 'D': 'dremora'}.get(tag)
-        return _build_hdpt(
-            rec,
-            model_override=output_model_path(model, bucket, female, name_grp)
-            if model else '',
-            tri_path=output_tri_path(model, bucket, female, name_grp)
-            if want_tri else '',
-            edid_override=variant_edid(edid, bucket, female, edid_grp),
-            fid_override=fid_override,
-            female=female,
-            rnam_override=rnam)
 
-    base = build(0, base_female, '', None, groups[0][2])
-    if writer is None:
-        return base
+def emit_master_hair_variants(writer, master_export) -> int:
+    """Emit the HDPTs this plugin adds to its masters' hairs; returns how many."""
+    recs = {get_formid(r, 'FormID') & 0x00FFFFFF: r
+            for r in values_of(master_export, 'HAIR')}
+    return sum(emit_hair_variants(recs[fid], e, writer)
+               for fid, e in hair_variants.master_extras().items() if fid in recs)
 
-    for female in genders:
-        for bucket in hair_buckets_for(source_fid):
-            for tag, name_grp, rnam in groups:
-                if bucket <= 0 and female == base_female and not tag:
-                    continue
-                vid = hair_variant_formid(writer, source_fid, bucket,
-                                          female, base_female, tag)
-                writer.add_record('HDPT', build(bucket, female, tag,
-                                                name_grp, rnam, vid))
-    return base
+
+def _hair_hdpt(rec: dict, e: dict, v, fid: int) -> bytes:
+    """Pack the HDPT of one planned hair variant (fid 0 keeps the source FormID)."""
+    mesh = mesh_name_family(v, e)
+    home = v.family == e['home']
+    model = e['model']
+    return _build_hdpt(
+        rec,
+        model_override=(output_model_path(model, v.bucket, v.female, mesh)
+                        if model else ''),
+        tri_path=(output_tri_path(model, v.bucket, v.female, mesh)
+                  if model and e['has_tri'] else ''),
+        edid_override=variant_edid(e['edid'], v.bucket, v.female,
+                                   None if home else v.family),
+        fid_override=fid, female=v.female,
+        rnam_override=0 if home and not e['generic'] else FAMILY_RNAM[v.family])
 
 
 def _build_hdpt(rec: dict, *, model_override: str = '',

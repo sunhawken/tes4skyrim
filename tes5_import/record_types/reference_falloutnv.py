@@ -51,25 +51,38 @@ _DALC_FRESNEL = 1.0
 #: Source FormIDs whose own record type this run writes; FLST members must be in it.
 _CONVERTIBLE = set()
 
+#: The record types whose conversion asks `convertible` (FLST members, IPCT/EXPL links).
+_ASKS_CONVERTIBLE = ('FLST', 'IPCT', 'EXPL')
 
-def index_convertible_records(by_type: dict, dispatch, skip) -> int:
-    """Index every source FormID whose type will actually be written.
 
-    A FLST may name any type at all, and FO3/FNV lists reach ARMA, IMOD and
-    EXPL -- none of which convert. Writing those members verbatim produces a
+def index_convertible_records(by_type: dict, dispatch, skip,
+                              master_export: dict = None) -> int:
+    """Index every source FormID whose type will actually be written, the
+    plugin's own records and its masters'.
+
+    A FLST may name any type at all, and FO3/FNV lists reach ARMA and IMOD,
+    neither of which converts. Writing those members verbatim produces a
     dangling FormID, which the engine treats as a broken reference.
+
+    Built only when this plugin has a record type that asks `convertible`.
 
     See: docs/commentary/tes4_export_falloutnv.md#formlist-members
     """
     _CONVERTIBLE.clear()
-    for sig, recs in by_type.items():
-        if sig in skip or sig not in dispatch:
-            continue
-        for rec in recs:
-            fid = rec.get('FormID')
-            if fid:
-                _CONVERTIBLE.add(fid.upper())
+    if not any(by_type.get(sig) for sig in _ASKS_CONVERTIBLE):
+        return 0
+    recs = [(sig, r) for sig, rs in by_type.items() for r in rs]
+    recs += [(r.get('Signature'), r) for r in (master_export or {}).values()]
+    for sig, rec in recs:
+        fid = rec.get('FormID')
+        if fid and sig in dispatch and sig not in skip:
+            _CONVERTIBLE.add(fid.upper())
     return len(_CONVERTIBLE)
+
+
+def convertible(fid: str) -> bool:
+    """Whether a source FormID names a record this run writes."""
+    return not _CONVERTIBLE or (fid or '').upper() in _CONVERTIBLE
 
 
 def convert_FLST(rec: dict) -> bytes:
@@ -85,7 +98,7 @@ def convert_FLST(rec: dict) -> bytes:
     i = 0
     while (key := f'LNAM[{i}]') in rec:
         i += 1
-        if _CONVERTIBLE and (rec.get(key) or '').upper() not in _CONVERTIBLE:
+        if not convertible(rec.get(key)):
             continue
         subs += pack_formid_subrecord('LNAM', get_formid(rec, key))
     return pack_record('FLST', get_formid(rec, 'FormID'),

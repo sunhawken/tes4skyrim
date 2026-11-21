@@ -4,6 +4,7 @@ import hashlib
 import re
 
 from asset_convert.game_paths import current_namespace
+from script_convert.constants_falloutnv import FALLOUT_ACTOR_VALUE_MAP, FALLOUT_ATTRIBUTES
 
 # ===========================================================================
 # Constants
@@ -11,6 +12,46 @@ from asset_convert.game_paths import current_namespace
 
 #: TES4 player-base script rides a QUST alias. See: docs/commentary/script_convert.md#player-base-script-needs-quest-alias
 PLAYER_ALIAS_EXTENDS = 'ReferenceAlias'
+
+#: Set once a statement's expression fails to evaluate. See: docs/commentary/script_convert.md#missing-operand-halts
+HALTED_VAR = 'TES4_Halted'
+
+#: Name prefix of the function through which another script adds to one of a script's variables.
+REMOTE_ADD_PREFIX = 'TES4Add_'
+#: Functions on a script other scripts write to: a run of such writes sits between them, one writer at a time.
+REMOTE_HOLD = 'TES4Hold'
+REMOTE_RELEASE = 'TES4Release'
+
+#: The object's last activator, recorded by OnActivate. See: docs/commentary/script_convert.md#last-activator
+LAST_ACTIVATOR_VAR = 'TES4_LastActivator'
+
+#: An OBSE user function's result, set by SetFunctionValue. See: docs/commentary/script_convert.md#set-function-value
+UDF_RESULT_VAR = 'TES4_Result'
+
+#: A user function's calling reference, its implicit `Self`. See: docs/commentary/script_convert.md#udf-calling-reference
+UDF_CALLER_PARAM = 'akCallingRef'
+
+#: TES4 misc-stat index (xEdit wbMiscStatEnum) -> Skyrim QueryStat name; '' = Skyrim tracks none.
+TES4_MISC_STAT_NAMES = (
+    'Days Jailed', 'Days Passed', 'Skill Increases', 'Training Sessions',
+    'Largest Bounty', 'Creatures Killed', 'People Killed', 'Locations Discovered',
+    'Locks Picked', '', 'Souls Trapped', 'Ingredients Eaten',
+    'Potions Mixed', '', 'Horses Owned', 'Houses Owned',
+    'Stores Invested In', 'Books Read', 'Skill Books Read', '',
+    'Hours Slept', 'Hours Waiting', 'Days as a Vampire', '',
+    'Necks Bitten', '', 'Diseases Contracted', 'Nirnroots Found',
+    'Items Stolen', 'Items Pickpocketed', 'Trespasses', 'Assaults',
+    'Murders', 'Horses Stolen',
+)
+
+#: TES4 skills Skyrim split in two; a read takes the higher. See: docs/plans/character_sheet.md#bug-blade-blunt
+SPLIT_SKILLS = {name: ('OneHanded', 'TwoHanded') for name in ('blade', 'blunt', 'meleeweapons')}
+
+#: Misc stats Oblivion content writes; its engine keeps the rest. See: docs/commentary/script_convert.md#pc-misc-stat-names
+TES4_SCRIPT_OWNED_MISC_STATS = frozenset({14, 15, 16, 19, 27})
+
+#: A page value a quest script variable holds: (quest EditorID, variable, label). Nehrim's journal bank page.
+PAGE_VARIABLES = (('ErothinBankQuest', 'PlayerKontostand', 'Bank balance'),)
 
 from script_convert.reserved_names import papyrus_reserved
 
@@ -32,37 +73,13 @@ TYPE_MAP = {
     'array_var':  'String',
 }
 
-# Actor value name mapping (TES4 -> TES5)
-# TES4 attribute names. SKYRIM HAS NO ATTRIBUTES — Strength, Intelligence,
-# Willpower, Agility, Speed, Endurance, Personality and Luck do not exist as
-# actor values, and no TES5 actor value is a faithful stand-in, because every
-# candidate sits on a different scale than TES4's 0-100.
-#
-# They used to be aliased onto the nearest-looking AV here
-# (strength->UnarmedDamage, endurance->HealRate, agility/speed/acrobatics->
-# SpeedMult, personality->Speechcraft, luck->LuckModifier — which is not even
-# a real AV name, so it failed silently). That broke every Morroblivion guild:
-# the Fighters Guild gates each rank on `Player.GetAV Strength >= 30 &&
-# Player.GetAV Endurance >= 30`, and UnarmedDamage sits near 0, so no character
-# could ever qualify at any level; the Thieves Guild's Agility gate read
-# SpeedMult (~100) and passed unconditionally instead.
-#
-# An attribute read is now a no-op that returns ATTRIBUTE_STUB_VALUE, so the
-# gate falls OPEN, and an attribute write is discarded. Falling open is the
-# faithful outcome: an Oblivion attribute gate exists to keep an
-# under-developed character out, and a Skyrim character cannot raise an
-# attribute at all, so enforcing it would lock the content away permanently
-# rather than merely early. Mirrors dialog_conditions._TES4_AV_ATTRIBUTES,
-# which drops the equivalent CTDA, and TES4Polyfill.IsTES4Attribute.
+#: TES4's attributes, which no Skyrim actor value carries. See: docs/commentary/script_convert.md#skyrim-has-no-attributes
 TES4_ATTRIBUTES = frozenset({
     'strength', 'intelligence', 'willpower', 'agility',
     'speed', 'endurance', 'personality', 'luck',
 })
 
-# Value substituted for a removed attribute read. Above every authored TES4
-# attribute threshold (TES4 attributes cap at 100; the highest in the guild
-# advancement scripts is 35) so `>=` gates pass, and positive so the rarer
-# `> 0` / `!= 0` forms behave the same way.
+#: An attribute read nothing answers (an NPC's): above every authored gate, so it falls open.
 ATTRIBUTE_STUB_VALUE = '100.0'
 
 ACTOR_VALUE_MAP = {
@@ -82,10 +99,7 @@ ACTOR_VALUE_MAP = {
     'conjuration':  'Conjuration',
     'destruction':  'Destruction',
     'illusion':     'Illusion',
-    # Mysticism was folded into Illusion in Skyrim (Detect Life, Telekinesis
-    # and Soul Trap all became Illusion/Conjuration spells); Alteration was a
-    # mismatch with the record side, which already maps it to Illusion.
-    'mysticism':    'Illusion',
+    'mysticism':    'Alteration',
     'restoration':  'Restoration',
     # Acrobatics and Athletics have no Skyrim skill at all. Stamina is the
     # athletic-capacity value the engine actually tracks, and matches the
@@ -133,6 +147,12 @@ ACTOR_VALUE_MAP = {
     'responsibility': 'Morality',
 }
 
+#: Primary stats Skyrim lacks, TES4's and FO3/FNV's: a read passes any threshold, a write drops.
+PRIMARY_STATS = TES4_ATTRIBUTES | FALLOUT_ATTRIBUTES
+
+#: Actor-value command argument -> Skyrim's name; FO3/FNV's renames apply to this argument only.
+AV_ARGUMENT_NAMES = {**ACTOR_VALUE_MAP, **FALLOUT_ACTOR_VALUE_MAP}
+
 
 # TES4 global variables that exist in Skyrim — these need GlobalVariable property access
 KNOWN_GLOBALS = {
@@ -166,6 +186,7 @@ PAPYRUS_BOOL_FUNCTIONS = {
     'issprinting', 'isonmount', 'isalerted', 'isequipped', 'ismounted',
     'istrespassing', 'isavrecoverydisabled', 'isfurnitureinuse',
     'isflightblocked', 'isinterior', 'islocked',
+    'isactor', 'isactorsaioff', 'isplayable', 'isplayable2',
     'getdead', 'getdisabled', 'getlocked', 'getghost', 'getisalerted',
     'getincombat', 'getnobleedoutrecovery', 'getisplayablerace',
     'getcurrentweatherpercent', 'getiscurrentpackage',
@@ -514,14 +535,6 @@ def script_type_may_override(record_ptype: str) -> bool:
     return record_ptype not in _BASE_OBJECT_PAPYRUS
 
 
-def converted_worldspace_edid(edid: str) -> str:
-    """The EditorID a TES4 worldspace carries in the CONVERTED plugin.
-
-    See: docs/commentary/script_convert.md#worldspace-property-rename
-    """
-    return 'TES4Tamriel' if edid == 'Tamriel' else edid
-
-
 def wants_placed_reference(ptype: str) -> bool:
     """Whether a VMAD property of this Papyrus type must bind a PLACED
     reference rather than an actor BASE record.
@@ -599,6 +612,36 @@ SELF_NAMES = ('self', 'myself', 'getself')
 
 #: Export signatures of a PLACED reference (as opposed to its base record).
 PLACED_REF_SIGS = ('ACHR', 'ACRE', 'REFR')
+
+#: Base signatures of an ACTOR (a leveled list spawns one), which takes a graph event and never PlayAnimation.
+ACTOR_SIGS = ('NPC_', 'CREA', 'ACHR', 'ACRE', 'LVLC', 'LVLN')
+
+#: Placeable object base signatures whose NIF can carry a NiControllerSequence; a TRACED target must be one.
+SEQUENCE_OBJECT_SIGS = ('ACTI', 'DOOR', 'CONT', 'FLOR', 'FURN', 'LIGH', 'MISC', 'STAT')
+
+#: Zero-argument commands whose result is traceable to the records the script is attached to.
+TRACEABLE_SOURCES = ('getself', 'getparentref')
+
+#: The importer's force-greet alias quest, which StartConversation's Quest property names.
+FORCE_GREET_QUEST = 'TES4ForceGreets'
+
+#: Poll variable holding a running StartConversation walk's deadline (TES4Polyfill.WalkDeadline).
+CONV_WALK_VAR = 'TES4_WalkUntil'
+
+#: The importer's flee alias quest, which ForceFlee's Quest property names.
+FORCE_FLEE_QUEST = 'TES4ForceFlees'
+
+#: The importer's combat-approach alias quest, which StartCombat and StopCombat's Quest property names.
+COMBAT_APPROACH_QUEST = 'TES4CombatApproaches'
+
+#: The static script on that quest that queues and carries out StartCombat and StopCombat.
+COMBAT_QUEUE_SCRIPT = 'TES4_CombatQueue'
+
+#: The static alias script that re-checks its actor's AI packages when its quest's stage is set.
+STAGE_PACKAGE_ALIAS_SCRIPT = 'TES4_StagePackageAlias'
+
+#: The importer's fall-damage spell, which ResetFallDamageTimer's Spell property names.
+FALL_DAMAGE_SPELL = 'TES4NoFallDamage'
 
 
 # ===========================================================================

@@ -11,7 +11,15 @@
 - [Per-game asset namespace](#per-game-asset-namespace)
   - [A master is resolved by `record_dir`, never by joining its name](#master-resolved-by-record-dir)
     - [...and the ROOT it resolves against is found by marker, not by `.parent`](#export-root-by-marker)
+- [A lookup ignores case only after an exact miss](#case-blind-lookups)
+- [Loose .tga/.bmp textures are transcoded, not just copied](#loose-tgabmp-textures)
 - [The blacklist prune](#the-blacklist-prune)
+- [Texture repairs write in place, never by rename](#texture-repairs-write-in-place)
+- [Morroblivion texture substitution](#morroblivion-texture-substitution)
+  - [Pairing meshes through their records](#pairing-meshes-through-records)
+  - [Comparing shapes across the pair](#comparing-shapes-across-the-pair)
+  - [A texture is its path, not its name](#texture-identity)
+  - [Who swaps, and how workers know](#who-swaps)
 
 ## Oblivion parallax → Skyrim height maps (`asset_convert/texture/parallax.py`, opt-in, 2026-08-15)
 <a id="oblivion-parallax-skyrim-height-maps"></a>
@@ -627,7 +635,7 @@ being mesh products.
 - Skyrim's landscape shader reads the normal map ALPHA channel as the specular mask. Oblivion's terrain shader never used it, so most Oblivion landscape `*_n.dds` are DXT1 (no alpha) → sampled alpha = 1.0 → full-strength specular over the whole terrain (user-visible "very shiny ground"). Oblivion normals that are already DXT5 carry a real mask (avg ~77/255) and are correct as-is.
 - Fix: `asset_convert/texture/landscape_normals.py` (pipeline step after the texture copy, so re-copies can't resurrect DXT1) re-containers DXT1 → DXT5 with constant dark alpha 32/255. DXT1 and DXT5 share the 8-byte color block format, so RGB is preserved losslessly; DXT1 3-color blocks (c0<=c1, ~0.05%) get endpoints swapped + indices 0↔1 remapped since DXT5 color blocks are always 4-color mode.
 - **A DXT5 landscape normal with a "real-looking" mask is not evidence of intent either.** Morroblivion's 127 terrain normals (`tes4\landscape\morro\`) are all DXT5; 97 classify as a per-texel mask with median alpha 102 and p90 119, against a median of 16 / p90 72 for Oblivion's own DXT5 landscape normals. In TES4 the normal alpha is the PARALLAX height field (what `parallax.py` turns into `_p` maps), never specular, so `run()` now gives every landscape normal the 32/255 constant whatever its format, skipping files already carrying it.
-- **A land texture with NO normal map at all renders shiny too.** `convert_LTEX` names `<diffuse>_n.dds` in every TXST, and Morrowind ships no normal maps: Tamriel Rebuilt's 294 LTEX all pointed at files that exist nowhere in `output/`. `landscape_normals.ensure_ltex_normals` (run for every plugin at the end of `convert_meshes`, even one with no texture tree of its own) looks for each LTEX's normal under every plugin's output tree and writes a flat DXT5 normal with the 32/255 mask under this plugin's tree when none ships it. Path spelling comes from `tes5_import.record_types.common.landscape_texture_path`, the same function the TXST writer uses. NOT yet in-game verified.
+- **A land texture with NO normal map at all renders shiny too.** `convert_LTEX` names `<diffuse>_n.dds` in every TXST, and Morrowind ships no normal maps: Tamriel Rebuilt's 294 LTEX all pointed at files that exist nowhere in `output/`. `landscape_normals.ensure_ltex_normals` (run for every plugin at the end of `convert_meshes`, even one with no texture tree of its own) looks for each LTEX's normal under every plugin's output tree, [ignoring case](#case-blind-lookups), and writes a flat DXT5 normal with the 32/255 mask under this plugin's tree when none ships it. Path spelling comes from `tes5_import.record_types.common.landscape_texture_path`, the same function the TXST writer uses. NOT yet in-game verified.
 - Related: LTEX SNAM is a Phong exponent (never write 0 — see convert_LTEX comment); the alpha mask is what actually controls specular *amount*.
 
 ### <a id="default-normal-is-dxt5"></a>The shared `default_n.dds` is DXT5, not the uncompressed form
@@ -769,6 +777,17 @@ namespace into MODL paths; if the asset copy and the record writer disagree,
 every converted record points at a path no BSA provides. That is total purple,
 far worse than the handful of missing textures this fixes.
 
+🛑 **Every path is prefixed exactly once, with no "already prefixed" test.**
+`prefix_path`, `rewrite_tex_path`, navmesh `model_key` and `cross_ref`'s mesh key
+take AUTHORED paths only. They used to skip a path that already started with the
+namespace, a harmless test while the namespace was a fixed `tes4` no mod
+authors. Now that it is the root plugin's name, Nehrim's own `Nehrim\` folder
+matched it: 398 of Nehrim's 10,055 distinct model paths start with `Nehrim\`,
+and those records named `meshes\Nehrim\x.nif` while the copy wrote
+`meshes\nehrim\nehrim\x.nif`, so the meshes did not draw (the intro gear
+`ZahnradGrobLoch01.nif`) and their OBND fell back to the type default. Textures
+authored under `Textures\Nehrim\` (578 files) broke the same way.
+
 ### A master is resolved by `record_dir`, never by joining its name
 <a id="master-resolved-by-record-dir"></a>
 
@@ -860,6 +879,114 @@ harmless, explicit, and independent of environment inheritance.
 plugins must call `set_namespace` for each -- it is the phase's entry point
 that owns this, not the pool.
 
+## A lookup ignores case only after an exact miss
+<a id="case-blind-lookups"></a>
+
+**Code:** `find_nocase`, `folder_names` in `asset_convert/game_paths.py`;
+`ensure_ltex_normals`, `_Listings` in `asset_convert/texture/landscape_normals.py`;
+seven more callers, listed at the end of this section
+
+A record keeps its author's mixed case, and the file it names may be spelled
+otherwise on disk: a BSA stores every internal path lowercase and
+`bsa_extract.py` keeps that. A case-insensitive filesystem answers for every
+spelling; on a case-sensitive one an exact join misses, and nothing reports it.
+
+`find_nocase` is `win_join` followed by the lookup a case-insensitive filesystem
+does on its own:
+
+- **The exact join is probed first and returned untouched.** An exact hit lists
+  nothing, so where the filesystem ignores case a file that exists costs the one
+  probe it always did, and the result is the path the code always built.
+- After a miss, on any filesystem, each segment is matched ignoring case through
+  EVERY folder that spells it, so an empty `Oblivion/` beside `oblivion/` cannot
+  hide a file. Of two names that differ only by case, the first in sorted order
+  answers. Names are compared with `str.lower()`.
+- A miss is `None`, never a guess: a caller that reports the missing path keeps
+  naming the one it asked for.
+
+A miss costs one `os.listdir` per folder on the path. `folder_names` reads the
+folder on every call, so a file written between two lookups is seen by the
+second. `listing` replaces the lister: the tests pass an in-memory tree, and a
+caller with many names to look up may pass one that remembers what it read, as
+long as it forgets a folder the run writes into. A case-blind hit is probed
+again before it is returned, so a stale listing can miss a file created mid-run
+but cannot return one that is gone.
+
+`ensure_ltex_normals` is the first caller. An LTEX spells
+`Oblivion\TerrainHDOblivionRock01.dds` and the converted file is
+`oblivion/terrainhdoblivionrock01_n.dds`. Of the 166 land textures Oblivion.esm
+names, 160 ship a normal, and on a case-sensitive filesystem the exact probe
+found none of them. Run on a names-only copy of that build with no placeholder
+written yet, it wrote 166 flat placeholders, 160 beside the real normal and
+differing from it only by case; now it writes the 6 that ship none.
+
+- The `textures` folder is matched like every other segment, so a master whose
+  tree is `Textures/` is searched too.
+- It looks every land texture up through the same few folders, so it passes a
+  lister that reads each folder once (`_Listings`) and empties it whenever it
+  writes a placeholder, because the write changes a folder it searches. On that
+  copy the call takes about 3 ms where the exact probe took under 2 ms.
+- What that memory does not save: a plugin whose textures ship no normal at all
+  writes a placeholder per texture and lists the searched folders again after
+  each. With 294 such textures and three master trees whose folder holds 3,000
+  names, the first call took 0.5 s against 8 ms, and later calls 10 ms
+  (generated trees, not a Morrowind build).
+- A placeholder is still written under the record's spelling: for a texture
+  that ships no normal, a record that spells `Oblivion\` opens a folder beside
+  `oblivion/` (one such folder for Oblivion.esm, where there were four).
+- A placeholder an earlier build wrote beside a real normal is not removed: it
+  sits at the record's own spelling, so the exact probe finds it first.
+
+Four more lookups ask it:
+`shaders.resolve_source_texture` ([source textures](asset_convert_shader.md#texture-fallback-roots)),
+`book_inam.find_source_mesh` with the book's cover and its normal,
+`audio_converter._voice_root` with `say_durations.scan_voice_durations`
+(a mod's loose `sound/Voice`), and `hkx_behavior._skeleton_nif`
+(a mod's `Skeleton.NIF`).
+
+Three more ask it for a path that a record or a creature project spells in its
+own case and with backslashes:
+`magic_art.phases_for` with `magic_art.split_effect_meshes` (an MGEF's
+`MagicEffects\Fireball.NIF`, for its [phase meshes](asset_convert_magic_art.md#phase-meshes)
+and the ARTO, PROJ and EXPL that name them),
+`npc_face_mapper.load_race_skin_tones` (a race's body texture and head `.egt`,
+for its [skin color](asset_convert_facegen.md#where-color-actually-lives)), and
+`creature_races._pile_mesh_bounds` (a [death pile's](asset_convert_creature.md#pile-acti-record-fields)
+converted mesh under `Actors\tes4\oblivion\ghost`).
+
+## Converted asset paths are plain ASCII
+<a id="ascii-asset-paths"></a>
+
+**Code:** `ascii_path`, `ascii_dest`, `remove_non_ascii` in `asset_convert/game_paths.py`;
+`path_text` / `path_bytes` in `asset_convert/nif/tex_paths.py`
+
+Skyrim mis-resolves a non-ASCII mesh path. Measured live on Arktwend (SSE
+1.6.1170): ref `1B86EC16`'s base was `a_Marktuberhang04` with MODL
+`...\Markt\xfcberhang04.nif`, the Data folder held exactly our file (same inode
+and MD5 as `output/`, no BSA carrying it), and the system code page was 1252
+(the loose-file open is `CreateFileA`). Yet the loaded 3D was
+`Marktüberhang05.nif`'s tree (`Furn_overhang_09`, cloth texture set
+`TX_Viking_Tent_Cloth_02`), whose cloth names a texture Arktwend never shipped:
+purple. Renaming every shipped path to ASCII fixed it in game. Vanilla ships
+zero non-ASCII asset paths.
+
+- `ascii_path` drops accents to the base letter (`Marktüberhang04` →
+  `Marktuberhang04`) and writes any other non-ASCII character as `_xx`
+  (`ß` → `_df`). No folded name collides in Arktwend (33 meshes, 8 textures).
+- It is applied where an output name is MADE: mesh and texture file names
+  (`ascii_dest`), NIF texture strings (`path_bytes`), and record paths
+  (`prefix_path`). Source lookups keep the authored spelling, because `export/`
+  keeps it; `win_join` falls back to the folded name on a miss, and the
+  bounds/collision getters accept either key, so the navmesh files (and the
+  shared navmesh cache hash) are untouched.
+- Authored NIF strings are Windows-1252 (`path_text`). Reading them as UTF-8
+  turned `0xFC` into U+FFFD, which wrote `w\xef\xbf\xbdstea03rock.dds` into 16
+  Arktwend/Nehrim/LOD meshes — purple even before the fold existed.
+- A full mesh run deletes every non-ASCII file under `meshes/<ns>` and
+  `textures/<ns>` (`remove_non_ascii`): an older build's spelling of a file now
+  shipped under its folded name.
+- Not yet folded: music (`Data\Music\...\Wüste01.xwm`), named by the music stage.
+
 ## The blacklist prune
 <a id="the-blacklist-prune"></a>
 
@@ -908,8 +1035,12 @@ named by any mesh:
 | `menus50` | 3,787 | 52.9 | 0 |
 | `landscapelod` | 264 | 213.1 | 0 |
 | `distantlod` | 0 | 0.0 | 0 |
-| `lowres` | 758 | 1.5 | 0 |
 | non-`.dds`/`.tga` | 150 | 1,120.3 | 0 |
+
+`lowres` (758 files, 1.5 MB) was once on this list. Its "0 false positives"
+held only because mesh conversion stripped the `lowres` segment from every
+path; `_far` meshes now name `lowres` textures that have no full-res twin, so
+the tree ships. See [lowres textures](asset_convert_shader.md#lowres-textures).
 
 `faces/` is FaceGen output keyed `<formid>_0.dds`, which Skyrim regenerates
 from NPC records; `landscapelod/` is superseded by our own bake into
@@ -939,3 +1070,171 @@ dumping ground of `bell.dds`, `cube.dds`, `elevator01.dds`) is genuinely dead,
 but the rule to catch it would name one plugin's folder. Both are accepted
 dead weight: shipping a few hundred MB nothing reads is strictly cheaper than
 one texture that fails to ship.
+
+<a id="loose-tgabmp-textures"></a>
+## Loose .tga/.bmp textures are transcoded, not just copied
+
+**Code:** `asset_convert/texture/image_transcode.py`
+
+`tex_paths.as_dds` rewrites every `.tga`/`.bmp` reference in a converted NIF to
+`.dds`, because Morrowind and Oblivion both name the artist's source file while
+their archives ship the DDS and substitute the extension at load. Skyrim does
+not substitute, and it cannot read TGA or BMP at all.
+
+The rewrite is therefore only half a fix. A plugin that ships its art LOOSE
+rather than in a BSA has no DDS for the mesh's rewritten path to find, so the
+mesh renders untextured. Measured on Arktwend: 5,589 DDS ship, but 179 `.tga`
+and 78 `.bmp` do too, and **251 of those have no DDS twin** — every mesh naming
+one of them lost its diffuse. `arktwendenglish\a pmelise.tga` was the reported
+case; `pmelisenstrauch.NIF` asks for `a pmelise.dds`, which was never written.
+
+So the copy is followed by a transcode: any `.tga`/`.bmp` with no `.dds`
+sibling gets one written beside it, mip chain included. Skipping when the twin
+exists keeps the pass idempotent and, more importantly, stops it clobbering
+the DDS the plugin shipped itself or one the L8/specular/parallax repairs
+rewrote — which is also why it runs FIRST, before those passes, so they see
+the new files.
+
+`.jpg` is deliberately left alone (1 file on Arktwend). `as_dds` does not
+rewrite `.jpg`, so transcoding it would write a DDS nothing names while the
+mesh still points at a file Skyrim cannot read; the fix there is a path rewrite,
+not an encode.
+
+### DXT5 only when the alpha is real
+
+Format is picked from the pixels, not the source extension: DXT5 when any
+alpha sample is under 250, DXT1 otherwise. TGA authors habitually save 32-bit
+with a fully opaque alpha channel — 94 of the 172 orphaned TGAs read as RGBA —
+and taking those as DXT5 would double their size for nothing.
+
+Both block encoders already existed for the terrain LOD bake. A DXT5 block is
+a BC4 alpha block followed by an unmodified DXT1 color block, so
+`encode_bc4_channel` and `encode_dxt1_quality` compose into one without a new
+codec. The only gap was the header: `dds_header` writes one side into both
+dimensions, and 44 of these textures are non-square, so the width word is
+patched after the fact rather than duplicating the 128-byte layout.
+
+<a id="texture-repairs-write-in-place"></a>
+## Texture repairs write in place, never by rename
+
+**Code:** `convert_file` in `asset_convert/texture/luminance_textures.py`, `strip_diffuse_alpha` in `asset_convert/texture/parallax.py`
+
+User report (2026-09-24): `lights\uppersilverplatecandles01.nif` and many other
+candles glowed red again. The L8 glow-map fix
+([asset_convert_nif.md](asset_convert_nif.md#nif-flamenode-grafted-converted-flame))
+was still in place, and `output/` held a correct grey BGRA `candle_g.dds`.
+The game did not read that file.
+
+The deployed game copy is a **hard link** into `output/`. A rebuild runs
+`_copy_tree` (`shutil.copy2`), which writes the L8 original INTO the existing
+file, so every link receives it. The repair then wrote a temp file and
+`os.replace`d it over the path. The rename gives `output/` a new file and cuts
+the link, so the deployed copy keeps the L8 bytes the copy just gave it.
+Measured over `output/Oblivion.esm/textures`: 20,436 files had link count 2 and
+479 had count 1. **469 of those 479 were `_g` glow maps**, exactly the L8 census
+count. `landscape_normals` already wrote with `open(path, 'wb')` and its
+normals stayed linked.
+
+Rule: a pass that repairs a file already in `output/` overwrites that file's
+bytes (`open(path, 'wb')`). It never renames a new file over it. Both passes
+read the whole file into memory first, so the in-place write is safe. A
+deployment cut off by the old behavior has to be re-linked once. Guarded by
+`test_hard_linked_copy_receives_the_fix`.
+
+## <a id="morroblivion-texture-substitution"></a>Morroblivion texture substitution
+
+**Code:** `tes4_export/morroblivion_texture_map.py` (proves the map, in the
+compatibility patch's Export step); `asset_convert/nif/morroblivion_textures.py`
+(reads it); `_fill_texture_slots` in `asset_convert/nif/geometry_shader.py`
+(swaps).
+
+Morroblivion renamed every Morrowind texture by replacing `_` with `u`
+(`tx_hlaalu_wall2_01` -> `txuhlaaluuwall2u01`) and repainted many at higher
+resolution. In Morroblivion mode a Tamriel Rebuilt wall therefore renders beside
+a Morroblivion wall built from the same authored art at a fraction of its texel
+density: `tx_hlaalu_wall2_01.dds` ships 256x256 / 43 KB,
+`txuhlaaluuwall2u01.dds` 1024x1024 / 699 KB.
+
+A twin is not interchangeable on its name alone. Morroblivion re-modelled part
+of the mesh tree, and its textures are hand-authored: comparing the images
+cannot say whether a mesh still addresses the twin the way it addressed the
+original. The vanilla/Morroblivion mesh pair can. Where Morroblivion kept a
+vanilla shape's geometry and UVs exactly and put the renamed twin on it, the
+twin is proven to fit the vanilla layout, and it then fits wherever any mesh
+names that texture -- including Tamriel Data and Tamriel Rebuilt, whose own
+`tr_` meshes have no Morroblivion counterpart to compare. A first version keyed
+the map on the mesh and so swapped on none of their meshes.
+
+The map is built by the patch, not committed: the patch's Export step already
+walks every entry of the vanilla BSAs once, so it keeps the bytes of each
+paired vanilla mesh in that same pass and needs no authored-mode
+`export/Morrowind.esm`, which a Morroblivion-mode user never has. It is written
+as `morroblivion_textures.txt` beside the patch's records, one
+`<vanilla texture>\t<Morroblivion texture>` per line (`write_manifest`'s
+format). Where several Morroblivion copies of a twin ship, the largest wins.
+A twin no Morroblivion file backs is dropped: some Morroblivion meshes name
+textures its archives never shipped.
+
+The patch still ships every vanilla texture (see
+[tes4_export_morrowind.md](tes4_export_morrowind.md#morroblivion-gap-patch)).
+The map rewrites only mesh diffuse slots; records (landscape textures,
+inventory icons) and the other slots still name the vanilla files.
+
+### <a id="pairing-meshes-through-records"></a>Pairing meshes through their records
+
+A vanilla mesh's Morroblivion counterpart is the model of the Morroblivion
+record that replaced the vanilla record naming it -- `MorroblivionModels.replacement`,
+the same chain that remaps a dependent plugin's models. Guessing the
+counterpart's file name (`morro\` + the `_`->`u` renaming) found 3,033 pairs;
+the records find 4,874 with a file behind them.
+
+### <a id="comparing-shapes-across-the-pair"></a>Comparing shapes across the pair
+
+Morroblivion reorders shapes within a NIF, permutes vertices within a shape,
+and drops vanilla's untextured collision geometry. Three consequences, each of
+which produced a wrong answer before it was handled:
+
+- **Compare by content, not file order.** Pairing shapes by index reported 97
+  of 120 meshes as mismatched; nearly all were the dropped collision shape
+  shifting every later index.
+- **Compare as a multiset, not a sorted array.** Sorting by position is
+  ambiguous -- a UV seam puts two UVs on one position -- and sorting by UV
+  assumes the answer. `pair_set` reduces a shape to a `Counter` of
+  `(x, y, z, u, v)` tuples, which ignores order without a tie-break.
+- **Round position and UV differently.** NIF stores float32, so identical
+  geometry disagrees in the 4th decimal (`-111.2258` against `-111.2257`).
+  Positions round to 2 decimals and serve only as identity; UVs round to 4,
+  since the UV is what is under test.
+
+A synthetic UV shift down to 5e-4 is detected; a permuted vertex order reads
+as identical. `act_banner_ald_velothi` is correctly refused: same vertex count
+and [0,1] UV range, but Morroblivion rotated it from the XY plane to XZ.
+
+### <a id="texture-identity"></a>A texture is its path, not its name
+
+`texture_key` identifies a texture by its path below `textures\`, lower case,
+without extension. The extension goes because Morrowind names `.tga` where its
+archives ship `.dds`. The directory stays, because it is part of which file is
+meant: 4,677 of the vanilla archives' 4,783 textures sit at the archive root
+(the rest are UI and water), so a plugin's own `tr\tx_hlaalu_wall2_01.dds` is a
+different file that merely shares a name, and keeps its art. The normalizing
+(separators, a leading `data\`, then `textures\`) is `texture_rel_path`, the
+same step `rewrite_tex_path` uses.
+
+Only the diffuse is swapped. The normal map then follows from the swapped
+diffuse through `_normal_slot`, which finds Morroblivion's `_n` through the
+masters' texture roots.
+
+### <a id="who-swaps"></a>Who swaps, and how workers know
+
+A plugin swaps when its own export or any master in its chain carries the map:
+the patch itself, and everything converted in Morroblivion mode, since all of it
+masters the patch. Authored-mode Morrowind never masters it and never swaps.
+
+The choice is made once per plugin, where the namespace is installed
+(`_activate_namespace` and `convert.py`'s `_use_plugin_namespace`), and carried
+the same way the namespace is: `activate` puts the map's folder in
+`TESCONV_MORROBLIVION_TEXTURES`, which every spawned mesh worker inherits. A
+first version kept an on/off flag in module state, which a spawned worker never
+sees, so a real build would have swapped nothing while every in-process test
+passed. `test_the_map_reaches_a_spawned_worker` spawns one.

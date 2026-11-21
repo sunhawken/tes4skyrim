@@ -18,7 +18,7 @@ MEASURED GROUND TRUTH (2026-08-23, after an in-game round trip):
 
 THE MECHANISM (v3) — one smooth scalp-to-scalp displacement field:
 
-  At BUILD time (body_wrap.build_field -> build_arrays) a per-scalp-vertex
+  At BUILD time (body_wrap_build.build_field -> build_arrays) a per-scalp-vertex
   displacement field is computed once per gender/race: for every vertex of
   the OB head, where the matching point on the SK head is.  It initialises
   from NEAREST POINT over the identity carrier (the shared FaceGen UV
@@ -50,7 +50,7 @@ THE MECHANISM (v3) — one smooth scalp-to-scalp displacement field:
   hair sides exactly as vanilla hair allows.
 
 Build data lives in body_wrap's generated npz (hf_*/hfr_* arrays, written by
-body_wrap.build_field via build_arrays below; 'hf_v4' marks the field
+body_wrap_build.build_field via build_arrays below; 'hf_v4' marks the field
 format).  Surfaces are stored in WORLD coordinates; O_OB / O_SK translate
 face space to and from it.  The same field also replaces the wrap's ICP head
 surface (build_field), so skinned head gear takes the identical mapping.
@@ -68,6 +68,9 @@ except ImportError:
     _SCIPY = False
 
 _GEN_DIR = paths.GENERATED
+
+#: The Oblivion head the shipped field was built from (relative to characters\\).
+OB_HEAD_MESH = Path('imperial') / 'headhuman.nif'
 
 # HAIR IS BAKED PER RACE GROUP (2026-08-24).  A races.tri on a type-3 (Hair)
 # HDPT was tried and the ENGINE DOES NOT APPLY IT (vanilla never ships one on
@@ -580,7 +583,7 @@ def _sample_fields(P, src_v, src_t, tree, dv_list, k=None):
 
 
 # ---------------------------------------------------------------------------
-# Build (called from body_wrap.build_field)
+# Build (called from body_wrap_build.build_field)
 # ---------------------------------------------------------------------------
 
 # EARS ARE EXCLUDED FROM EVERY SURFACE, both sides (2026-08-23, in-game).
@@ -851,7 +854,7 @@ def beast_races_available(female: bool) -> tuple:
 
 def _load_unskinned(char_dir, rel):
     """(verts_face_local, tris) of an unskinned OB face-part mesh, or None."""
-    from asset_convert.character.body_wrap import read_nif, geom_triangles
+    from asset_convert.character.wrap_mesh import read_nif, geom_triangles
     from asset_convert.nif.pyffi_monkey_patch import apply_patches
     apply_patches()
     from pyffi.formats.nif import NifFormat
@@ -898,7 +901,7 @@ def _neck_surfaces(gender):
     field, the refinement and the ear-cover floor all see real skin there.
     """
     try:
-        from asset_convert.character.body_wrap import load_ob_group, load_sk_surface
+        from asset_convert.character.body_wrap_build import load_ob_group, load_sk_surface
         g = load_ob_group(gender)
         if 'body' not in g:
             return None
@@ -967,9 +970,51 @@ def _relax_field(src_v, src_t, targets, sk_v, sk_t):
     return gv[wg] + dg[wg]
 
 
+def relaxed_deltas(src_v, src_t, flat, sk_t, o_ob, o_sk):
+    """(field tris, per-vertex deltas) mapping a source head onto a Skyrim head.
+
+    `src_v`/`flat` are WORLD coordinates about `o_ob`/`o_sk`; `flat` is the
+    ear-capped target.  The field lives on the source's visible exterior,
+    starts from nearest points and is relaxed by _relax_field; hidden verts
+    take their deltas from the exterior field.
+
+    See: docs/commentary/asset_convert_armor.md#hair-source-head
+    """
+    v_local = src_v - o_ob
+    vis = _visible_exterior(v_local, src_t)
+    field_tris = src_t[vis[src_t].all(axis=1)]
+    if not len(field_tris):
+        field_tris = src_t
+    init = _project_exact(v_local + o_sk, flat, sk_t,
+                          cKDTree(flat[sk_t].mean(axis=1)))
+    targets = _relax_field(src_v, field_tris, init, flat, sk_t)
+    dv = (targets - o_sk) - v_local
+    if (~vis).any():
+        tree_f = cKDTree(v_local[field_tris].mean(axis=1))
+        dv[~vis] = _sample_field(v_local[~vis], v_local, field_tris, tree_f,
+                                 dv)
+    return field_tris, dv
+
+
+def _neck_extended(head_v0, head_tris, sk_surface, gender):
+    """(src_v, src_t, sk_v, sk_t, n_head_sk): both surfaces plus the neck column.
+
+    See _neck_surfaces for why the neck is appended; without it both are the
+    bare heads.
+    """
+    sk_v = np.asarray(sk_surface[0], dtype=np.float64)
+    sk_t = np.asarray(sk_surface[1], dtype=np.int64)
+    neck = _neck_surfaces(gender)
+    if neck is None:
+        return head_v0, head_tris, sk_v.copy(), sk_t, len(sk_v)
+    onv, ont, snv, snt = neck
+    return (np.vstack([head_v0, onv]), np.vstack([head_tris, ont + len(head_v0)]),
+            np.vstack([sk_v, snv]), np.vstack([sk_t, snt + len(sk_v)]), len(sk_v))
+
+
 def build_arrays(head_v0, head_tris, sk_surface, char_dir,
                  o_ob, o_sk, gender='male') -> dict:
-    """The hf_* arrays body_wrap.build_field stores in the field npz.
+    """The hf_* arrays body_wrap_build.build_field stores in the field npz.
 
     head_v0 / head_tris   OB head group, authored T-pose, WORLD coords
     sk_surface            (verts, tris) of the real Skyrim head, WORLD
@@ -982,66 +1027,18 @@ def build_arrays(head_v0, head_tris, sk_surface, char_dir,
     head_tris = np.asarray(head_tris, dtype=np.int64)
     o_ob = np.asarray(o_ob, dtype=np.float64)
     o_sk = np.asarray(o_sk, dtype=np.float64)
-
-    sk_v_raw, sk_t_raw = sk_surface
-    sk_v_raw = np.asarray(sk_v_raw, dtype=np.float64)
-    sk_t_raw = np.asarray(sk_t_raw, dtype=np.int64)
-    n_head_sk = len(sk_v_raw)
-
-    # BOTH surfaces are extended with the body meshes' NECK columns: the OB
-    # head ends at local z -3.5 on the back, so hair below it had nothing to
-    # conform to (visible gap off the nape/neck).
-    src_v, src_t = head_v0, head_tris
-    neck = _neck_surfaces(gender)
-    if neck is not None:
-        onv, ont, snv, snt = neck
-        src_v = np.vstack([head_v0, onv])
-        src_t = np.vstack([head_tris, ont + len(head_v0)])
-        sk_full_ext = np.vstack([sk_v_raw, snv])
-        sk_t = np.vstack([sk_t_raw, snt + n_head_sk])
-    else:
-        sk_full_ext = sk_v_raw.copy()
-        sk_t = sk_t_raw
-
-    # the field domain is the VISIBLE EXTERIOR surface only (see
-    # _visible_exterior); interior mouth-bag geometry is excluded
-    vis = _visible_exterior(src_v - o_ob, src_t)
-    field_tris = src_t[vis[src_t].all(axis=1)]
-    if not len(field_tris):
-        field_tris = src_t
-    carrier = src_v - o_ob + o_sk
-
-    # the races-tri morph each group's target head wears (head verts only;
-    # the appended neck is unmorphed)
+    src_v, src_t, sk_full_ext, sk_t, n_head_sk = _neck_extended(
+        head_v0, head_tris, sk_surface, gender)
     group_deltas = _group_head_deltas(gender, n_head_sk, len(sk_full_ext))
 
     def _build_one(morph_delta):
-        """(dv, sk_flat_v) for one target head (base or group-morphed)."""
-        skv = sk_full_ext.copy()
-        if morph_delta is not None:
-            skv += morph_delta
-        # Target surface: the head with its EARS CAPPED — ear-box verts are
-        # projected onto the surrounding skull (_flatten_ears), closing the
-        # opening at the REAL skull contour (an OB-socket cap recessed the
-        # region and sank short hair under the skin; cut triangles left a
-        # rim that attracted projections outward).  Only HEAD verts flatten.
+        """(field tris, dv, ear-capped target) for one base or group-morphed head."""
+        skv = sk_full_ext if morph_delta is None else sk_full_ext + morph_delta
         flat, _m = _flatten_ears_with_tris(skv.copy(), sk_t, 'human', o_sk,
                                            limit=n_head_sk)
-        # NEAREST-POINT init from the identity carrier (the shared FaceGen
-        # UV layout was rejected as init: ~2 units of v-coordinate bias).
-        init = _project_exact(carrier, flat, sk_t,
-                              cKDTree(flat[sk_t].mean(axis=1)))
-        targets = _relax_field(src_v, field_tris, init, flat, sk_t)
-        dv = (targets - o_sk) - (src_v - o_ob)
-        hidden = ~vis
-        if hidden.any() and len(field_tris):
-            v_local = src_v - o_ob
-            tree_f = cKDTree(v_local[field_tris].mean(axis=1))
-            dv[hidden] = _sample_field(v_local[hidden], v_local, field_tris,
-                                       tree_f, dv)
-        return dv, flat
+        return relaxed_deltas(src_v, src_t, flat, sk_t, o_ob, o_sk) + (flat,)
 
-    dv, sk_flat = _build_one(None)
+    field_tris, dv, sk_flat = _build_one(None)
     out = {
         'hf_src_v': src_v.astype(np.float32),
         'hf_src_t': field_tris.astype(np.int32),
@@ -1052,14 +1049,10 @@ def build_arrays(head_v0, head_tris, sk_surface, char_dir,
         'hf_n_head': np.array([len(head_v0)], dtype=np.int64),
         'hf_o_ob': o_ob,
         'hf_o_sk': o_sk,
-        # format marker: v4 = neck-extended surfaces + per-race-GROUP fields
-        # (baked meshes per group; a races.tri on hair is NOT applied by the
-        # engine).  The loader requires it, so a stale npz can never
-        # silently feed the new runtime.
         'hf_v4': np.array([1], dtype=np.int8),
     }
     for gname, delta in group_deltas.items():
-        gdv, gflat = _build_one(delta)
+        _ft, gdv, gflat = _build_one(delta)
         out[f'hf_g_{gname}_dv'] = gdv.astype(np.float32)
         out[f'hf_g_{gname}_sk_v'] = gflat.astype(np.float32)
         out[f'hf_g_{gname}_skf_v'] = (sk_full_ext + delta).astype(np.float32)
@@ -1116,7 +1109,7 @@ def _build_race_pack(race, char_dir, gender, o_ob, o_sk):
     field.  A race whose own SK mesh cannot be fetched is skipped entirely —
     the runtime then falls back to the human field.
     """
-    from asset_convert.character.body_wrap import head_uv_geometry
+    from asset_convert.character.body_wrap_build import head_uv_geometry
     head_rel, sk_names, ear_box = _RACE_PACKS[race]
     o_ob = np.asarray(o_ob, dtype=np.float64)
     o_sk = np.asarray(o_sk, dtype=np.float64)
@@ -1159,23 +1152,7 @@ def _build_race_pack(race, char_dir, gender, o_ob, o_sk):
     # flattening removes a large area the hair then sinks into).
     sk_full = sk_v.copy()
     sk_v, _m = _flatten_ears_with_tris(sk_v.copy(), sk_t, ear_box, o_sk)
-
-    carrier = hv - o_ob + o_sk
-    init = _project_exact(carrier, sk_v, sk_t,
-                          cKDTree(sk_v[sk_t].mean(axis=1)))
-    vis = _visible_exterior(hv - o_ob, ht)
-    field_tris = ht[vis[ht].all(axis=1)]
-    if not len(field_tris):
-        field_tris = ht
-    targets = _relax_field(hv, field_tris, init, sk_v, sk_t)
-    dv = (targets - o_sk) - (hv - o_ob)
-    hidden = ~vis
-    if hidden.any() and len(field_tris):
-        v_local = hv - o_ob
-        tree_f = cKDTree(v_local[field_tris].mean(axis=1))
-        dv[hidden] = _sample_field(v_local[hidden], v_local, field_tris,
-                                   tree_f, dv)
-
+    field_tris, dv = relaxed_deltas(hv, ht, sk_v, sk_t, o_ob, o_sk)
     return {
         f'hfr_{race}_src_v': hv.astype(np.float32),
         f'hfr_{race}_src_t': field_tris.astype(np.int32),
@@ -1264,6 +1241,42 @@ def _get(female: bool):
 
 def fit_available(female: bool) -> bool:
     return _get(female) is not None
+
+
+def _target_surfaces(fit, race, group):
+    """(ear-capped verts, real verts, tris) of the Skyrim head race/group names."""
+    if race is not None:
+        flat, tris = fit.races_sk[race]
+        return flat, fit.races_full.get(race, (flat,))[0], tris
+    if group in fit.groups:
+        _dv, flat, real = fit.groups[group]
+        return flat, real, fit.sk_t
+    real = fit.sk_full_v if fit.sk_full_v is not None else fit.sk_v
+    return fit.sk_v, real, fit.sk_t
+
+
+def register_source_pack(female: bool, key: str, src_v, src_t, race=None,
+                         group=None):
+    """Fit from another source head; returns the `race` key to fit with, or None.
+
+    `src_v`/`src_t` are that head in its own face space; the target is the
+    Skyrim head `race`/`group` selects.  Built once per process, then fitted
+    through exactly like a beast race pack.
+
+    See: docs/commentary/asset_convert_armor.md#hair-source-head
+    """
+    fit = _get(female)
+    if fit is None:
+        return None
+    if key not in fit.races:
+        flat, real, tris = _target_surfaces(fit, race, group)
+        src_w = np.asarray(src_v, dtype=np.float64) + fit.o_ob
+        field_tris, dv = relaxed_deltas(src_w, np.asarray(src_t, dtype=np.int64),
+                                        flat + fit.o_sk, tris, fit.o_ob, fit.o_sk)
+        fit.races[key] = _SurfPack(src_w, field_tris, dv, fit.o_ob)
+        fit.races_sk[key] = (flat, tris)
+        fit.races_full[key] = (real, tris)
+    return key
 
 
 def field_deltas(P, female: bool, race=None):

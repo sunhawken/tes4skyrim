@@ -25,8 +25,8 @@ from script_convert.constants import (
     script_type_may_override
 )
 from script_convert.command_rows import (
-    COMMAND_ROWS, HANDLED_COMMANDS, ACTOR_VALUE_MAP_LOW,
-    BARE_NO_EQUIV_COMMANDS
+    COMMAND_ROWS, CRIME_FACTION, CRIME_REALMS, HANDLED_COMMANDS,
+    ACTOR_VALUE_MAP_LOW, BARE_NO_EQUIV_COMMANDS
 )
 from script_convert.resolve import digit_stripped_formid
 
@@ -61,12 +61,12 @@ BARE_READINGS = {
 #: time is how each new spelling reached the compiler as an undefined name.
 BARE_INERT = frozenset({
     'getisalerted', 'israining', 'menumode', 'istimepassing',
-    'getplayerinseworld', 'getcurrentaiprocedure', 'getcurrentaipackage',
+    'getcurrentaiprocedure', 'getcurrentaipackage',
     'getiscurrentpackage', 'isidleplaying', 'getbookread', 'gettalkedtopc',
     'getcrimeknown', 'getstartingpos', 'getisplayerbirthsign',
     'hasbeenpickedup', 'getgameloaded', 'hasvariable', 'getownership',
     'isonguard', 'isindangerouswater', 'getarmorrating', 'isspelltarget',
-    'isswimming', 'isactor', 'getspellcount', 'getrestrained',
+    'isswimming', 'getspellcount', 'getrestrained',
     'getpcfactionattack', 'getpcfactionsteal', 'getpcfactionmurder',
 })
 
@@ -74,11 +74,12 @@ BARE_INERT = frozenset({
 #: argument-bearing path.  Without routing, each survives into the output as an
 #: undefined identifier -- a hard compile error that fails the whole script.
 BARE_COMMANDS = frozenset({
-    'isanimplaying', 'getiscreature', 'iscreature', 'hasvampirefed',
+    'isanimplaying', 'getiscreature', 'iscreature', 'hasvampirefed', 'isactor',
+    'isplayable', 'isplayable2', 'isactorsaioff',
     'isspelltarget', 'isguard', 'getnextref', 'isowner', 'getbaseobject',
     'isonground', 'isthirdperson', 'isplayerinjail', 'getpcinfamy',
     'getrestrained', 'ispcamurderer', 'getcrimegold', 'getpcfame',
-    'gettalkedtopc', 'payfine', 'getdayofweek', 'getdayoftheweek',
+    'gettalkedtopc', 'payfine', 'getdayofweek', 'getdayoftheweek', 'getplayerbirthsign',
 })
 
 
@@ -160,12 +161,12 @@ def _fixed_reading(conv, low: str, extends: str):
         conv.sc.property_refs[prop] = 'GlobalVariable'
         return text
     if low in _MURDERER_NAMES:
-        conv.sc.property_refs['TES4CyrodiilCrimeFaction'] = 'Faction'
-        return (f'(TES4CyrodiilCrimeFaction.GetCrimeGoldViolent() '
+        conv.sc.property_refs[CRIME_REALMS[0]] = CRIME_REALMS[1]
+        return (f'({CRIME_FACTION}.GetCrimeGoldViolent() '
                 f'>= {TES4_MURDER_BOUNTY})')
     if low == 'getcrimegold':
-        conv.sc.property_refs['TES4CyrodiilCrimeFaction'] = 'Faction'
-        return 'TES4CyrodiilCrimeFaction.GetCrimeGold()'
+        conv.sc.property_refs[CRIME_REALMS[0]] = CRIME_REALMS[1]
+        return f'{CRIME_FACTION}.GetCrimeGold()'
 
     if low in ('getactionref', 'isactionref'):
         return conv._get_action_ref_param()

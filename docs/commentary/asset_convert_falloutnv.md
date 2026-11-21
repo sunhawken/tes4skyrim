@@ -291,10 +291,18 @@ files, so its Havok collides both sides. Skyrim's CMS carries a welding type
 NONE 6) and vanilla writes 0 in all 346 sampled blocks. Writing TWO_SIDED (5)
 was tried first and the player still fell through roads and floors, so the
 engine does not honour the byte; it is back to 0. FO3/FNV sources instead
-always run the inference winding repair (steps 1-3, `repair_inverted_floors`),
-which is otherwise gated per plugin; the render mesh is the authored surface.
-Scored offline: roads 133 inverted to 0, nv_rocks 295 to 0, office/hallsmall
-2 to 0.
+always run the winding repair (`repair_inverted_floors`), which is otherwise
+gated per plugin; the render mesh is the authored surface. Scored offline:
+roads 133 inverted to 0, nv_rocks 295 to 0, office/hallsmall 2 to 0.
+
+**Round 4 rebased this onto the twin/nearest rule** that replaced steps 1-3
+([why](asset_convert_collision.md#morroblivion-collision-is-copied-render)).
+The principle is the one this section already relied on — the render mesh is
+the authored surface — so the rebase is a change of matching method, not of
+evidence, and it matters more here than anywhere: FO3 packed data carries no
+per-triangle normal, so step 0 is structurally inert and the render mesh is
+the ONLY signal. Re-scored on 44 architecture meshes: **815 inverted -> 0**,
+no residual on any mesh.
 
 ### <a id="static-collection-parts"></a>Static-collection parts
 
@@ -320,6 +328,78 @@ walked through them. Census of 1,500 FNV world meshes: layer 1 x373, 4 x32,
 3 x23, 10 x13, 13 x13, 2 x12, 19 x12, 26 x9, 5 x4, 15 x2, 6/9/14 x1.
 `fo3_layer()` passes 0-28 through and renumbers 29+.
 
+## <a id="stool-entries"></a>Sit entries an authored enter animation places
+
+**Code:** `asset_convert/nif/furniture_travel.py` (`sit_travels`),
+`asset_convert/nif/furniture_markers.py` (`marker_seats`, `_travel_seat`);
+the asset stage carries the travels in its plan (`SIT_TRAVEL_KEY`), the
+importer per mesh tree (`items._load_marker_seats`), so both seat consumers
+use the same plugin's tree.
+
+A plugin picks a furniture's sit-down animation through the IDLE tree: an IDLE
+conditioned on `GetFurnitureMarkerID == N` (function 160) has a descendant
+conditioned on `GetSitting == 2` ("getting ready to sit", function 159) whose
+model is the enter animation. That animation's `Bip01` root starts at the
+entry and ends on the seat, so its travel IS the entry-to-seat offset. In
+FalloutNV.esm three marker ids name a .kf:
+
+| Marker | Sit-down IDLE | Animation | Root travel (right, forward) |
+|---|---|---|---|
+| 15 stool | `SitDownStool` | `StoolEnter.kf` | (-18.95, 47.20) |
+| 16 pod | `PodEnter` | `SitTranquilityChairEnter.kf` | (-21.40, 89.66) |
+| 20 child bar | `BarEnter` | `ChildBarEnter.kf` | (0.00, 45.52) |
+
+Chairs (11-14), beds, floor sitting and wall leaning name only the
+`IdleAnims` folder: their entry animation is the engine's own, and they keep
+the Oblivion walk distances. Oblivion.esm (29 marker-id idles) and Nehrim.esm
+(21) use the same functions (TES4 159/160) with the parent in
+`DATA.IdleParent`, and none of their getting-ready-to-sit idles names a .kf,
+so no TES4 seat changes. None of the three .kf roots rotates, so the sitter
+keeps facing the way it walked in.
+
+<a id="bar-stool-keyword"></a>**Such a seat is entered from behind, so its
+FURN carries `isBarStool`** (`items.furn_keywords`). Walking in and sitting
+without turning is a behind entry (FNPR 0x0002). Skyrim plays a sit-down
+through its IDLE tree, and the plain chair branch for a behind entry,
+`EnterChairBack`, names no animation event: the player activated the stool and
+nothing played. Two vanilla branches do animate a behind entry, gated by a
+FURN keyword: `EnterBarStoolRoot` (`isBarStool`, `IdleStoolEnter` /
+`IdleStoolEnterPlayer`) and `EnterTable` (`IsTable`). Vanilla's one bar stool,
+`WoodenBarStool`, is exactly this: `isBarStool` and `FNPR 00020001`. So every
+FURN with an authored-travel seat gets the keyword: in FalloutNV.esm 17 of 234
+(the stools, the pod chair, the blackjack seats, and the couches and child-bar
+marker carrying a marker-20 entry).
+
+A TES4 record that leaves a sit seat open only behind gets it too. Oblivion's
+`MCStool01B` enables marker 2 of `middlestool01.nif` (ref 13: walk in from
+behind and sit, facing on). Once the record's restriction became NAM0
+([furniture-entry-restrictions](asset_convert_nif.md#furniture-entry-restrictions)),
+the player activated it from every side and never sat (run 39f, Luther
+Broad's).
+
+A bench is different: when the behind-only seat is one of several open seats
+the FURN takes `IsTable` instead. Vanilla Skyrim.esm splits it exactly that
+way (temp/vanilla_behind_census.py): its one single-seat behind-only sit
+furniture is `WoodenBarStool` (`isBarStool`), and all 20 multi-seat
+behind-only benches carry `IsTable` (CommonTableTwoBenches, NobleLongTableWindhelm,
+...). Measured on Oblivion's `LCBench01BmidR` in ICImperialLegionWatchTowerN:
+with `isBarStool` no behind entry seated the player; with `IsTable` both seats
+the record allows did.
+
+Only seats with a marker the record enables are open (MNAM seat bits,
+`items._open_seats`): `LCBench01BmidR` enables markers 1 and 3 of
+`lowerclassbench01.nif`'s three seats, so seat 0 is off, as it is in Oblivion.
+A record that enables none of any seat's markers keeps every seat open.
+
+`stool01.nif`'s single entry stands at (20.5, -41.0) facing +Y, exactly
+where `StoolEnter.kf`'s root starts; the seat is (1.5, 6.2), where it ends.
+The Oblivion rule (55 units straight ahead, then turn round) put it at
+(20.5, 14.0), half off the 30-unit stool, facing away. Each entry's travel is
+turned to its own approach, so the blackjack table's four rotated stool
+entries get the same authored offset. The tree is read from the plugin's own
+export, then its masters'; it needs the FO3/FNV IDLE `ANAM.Parent` the
+exporter now writes ([idle-anam-data-swapped](tes4_export_falloutnv.md#idle-anam-data-swapped)).
+
 ## <a id="gun-graph"></a>Guns are hand type 13, not crossbows
 
 **Code:** `asset_convert/havok/gun_anim_falloutnv.py`,
@@ -328,7 +408,7 @@ walked through them. Census of 1,500 FNV world meshes: layer 1 x373, 4 x32,
 
 Skyrim's `GetHandAnimType` (Address Library id 14220) answers an anim type per
 equipped form, topping out at 12 for a crossbow. A gun is given a **new type,
-13**: TESRuntime patches every call site of that function and of the one
+13**: FalloutRuntime patches every call site of that function and of the one
 routine that writes the value into a graph
 (`BShkbAnimationGraph::SetVariableInt`, id 63609), so a WEAP listed in
 `<plugin>.guns.json` answers 13 and the write of `iRightHandType = 13` is
@@ -469,7 +549,7 @@ overwritten; the census over all 24 humanoid graphs found only these two. Per cl
 state runs fire (A/B alternation for automatics) → reload once the WEAP's clip
 size is spent → done, over a standing/moving lower body.
 
-The shot is TESRuntime's: each clip carries one `TES4GunShot` trigger at
+The shot is FalloutRuntime's: each clip carries one `TES4GunShot` trigger at
 the FNV `Hit` text key and the DLL fires the gun on it
 ([the shot](tes_runtime_guns.md#the-shot)); the bow event trio it used to
 raise went through the engine's attack state machine, one cycle per shot,
@@ -530,7 +610,7 @@ Done were both active for ~18 frames and every frame counted a shot ("two
 shots then reload"); with instant transitions (`instant=True`, a null
 transition) the count still ran past a 13-round clip after one shot, a
 reload clip playing straight after the fire clip's `TES4GunFireEnd`.
-TESRuntime already counts shots for the HUD, so it now writes
+FalloutRuntime already counts shots for the HUD, so it now writes
 `iGunShots` into every graph of the actor on each shot and resets it on
 `TES4GunReloadEnd` (`SetActorGraphInt`); the fire states carry only the
 automatic's loop-speed assignment. The transitions stay instant since the
@@ -689,6 +769,58 @@ lacks a `<class>forward`, filled with that class' aim and named
 67 selected + 40 stand-in first-person clips, 138 clip generators in the
 FirstPerson project against 310 in DefaultMale/DefaultFemale.
 
+<a id="first-person-hands-spread"></a>**The rotation retarget spreads the
+hands and moves the sight.** Measured in each rig's `Camera1st` frame, frame
+0 (scratch script, FNV source vs `retarget_gun_clip` output): FNV's own
+iron-sight poses already center the `##SightingNode` side to side (0.03
+units off in `1hpattackleftis` with `9mm.nif` and in `2hraimis` with
+`varmintrifle.nif`) and stack the hands (5.8 and 24.9 units apart). After
+the retarget each hand sits 2-3.5 units further to its own side (hand-to-hand
+error 4.7-5.5 in all four clips measured), and the sight moves with the right
+hand, 2.9 units (pistol) and 8.8 (rifle), because `Weapon` keeps FNV's
+offset from the Skyrim hand. Every arm segment pushes outward: Skyrim's
+clavicle-to-shoulder offset is 14.04 against FNV's 11.24 and points
+outward, the upper arm is 20.26 against 17.36, and the forearm, the segment
+that brings each hand in towards the middle, is 16.05 against 18.13. The
+rifle adds a whole-torso shift: Skyrim's spine starts 6.7-7.6 units behind
+FNV's from the same COM, which the aim's torso twist turns into a sideways
+move of both shoulders. So both the sight offset and the loose left hand are
+the retarget keeping Skyrim's proportions, not a missing runtime step.
+
+The first-person retarget now ends with a two-bone IK per arm
+(`FIRST_PERSON_ARMS`, `clip_retarget._chain_fix`): after the rotation pass,
+each Skyrim upper arm and forearm bend and swing so the hand reaches the
+FNV hand's position (look-node anchored, like the camera), then roll about
+the shoulder-to-hand line so the elbow points the way FNV's does, projected
+onto that line's plane (the unprojected elbow direction rolled the hand off
+target by 5-6 units). The hands keep their own rotation, so `Weapon` and
+the sight follow. Measured after: hands, `Weapon` and `##SightingNode` at
+0.00 units from FNV's camera-relative positions in `1hpattackleftis`,
+`1hpattack3is`, `2hraimis` (frames 0 and 20) and `2hraim`; the pass adds
+0.13 s to a 91-frame clip. The third-person rig has no camera anchor and
+keeps the rotation-only retarget.
+
+An iron-sight clip is composed over its own stance first (`_fill_clips`:
+iron aim, then hip aim), as is a synthesized iron aim; the hip-only fill
+dropped `1hpattack3is`'s left forearm and hand (no tracks) 41 units below
+the camera. That clip's authored left upper arm still hangs, as in FNV.
+
+<a id="camera-kick"></a>**The fire clips move the camera.** Skyrim's
+first-person camera is the `Camera1st [Cam1]` node's world transform
+(`FirstPersonState` +0x58 is `GetObjectByName("Camera1st [Cam1]")`; its
+GetTranslation reads the node's world translation, GetRotation its world
+rotation plus the look pitch), as FO3's is (the camera code reads the
+`Camera1st` node's position and rotation, `fFirstPersonCameraMult` 1.0
+only blends toward `Camera3rd` while switching views). FNV's fire clips
+animate that bone (`2haattackloopis`: 3.4 units forward, 1.4 degrees per
+shot) and the retarget keeps it exactly, but the attack machine's
+upper/lower blend reuses the vanilla crossbow weights, which give
+`Camera1st` (with the root, look node and COM) to the standing pose: the
+camera never moved. The first-person fire and reload states now take
+copies of those weights with the camera bone on the fire clip
+(`_camera_on_upper`; the manifest records the rig's camera bone index,
+97). Confirmed in game on the 10mm pistol.
+
 ## <a id="gun-parts"></a>Gun parts: the magazine, slide and bolt
 
 **Code:** `asset_convert/nif/gun_parts_falloutnv.py`,
@@ -713,7 +845,7 @@ NiControllerSequence named after the clip stem (transform interpolators
 sampled from the clip, `start`/`end` keys, a managed
 NiTransformController per node), and the actor clip raises the stem as a
 trigger at its first frame (the manifest records `parts` per clip; the
-patch registers those stems as graph events). TESRuntime starts the
+patch registers those stems as graph events). FalloutRuntime starts the
 sequence on that event (`parts.cpp`): the weapon root under the actor's
 `WEAPON` bone, its NiControllerManager, the name map and
 `NiControllerSequence::Activate`, the exact path of
@@ -730,11 +862,11 @@ so only the slide of an automatic can drift.
 ## <a id="dismemberment"></a>Limb dismemberment at runtime
 
 **Code:** `tes5_import/record_types/bodypart_falloutnv.py`,
-`tes_runtime/plugin/sever.cpp`.
+`tes_runtime/fallout/sever.cpp`.
 
 TES5's BPTD cannot hold FNV's limb data: the engine keys dismemberment on six
 part types, and FO3/FNV author many more. The import therefore writes a
-sidecar (`SKSE/Plugins/TESRuntime/<plugin>.bodyparts.json`) beside the plugin
+sidecar (`SKSE/Plugins/FalloutRuntime/<plugin>.bodyparts.json`) beside the plugin
 and mints one **MSTT per gore model** so a severed limb has a real form to
 place — `derive_formid('BPTD_LIMB', <model path>)`, keyed on the authored
 path.
@@ -759,7 +891,7 @@ Skyrim attaches an equipped AMMO's model to the actor at the node its NIF
 names in the `Prn` NiStringExtraData (Oblivion arrows carry `Quiver`,
 remapped to `QUIVER`); a NIF without one attaches at the skeleton root, so
 FNV's ammo boxes, which never hang on an actor in FNV and carry no `Prn`,
-appeared at the player's feet and outside the QUIVER node TESRuntime culls
+appeared at the player's feet and outside the QUIVER node FalloutRuntime culls
 for a gun holder. The wearable plan now flags every `AMMO` record's
 `Model.MODL` (`QUIVER`), and `convert_prn` gives such a root without an
 authored `Prn` the value `QUIVER` with no seating transform or inventory

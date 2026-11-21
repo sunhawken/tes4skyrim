@@ -1,0 +1,584 @@
+# Full-run worklog (2026-11-01 ..), organized by quest
+
+## 🛑 USER'S STANDING INSTRUCTIONS -- obey every one, every time
+1. 🛑 (user, 11-16: "NO EXCEPTIONS EVER") Read THIS WHOLE FILE before working on ANY automated quest run --
+   at the start of the work, and after every compaction or resume (a hook enforces the latter). Not sections: all of it.
+2. Goal: two back-to-back clean full runs. Known failures fixed one by one first; in a full run, fix a failure
+   and resume from it, never restart everything. Never stop a running loop or lane.
+3. One pass proves nothing: 3 consecutive passes per changed case (repeat_case.py); flaky history needs more.
+4. Tests NEVER run slower than real time and are never slowed; making them faster needs no permission.
+   Exception (user, 11-06): a lower speed is an OPTION for the specific cases that need it -- the case's
+   `pace <speed>` step (authored game-time windows, slope climbs the ~25x governor steps break); default elsewhere.
+   NEVER ask about a global slowdown (step cap, lower default): "the answer is ALWAYS no other than specific cases".
+5. Followers really walk: never teleport the player with a follower; doors used from their landing.
+6. No route-forcing legs of ANY kind -- `walk` legs at mesh_route points are route forcing too, not just
+   `steer` (user, 11-06; the enderal_burg_battle legs stay because they work, nothing new). Only exception: a long
+   path across several cells around a large obstacle may need legs; anything else is a navmesh problem. Bad
+   navmesh on a quest route = a CLEAN pin (no overlaps, holes, slivers, T-junctions), checked visually; never a
+   generator change; no steer workaround.
+7. NPCs move: don't wait for an NPC at a spot -- `approach` it. Change tests only where failures are found.
+   User 11-06: "This is the ENTIRE reason we built approach. Just teleport to an npc if the player doesn't have
+   a follower." An NPC not where the case expects (no follower along) -> `approach <ref FormID>` (a FormID
+   reaches an unloaded NPC); do NOT investigate where it went.
+8. No bribery/persuasion RNG in cases: SetDisposition stands in.
+9. Fixes are generic (never for one record, plugin or game); the goal is complete conversion.
+10. Two failed attempts on one theory = the theory is wrong. Gain in one place + regression elsewhere = wrong idea.
+11. Every shell command through `python tools/validate/safe_run.py` (-c for loops, pipes, $(), sed, printf).
+12. Never git commit/push/stash/add/rm/reset. No docs or tests before in-game confirmation. No code in AppData.
+13. Never limit workers. Every check under 120 s. Build only the plugin about to be tested.
+14. TR/TD builds take --morrowind-source morroblivion. Mod names Morrowind.esm/Tribunal.esm/Bloodmoon.esm.
+    The morroblivion stage (TR's game start) runs UNCHANGED; arktwend and morroblivion never share a lane.
+15. Autonomous = no questions; keep going. Plain words in reports. Report honestly: untested is said.
+16. Measure the invariant asked for; trust the user's in-game results; a stated fact is ground truth.
+17. 🛑 (user, 11-07) A FLAKY case's FIRST fix = REMOVE its walking/steering. No follower along -> place the player
+    (Position/PositionCell/approach -- not rigging). Follower must come -> ONE `walk` to the destination; a stall
+    there = navmesh pin. Never add or tune steer/walk legs. Two weeks went into tuning legs against this rule.
+18. 🛑🛑 (user, 11-09) EVERY walk stall is diagnosed FIRST with the engine-matched offline predictor
+    (tools/navmesh/pathfind.py + pathfind_body.py via pathfind_calibrate.predict / pathfind_calibrate.py on
+    walk_outcomes.py output), start -> target, its stop/reason set beside the game's; a disagreement is a tool
+    calibration gap to fix. Every case walk is predicted offline BEFORE a full run. The engine often stops an
+    actor where it can SEE the problem (e.g. entering the problem cell), so the mesh under a stall point proves
+    nothing. On 11-09 I ignored this all day and chased slope/overhang theories with one-off scripts.
+19. (user, 11-12) Flaky = fix it, never "left unchanged". Pictures for the user = clickable links + cell names +
+    key + game track + target (tools/navmesh/route_pic.py --track; see the navmesh skill).
+20. (user, 11-09) Overnight/autonomous work is mine to finish: don't stop to wait on questions that are mine.
+    Before ending any turn, both instances run a batch; a "parked" case is never a stopping point.
+21. Keep the next 2-3 quests' cases drafted ahead, so a pass runs straight on (`--from` runs every later case).
+22. A run takes MINUTES (the whole Morrowind main quest < 10 min); `--timeout` is a hang cap, never an estimate.
+23. A new runner step a case needs to stand in for a player: just build it, don't ask. Never rig a case.
+24. docs/audits/headless_quest_runs.md records GAME bugs only (fixes with blast radius, open findings), added the
+    moment a case passes or a bug is found; case quirks go in the case header, harness notes in headless_testing.md.
+
+## 🛑 BUG-FIX PROCESS (user, 2026-11-08 -- after weeks at ~4 Arktwend fails/run)
+1. Work failures by their RATE over all logged runs (temp/.../run_totals.py + the run ledger below).
+2. No edit before the mechanism is proven (reproducer or log line explaining passes AND fails).
+3. Fix in the layer the bug lives in, generically. Case edits only REMOVE steps -- never add steer/pace/legs/waits.
+4. One change at a time, judged by the case's rate over ~10 runs; 3/3 proves nothing (10% flake passes it 73%).
+5. A change that doesn't move the rate is reverted, not stacked on. Every lane failure gets a cause.
+6. Each fix logged: cause, change, rate before/after.
+
+## 🛑 HOW THIS FILE IS KEPT (compacted 11-11 from 2,242 lines)
+- Organized by quest: update the quest's entry IN PLACE -- status/rate, proven cause, fix, failed attempts.
+  ~10 lines per entry max. No diary, no per-run narrative: a run gets ONE ledger line.
+- Superseded detail moves to the archive, never deleted. Archives (grep them when an entry lacks detail):
+  [mwscript_full_runs_archive_1.md](mwscript_full_runs_archive_1.md) (10-31 .. 11-04) and
+  [mwscript_full_runs_archive_2.md](mwscript_full_runs_archive_2.md) (11-04 .. 11-11, the full pre-compaction file: pin coordinates, probe names, disasm chains, batch results).
+- Before touching a quest: read its entry; never re-try an attempt listed under "Failed".
+- A quest that keeps coming back = a generic bug patched around per case: fix the mechanism once.
+- Context discipline: pull numbers (grep -c, tail -1, one field), never raw logs/scripts/JSON/disassembly.
+  Heavy digging -> haiku/sonnet subagent, one-paragraph answer. Run output lands in temp/full_run/ (disposable).
+
+## Goal and procedure
+- GOAL: two back-to-back, fully autonomous, fully clean full runs of every .mwtest under
+  tes_runtime/morrowind/testdata (driver tools/live/full_run.py; watch a lane with tools/live/watch_lane.py).
+  **Morrowind lane 2/2 (runs 20, 21). Morroblivion lane 2/2 (runs 16, 19). Arktwend lane 0/2 -- ACCEPTED by the
+  user 11-12 at 190/191 x3 (runs 41-43; the one fail = sohn_home, the test's own long player walk).**
+- Lanes (one instance each, env INSTANCES): (morrowind -> bloodmoon -> tribunal) | (arktwend) | (morroblivion).
+  Morroblivion = how Tamriel Rebuilt starts (morroblivion_main --new-game 3, quiz, tr_telvanni, tr_necrom).
+- Lane resume: RESUME=folder:case. A fix counts at 3/3 from the checkpoint (repeat_case.py); fail history ~10.
+- Every lane watched by a Monitor on watch_lane.py; test_instance ends a run whose runtime log is quiet 180 s
+  ("GAME HUNG", takes a hang dump via crash_capture.snapshot). crash_capture --watch stays attached on both
+  instances (a second watcher fails on the open pid file -- don't start more).
+
+## Launch pitfalls
+- `approach` takes a REF FormID; the "activation: X is" log line prints the BASE id (TRACE / ACHR give refs).
+- Launch: mwtest --timeout default 60 (repeat_case sets 3600); --mod Morrowind.esm (not Morrowind);
+  a folder's first case can't take --from (repeat_case `-- --load <save>`); Bloodmoon stage = MW+BM build
+  (refs carry slot 06), MW_ALL puts Bloodmoon at 07.
+- 🛑 An import writes a NEW ESM; instances hard-link the OLD one -> `test_instance build` after every reimport.
+- repeat_case never writes checkpoints: a stale shared save (mwtest_<case>) reproduces old bugs. Rewrite it with
+  `test_instance --instance N mwtest --checkpoints --from X --to X`. A resumed case whose predecessor spoke
+  the awaited line fails (quiz must run from its folder start).
+- TaskStop orphans a batch + its game (locks mwtest.jsonl, WinError 32) -> taskkill /T.
+- Unlink the ESM from a running game before an in-place patch (mesh_to_esm); the game keeps the old inode.
+
+## Run ledger (one line per lane run; detail in mwscript_full_runs_archive_2.md)
+| Run | Lane | Result | Fails |
+|---|---|---|---|
+| 6 (11-04) | all | -- | b2_escort, a1_2_key, bm_morale, tr_assassins, tate, sohn_worldend/home, fortress, brother, tr_shrine_dead, chargen_hall |
+| 7 | MW | 3 fails | bm_beasts, co_supply_ship, co_estate, ms_performers (all governor timing/case; fixed) |
+| 7 | Ark | 6 fails | tate, sohn_airship, sohn_home, verrat_brutus, burg_camp, burg_battle |
+| 8 | MW | 3 fails | chargen_captain, b2_escort, co_supply_ship (carry) |
+| 8 | Ark | 11 fails | tate, calisto_house, child, airship, worldend, home, scout, brother, picks, shaft, demon_king |
+| 9 | MW | 1 fail | tr_shrine_dead (Gardens pin) |
+| 10 | MW | 4 fails | chargen_captain, a1_v_levels (exit), ms_warlords, tr_blade (carry) |
+| 11 | MW | 4 fails | chargen_captain, bm_carius, tt_join (exit), b2 parked |
+| 11 | Mwob | 3 fails | quiz hang (runner), mb_chargen_sellus (dialogue timer), ht_va1_priest (exit) |
+| 12 | MW | 3 fails | chargen_papers, a1_v_levels (exit), da_malacath_rumors |
+| 13 | MW | CLEAN 443 | -- |
+| 13 | Ark | 9 fails | tate, calisto_house, worldend, home, scout, camp, brother, mert, picks |
+| 14 | Mwob | 2 fails | ht_join (exit), ht_vaerin_q6_done (alarm flag) |
+| 15 | Mwob | 1 fail | ht_ra2_contact |
+| 16 | Mwob | CLEAN 122 | -- |
+| 17 | Ark | 194/197 | herbert_house, sohn_child, dwarves_shaft |
+| 17 | MW | 442/443 | chargen_papers |
+| 18 | Ark | 191/197 | herbert_house, baron_house, calisto_house, sohn_lift, sohn_home, demon_king |
+| 18 | MW | 441/443 | b2_escort, b3_bride |
+| 19 | Mwob | CLEAN 122 | -- (Morroblivion lane done) |
+| 19 | Ark | 186/191 | herbert_house, sohn_lift, sohn_home, scout, shaft |
+| 19 | MW | 440/443 | chargen_papers, b2_escort, co_razing_forest |
+| 20, 21 | MW | CLEAN 443 x2 | -- (Morrowind lane done) |
+| 22 | Ark | 5 fails | tate, baron_hideout (exit), calisto_house, sohn_airship, sohn_home |
+| 23 | Ark | 4 fails | herbert_meet, calisto_house, sohn_home (+1) |
+| 24 | Ark | 189/191 | baron_house, sohn_child |
+| 25 | Ark | 186/191 | baron_hideout (exit), theater_guards, gargart_cell, goths_camp |
+| 26 | Ark | 182/191 | dead_rise, gron (hang), baron_hideout, theater_guards, child, home, gate/camp/battle |
+| 27 | Ark | 185/191 | gron, calisto_house, home, camp, battle, picks |
+| 28 | Ark | 186/191 | dead_rise, baron_hideout (crash), home (hang), camp, battle |
+| 29 | Ark | 188/191 | calisto_house, home, goths_camp |
+| 30 | Ark | 189/191 | dead_rise, home |
+| 31 | Ark | (not totalled) | herbert_escape, gron, demon_king |
+| 32 | Ark | 189/191 | gron (case), home |
+| 33 | Ark | 189/191 | sohn_irfl, demon_king |
+| 34 | Ark | 186/191 | theater_guards, calisto (cascade), child, sohn_lift, home |
+| 35 | Ark | 190/191 | herbert_meet |
+| 36 | Ark | 186/191 | pass_judas_paid (exit), enderal_pass (exit), gargart_cell, camp, dwarves_mao |
+| 37 | Ark | 190/191 | tate_door |
+| 38 | Ark | 189/191 | home, dwarves_mert |
+| 39 | Ark | 188/191 | storm_markus_reward, calisto_house, dwarves_mao (old case) |
+| 40 | Ark | 189/191 | theater_guards, home |
+| 41 | Ark | 190/191 | home (Ice Flow) |
+| 42 | Ark | 190/191 | home (plank walkway drop) |
+| 43 | Ark | 190/191 | home (X24Y1 ridge climb, on mesh; run43_sohn_home_stop.png) |
+| 46 (11-15) | Ark main, recorded, inst 2 | 137/138 then stopped | home (walkway leg north: (96247 7865 980) -> (98827 8624 1908), target 97560 4122; mesh rebuild w/ alpha+shared-ctrl fixes) |
+| 47 | Ark from sohn_home, rec | stall | home (stop not logged; log overwritten) |
+| 48 | " | stall | home (walkway leg north: stop 100216 8982 2044 on NordrenX24Y2's SE mesh edge; temp/sohn_stalls/a2_X24Y2_walk.png) |
+| 49 | " | stall | home (descent leg 120864 51537 -> 96068 8603: stop 109976 17030 133, NordrenX27Y4) |
+| 50 | " | until fail | home (Ice Flow, last walk 3127 16896 -1408, 1100 short; until 3000 likely Mauragin GetDistance, unconfirmed; a4_IceFlow_walk.png) |
+| 51 | " | stall | home (descent leg: stop 112082 17721 140, NordrenX27Y4, flat mesh; a5_X27Y4_walk.png) |
+| 52 | " | stall | home (descent leg: stop 109441 16447 290, NordrenX26Y4; attempt6_runtime.log) |
+| 53 | " | stall | home (descent leg, further on: stop 97303 15706 321, cell X23Y3; attempt7_runtime.log) |
+| 54 | " | stall | home (descent leg: stop 109575 16849 37, NordrenX26Y4; attempt8_runtime.log) |
+| 55 | " | stall | home (passed the descent; walkway leg north: stop 99416 7481 2427, X24Y1, target 97560 4122; attempt9_runtime.log) |
+| 56 | ", +leg 110200 17000 | stall | home (leg walked; engine still climbed the x 109400 bank, slid z 499->230 for ~14 s, got over; then stop 95476 12490 1248, X23Y3, climbing toward 96068 8603; attempt10_runtime.log) |
+| 57 | ", +5 legs, walkway target moved | stall | home (dip leg 109800 16400 reached, then the engine went NW into the dip and slid 36 s on the x 109300 bank, got over; then NO walk lines after 105495 14412 311 (X25Y3) following a burst of BaumFallScript binds -> game stopped walking, not a slide; attempt11_runtime.log). Added `walk 109600 16200 429` (6 of 10) from attempt 13 |
+| 58 | " | stall | home (over the dip by sliding again; walk to 94800 14900 stopped SILENTLY at 100093 14587 214: video shows the player standing still with Mauragin, no menu; same as 57. That target and 95400 12300, 109600 16200 were NOT inside a navmesh tri (94800 14900 over a hole, 226 from mesh) -> moved to 94575 14925 1121, 95400 12275 1338, 109675 16150 447 from attempt 14; attempt12_runtime.log) |
+| 59 | ", on-mesh legs | stall | home (over the dip AND the X23Y3 hill -- furthest yet; reached 96068 8603 exactly, then frozen at 96077.9 8604.9 for 4 min: video = tree trunk on the player's west, Mauragin in front; next leg goes west. 3 walk reissues, no movement. Old route came from the NE and passed by. Moved that target to 95700 8550 1314 (flat, on mesh, planner route in/out >= 382 from the tree spot) from attempt 16; attempts 13/15 stopped by hand; attempt14_runtime.log) |
+| 60 (11-16) | " + Face Discoloration Fix linked (attempts 16-18 stopped by hand) | stall | home (X23Y3 hill: slid z 1303..1390 on the straight 95400 12275 -> 94700 12200 run, stop 94988 12105 1475; I had dropped the gentle route's points there. Hill legs now 94575 14925 1121, 95800 12400 1344, 95800 12200 1396, 95700 12100 1401, 94700 12100 1515, 94600 12000 1549 (all in-tri, straight runs 17/21/4/14/14 deg, planner ok); 8 of 10 legs used; attempt19_runtime.log) |
+| 61 | " | harness kill | home (walking normally at 106615 15155 when the STALLED dump froze + ended it -> harness fixed: stall is report-only; attempt21_runtime.log) |
+| 62 | " + stall fix | stopped by hand | home (dip, hill, tree all passed; walkway leg went north from the landing 96576 4257 -- known plank issue, user: leave it; attempt22_runtime.log) |
+| 63 | " | **sohn_home PASS** 01:12:35, then 54/54 to the end | recorded second half: temp/recording_arktwend_sohn/attempt23/2026-11-16 01-05-25.mp4 (16:50, face fix) |
+| 64, 65 | rc sohn_home x3 (stops at first fail) | PASS, FAIL | fail = walk home slid on the X24Y1 ridge neck (101000 6750 2800); every saved walk home (passes too) climbs and jitters there (temp/full_run_2026_10_31/rc/*.log). USER 11-16: 2 of 3 "good enough" -> step 3 |
+| 66 | Ark main from New Game, recorded, face fix | 137/138 | home FAILED at its first `until 3000 Mauragin01 GetDistance < 600` (player at the crevice door 165364 78774; follower never came within 600). RECORDED first half: temp/recording_arktwend_sohn/attempt24/2026-11-16 01-43-55.mp4 (26:22); sohn_worldend checkpoint at 24:27 = splice point onto attempt23's clip. Step 3 DONE |
+| 67 (11-16) | Ark main from New Game, recorded (FOV 90 try), inst 2, stopped by the user | 104+33+48 over 3 attempts | theater_calisto_house (slid in the dip south of 14089 34673 heading for 33300 37150), sohn_home (walkway leg north to 100165 9004, stalled), dwarves_mao (walk issued 1 s after the canyon door: player back in Dwarven Shaft at 3112 3291 -- marker race, see dwarves entry). Clips temp/recording_arktwend_fov90/attempt1-4 |
+| 68 (11-16) | Ark main from New Game, recorded, face fix, inst 3 (theater legs + door-landing DLL; sohn_home as accepted) | **CLEAN 191/191, one attempt, no cut** | recording temp/recording_arktwend_final/attempt1/2026-11-16 22-28-21.mp4 (44:56, 2560x1440 60 fps, 15 GB) |
+arktwend_side 6/6 in every Arktwend run since 13.
+
+---------------------------------------------------------------------------------------------------------
+# GENERIC MECHANISMS (cross-quest)
+
+## Carry -- FIXED (hello approach)
+- Cause (measured + disasm): Skyrim's hello evaluator (39632) gives an NPC whose package has "Hellos to player"
+  and that sees the player within 150 a created Follow package (37367 -> 39300); only a spoken hello ends it, so
+  the talked-to NPC followed the player through doors and after every teleport.
+- Fix: activation.cpp HelloApproachHook skips the approach for Morrowind-index actors. hello_check: warlords
+  6/6 (was 1-5/6), urvel 3/3, bm_morale 2/2; 0 created packages. UNTESTED: whether hello barks still play.
+- Failed (don't retry): teleport-carry hook 41346; skipping the activation-interaction package (37864);
+  ExtraInteraction 0xA9; EvaluatePackage at goodbye; bye settle ticks; talk-then-teleport probes.
+- Related runtime rules: followers along = PlayerFollowersAlong (<= 800, OpenMW door/travel rule) for travel,
+  fares, doors; PlayerParty (same place, <= 4096) for approach, door-reach guard, KillPlayerAttackers. Script
+  moves of the player leave other followers behind (LeaveFollowersBehind, "stays behind", OpenMW rule; user OK).
+- `approach` lines added to cases during the carry hunt stay (rule 7).
+
+## Follower freeze -- mostly resolved; residue open
+- Fixed causes: (1) Rolf (Bloodmoon, AiFollow forever) first in the player's ExtraFollower list pushed later
+  followers out by the spacing term R -> FollowSpacingHook (R = 0 for our slot followers). (2) Slot reuse: a 2nd
+  order into the slot whose PACK the actor still runs kept the finished procedure -> slot rule v3 (EvaluatePackage
+  first) + LRU of the last 4 PACKs per actor ("ran it lately: re-evaluated first"). (3) Script SetPos of an actor
+  bypassed the engine move -> actor SetPos goes through MoveInto (sohn 8/8). (4) b2: Eigma's paralysis never wore
+  off -- MW AppliedOnce (0x1000) was not mapped to Recover -> magic_morrowind maps it (b2 ~50% -> 8/10).
+- Residue: b2 Inner Shrine standoff (Eigma frozen at her placement in fails; she does move in passes). b2 passed
+  lanes 20/21 with the stripped case. theater Wache01 follow freeze (run 34, ~1030 away after W02's greeting).
+- Failed (don't retry): radius 64/128 (crowds); Accompany?=1; console evp; re-evaluate after door; teammate
+  flag; RestartFollow on cell change; observe-combat interrupt bit 0x04 (reverted, MW+BM reimported back);
+  swim state; lingering combat group; follow-order waits for SetPos (MoveLanding, removed); combat assist.
+- Engine notes: Follow update 0x468f10 freezes a follower while a combat group targets the FOLLOW TARGET;
+  ExtraFollower entry removed only by package END (11653 via 29620). Nearby combat suspends Follow; its end
+  resumes it (b2: fail = fight never ends).
+
+## Door decline (load door with a script that claims OnActivate) -- FIXED
+- Cause: Skyrim's GetLock (20223) falls back to the LINKED door's lock; Enderal's outer gate locks itself 100 ->
+  the inner gate's scripted Activate was refused. TES3 locks each door alone. Fix: activation.cpp OwnLockOnly
+  (clears bit 0 around the original Activate when the lock is not the door's own; log "is unlocked -- its
+  linked door's lock is not its own"). Door retry (kDoorActivateTries) REMOVED as a wrong theory.
+- Door-reach guard: kDoorReach 512 + 128 (measured from the door origin; a walk stops up to 128 short).
+
+## Faction-wide alarm -- FIXED
+- Cause (disasm): an actor running an ALARM package reacting to a non-player target calls SetPlayerEnemy on its
+  crime faction (40076+0x4FE) with no crime test -> House Telvanni enemy for 24 game h (Vaerin attacks).
+- Fix: game_calls_crime InstallAlarmPlayerEnemy skips factions in plugin slots (> 4, < 0xFE). vaerin 3/3.
+- Watch: ht_ra2_contact (2/11 fails since; the lv-1 contact can kill the guard on authored spells; A/B on the
+  old DLL 4/4 with no guard death). Not rigged. If it recurs: compare OpenMW's AI choice for a 1-hp caster.
+
+## Engine crash on Disable of a non-persistent scripted actor -- FIXED
+- Cause (3 dumps + disasm): Disable's actor task (19801) rebuilds the MovementControllerNPC; the ctor looks up
+  the actor's FormID, which is 0 for a non-persistent ACHR -> null owner -> AV at SkyrimSE+0x783642.
+- Fix (import, world_morrowind.persist_script_named_refs): every TES3 actor placement whose base has a local
+  script ships persistent. Counts: Arktwend 297 -> 1539, MW 800 -> 1507, Tri 210 -> 299, BM 180 -> 446
+  (vanilla 1806/10504). baron_hideout 12/12 (was 4/4 crashes with that disable). Other MW-format plugins need a reimport.
+- Other silent exits: ~7 since uncapped --fast; one was the doorjamb NaN crash (fixed); runs 36's two exits came
+  right after a player script move with 5-6 attackers; 0 exits in 15 reruns. Watchers stay attached.
+
+## Timing under the pace governor (~25x)
+- Governor (runtime, frame timer kFrameTimer 0x31cc270 +0x10 = step in ms): PaceFrames rescales toward 25x,
+  bounds 1..100 ms. v3 works (22-35x; Arktrand 0.8-5.6x). v4 (NextPaceStep) built, UNMEASURED.
+- Any NEW timing failure since run 6: check the governor first (game-time windows shrink ~25x).
+- Fixes: `pace <N>` runner step (per case, reset at case end); fAIInDialogueModewithPlayerTimer scales with the
+  pace (KeepDialogueIdleRealTime); bm_beasts kills in one `run` block; dead actor's distance measured from its
+  death spot (DistanceFromDeathSpot -- ragdolls fell through the floor, demon_king); landing check (MoveInto
+  records the player's landing; Distance() answers from it until within kLandedWithin 16 -- chargen_papers).
+- Failed (don't retry): controller sub-step patch (FinerControllerSubsteps; no change -- slope theory wrong for
+  tate/scout/battle); iFPSClamp 6 (can't climb 38 deg); global step caps (user: never).
+
+## Walk runner rules (test_runner)
+- `approach <npc>`: player MoveTo 80 in front of the NPC, any cell, actor refs only, never with followers along.
+- Followers through doors (fix 4/4b/4c): within 800 move with the player, onto the landing after 128 off / 120 ticks.
+- `until` already true ignores held menus (both runners); HeldMenuError names open menus; rest refusal cap 10.
+- `talk X` (11-13): the Oblivion session (8df7edec) made talk take ANY open conversation (force-greets); a window
+  left open by a "Goodbye" result (Hroldar, co_blocked_door) or a case with no `bye` (Sinyaramen, va_child_kjeld)
+  then served the wrong speaker's topics. Fix: backend hook talkingWith (MW: ConversationWith, id or name); talk
+  clicks Goodbye on someone else's window first. TES backend has no hook -> its behavior unchanged.
+- Walk done when the player already stands at the end (no travel package; crevice fall fix). AiWalkSettledNear:
+  stalled within 2 x kArrivedDistance of the end = arrived. StopAiPackage re-evaluates.
+- RestartedWalk (user 11-11: "a walk that doesn't start is a framework failure"): stalled within kWalkStarted 128
+  of its issue point -> re-issued, up to 3. Not yet seen firing in a lane.
+- RescuedSlide (user 11-12): a stalled walk OFF the mesh asks navmesh_rescue.py for the nearest mesh point +256
+  along the route, places the player, re-issues (kWalkRescues 3); ON the mesh = real stall, fails.
+- A steer/walk failure appends the player's whereIs; "never loaded" appends where the NPC is.
+- KillPlayerAttackers skips actors whose staged script is not yet bound (co_razing_forest) and also kills
+  attackers of followers along.
+- PlaySoundAt skips a disabled source (lava sound storm: 397k retries/run).
+
+## Navmesh: pins, tools and generic defects
+- Pin method: restore pins -> import -> plan on the shipped NAVM (pin_region.py) -> pin -> import (or in-place
+  patch: mesh_to_esm / navm_patch) -> mesh_clean 0/0/0/0 + CheckNavMesh + picture + predictor. Always plan from the
+  restored backup + unpinned reimport. Never pin a SEEDED cell near its border (neighbours re-grow).
+  Every pin edit keeps a backup navmesh_pins/<plugin>.pins.pre_<name>.json (or temp/.../<plugin>.esm.pins.pre_*)
+  and an ESM baseline <plugin>.pre_<name>.esm; one-off route/pin scripts (route_down, route_pins, steep_notch,
+  snap_pin_seam, fix_x33yn36_pin, footprint, floor_points) live in temp/full_run_2026_10_31/.
+- Recurring defects pinned: mesh under slabs/terraces/planks/platforms, channels bridged above the floor,
+  floating strips, pinches, tris under a thin wall's end, mesh crossing ledges (65 deg tris), corridor routed
+  under a rock shelf (route_down now has OVERHEAD + MAXSLOPE), pin verts a few units off a seam (snap_pin_seam.py).
+- Fixed generically (import/tools): split NAVMs whose door tris lie in 2+ components (Wagon); door joins
+  (improve-only) + landing seeds + door-at-landing pick (blast radius measured: Oblivion 12 cells, Nehrim 21,
+  MW 20, Arktwend 38; protected chargen/Schattenruf cells unchanged); pins applied AFTER door choices (pin order;
+  only DragonRidgeX40Y18 changes); seam lip fix in clean.cpp (bridge deck); storey gap over all overlap corners
+  (FROZEN_VERSION 6); T-junction closing (FROZEN_VERSION 5); navm_patch restitches neighbours from their own
+  NVNM + rewrites NAVI edge links (check.py NAVI_EDGE_LINKS); WinError 1450 parse retry; drop_buried removed
+  (enclosure rule kept for the flood only).
+- Open generic: 96 zero-area tris in Arktwend (5 on seams; drop_degenerate_guarded keeps them); apply_frozen
+  leaves T 1 / slivers in X30Y12, holes 3 / slivers 5 in X29Y12; cellview differs from import (no spawns,
+  obstacles, water; non-edge pin applied on the finished mesh); exterior To ESM loses seam links.
+- Open for the USER (generator, parked): flood meshes slopes to 46 deg but the AI-walked actor slides on 41+
+  (slope A/B 46 -> 41: TrollMountainsX24Y1 >41 tris 72 -> 13); exterior pathgrid cells never get the seeded
+  flood (rock-static mountains unmeshed; prototype +52% area, 8 cells shrink); 11-08 flood meshed mountainsides
+  the engine now sometimes routes over (gron, dead_rise, calisto).
+- Offline predictor: pathfind.py (CK A* costs from disasm), pathfind_body.py, pathfind_calibrate.py;
+  calibration set walk_outcomes.py -> walks.jsonl. Known false-stall classes listed in the archive.
+
+## Crash: NaN cast hits (fixed)
+- tr_assassins stack overflow: in_mh_doorjamb_02 sliver with det 0 in Havok's float32 decode -> cms.py fix,
+  collision_sanity check; 102 meshes rebuilt.
+
+---------------------------------------------------------------------------------------------------------
+# QUESTS -- MORROWIND LANE (DONE: clean runs 20, 21)
+- ingame 187/187; daedric 24/24 (da_boethiah_build indoors; rest cap fixed a 40-min hang; 11-13 `rest 25x24` --
+  ShrineBoethiah counts Day changes > 20, ~30 min of 1-h sleeps -> ~1 min); temple 70/70;
+  raven_rock_brawl 3/3; mournhold 11/11 (warlords/scroll_sales SetDisposition; ms_performers player on the stage
+  before the 2nd Meryn greeting); story 17/17.
+- chargen_captain/papers/hall "MessageBoxMenu holds": `button 0` before `run` (case order) + button settle 2
+  ticks + landing distance (kLandedWithin 16). TEMP box log in object_script.cpp still in.
+- a1_2_key: carry (fixed); stale shared save once. b3_bride: Falura escort legs; passes.
+- **b2_escort -- passes since the stripped case (runs 20, 21, 44 + the user's ~5 game runs); was ~50%.** 11-13
+  regression run (new game, follow-reach DLL): 1 fail -- Sinnammu frozen in the Inner Shrine ~990 from the player at
+  (5376 3632), combat state 0; Inner/Outer Shrine NAVMs identical to 11-01 (hash). Then 3/3 rc + 1 in the folder
+  resume. Read as the old standoff at ~1 in 10, not the reach change (only matters within 256 of the point). Case: walks (shrine door, Inner Shrine
+  door, statue), creature kills before the first walk. Residual risk: Nals/Eigma standoff (see follower freeze).
+  Failed: steer to the statue; walk onto 4471 3620; re-evaluate; Accompany; governor speed; observe flag; swim.
+- bloodmoon 18/18: bm_beasts riekling kills in one `run` block; bm_carius `approach 0635C797`; bm_siege waits all
+  7 werewolves; bm_trees waits the riekling disabled; bm_karstaag pins + Krish walks; bm_morale carry fixed.
+- raven_rock 16/16: co_supply_ship/co_estate `approach` (Aldam approached in Raven Rock, not the mine);
+  co_report shown exterior names; co_razing_forest = defend killed an unbound spriggan (runtime fix).
+- tr_shrine_dead (Urvel): 10/10 after slot rule v3 + Gardens drop/north pins + Sewers crack pin; (325 -2257)
+  Gardens stall seen 2 in ~25 runs before. tr_blade/ms_warlords: carry -> `approach`. da_malacath_rumors
+  `approach 053E05E5`. tr_assassins: doorjamb crash fixed.
+
+# QUESTS -- MORROWIND VAMPIRES (DONE 11-12: aundae 9/9, berne 7/7, quarra 6/6, each x2 full)
+- Folders morrowind_vampire_{aundae,berne,quarra}, each `--load mwtest_a1_11_report` (morrowind stage, MW-only
+  build; in full_run.py). NOT from the lane end: Divayth Fyr's cure gives Resist Common Disease 100 (player
+  DiseaseResist read 350), so a post-cure player can never catch vampirism -- vanilla behavior, not a bug.
+- Mechanism (user 11-12: Skyrim's vampirism, never two): import actors/vampirism_morrowind.py -- bloods carry
+  Skyrim's DisDamageHealthVampire (10%/hit, 3-day VampireChange); carriers (script AddSpells a blood on self: MW 64,
+  Tri 1) get per-NPC ATKD attack spells (disasm: applied on EVERY melee hit incl. weapons; Disease rolls DiseaseResist);
+  TES3VampireChange spell (VampireChangeEffect). Runtime: turn-script gifts no script GetSpells are stand-ins
+  (skipped; the Vampirism one casts TES3VampireChange); PcVampire = player race in `vampire_race:` rows; GetSpell
+  also counts an active effect from the spell (combat diseases are effects, not list entries).
+- Case lessons: infect from tomb carriers (Flee 70 -> visit each), never the clan elder (SetFight never ends a
+  fight: OpenMW); sleep in Caius' bed 05201D4E (Ebonheart cave bedroll refused at Act 1); Volrina (Fight 90) is
+  reached through the upper-level door 056757B0; NotLocal NoLore keeps Edwinna quiet (Anarenen answers).
+- Vanilla data gaps reproduced faithfully: Berne VA_VampBlood 30 and Quarra VA_VampAmulet 40 never logged;
+  Quarra "raw materials" dead end (UESP confirmed bug) -> case runs UESP's `Journal VA_VampAmulet 20` + AddTopic.
+- FormID removal 02103B61 (orphaned RestoreFatigue ability) approved by the user 11-12.
+- FIXED 11-12: the cure (MS_VampireCure, Molag Bal) runs Skyrim's VampireCure (PlayerVampireQuest stage 10) when
+  Vampire_Cure_PC removes the Vampirism stand-in; case 0130_va_aundae_cure 3/3 (Anarenen's greeting: `unsaid vampire`,
+  new runner steps `said`/`unsaid`). Dialogue PcCommonDisease/PcBlightDisease/PcCorprus were a constant 0 -> real;
+  GetCommon/BlightDisease now also read the spell list (AddSpell'd diseases were invisible); ingame/45_talk
+  talk_disease_greetings 3/3. Docs: tes5_import_actors.md#morrowind-vampirism, morrowind_runtime.md#disease-queries.
+- FIXED 11-12 (user: use Skyrim's creature-disease system): common/blight contact on hits = carriers' ATKD attack
+  spells + per-disease MGEF clones rolling GetRandomPercent <= 2.5 (actors/disease_contact.py). The clone needed
+  vanilla's disease DATA (flags 0x00400A06, skill 22); with the source DATA nothing landed even at 100%. Case
+  quests/morrowind_disease (rat Witbane, alit blight) 3/3; in full_run.py. Docs tes5_import_actors.md#disease-contact.
+  Drift: MGEF +45 new, SPEL ~22, NPC_ ~85, no ids moved. Open: corpse-loot contact; Oblivion not reimported.
+
+# QUESTS -- MORROWIND HOUSE HLAALU (DONE 11-13: run 1 with 2 fix-resumes, run 2 CLEAN 46/46 in 11 min)
+- Run 3 (after the talk/approach fix) 43/46: hh_twin_lamps_escort until-70 fail (log lost -- chained run relaunched
+  the game); then 4/4 rc (rc_twin/, logs kept). ~1 in 11 overall; cause unknown, catch it with a kept log.
+- Folder morrowind_hlaalu (0100-0250), `--load mwtest_a1_11_report`, MW-only build; in full_run.py.
+- 11-13 run 1: (a) MY MISREAD: the watch's 180 s STALLED fired during hh_stronghold_foreman's legit `rest 240`
+  (1-h sleeps ~2 s each, ~140 per stage) and I stopped a working run. Rests now `rest 10x24` (new runner syntax
+  `<max>x<hours>`; 24 h = one Day change, which Strong_Build*_H count) -> seconds. Runner fixes: a sleep counts once,
+  when its Sleep/Wait menu closes (a long sleep was re-ordered into the open menu and counted twice); the step no
+  longer ends before its last sleep lands. (b) hh_stronghold_mine: MY REGRESSION from the 11-12 disease queries --
+  Skyrim's RemoveSpell can't take a BASE-list spell off (kwama queen's ash-chancre), so GetSpell/GetBlightDisease
+  stayed 1 -> game_calls_spell records script removals (state "spell|removed", AddSpell clears) + dispels. Probe 0/0.
+- Runtime fix: PcClothingModifier was a flat 100 -> real worn value (game_calls_query PlayerWornValue: ARMO forms
+  equipped, TESValueForm value at +0x70; logged 177 = Neminda helm 167 + 10). Neminda's disguise and Crassius's
+  sponsorship (worn value 0) both depend on it.
+- Case lessons: most givers teach their topic only through "business" (ask it first); Mercantile is folded into
+  Speechcraft (never SetSpeechcraft after SetMercantile); past Lawman the sponsor (Crassius) promotes; dress again
+  after Crassius (undressed = "Cover yourself!" greetings hide topics); an unscripted NPC is non-persistent ->
+  PositionCell into its cell before `approach`; closed LOCKED doors leave AI walks standing (Odirniran cell door +
+  hall door, key_Odirniran); river creatures freeze followers (Tarvyn escort: `defend`); chests resolve by base id.
+- Escort walks: Tarvyn (Vivec -> Pelagiad: walk to bank, steered swim across the bridgeless river, walk; rule 6
+  exception), Vedelea (Odirniran). Predictor false stalls ("ceiling below body height" at the Odirniran landing).
+- Stronghold all 3 stages pass (Fjorgeir hired to guard, "Guard this spot." 2 -- no follower; Maros killed; 300).
+- hh_twin_lamps_escort 3/3: user pinned AshalmawiaXN20Y30; then J'Saddha fell off the Ald Velothi dock and stuck
+  swimming under it (generic "mesh under a platform": deck tris on the sea floor) -> my pin AldVelothiXN22Y31
+  (pin_region, 229 frozen tris, mesh_to_esm into NAVM 0217F704; mesh_clean unchanged 8/2/7 sea-floor faults, holes
+  3 -> 1; picture AldVelothiXN22Y31_walk.png); walk end moved past Galyn (-88640 128480) -- a walk ending AT him
+  stopped behind him, ~300 away. Predictor false stall "collision ahead" at the deck corner (-88612 128100).
+- hh_twin_lamps3 (0250, Hides-His-Foot) 3/3: runtime fix -- a follow with a destination counted done only within
+  128 of its point; OpenMW AiFollow uses followDistance (NPC 64 + 64 + 2x64 = 256). Hides rested ~190 from the
+  point (120 behind the player). game_calls_ai FollowReach (creatures keep 128: no real bounds). Earlier work had
+  noted the mismatch (archive 716) and dropped a 256 edit UNTESTED (archive_2 1560). Predictor false stall
+  "climb 54 over 12" at (34570 -39158); the walk reached the farm.
+- hh_game_rats: blighted rats' hits can now pass Black-Heart Blight (disease contact) -> Greeting 4 disease lines hid
+  Dondos's stronghold offer (topic learned only from his Greeting 5) -> case drinks cure blight/common potions.
+
+# QUESTS -- MORROWIND THIEVES GUILD (DONE 11-13: 42/42 x2 full, ~5 min each)
+- Folder morrowind_thieves_guild (0100-0160), `--load mwtest_a1_11_report`, MW-only build; in full_run.py.
+  0100 Habasi (join + 6 jobs), 0110 Aengoth (6), 0120 Big Helende (5), 0130 Stacey (Nads Tharen .. Ienith),
+  0140 Bal Molagmer (8), 0150 Sjoring Hard-Heart -> Master Thief, 0160 bounty (the 4 "price on your head" NPCs)
+  + prison (turn in to a Balmora tower guard, "Go to Jail." -> served, bounty 0; tg_prison_released.png).
+- Ranks: TG attributes are Agility + PERSONALITY (FACT 3,6 -- not Speed); OpenMW hasSkillsForRank = best guild skill
+  >= primary, second >= favoured. tg_join sets 34/34, Security 80, Sneak 30 (Mastermind's); reputation from jobs
+  (5 each; Master Helm's goes to Redoran) carries rank 4 / 5 / 7 / 8; Stacey's jobs need rank 6, the last two 8.
+- Order lessons: each Bal Molagmer job is named in Stacey's next "Bal Molagmer" answer (ask it first); staceyScript
+  disables Stacey at a cell change once TG_KillHardHeart is 100 -> Hard-Heart last; Ranes Ienith is PlaceAtPC'd by
+  Navil's script on the first hit (punch + defend); GotoJail runs only once the player clicks Goodbye (`bye`).
+
+# QUESTS -- MORROBLIVION LANE (DONE: clean runs 16, 19)
+- morroblivion_main 10/10; quiz 4/4 (runner until/menu fix in common test_runner.cpp); tr_necrom 19/19
+  (nm_drunk causeway pins; nm_wake_start ENCH self-only); tr_telvanni 89/89 (vaerin = alarm fix; ht_el1
+  SetDisposition; ht_oathrung winding oracle v2). mb_chargen_sellus = dialogue idle timer fix.
+- Watch: ht_ra2_contact (see faction alarm); silent exits ht_join / ht_va1_priest were one-offs (3/3 reruns).
+
+---------------------------------------------------------------------------------------------------------
+# QUESTS -- ARKTWEND LANE (OPEN; arktwend_side 6/6). Best lanes: 190/191 (runs 35, 37, 41)
+
+## Fixed (keep unless they fail again)
+- 11-16 dwarves_mao (run 67): the walk issued 1 s after the canyon door took the player back into Dwarven Shaft --
+  the runner's move-landing hold covered script moves only (MoveInto). Runtime: object_tick PlayerCellChanged now
+  starts the same hold (HoldMenusForPlayerMove) on every player cell change, so a door lands before the next walk.
+  rc 3/3; mechanism (marker in the old cell) inferred, not logged.
+- galeone_rowboat `until 6000`. storm_calisto `until Tuniervar >= 13`. storm_markus_reward `approach 05366940`
+  (3/3). gargart_cell `approach 0552AFC2` after journal 1 (6/6; Skyrim melee holds ~230). goths_camp `approach
+  05A96921` (6/6). verrat_brutus `pace 5`. enderal_brother `pace 2` (moving marker boxes within 1000). tate_door
+  one walk (3/3). dwarves_picks one walk (6/6). dwarves_mao one walk to the canyon door (3/3). dwarves_mert last
+  steer removed (3/3). dwarves_shaft walk to the lift operator (3/3, rail pin). dwarves_demon_king death-spot
+  fix (6/6) + Grul bridge/door pins. sohn_airship 3 walks. baron_house walks (3/3). baron_hideout crash fixed.
+  herbert_house walk to the GorScript02 marker (3/3). herbert_meet `defend` (4/4; attackers knocked the player
+  away). sohn_guard/sohn_child/sohn_irfl `defend` (4/4; snow wolves attack on arrival). sohn_worldend: pre-greet
+  check accepts MenuMode (3/3). theater_calisto_house X0Y5/X0Y6 seam snap (5/5).
+- Lava sound storm fixed (all MW-format games). Door decline fixed (fortress gate).
+
+## herbert_gron -- watch
+- Case: last walk to the marker itself (-47046 9635 128; Herbertvar 7 within 150) -> 3/3. Separately: dead still
+  at the exact path corner (-47437.7 8800.8) in runs 26/27/31 + 2 of 6 reruns; mesh flat, clean. Mechanism OPEN.
+  Not seen since run 32. HamletofGronXN12Y2 grew 212 -> 537 tris in the 11-08 flood.
+
+## herbert_dead_rise / herbert_escape -- watch
+- dead_rise: 13 of last 14 + run 30 fail at the GorXN17Y0 plateau ledge link (020421FF tri 86 -> 420). Fails head
+  NW; offline route OK. Mechanism unproven, no change.
+- herbert_escape run 31: dead still at the plateau edge (-66283 800 592); mesh there 70-120 under the real floor.
+  User called Gor's mesh flawless on 11-09 -> SHOW THE USER before any pin.
+
+## theater_guards -- 11/12 since `defend`
+- Case: start Position ON the mesh (-776 48005 239) + `defend` (guild thieves renewed the fight; a player in
+  combat runs no Travel); walk to (-690 48955) (inside W02's 500 greeting, outside W01's 400 -> W02 greets first).
+- Remaining fail = first walk never starts (Travel slot 1 PACK 051D1C16, player still) -> RestartedWalk built.
+  Old off-mesh start picture: run34_theater_guards_stop.png.
+- Failed: start off-mesh (-343 47700) kept; on-mesh start WITHOUT defend 1/3; walk end (-343 49200) = race.
+
+## theater_calisto_house -- watch (5/5 after the seam snap)
+- 11-16 run 67: walk 14089 34673 -> 33300 37150 turned south into the dip (14600 34200, z -44..280) and slid 5 min;
+  planner goes NE. USER-allowed legs at the planner's turns `walk 15170 35301 670`, `walk 18107 37130 847`: rc 3/3.
+- Case: walks + `bye if open`; X0Y6 hill = user's long-path leg exception (steers v2 + valley legs 9960 28811 /
+  11602 31869 / 14089 34673).
+- Fixed: Wache02 must greet first (theater_guards walk); PastureLandX0Y6 user pin verts snapped onto the X0Y5 seam.
+- X0Y6 corridor history (all FAILED, don't retry): ribbon pin; pins v1-v8 of the rock/strip (v8 kept as
+  engine-valid); single walk replacing the steers; choke theory (150-172 wide); followers-as-obstacles;
+  preferred-flag; slope sub-steps; stand-on-top / step / face-direction rules.
+
+## tate_nembrest -- passing
+- Case: steers v2 over X0Y6 (user allowed a FEW high-level steers) + station walk; plaza pin (pocket under the
+  stands), cemetery wall-end pin, X2Y5 rock pin, X0Y6 v8. 3/3 since; not in a lane fail since run 22.
+
+## sohn_home -- OPEN (the one recurring Arktwend fail; runs 38, 40, 41)
+- 🛑 USER GOAL (11-16, do not substitute): (1) make sohn_home MOSTLY pass -- after EVERY failure look at the stop
+  and adjust the legs (up to 12 approved) BEFORE the next run, one attempt at a time; (2) the FIRST pass keeps
+  recording to the end of the quest (keep that clip); (3) then record a NEW run from New Game with the Face
+  Discoloration Fix linked (memory: feedback_recordings_need_face_fix) and let it run -- to the end, or to
+  sohn_home, either is fine (user splices). Driver: temp/arktwend_recording/record_attempts.py <first> 2 <token> 1 <n>.
+- 11-16 HARNESS BUG (fixed): wait_results ENDED the run on "RUN STALLED" (runner silent 180 s) and dumped the game
+  (freezing it). USER: a stall is report-only. Every attempt 2-21 ended at that dump (dump time == last walk line);
+  sohn_home's walk home writes nothing to the runner, so at recording pace (13-19x vs ~24x) it always passed 180 s.
+  Attempts 11/12/21 were walking normally when killed. Now: print, keep waiting. Real stalls seen tonight (dip
+  slide, tree at 96068 8603, walkway north) remain real; the "silent stops" were this bug, not the game.
+- Authored route (Grignir): crevice door a_Spalte_01 -> 'Ice Flow' -> 'Slate Cavern' -> exit -> descent -> Northron.
+  Case: walk to each cave door + activate (0578DEC7, 05DDBAB8, 05B23937), walks down, walkway legs, walk home.
+- Fixed: doors had no door tri (door joins/landing seeds); crevice mouth pin + pins-after-door-choices; crevice
+  fall (walk already at its end starts no travel); descent = tri-94 south corridor + seam repair (navm_patch);
+  X24Y1 zero-area seam tri (box pin restored); FrozenWildernessX40Y19 start pin; plank walkway twisted tri pin.
+- Open stops (pictures for the USER, in temp/full_run_2026_10_31/): X24Y1 climb (101000 6700;
+  run32_sohn_home_stop.png, noop3_sohn_home_stop.png at 101418 3128); X26Y0 pocket off the mesh's east edge
+  (107816 1326; run38_sohn_home_stop.png); walkway leg goes NORTH up the mountain (96262 7812;
+  noop4_sohn_home_stop.png); X29Y12 45-49 deg face slide (118999 49873; run 40). Ice Flow junction fall
+  (run 41, run41_iceflow_stop.png) -> USER pinned Ice Flow 11-11,
+  patched in place (021DA0B3 1900 -> 1852 tris); predictor then stops "no floor" at (3207 10122 -1270).
+- rescue_home x3: 2/3 (no slide happened; fail = walkway leg north, on mesh). iceflow_pin x3 (user's Ice Flow
+  pins in): 1/3. Rescue FIRED in game twice: walkway (96358 7880) -> (96239 7782 936), X29Y12 face (118801
+  49675) -> (118567 49422 2271), walks went on. Fails: run 3 Ice Flow -- player came round the N ring (1062 3287
+  -677) and dropped into the SAME pocket (1825 2198 -1030) as run 41 (on mesh, rescue 'none'); run 1 walk home
+  stalled ON mesh at (101737 2398 4371) NordtorX24Y0/TrollMountainsX24Y1 (= noop3 picture).
+- RUN 42 (restart + rescue DLL, pre-Ice-Flow-pin ESM): main 190/191, side 6/6. Fail = sohn_home walkway leg
+  (97560 4122 43 -> 98304 4352 344): 30 units in, the player DROPPED 150 to the ground layer (97582 4134 -108)
+  under the three-wide ex_de_shack_plank_04 run, then the engine routed it NW up the mountain (picture
+  run42_sohn_walkway_stop.png). Mesh there is ON the planks (43.4 vs tops 34..44) and inside their width
+  (y 4096..4175 vs 4063..4217); a ground mesh layer lies under (-109, tri 450). Plank collision fits in z 34..43
+  (<= 9 thick). Lead (unproven): falls through a thin collision slab at test speed; next = compare
+  ex_de_shack_plank_04's original MW collision vs ours (asked the user).
+- 11-12 plank block (user: "connect the whole thing as a block"): hand frozen tris (plank_block_pins.py) in
+  FelslandX23Y0 (2) + X23Y1 (3) sharing seam verts 97564.9/97679.1/97755 at z ~43; pre-existing X23Y0 hole only.
+  pin_region attempt first (holes, resampled seam) reverted. rc plank_block 3/3.
+- RUN 43: walk home stalled ON mesh at the X24Y1 ridge neck (99335 5178 1245), climb/slide 5 min; predictor
+  also routes north over the mountain, stops climb (101025 6648). Picture for the user; no pin yet.
+- 11-15 (runs 46-51+, after the Arktwend mesh rebuild): 6/6 home fails at THREE places (walkway leg north,
+  NordrenX27Y4 descent leg, Ice Flow). USER: navmesh at all 3 stops looks flawless (a little steep in places)
+  -> rerun several more times and log each to find a pattern (attemptN_runtime.log in temp/recording_arktwend_sohn).
+  route_pic predictor: "no floor" at the start on X27Y4's leg and all of Ice Flow; "reached ok" where the game
+  went north (calibration gaps).
+- 11-15 USER-directed extra leg (exception to rule 17): runs 49/51/52/54 stalled at the same dip, climb-and-slide
+  (z swings 37..390 in place). floor_points + minimax search (temp/sohn_stalls/gentle_route.py): the attempts'
+  climb at x 109400 has a 41-deg step; a route over the shoulder tops out at 19 deg -> `walk 110200 17000 303`
+  before `walk 96068 8603 1326`. First run with it: attempt 10 (run 56). Not checked with the predictor (no floor).
+- 11-16 USER allowed up to 10 more legs. Run 56: the engine still climbed the x 109400 bank after the leg -> added
+  `walk 109800 16400 329` (on the gentle slope). X23Y3 hill (run 56 stall 95476 12490; straight face 22-27 deg,
+  floor_points --route along run 55's track + minimax: switchback <= 15 deg) -> 4 legs 94800 14900 1143,
+  95400 12300 1311, 94700 12200 1474, 94600 12000 1549 (on mesh, planner-connected). Walkway north (46/48/55):
+  the player REACHED 96650 4180, then the walk to 97560 4122 went north: that target has TWO layers (planks z 43.3
+  tri 109 over ground z -120.8 tri 450, NAVM 021D9E2F); the planner routes straight east on the planks -> moved the
+  target to 97750 4130 44 (planks only). Theory (game snaps the target to the ground layer) UNPROVEN. 5 of 10 used.
+- Failed: Ice Flow route pin (removed 11-08); NordrenX24Y2 pin (seeded cell); tri-94 corridor (under a shelf);
+  40-deg corridor pins in 3 cells (2 attempts); last-pack rule alone; follower-ahead theory.
+
+## sohn_child -- passing (defend)
+- Old steer chain + `pace 10` (user); NordrandX32YN10 wedge notch (>= 41 deg) + fold pin (9/9); bridge deck seam
+  fix (5/6). Run 34 fail = wolf on arrival -> `defend` (4/4).
+- Open question (user, parked): why the AI-walked actor slides on a 42 deg face the steered player climbs.
+
+## sohn_lift -- watch
+- Walks (rule 17). Run 34 fail in 'Arpk, Ancient Temple' (target on a tri 278-287 off the floor; one straight
+  3200 leg; run34_sohn_lift_stop.png) -> USER pinned Arpk 11-11; userpins check 3/3.
+
+## enderal_burg_* (fortress) -- passing on the user's pins
+- gate: case waits `until player->GetPos Y < -143500` after the gate (landing y -143673). scout: `pace 10` +
+  `defend` (5-6 attackers; 3/3). camp: TrunTelurX33YN35 ledge pin; X33YN36 user pin + seam fix (11-11) -> fort 3/3.
+  battle: TrunTelurX34YN35 pin + the legs that work (rule 6 exception). brother = cascade.
+- Failed (don't retry): legs/slope for scout (archive r9); stale-slot theory; gate-ckpt state theories (rock
+  margin, cannons, followers, quest stage, start mode, steam vent, stale marker); inner-gate route for battle;
+  door retry; closer scout target (engine declined from off the landing).
+
+## Arktwend open questions for the user
+- Run-26 pictures/notes: DorrenDornForestX22YN40 reshuffle from the seam fix (run26_pics/seamfix_22_40.png).
+- Follower-rule debt: chapters VI+ (0840-0870) still `player->Position` with Jarko/Gargart/Calisto following.
+- sohn_irfl run 33: bound proximity greeting never fired with attackers (now `defend`; watch).
+
+---------------------------------------------------------------------------------------------------------
+# UNCOMMITTED CHANGES (git status 11-11; the user commits after in-game testing)
+- Staged: native navgrow (bridge/world .cpp/.h + dist .pyd), navmesh_pins.py, from_pgrd.py, Arktwend pins json,
+  tests/test_navmesh_pins.py, cellview (bake/server/world/index.html), navmesh/check.py, navm_patch.py.
+- Unstaged: MorrowindRuntime.dll; runtime dialogue_state.h, game_calls.cpp, game_calls_ai.cpp,
+  game_calls_internal.h, game_calls_query.cpp, test_runner.cpp; Arktwend cases 0400/0600/0730/0760/0790/0800/0860;
+  Arktwend pins json; test_instance.py; python_tools.md; this file. New: tools/navmesh/navmesh_rescue.py.
+- FormID moves: approved for Arktwend TESTING (BPTD, NAVMs). NOT asked yet: vs pre-session 402 NAVMs new / 3 gone
+  (02070E09, 02080068, 0219A866; navm_diff_session.txt) + 4 new from the tri-94 corridor; TR Kulidon/Manrizache
+  NAVM ids; MW 02182139 removed; 2 MW + 21 TR NAVMs added.
+
+# RECORDING (user 11-12): Morrowind main quest, one complete run, time-lapse (test speed), 1440p60, hidden.
+- OBS on the SAME hidden desktop as the game records it (obs_hidden_probe.py: 640x360 hevc 60 fps, main menu
+  frame OK). hidden_launch.launch takes `args`. OBS profile/scene "TESRecording" in the user's OBS config.
+- BUILT: `test_instance mwtest ... --record DIR` (tools/live/obs_record.py): High.ini + 2560x1440, OBS on the
+  hidden desktop, .mkv -> .mp4, Low.ini restored. Checked: ingame recorded at 2560x1440 60 fps, full frame
+  (temp/recording_check). Its 4 fails (currentmagicka/fatigue/angle/position) = `--fast` god mode on the ingame
+  cases (the lane runs ingame WITHOUT --fast); same fails at 640 with --fast. Recording run started 11-11
+  (inst 1, temp/recording_mw_main[.out]) -> 72 passed, FAIL b3_bride (steer stuck 82 short of 109058 70235,
+  the zigzag legs). Rule 17: steer chain (lines 119-189) -> one `walk 76766 83714 776` (backup
+  temp/.../1200_b3_zainab_bride.pre_walk.mwtest); predictor: route found, false "collision ahead" at the yurt
+  (77600 84186) where run 44's steers passed. Test bride_walk x3.
+  User: the recording's camera rotates the whole video = Skyrim's idle vanity camera orbit (no input ever) ->
+  SKYRIM_INI [Camera] fAutoVanityModeDelay=1000000 (string present in the 1.6.1170 exe). bride_walk 3/3.
+  User: recording looked low-res -> launch() re-applied PREFS_INI 640x360 over the record size (fixed: launch
+  takes `prefs`; 1:1 crop now sharp). Face Discoloration Fix (user's Vortex staging, FaceGenFixes.dll) linked
+  via new `build --skse-plugin DLL` (removed again by the next build without it); skse64.log: loaded.
+  RECORDED: temp/recording_mw_main2/2026-11-11 16-12-10.mp4, 97/97 passed, 2560x1440 60 fps, 8 m 29 s, 2.0 GB.
+  User: no Azura / robes messed up. Azura = 'azura spirit' ACTI (r\Azura.NIF), AzuraEnd: ~12 game s visible
+  (0.5 s at 25x) then the harness stopped the game the same second; mw_end.bik never shipped (Morrowind's sound
+  stage predates video.py 10-12; the instance's mw_cavern.bik was a Morroblivion leftover) -> video step run for
+  Morrowind.esm. Robes: output/Morrowind.esm meshes 6379 Sep / 457 Oct / 127 Nov; arm-fit fix d085a80a 10-11 ->
+  user OK'd full --meshes-only for Morrowind/Tribunal/Bloodmoon after the azura_view clip, then re-record.
+  azura_view (normal speed, held open; temp/recording_azura): mw_end.bik PLAYS; Azura NOT visible. She stands
+  150 ahead of the player (REFR 00417C86 at 4037 5301). Cause: game_calls_anim PlayGroupNow dropped a PlayGroup
+  on a ref whose 3D was still loading (AzuraEnd: Enable, then PlayGroup Idle2 = fade-in next pass; no 'idle2'
+  anim line). Fix: g_pending + PendingTick (plays once the 3D loads, drops after 600 ticks). DLL built, gates
+  pass. recording_azura2: idle2 now plays but she is STILL invisible -> real cause #2: source azura.nif has
+  material alpha 0 + 28 NiAlphaController (the fade); object_anim_morrowind cut only keyframe/morph
+  controllers, so the fade was dropped. Fix: _controllers() includes property controllers, NiAlphaController
+  -> NiFloatInterpolator block (sequences.py retargets to the shader Alpha). Also: vanilla census 1454/1454
+  shader values driven from 2+ sequences share ONE controller; ours chained one per sequence ->
+  attach_seq_shader_controllers reuses the shader's twin (_chained_twin). Azura test: 8 seqs, Idle2 Intro
+  0->1, 1 ctrl/shader. Tests: 51 + 6 pass. Blast radius: (a) every MW-format fixture mesh with material
+  alpha keys; (b) EVERY plugin's meshes with a shader value in 2+ sequences. Rebuilt meshes: MW 6375/6377
+  (2 NOGEO crystals), Tribunal 750, Bloodmoon 1073. recording_azura3: AZURA FADES IN AND SHOWS (strip.png).
+  NOT YET rebuilt for the alpha/shared-controller fixes: Arktwend, TR/TD, Morroblivion, Oblivion, Nehrim, FNV.
+  Re-recording from temp/recording_cases/morrowind_main (copy; c3_azura gets `pace 1` + `wait 1500`) into
+  temp/recording_mw_main3. DONE: 97/97, 2026-11-11 17-01-09.mp4, 10 m 28 s, 2.4 GB; Azura shows at ~8:30
+  (azura.png), mw_end.bik follows. Run 44 (MW lane) done: all clean but co_protect_falco (fixed). Recording run = morrowind stage build +
+  `mwtest --cases quests/morrowind_main --new-game 2 --fast --timeout 21600 --record <dir>`; sound off.
+- Run 44 (MW lane, inst 2) and run 45 (Morroblivion, inst 1) = post-change verification of the done lanes.
+  Run 44: co_protect_falco FAIL (1 in 15 logged runs): last step SetPos x/y/z onto Falco, then Falco 1802 away
+  for 600 ticks -> replaced by `approach Falco Galenus` (rule 7). Rerun 2/3: the fail was `until CO_12 == 20`
+  with the journal already at 100 (assassins dead before the check) -> `>= 20`. falco_ge20 5/5.
+  Run 45 (Morroblivion): CLEAN 122.
+
+# PENDING (in order)
+1. Read run 42 (run42_ark.out): fails, and whether "never started" / slide rescue fired.
+2. Read rescue_home + iceflow_pin results (sohn_home); fix or picture each stop for the user.
+3. Show the user herbert_escape's Gor plateau edge; theater Wache01 freeze if it recurs.
+4. Next Arktwend full runs until 2 back-to-back clean.
+Later: remove TEMP logs (activation.cpp ActivateHook; game_calls_crime SetPlayerEnemy + TempCrimeNote;
+game_calls_combat health; game_calls_ai follower list/swim/fighters; ids.h GetCombatState/ExtraFollower;
+object_script box owner); kWalkLogTicks 60 -> 300; measure pace v4; republish the navmesh cache; reimport the
+other MW-format plugins (Recover, persistent actors, door joins); landing-link blast radius on Oblivion; docs
+after in-game confirmation (hello approach, door lock, alarm, persistent actors, split/door joins, pins, root
+rule, ENCH, lift); ask about the NAVM id changes above.

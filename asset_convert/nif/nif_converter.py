@@ -39,10 +39,14 @@ import numpy as np
 
 from asset_convert import paths
 from asset_convert.nif.geometry_sanitize import sanitize_geometry_data
+from asset_convert.nif.nif_materials_morrowind import carry_havok_material
 from asset_convert.nif.nif_converter_morrowind import (
-    attach_morrowind_collision, build_skin_partitions, disable_specular,
-    is_morrowind, run_morrowind_fixups, strip_collision_nodes)
-from asset_convert.nif.tex_paths import rewrite_tex_path
+    animate_doors, attach_morrowind_collision, build_skin_partitions,
+    disable_specular, is_marker_shape, is_morrowind, latch_root_flags,
+    opaque_unblended_shapes,
+    run_morrowind_fixups, source_root_flags, strip_collision_nodes,
+    strip_spinning_doors)
+from asset_convert.nif.tex_paths import path_text, rewrite_tex_path
 from asset_convert.nif.shaders import (ALPHA_BLEND_ENABLED,
                                        ALPHA_DST_ONE, ALPHA_DST_SHIFT,
                                        APPLY_HILIGHT2,
@@ -63,17 +67,21 @@ from asset_convert.character.skin_replacement import (apply_armor_offset,
 from asset_convert.character.head_gear import (is_ground_model,
                                                strip_gnd_skin)
 from asset_convert.character.prn_skin import get_prn_bone
+from asset_convert.character.skin_bone_cap import cap_skin_bones
 from asset_convert.nif.nif_passes import (add_animobject_bged, wrap_root_transform,
                                           add_bsx_flags,
                                           collect_sequence_names,
-                                          convert_sound_text_keys,
+                                          graph_sound_text_keys,
+                                          fade_above_rig_root,
+                                          wrap_geometry_root,
                                           fix_controller_flags,
                                           resolve_palette_strings,
                                           strip_empty_text_keys,
     zero_fallout_root_rotation)
-from asset_convert.nif.morphs import (emulate_morphs,
+from asset_convert.nif.morphs import (complete_object_palette, emulate_morphs,
                                       normalize_blend_interpolators)
-from asset_convert.nif.sequences import (apply_rest_visibility,
+from asset_convert.nif.sequences import (apply_rest_emissive,
+                                         apply_rest_visibility,
                                          attach_seq_shader_controllers,
                                          autoplay_ambient_sequences,
                                          match_seq_shader_types,
@@ -84,8 +92,15 @@ from asset_convert.character.wearable_plan import (body_part_for_flags,
 from asset_convert.character.wearable_plan_falloutnv import shield_flags
 from asset_convert.havok.hkx_skeleton import BONE_RENAMES
 from asset_convert.character import wearable_plan as wp
+from asset_convert.collision.clutter_plan import latch_clutter_mass
+from asset_convert.nif.door_anim_morrowind import latch_source_hinge
+from asset_convert.collision.collision_original import latch_original
+from asset_convert.nif.door_plan import latch_door_model
+from asset_convert.nif.fixture_plan import latch_fixture_model
 from asset_convert.character.body_wrap import morph_converted_to_weight1
-from asset_convert.havok.hkx_animobject import generate_animobject_project
+from asset_convert.havok.hkx_animobject import (VANILLA_AUTOPLAY_BGED,
+                                                generate_animobject_project)
+from asset_convert.nif.addon_nodes_falloutnv import remap_addon_nodes
 from asset_convert.nif.gun_parts_falloutnv import add_gun_part_sequences
 from asset_convert.nif.particles import (convert_particle_system,
                                         skyrimize_billboard,
@@ -132,8 +147,11 @@ from asset_convert.character.dismember_falloutnv import hide_dismember_caps
 from asset_convert.nif.mesh_scan_emit import (record_scan_alias,
                                               record_scan_entry,
                                               record_scan_removal)
-from asset_convert.collision.collision import (hoist_collision,
+from asset_convert.collision.collision import (collision_owner,
+                                               hoist_collision,
+                                               mesh_has_held_body,
                                                remove_empty_collision_nodes)
+from asset_convert.collision.collision_anim import node_transform_is_animated
 from asset_convert.collision.collision_falloutnv import (
     is_fallout_source, latch_source, merge_static_parts)
 from asset_convert.collision.collision_constraints import (enforce_ragdoll_tree,
@@ -200,29 +218,25 @@ from asset_convert.nif.furniture_markers import (
     ENTRY_FRONT as _ENTRY_FRONT,
     ENTRY_LEFT as _ENTRY_LEFT,
     ENTRY_RIGHT as _ENTRY_RIGHT,
-    cluster_seats as _cluster_seats,
     drop_superseded_markers,
-    extract_entries as _extract_furniture_entries,
     geometry_center_xy as _geometry_center_xy,
-    origin_shift as _furniture_origin_shift,
+    marker_seats as _marker_seats,
 )
+from asset_convert.nif.furniture_travel import latch_sit_travels, latched_sit_travels
 
 
 def _convert_furniture_markers(markers, root):
-    """Convert Oblivion BSFurnitureMarker blocks (entry points) into one
-    Skyrim BSFurnitureMarkerNode (seat positions).
+    """Convert source BSFurnitureMarker entry points into one Skyrim
+    BSFurnitureMarkerNode of seats, z in re-origined coords (floor = 0).
 
-    Returns (frn, origin_shift) — origin_shift is the +z translation that
-    re-origins the model to the vanilla floor-origin convention.  The
-    engine anchors the seated actor to the REFR z (not the marker z), so
-    the model must be wrapped in an inner NiNode translated by this amount
-    and the importer lowers the REFRs to match (see furniture_markers.py).
-    Returns (None, 0.0) if the markers contain no positions."""
-    entries = _extract_furniture_entries(markers)
-    if not entries:
+    Returns (frn, origin_shift): the +z translation re-origining the model to
+    the vanilla floor-origin convention, which the importer mirrors on the
+    REFRs (see furniture_markers.py).  (None, 0.0) without positions.
+    """
+    seats, shift = _marker_seats(markers, lambda: _geometry_center_xy(root),
+                                 latched_sit_travels())
+    if not seats:
         return None, 0.0
-    shift = _furniture_origin_shift(entries)
-    seats = _cluster_seats(entries, lambda: _geometry_center_xy(root))
 
     frn = NifFormat.BSFurnitureMarkerNode()
     frn.name = b'FRN'
@@ -232,7 +246,7 @@ def _convert_furniture_markers(markers, root):
         dst = frn.positions[ci]
         dst.offset.x = seat['x']
         dst.offset.y = seat['y']
-        dst.offset.z = seat['z'] + shift  # re-origined coords (floor = 0)
+        dst.offset.z = seat['z'] + shift
         dst.heading = seat['heading']
         dst.animation_type = 2 if seat['sleep'] else 1
         ep = dst.entry_properties
@@ -251,9 +265,7 @@ def _norm_tex_ref(raw):
     """
     if not raw:
         return None
-    if isinstance(raw, bytes):
-        raw = raw.decode('utf-8', errors='replace')
-    p = raw.strip().lower().replace('\\', '/').lstrip('/')
+    p = path_text(raw).strip().lower().replace('\\', '/').lstrip('/')
     if not p.endswith('.dds'):
         return None
     if p.startswith('textures/'):
@@ -358,154 +370,6 @@ def _prune_orphan_roots(data):
     return removed
 
 
-# Equip/sheath nodes Skyrim looks up by hard-coded name, and where each one
-# hangs on a vanilla weapon-using creature rig (Draugr skeleton.nif node order:
-# WeaponAxe/Sword/Mace sit by the pelvis, WeaponBack/Bow/QUIVER after the left
-# pauldron on the upper spine, WEAPON under the right hand, SHIELD under the
-# left).
-#
-# Oblivion rigs have only three attachment points — Weapon, Torch, Quiver —
-# which the BONE_RENAMES pass turns into WEAPON/SHIELD/QUIVER.  The per-type
-# SHEATH nodes have no Oblivion counterpart at all, so the converted rig simply
-# lacked them: a converted weapon carries Prn=WeaponMace (the sheathed node,
-# which is what vanilla Skyrim weapon meshes use), the engine could not find a
-# node by that name, and the mesh fell back to the actor root — the weapon
-# visibly slid around at the creature's feet instead of sitting in its hand,
-# and no draw animation could ever reparent it.
-#
-# 'anchor' is the node to hang it under, in preference order (the first that
-# exists on this rig wins); 'source' is the node whose LOCAL transform is
-# copied, so the new node lands somewhere sensible for a rig of any size
-# rather than at a hardcoded human offset.
-#
-# Oblivion creatures do NOT sheathe: every one of the 41 armed creature folders
-# ships equip/unequip clips whose text keys are `attach`/`detach` (the AnimObject
-# mechanism) -- the weapon is created in the hand and destroyed, never parked on
-# the body.  38 of those 41 rigs accordingly carry NO Quiver/Shield/BackWeapon
-# node at all.  So the per-type SHEATH nodes below exist only to give the ENGINE
-# a node of the name it looks up; nothing is ever displayed at them, and the
-# creature's own rig is the authority on what it needs.
-#
-# An earlier pass synthesized "proportionate" offsets for them from vanilla
-# Skyrim ratios.  That was wrong on two counts: the placements disagreed with
-# vanilla anyway (axe/mace hang on the RIGHT hip in Skyrim, the guessed offset
-# put them on the left), and no Oblivion creature has anything to place there.
-# The node is created at the anchor's origin, which is what a node nothing
-# renders at should be.
-_CREATURE_EQUIP_NODES = (
-    # name,           anchors (first match wins),               source
-    ('WeaponSword',  ('Bip01 Pelvis', 'Bip01 Spine'),           'WEAPON'),
-    ('WeaponDagger', ('Bip01 Pelvis', 'Bip01 Spine'),           'WEAPON'),
-    ('WeaponAxe',    ('Bip01 Pelvis', 'Bip01 Spine'),           'WEAPON'),
-    ('WeaponMace',   ('Bip01 Pelvis', 'Bip01 Spine'),           'WEAPON'),
-    ('WeaponBack',   ('Bip01 Spine2', 'Bip01 Spine1',
-                      'Bip01 Spine'),                           'QUIVER'),
-    ('WeaponBow',    ('Bip01 Spine2', 'Bip01 Spine1',
-                      'Bip01 Spine'),                           'QUIVER'),
-    ('WeaponStaff',  ('Bip01 Spine2', 'Bip01 Spine1',
-                      'Bip01 Spine'),                           'QUIVER'),
-)
-
-#: Spell-cast attach points: one per hand plus a body-center node, as vanilla rigs carry.
-_CREATURE_MAGIC_NODES = (
-    ('NPC L MagicNode [LMag]', ('Bip01 L Hand',),               'SHIELD'),
-    ('NPC R MagicNode [RMag]', ('Bip01 R Hand',),               'WEAPON'),
-    ('MagicEffectsNode',       ('Bip01 Spine', 'Bip01 Spine1'), None),
-)
-
-
-def _add_creature_equip_nodes(data):
-    """Give a converted creature rig the equip/sheath nodes Skyrim expects.
-
-    Returns the number of nodes added.  Runs AFTER the BONE_RENAMES pass so the
-    renamed WEAPON/SHIELD/QUIVER nodes are available as transform sources, and
-    is a no-op for any node the rig already has (so re-running is safe and a rig
-    that legitimately ships one keeps its own).
-    """
-    added = 0
-    for root in data.roots:
-        if root is None:
-            continue
-        by_name, parent_of = {}, {}
-        for block in root.tree():
-            if not isinstance(block, NifFormat.NiNode):
-                continue
-            by_name.setdefault(
-                bytes(block.name).rstrip(b'\x00').decode(
-                    'cp1252', 'replace'), block)
-            for child in block.children or []:
-                if isinstance(child, NifFormat.NiNode):
-                    parent_of[id(child)] = block
-
-        for name, anchors, source in (_CREATURE_EQUIP_NODES
-                                      + _CREATURE_MAGIC_NODES):
-            if name in by_name:
-                continue
-            parent = next((by_name[a] for a in anchors if a in by_name), None)
-            if parent is None:
-                continue
-            node = NifFormat.NiNode()
-            node.name = name.encode('latin-1')
-            # Copy a sibling attachment point's local transform where we have
-            # one; otherwise sit at the anchor's origin.  Either way the node
-            # is scaled to THIS creature, not to a human.
-            src = by_name.get(source) if source else None
-            if src is not None and parent_of.get(id(src)) is parent:
-                node.translation.x = src.translation.x
-                node.translation.y = src.translation.y
-                node.translation.z = src.translation.z
-                node.rotation = src.rotation
-            node.scale = 1.0
-            node.flags = parent.flags
-            parent.add_child(node)
-            by_name[name] = node
-            added += 1
-    return added
-
-
-def _strip_creature_bone_controllers(data):
-    """Remove Oblivion-runtime controllers from creature NIF node chains.
-
-    Oblivion creature skeletons carry an active (flags=12) but DATALESS
-    NiTransformController on every bone plus a bhkBlendController on every
-    ragdoll bone and a NiBSBoneLODController on Bip01 — all driven by
-    Oblivion's engine at runtime.  Vanilla Skyrim creature skeletons ship
-    NONE of these (bhkBlendController: 0 of all vanilla actor meshes; their
-    only NiTransformControllers have a real interpolator+data — e.g. the
-    dog's jaw/tongue idle).  Skyrim drives bones from the behavior graph, so
-    these leftovers are at best dead weight and at worst engine hazards
-    (an active controller with a null interpolator on every bone).
-
-    Keeps NiTransformControllers that have an interpolator (real embedded
-    animation).  Returns the number of controllers removed.
-    """
-    removed = 0
-    for root in data.roots:
-        if root is None:
-            continue
-        for block in root.tree():
-            if not hasattr(block, 'controller'):
-                continue
-            prev = None
-            ctrl = getattr(block, 'controller', None)
-            while ctrl is not None:
-                nxt = getattr(ctrl, 'next_controller', None)
-                dead = isinstance(ctrl, (NifFormat.bhkBlendController,
-                                         NifFormat.NiBSBoneLODController)) \
-                    or (isinstance(ctrl, NifFormat.NiTransformController)
-                        and getattr(ctrl, 'interpolator', None) is None)
-                if dead:
-                    if prev is None:
-                        block.controller = nxt
-                    else:
-                        prev.next_controller = nxt
-                    removed += 1
-                else:
-                    prev = ctrl
-                ctrl = nxt
-    return removed
-
-
 #: PyFFI defaults endian_type to 0 (BIG); Skyrim NIFs are little-endian.
 ENDIAN_LITTLE = 1
 
@@ -519,17 +383,32 @@ def _is_stripped_node(node):
 
     SecretBigger* are tiny triangles parked far below the origin to inflate
     the bounding sphere; EditorMarker* are hidden in Oblivion by a flag our
-    conversion overwrites.  Both render as stray geometry in Skyrim.
+    conversion overwrites, and Morrowind's MRK-marked shapes by the engine.
+    All render as stray geometry in Skyrim.
     See: docs/commentary/asset_convert_nif.md#nodes-stripped-by-name
     """
     name = getattr(node, 'name', b'') or b''
     if not name:
         return False
-    return any(name.startswith(p) for p in _STRIPPED_NODE_PREFIXES)
+    return (any(name.startswith(p) for p in _STRIPPED_NODE_PREFIXES)
+            or is_marker_shape(node, source_root_flags()))
 
 
 def _walk_geometry(node, fix_textures, stats):
-    """Convert one shape, or None when it has no usable topology."""
+    """Convert one shape, or None when it has no usable topology.
+
+    A shape two parents share converts once; later visits reuse that result,
+    since a second pass would read the already-stripped properties.
+    See: docs/commentary/asset_convert_nif.md#shared-shapes-convert-once
+    """
+    done = stats.setdefault('_converted_shapes', {})
+    if id(node) not in done:
+        done[id(node)] = _convert_shape(node, fix_textures, stats)
+    return done[id(node)]
+
+
+def _convert_shape(node, fix_textures, stats):
+    """Run `process_geometry` on one shape, or None when it has no topology."""
     try:
         ts = process_geometry(node, fix_textures, stats,
                               sky_type=(stats or {}).get('_sky_type'),
@@ -626,7 +505,8 @@ def _run_animation_passes(root, stats):
     follows the walk and precedes rest visibility and sequence-name
     collection; the autoplay split precedes collect_sequence_names so the
     behaviour graph is built from the final names; shader controllers attach
-    after the type match; interpolator normalizing runs last.
+    after the type match, and the rest emissive follows every entry the morph
+    bake added; blend normalizing and the palette fill go last.
     See: docs/commentary/asset_convert_nif.md#post-walk-animation-passes
     """
     match_seq_shader_types(root)
@@ -634,30 +514,9 @@ def _run_animation_passes(root, stats):
     autoplay_ambient_sequences(root, stats)
     apply_rest_visibility(root, stats)
     attach_seq_shader_controllers(root, stats)
+    apply_rest_emissive(root, stats)
     normalize_blend_interpolators(root, stats)
-
-
-def _wrap_geometry_root(data, i, root, stats):
-    """Put a NiNode above a bare geometry root; the root to carry on with.
-
-    Skyrim never ships a geometry root -- a 400-mesh vanilla census found 0
-    (BSFadeNode 340, NiNode 55, BSMasterParticleSystem 2, BSLeafAnimNode 3) --
-    and LODGenx64 hard-crashes with "Unable to cast NiTriShape to NiNode",
-    abandoning the ENTIRE worldspace's object LOD rather than the one mesh.
-    The geometry keeps its transform, so the wrap is visually identity.
-    """
-    if not isinstance(root, (NifFormat.NiTriShape, NifFormat.NiTriStrips)):
-        return root
-    holder = NifFormat.NiNode()
-    holder.name = root.name
-    holder.flags = NIF_FLAGS
-    holder.num_children = 1
-    holder.children.update_size()
-    holder.children[0] = root
-    data.roots[i] = holder
-    stats['geometry_roots_wrapped'] = \
-        stats.get('geometry_roots_wrapped', 0) + 1
-    return holder
+    complete_object_palette(root, stats)
 
 
 def _demote_billboard_root(root, bb_mode):
@@ -845,19 +704,24 @@ def _hide_helper_geometry(root, stats):
     _hide_uvless_lit_shapes(root, stats)
 
 
-def _hoist_root_collision(root, wrapped, root_is_animated, has_constraints,
-                          creature):
+def _hoist_root_collision(data, root, wrapped, has_constraints, creature):
     """Move a child's collision onto the root, where Skyrim wants it.
 
-    Skipped when the root was wrapped (hoisting from under the wrapper would
-    have to compose the WRAPPER's transform too, and the wrap path already
-    absorbs it), for animated objects (the keyframed body must follow the
-    animated child), for constrained NIFs (the spatial relationship is the
-    constraint), and for creatures (ragdoll collision lives on the bones).
+    Skipped for a wrapped root (the wrap path already absorbs the transform),
+    when the node whose collision the hoist would take (`collision_owner`) is
+    really moved by animation, for constrained NIFs
+    (the constraint IS the spatial relationship), for creatures (ragdoll
+    collision lives on the bones), and for a mesh of held pieces a script
+    releases (each piece must fall on its own).  A keyless stub is not
+    animation.
+    See: docs/commentary/asset_convert_collision.md#keyless-transform-stubs
     """
-    if wrapped or root_is_animated or has_constraints or creature:
+    if wrapped or has_constraints or creature or mesh_has_held_body(root):
         return
     if not hasattr(root, 'collision_object') or root.collision_object is not None:
+        return
+    owner = collision_owner(root)
+    if owner is not None and node_transform_is_animated(data, owner):
         return
     if (is_fallout_source() and merge_static_parts(root)) or hoist_collision(root):
         remove_empty_collision_nodes(root)
@@ -870,7 +734,6 @@ def _run_source_fixups(data, stats=None):
     """
     _prune_orphan_roots(data)
     resolve_palette_strings(data)
-    convert_sound_text_keys(data)
     fix_controller_flags(data)
     sanitize_geometry_data(data)
     if is_morrowind(data):
@@ -881,12 +744,11 @@ def _classify_wearable(src_path, nif_basename, worn, biped_flags):
     """What the plugin says this mesh IS: armor, shield, and which slots.
 
     The wearing record's biped flags are AUTHORED data and always beat the
-    filename or the folder.  Folder alone is never enough -- Nehrim files its
-    armor under eyren/, spinat/, nehrim/ and skeletonk/, and would lose the
-    dismember skin, the NiNode root and the retarget on all 88 of them.
-    Bit 13 of BMDT is Shield, and it catches what a filename check misses:
-    'towersheild.nif' is misspelled.
+    filename or the folder (Nehrim files 88 worn meshes under its own
+    folders); bit 13 is Shield, which catches the misspelled
+    'towersheild.nif'. A one-sided Morrowind piece's own slot beats the flags.
     See: docs/commentary/asset_convert_armor.md#armor-offset-slot
+    See: docs/commentary/asset_convert_armor.md#body-slot-layout
     """
     lowered = src_path.lower().replace('\\', '/')
     in_armor_dir = worn or 'armor' in lowered or 'clothes' in lowered
@@ -894,6 +756,9 @@ def _classify_wearable(src_path, nif_basename, worn, biped_flags):
                  else 'shield' in nif_basename)
     authored_bp = body_part_for_flags(biped_flags) if biped_flags else None
     allowed = body_parts_for_flags(biped_flags) if biped_flags else None
+    sided = wp.mesh_sided_slot()
+    if sided:
+        authored_bp, allowed = sided, [sided]
     single_slot = allowed is not None and len(allowed) == 1
     return {
         'in_armor_dir': in_armor_dir,
@@ -921,12 +786,18 @@ def _capture_bow_masks(data, nif_basename, is_gnd, in_armor_dir):
 
 
 def _copy_root_frame(fade, root):
-    """Copy the root's transform, children, controller and collision across."""
+    """Copy the root's transform, children, controller and collision across.
+
+    The Morrowind havok material rides along: it is sampled pre-upgrade onto
+    the OLD root, so without this collision falls back to stone.
+    See: docs/commentary/asset_convert_nif.md#morrowind-surface-materials
+    """
     fade.name = root.name
     fade.flags = NIF_FLAGS
     fade.translation = root.translation
     fade.rotation = root.rotation
     fade.scale = root.scale
+    carry_havok_material(root, fade)
     if hasattr(root, 'collision_object'):
         fade.collision_object = root.collision_object
         if fade.collision_object is not None:
@@ -983,6 +854,8 @@ def _to_fade_node(data, i, root, stats, src_path, wants_gnd_marker):
     See: docs/commentary/asset_convert_nif.md#dangling-root-back-references
     """
     old_root = root
+    if bytes(root.name).rstrip(b'\x00') == b'NPC Root [Root]':
+        return fade_above_rig_root(data, i, root, stats)
     fade = NifFormat.BSFadeNode()
     _copy_root_frame(fade, root)
     if hasattr(root, 'extra_data_list'):
@@ -1023,10 +896,11 @@ def _convert_one_root(data, i, root, stats, fix_textures, src_path, creature,
     equivalent), the tree walk, the animation passes and the collision work,
     in the order each depends on the last.
     """
-    root = _wrap_geometry_root(data, i, root, stats)
+    root = wrap_geometry_root(data, i, root, stats)
     root = _normalize_billboard_root(data, i, root)
     zero_fallout_root_rotation(root)
 
+    latch_root_flags(root)
     is_sky = stats.get('_sky_type') is not None
     if type(root).__name__ == 'NiNode' and not is_worn_armor and not is_sky:
         root = _to_fade_node(data, i, root, stats, src_path, wants_gnd_marker)
@@ -1049,12 +923,9 @@ def _convert_one_root(data, i, root, stats, fix_textures, src_path, creature,
     _run_animation_passes(root, stats)
     _hide_helper_geometry(root, stats)
 
-    root_is_animated = isinstance(getattr(root, 'controller', None),
-                                  NifFormat.NiControllerManager)
     has_constraints = any(isinstance(b, NifFormat.bhkConstraint)
                           for b in data.blocks)
-    _hoist_root_collision(root, wrapped, root_is_animated, has_constraints,
-                          creature)
+    _hoist_root_collision(data, root, wrapped, has_constraints, creature)
     convert_root_collision(data, root, creature, nif_basename,
                             has_constraints)
 
@@ -1090,8 +961,7 @@ def _prepare_rig(data, creature, is_gnd, in_armor_dir, is_shield,
         strip_gnd_skin(data)
         has_skin = False
     if creature:
-        prepare_creature_rig(data, _strip_creature_bone_controllers,
-                             _add_creature_equip_nodes)
+        prepare_creature_rig(data)
     if creature and not has_skin:
         rigid_skin_creature_parts(data)
         has_skin = _has_skin(data)
@@ -1119,6 +989,27 @@ def _convert_roots(data, stats, fix_textures, src_path, creature,
     if was_morrowind:
         strip_collision_nodes(data, stats)
         disable_specular(data, stats)
+        opaque_unblended_shapes(data, stats)
+        animate_doors(data, stats)
+    else:
+        strip_spinning_doors(data, stats)
+
+
+def _splice_worn_body(data, src_path, body_nibs, cls, slot_for_offset) -> None:
+    """Splice Skyrim body skin into a retargeted worn piece.
+
+    `body_nibs` is None when the piece was not retargeted. The embedded skin it
+    names wins; otherwise the plan's skin fill fills whole partitions.
+    See: docs/commentary/asset_convert_armor.md#body-splice-fill-partition
+    See: docs/commentary/asset_convert_armor.md#morrowind-skin-fill
+    """
+    if body_nibs is None:
+        return
+    fill = wp.mesh_skin_fill()
+    if body_nibs or fill:
+        fill_bp = (cls['authored_bp'] if cls['single_slot'] else slot_for_offset) or 32
+        splice_body_geometry(data, body_nibs, fill_body_part=fill_bp, fill=fill,
+                             female=mesh_is_female(src_path))
 
 
 def _convert_nif(data, fix_textures=True, src_path='', weight=0,
@@ -1165,7 +1056,7 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
         data, nif_basename, _is_gnd, _in_armor_dir)
     has_skin = _prepare_rig(data, creature, _is_gnd, _in_armor_dir,
                             _is_shield, _authored_bp)
-    _body_nibs_to_splice: dict = {}
+    _body_nibs_to_splice = None
 
     was_morrowind = _upgrade_version(data, stats)
 
@@ -1182,14 +1073,16 @@ def _convert_nif(data, fix_textures=True, src_path='', weight=0,
     if not creature and not _is_gnd and _in_armor_dir and has_skin:
         _slot_for_offset, _body_nibs_to_splice = retarget_worn_armor(
             data, stats, src_path, weight, race, hair, has_skin,
-            _authored_bp, _authored_allowed, _single_slot, _slot_for_offset)
+            _authored_bp, _authored_allowed, _single_slot, _slot_for_offset,
+            morrowind=was_morrowind)
 
-    if _body_nibs_to_splice:
-        _fill_bp = (_authored_bp if _single_slot else _slot_for_offset) or 32
-        splice_body_geometry(data, _body_nibs_to_splice, fill_body_part=_fill_bp)
+    _splice_worn_body(data, src_path, _body_nibs_to_splice, _cls, _slot_for_offset)
 
     if _is_bow_weapon:
         add_bow_bend_rig(data, stats, _bow_string_masks)
+    if has_skin and not creature:
+        stats['skin_bones_capped'] = cap_skin_bones(
+            data.roots, os.path.join(os.path.dirname(src_path), 'skeleton.nif'))
     destripify_skin_partitions(data, stats)
     if not creature:
         finalise_inv_markers(data, stats, _has_skin)
@@ -1249,10 +1142,18 @@ def _authored_wear(src_path, src_meshes_dir, wearable_plan, creature, hair):
     Hair carries biped bit 1, the slot a helmet-bearing record would, so it
     resolves body part 131 without guessing.  Asked before the conversion so
     the armor rules apply to gear filed outside meshes\armor and clothes.
+
+    The clutter mass latches off the UNGATED plan: an item model is simulated
+    whatever folder it sits in, and only a creature is never loose.
     """
     plan = (wearable_plan if src_meshes_dir is not None and not creature
             and not hair else None)
     wp.latch_variants(plan, src_path, src_meshes_dir)
+    latch_clutter_mass(wearable_plan if not creature else None,
+                       src_path, src_meshes_dir)
+    latch_door_model(wearable_plan, src_path, src_meshes_dir)
+    latch_fixture_model(wearable_plan, src_path, src_meshes_dir)
+    latch_sit_travels(wearable_plan)
     if plan is None:
         return bool(hair), 0x02 if hair else 0
     return (wp.is_worn(plan, src_path, src_meshes_dir),
@@ -1316,6 +1217,8 @@ def convert_nif(src_path, dst_path, *, fix_textures=True, remap_skeleton=None,
         return result
     _worn, _biped_flags = _authored_wear(src_path, src_meshes_dir, wearable_plan,
                                          creature, hair)
+    latch_source_hinge(data)
+    latch_original(src_path, src_meshes_dir)
 
     stats = _convert_nif(data, fix_textures=fix_textures,
                          src_path=str(src_path), creature=creature,
@@ -1369,6 +1272,19 @@ def _output_root(dst_path):
     return dstn[:i] + os.sep, dstn[:i + len(key)], dstn[i + len(key):]
 
 
+def _texture_out_path(out_root, rel):
+    """Where a texture pass writes `rel` (a `Textures\\...` path) under out_root.
+
+    The texture copy writes the lowercase `textures` folder and the packer reads
+    only that, so a shader path's `Textures` root must not open a second
+    folder on a case-sensitive filesystem.
+    """
+    parts = rel.replace('\\', os.sep).replace('/', os.sep).split(os.sep)
+    if parts and parts[0].lower() == 'textures':
+        parts[0] = 'textures'
+    return out_root + os.sep.join(parts)
+
+
 def _build_flip_atlases(stats, dst_path):
     """Compose the frame-strip atlases process_geometry planned."""
     jobs = stats.pop('_flipbook_atlases', {})
@@ -1379,7 +1295,7 @@ def _build_flip_atlases(stats, dst_path):
         return
     from asset_convert.nif import flipbook
     for job in jobs.values():
-        out = out_root + job['atlas_rel'].replace('\\', os.sep)
+        out = _texture_out_path(out_root, job['atlas_rel'])
         if os.path.isfile(out):
             continue
         try:
@@ -1402,7 +1318,7 @@ def _build_height_maps(stats, dst_path):
         return
     from asset_convert.texture import parallax
     for job in jobs.values():
-        out = out_root + job['height_rel'].replace('\\', os.sep)
+        out = _texture_out_path(out_root, job['height_rel'])
         if not os.path.isfile(out):
             parallax.build_height_map(job['src'], out)
 
@@ -1412,7 +1328,7 @@ def _build_animobject_graph(data, stats, result, dst_path):
 
     Runs AFTER the conversion so stripped sequences cannot become dead states,
     and before the write so the BGED ships in the file. A gun's part
-    sequences never earn one: TESRuntime starts them itself.
+    sequences never earn one: FalloutRuntime starts them itself.
     See: docs/commentary/asset_convert_nif.md#animated-object-graphs
     """
     seq_names = collect_sequence_names(data)
@@ -1430,6 +1346,8 @@ def _build_animobject_graph(data, stats, result, dst_path):
         if bged and add_animobject_bged(data, bged):
             result['animobject_graph'] = bged
             stats['animobject_sequences'] = len(seq_names)
+            if bged != VANILLA_AUTOPLAY_BGED:
+                stats['graph_sound_keys'] = graph_sound_text_keys(data)
     except Exception as e:
         result['animobject_error'] = str(e)
 
@@ -1460,6 +1378,8 @@ def _run_post_passes(data, stats, result, src_path, dst_path, textures_only):
             convert_flame_nodes(root, src_path, _convert_nif, stats)
     _build_flip_atlases(stats, dst_path)
     _build_height_maps(stats, dst_path)
+    if is_fallout_source():
+        stats['addon_nodes'] = remap_addon_nodes(data)
     if not textures_only:
         parts = add_gun_part_sequences(data, src_path) if is_fallout_source() else []
         if parts:

@@ -242,163 +242,139 @@ citadeldeadralordscenterring 106, obeliskenergybox01 102, se01waitingroomwalls
 36).
 
 <a id="morph-emulation"></a>
-### NiGeomMorpherController does not exist in Skyrim — emulate as a shape swap (⚠ SCALE version REVERTED 2026-08-10, see notice below)
+### NiGeomMorpherController does not exist in Skyrim — emulate as a visibility swap on wrapper nodes (in-game confirmed 2026-09-24)
+
+**Code:** `emulate_morphs`, `_emit_flipbook`, `_flipbook_states`, `_wrap_shape`, `_own_properties` in `asset_convert/nif/morphs.py`
 
 The SSE exe has NO `NiGeomMorpherController` RTTI class (only the orphaned
 `NiMorphData` remains) and vanilla ships 0 uses, so morph entries HAD to be
 dropped — but the morph IS the visible effect for 18 Oblivion meshes
 (ctrigtripwire01's wire snap, se01waitingroomwalls, obliviongate_forming,
-gnarlspawner…).  `_emulate_morphs` (fed by a harvest at the drop site in
-`_process_controller_manager`) bakes each animated morph target into a sibling
-copy of the shape (relative_targets → base verts + deltas) and CUTS from base
-to copy where the weight curve crosses 0.5.  A smooth crossfade degrades to a
-cut — the closest this engine gets.
+gnarlspawner…).  `emulate_morphs` (fed by a harvest at the drop site in
+`_process_controller_manager`) replays the morph as a **30 fps flipbook** (in-game
+confirmed 2026-09-24): for each sequence and shape it samples every target's
+weight curve at `FLIPBOOK_FPS`, blends base + Σ weight × delta
+(relative_targets; absolute targets become target − base), bakes each distinct
+pose into a sibling shape, and shows exactly one shape per frame.  The first
+version baked only the full target and cut at weight 0.5 — Oblivion blends
+smoothly (the tripwire morphs taut → snapped over its whole 0.67 s `Forward`),
+so the wire visibly jumped.
 
-**The cut is animated as wrapper-node SCALE, never as a NiVisController on the
-geometry.**  Each shape — the base and every baked target — is wrapped in its
-own `NiNode` (`"<shape> Swap"`), and the sequence drives that node's scale
-1 ↔ 0 through an ordinary `NiTransformController` entry bound to the manager's
-`NiMultiTargetTransformController`.  Clone wrappers rest at scale 0 (so the
-authored rest pose shows only the base shape) and the clone geometry itself
-ships VISIBLE; wrappers are added to the MTC's `extra_targets` and to the
-manager's `NiDefaultAVObjectPalette`.  Scale keys are `LINEAR` (1) floats with
-a hold key one frame (1/30 s) before each transition, which expresses the step
-without touching the bool-key machinery.
+**Frame reuse keeps the size sane.**  A frame within `FLIPBOOK_TOLERANCE`
+(1.0 game unit, ~1.4 cm, max over vertices) of the shape on screen keeps it,
+else reuses the closest kept shape, else becomes a new shape.  Fast motion keeps
+every frame (the tripwire moves ~7 units a frame: 20 shapes, 91 KB → 838 KB);
+slow motion shares shapes.  At 0.25 units `sigillighttowerbase` (two targets on
+independent 56.7 s curves) baked 1,152 shapes; at 1.0 it bakes 375 (11 KB →
+716 KB).  The heaviest are genuine motion: `obgatemini01` 129 shapes
+(194 KB → 5.2 MB), `rootgatedementia01` 306 (205 KB → 3.4 MB).  Each baked
+shape gets its normals bent by the change in smooth normals between base and
+pose (keeps authored hard edges) and its tangents rebuilt, so a bent shape is
+lit as bent.
 
-> ## 🛑 REVERTED 2026-08-10 — THE SCALE SWAP FREEZES THE GAME
->
-> **Everything described above and below about the wrapper-node SCALE swap is
-> the state of `90d04a3`, which is NOT what the tree currently builds.**
-> `_emulate_morphs` has been reverted to the pre-`90d04a3` **NiVisController**
-> implementation because the scale swap hard-freezes Skyrim.
->
-> ### The symptom
-> Walking onto the tripwire in **Natural Caverns / `ImperialDungeon05`**
-> (ref `00051AC9`, base `CGTrigTripwire01` `000CD4CC`) freezes the game: no
-> crash, no crash log, nothing in the Papyrus log — the process stays alive
-> and never renders another frame.  The **same mesh file** in **Vilverin**
-> (ref `0006BF50`, base `CTrigTripwire01` `0004CAD9`) works perfectly, wire
-> snap and all.  One `ctrigtripwire01.nif` serves both cells, so the mesh
-> alone cannot explain the difference — that contradiction was never resolved.
->
-> ### How it was isolated (in-game bisection, user-run)
-> Each removed in turn from `output/`, one at a time:
-> * long mace `ctrapswingmacelong01.nif` removed → **still froze**
-> * tripwire `ctrigtripwire01.nif` removed → **no freeze**
-> * tripwire restored, `ctrigtripwire01_behavior/` removed → **froze**
->   (so the animobject graph is innocent)
-> * tripwire rebuilt with `_emulate_morphs` disabled → **no freeze**
->
-> That last step is the definitive result: **morph emulation ON = freeze,
-> OFF = no freeze.**  The trap-damage `OnTrapHitStart` scripts were also
-> stripped and rebuilt separately — the freeze persisted, so the scripts are
-> innocent too.
->
-> ### Four fixes attempted, all failed in-game
-> 1. **Move the wrappers off the MTC** (own `NiTransformController` each) —
->    still froze, and the wire stopped breaking.
-> 2. **Give the entries full translation+rotation+scale key channels** —
->    still froze.
-> 3. **Replace scale with a shader-ALPHA cross-fade**
->    (`BSLightingShaderPropertyFloatController`, variable 12) — no freeze
->    reported, but the wire **did not visually break**, so it is not a fix.
-> 4. **Add a constant rotation key channel** so the entry reads `r=3 s=3`
->    like vanilla's `t=0 r=1 s=0` shape — still froze.
->
-> ### Verified facts — do NOT re-derive these
-> From the **GOG/AE** `SkyrimSE.exe` (the Steam copy is DRM-packed and
-> disassembles to garbage — `tools/disasm/skyrim_disasm.py` still defaults to the
-> Steam path, pass `--exe` explicitly):
-> * `NiMultiTargetTransformController`: interpolator slots at `+0x48`, sized
->   `count * 0x48`, allocated at `0xd0d857`; target pointers at `+0x50`,
->   `count * 8`, zero-filled at `0xd0d91f`; `num_extra_targets` is a **ushort**
->   at `+0x58`.  Both arrays are walked **strictly by index** (`0xd0ca20`,
->   bounded by `cmp bx, word ptr [rdi+0x58]`).
-> * Blend bookkeeping at `0xd0b640` walks `0x20`-byte `NiBlendInterpolator`
->   records, reading each slot's interpolator pointer and **priority byte** at
->   `+0x10` to track highest / second-highest contributor.
-> * `NiTransformInterpolator`: `+0x18` translation, `+0x24` rotation quat,
->   `+0x34` scale, `+0x38` data pointer.
-> * `NiTransformData`: `+0x10`/`+0x18` translation count/keys, `+0x20`/`+0x28`
->   rotation, `+0x30` scale keys, `+0x14`/`+0x24` key types.
-> * `NiControllerSequence`: controlled blocks are a 32-byte stride array at
->   `+0x20`, count at `+0x18`, with a priority-ordered insertion pass at
->   `0xd08890`.  Its constructor seeds float fields with `0xff7fffff`
->   (**-FLT_MAX**) at `0xd04549`–`0xd04589`, so that sentinel is
->   **engine-native and correct** — writing real values there is wrong.
->
-> Ruled out by measurement, all dead ends:
-> * MTC target **count** — vanilla `alduin.nif` ships **246** targets.
-> * Targets with **no driving block** — vanilla `fxnocturnalbirdl.nif` has
->   10 targets and 1 block, 9 of them NULL.
-> * Missing `NiBlendTransformInterpolator` blocks — vanilla ships **0**; the
->   engine allocates them at runtime.
-> * MTC identity / manager-chain shape — ours matches vanilla exactly (one
->   MTC in the chain, all blocks binding to it).
-> * Degenerate `scale = 0.0` — replacing it with `1e-4` did not help.
-> * Orphaned manager-chain `NiTransformController` — present **identically**
->   in the pre-`90d04a3` build that works, so it is not the cause.
-> * `-FLT_MAX` statics, node/child array consistency, palette registration,
->   scene-graph reachability, clone geometry flags, controlled-block
->   priorities, the two maces' NIFs and behaviour graphs (8 bodies + 7
->   constraints each, identical graph file sizes) — all verified equal.
->
-> ### The one lead never chased to a conclusion
-> The two placements differ in exactly two authored ways: `XSCL` (0.75 in
-> ImperialDungeon05 vs 0.71 in Vilverin) and the **persistent** record flag
-> (Vilverin's ref is `0x400` persistent, ImperialDungeon05's is not).  A
-> non-persistent ref whose 3D unloads/reloads while a sequence holds MTC
-> interpolator slots is the only mechanism found that is consistent with
-> "same file, different cell, freezes *sometimes*".  Untested.
->
-> ### What "reverted" means concretely
-> `_emulate_morphs` is the pre-`90d04a3` body (`git show 90d04a3^:asset_convert/nif/nif_converter.py`),
-> plus its `_init_blend_interpolator` helper which `90d04a3` had deleted.
-> Output for `ctrigtripwire01.nif` is block-for-block identical to that build
-> (the only delta is `BSBehaviorGraphExtraData`, added by a later, unrelated
-> commit).  **Consequence: the wire does not visibly snap.**  That is the
-> accepted trade — a cosmetic loss instead of a hard freeze.  The two tests
-> named below still assert the SCALE design and will fail against the
-> reverted code; fix them together with the real fix.
->
-> **When returning to this:** the scale swap itself is not obviously illegal,
-> and it demonstrably works in Vilverin.  Start from the persistence /
-> ref-scale difference above, not from the mesh — the mesh has been
-> exhaustively compared and is identical in both cells.
+**The shipped design, and why each part is there:**
 
-**Do NOT "restore" the NiVisController version.**  *(Superseded — see the
-revert notice above; the NiVisController version is what currently ships.)*
-The first implementation
-toggled `NiVisController` entries aimed at the NiTriShapes themselves; it
-produced NO visible swap in-game across three rounds of fixes, and the vanilla
-census explains why it was never trustworthy: sequence-driven NiVisController
-controlled blocks target **NiNode / NiBillboardNode / particle systems in
-1852/1852 cases and a NiTriShape in ZERO**.  Meanwhile transform entries on
-plain NiNodes carrying scale keys are routine (406 in a 130-file sample), and
-converted transform sequences are the one animation path already confirmed
-working in-game (CharacterGen's secret wall).  The scale swap therefore reuses
-only proven machinery and generates no `NiVisController` /
-`NiBlendBoolInterpolator` at all — which also retires both Vilverin CTDs below
-for this path.  Two tests in
-`tests/test_asset_convert.py::TestAnimationBlockLayout` pin it:
-`test_morph_emulation_never_targets_geometry` (no vis entries are synthesized)
-and `test_tripwire_morph_ships_a_scale_swap` (converts the real
-ctrigtripwire01 and asserts inverse scale curves, wrapper rest scales, MTC
-extra-target + palette registration, and zero surviving NiVisController).
+1. **Every swapped shape — the base and each baked target — sits under its own
+   identity `NiNode` named `"<shape> Swap"`**, and the sequence's
+   `NiVisController` entry targets that wrapper, never the geometry.  Census of
+   vanilla sequence-driven `NiVisController` entries: the target is a NiNode /
+   NiBillboardNode / particle system in **1852/1852** cases (1221 plain
+   NiNodes), a NiTriShape in **zero**.  Aiming the controller at the NiTriShape
+   (the version shipped until 2026-09-23) produced no visible swap in-game.
+   The controller itself is the vanilla pattern: flags 108 on the target
+   node's own controller chain, a `NiBlendBoolInterpolator`, and step-keyed
+   `NiBoolInterpolator` data in the sequence.
+2. **The clone gets its OWN shader property and texture set.**
+   `_copy_block_fields` copies reference fields as pointers, so the first cut
+   had both ropes wearing the same `BSLightingShaderProperty` (block 29).  The
+   engine keeps per-shape render state inside the shader property, so a shape
+   made visible mid-view drew through its hidden twin's state: it showed
+   **semi-transparent for as long as the player watched it and snapped solid
+   the moment it left the screen**.  Settled live on the Vilverin tripwire by
+   snapshotting the swap nodes, both geometries and their shader property while
+   semi-transparent and again after looking away: the only non-counter
+   differences were inside the ONE shader property both ropes pointed at
+   (`+0x98`/`+0xa8` pointer fields).  Every other converted shape already had
+   its own property.
+3. **The clone's wrapper rests hidden** — `apply_rest_visibility` sets the
+   hidden bit from the entry's t=0 key — while the clone geometry itself ships
+   visible.
 
-> **Note (2026-08-10):** the "406 scale-key transform entries in a 130-file
-> sample" claim above **does not reproduce**.  A 250-mesh re-census found 36
-> `NiTransformData` total, only 8 with scale keys, and every one of those is
-> on `skeleton.nif` at a constant `1.0` — vanilla never animates a node's
-> scale, and ZERO sequence entries are scale-only.  Vanilla makes geometry
-> appear/disappear mid-sequence with shader float controllers instead:
-> `BSEffectShaderPropertyFloatController` (25),
-> `BSLightingShaderPropertyFloatController` (17),
-> `BSNiAlphaPropertyTestRefController` (4); `NiTransformController` accounts
-> for 4 and none drive scale.  Treat the original census as unreliable.
+**Ruled out while finding the above (1.6.1170, do not re-derive):**
 
-Historical note — **the two CTDs the vis-swap path caused**, kept because
-`normalize_blend_interpolators` still repairs blocks COPIED from Oblivion:
+* A hidden node still runs its own controllers, so a vis controller CAN unhide
+  its own node: `NiNode::UpdateDownwardPass` (0xd1dad0) and
+  `UpdateSelectedDownwardPass` (0xd1dc80) run the controller chain before they
+  read the hidden bit, and the geometry update (0xd1c170) always recomputes
+  world transform and bound.
+* `NiVisController::Update` (0xdc5230) writes bit 0 of the target's flags
+  (`+0xF4`) and, only when it UNHIDES a node, ORs 0x1000 into the update data
+  passed down.  Setting NiAVObject `kIgnoreFade` (0x8000) on the wrappers and
+  geometry live changed nothing.
+* The live readback showed the switch itself was always right: the flags
+  flipped the frame the keys said, and a freshly loaded tripped wire drew
+  correctly.  Only the in-view draw was wrong.
+
+Live tooling that settled it: `tools/live/nif_live.py tree` prints each node's
+flags and hidden bit; a sequence clamped on its last frame caches its value,
+so forcing a re-evaluation means writing the `NiBoolInterpolator`'s cached
+value (`+0x18`) and last time (`+0x10`), with the keys at the data pointer
+(`+0x20`) as `{float time, byte value}` at an 8-byte stride.
+
+**The scale swap (commit 90d04a3) froze the game — do not bring scale back.**
+It animated the wrapper nodes' scale 1 ↔ 0 through the manager's
+`NiMultiTargetTransformController`.  Walking onto the Natural Caverns
+(`ImperialDungeon05`) tripwire hard-froze Skyrim — no crash, no log — while
+the same mesh worked in Vilverin; in-game bisection pinned it to morph
+emulation, and moving the wrappers off the MTC, full t/r/s channels, a
+constant rotation channel and scale 1e-4 all still froze.  The cause was never
+found.  The visibility swap on the same wrappers has run in Vilverin without a
+freeze; the Natural Caverns placement has not been retested.
+
+Bisection detail: long mace `ctrapswingmacelong01.nif` removed → still froze;
+tripwire NIF removed → no freeze; `ctrigtripwire01_behavior/` removed → froze;
+`_emulate_morphs` disabled → no freeze; the `OnTrapHitStart` scripts stripped →
+still froze.  A shader-ALPHA cross-fade (`BSLightingShaderPropertyFloatController`
+variable 12) did not freeze but showed no break.  The one unchased lead: the two
+placements differ only in `XSCL` (0.75 vs 0.71) and the persistent flag
+(Vilverin `0x400`, ImperialDungeon05 not).
+
+Ruled out for the freeze by measurement: MTC target count (vanilla `alduin.nif`
+ships 246), targets with no driving block (`fxnocturnalbirdl.nif`: 10 targets,
+1 block), missing `NiBlendTransformInterpolator` (vanilla ships 0; the engine
+allocates them), MTC identity/chain shape, scale 0.0 vs 1e-4, the orphaned
+manager-chain `NiTransformController` (identical in the working build),
+`-FLT_MAX` statics, palette registration, scene-graph reachability, clone
+flags, block priorities, and both maces' NIFs and graphs.  A 250-mesh vanilla
+census found 36 `NiTransformData`, 8 with scale keys, all on `skeleton.nif` at
+a constant 1.0 — vanilla never animates a node's scale; it hides geometry
+mid-sequence with `BSEffectShaderPropertyFloatController` (25),
+`BSLightingShaderPropertyFloatController` (17) and
+`BSNiAlphaPropertyTestRefController` (4).
+
+Verified exe layouts from that hunt (GOG/AE exe):
+`NiMultiTargetTransformController` interpolator slots `+0x48` (`count * 0x48`,
+allocated at 0xd0d857), target pointers `+0x50` (`count * 8`, zero-filled at
+0xd0d91f), `num_extra_targets` a ushort at `+0x58`, both walked strictly by
+index (0xd0ca20); blend bookkeeping (0xd0b640) walks 0x20-byte records with the
+priority byte at `+0x10`; `NiTransformInterpolator` `+0x18` translation, `+0x24`
+rotation, `+0x34` scale, `+0x38` data; `NiTransformData` `+0x10/+0x18`
+translation count/keys, `+0x20/+0x28` rotation, `+0x30` scale keys,
+`+0x14/+0x24` key types; `NiControllerSequence` controlled blocks at a 32-byte
+stride from `+0x20`, count `+0x18`, priority insertion at 0xd08890, and its
+constructor seeds `-FLT_MAX` (0xd04549–0xd04589), so that sentinel is
+engine-native.
+
+**Vanilla's own tripwire is not a model for this.** `traptripwire01.nif` has
+no sequence and no swap: it is two `bhkBallSocketConstraintChain` ropes of
+dynamic bodies hung from fixed pegs, never joined to each other, which its
+`Tripwire` script (extends `TrapTriggerBase`) holds with `SetMotionType` and
+releases on trigger.  Oblivion's wire snap is a shape blend with no physics,
+so a swap is the faithful conversion.
+
+**The two CTDs the first vis-swap path caused** — both apply to the current
+swap and to blocks COPIED from Oblivion, which `normalize_blend_interpolators`
+repairs:
 
 1. **NiBoolData keys must be `CONST_KEY` (5), never `LINEAR` (1).**  Writing 1
    CTD'd on entering Vilverin — an access violation at `0x0` inside
@@ -412,8 +388,8 @@ Historical note — **the two CTDs the vis-swap path caused**, kept because
    `tools/validate/nif_block_type_audit.py`.
 2. The Manager-Controlled flag defect below, which the same crash hunt found.
 
-Both still apply to any NiBoolData / blend interpolator the converter copies
-through; they are simply no longer reachable from morph emulation.
+Both apply to every NiBoolData / blend interpolator the converter synthesizes
+or copies through, morph emulation included.
 
 ### NiBlendInterpolator must be Manager Controlled (2026-08-02)
 
@@ -476,7 +452,22 @@ attaching one to an Open/Close door CTDs it on cell load — so the rewritten ke
 matched nothing and was dropped.  Creature/actor sounds still correctly use
 `SoundPlay.` because they DO go through a graph (`hkx_behavior.py`).
 
-`_convert_sound_text_keys` is therefore a documented no-op returning 0.
+Doors keep their keys verbatim.  Meshes that get an animated-object behaviour
+graph have `sound: X` rewritten to `SoundPlay.TES4_X_SNDR` by
+`nif_passes.graph_sound_text_keys` (confirmed in-game 2026-09-24 on the
+tripwire): a vanilla census found `SoundPlay.` on 36 graph-driven meshes and 1
+graphless one, and `Sound:` on 114 graphless meshes and **zero** graph-driven
+ones — and the graph-driven Oblivion tripwire was silent with its `sound:` key
+intact.
+
+**The rewrite alone is still silent: the graph must declare a bare `SoundPlay`
+event.**  Every vanilla object graph behind a `SoundPlay.` key declares it
+(SarcophagusTopOpen, FarmhouseWindMill, BeeHive, IdlePlayIdle, IdlePlayIdle3;
+all event flags 0) and none declares the per-sound names, so the key raises the
+`SoundPlay` event with the SNDR name as its payload.  `hkx_animobject.
+behavior_xml` appends `SOUND_EVENT` after the sequence events (their ids stay
+unchanged).  Vanilla's shared `GenericBehaviors\Autoplay.hkx` does NOT declare
+it, so meshes on that graph keep their `sound:` keys unrewritten.
 
 ### DOOR sound records: SNAM/ANAM must name an SNDR (2026-08-05)
 
@@ -518,6 +509,68 @@ wins — which also matches Oblivion's own queue-depth-1 PlayGroup semantics).
 - **EVERY `NiTimeController` needs "Compute Scaled Time" (flags bit 6, 0x40) or a `PlayAnimation()`d sequence NEVER MOVES — the CharacterGen secret-wall fix (2026-07-26, `_fix_controller_flags`)**: `nif.xml` `TimeControllerFlags` declares bit 6 `default="true"`, and Oblivion's engine computed scaled time unconditionally without ever writing the bit — every controller in the Chargen secret-wall/switch NIFs stores 12 / 40 / 44, always 0x40 **clear**. Skyrim reads the flag: the sequence binds its targets, `ObjectReference.PlayAnimation("Forward")` returns success and logs **no Papyrus error**, but scaled time never advances so the object sits on frame 0 forever. Symptom was maximally misleading — the quest stage said the wall had opened (the switch fired, `secretDoor` flipped 0→1, the timer ran; all visible in the `TES4CharGen` user log) while the wall physically stayed shut. Census: across 62 vanilla animated door/activator meshes (Windhelm animated secret doors, Nordic animated doors, Dwemer doors, Labyrinthian panel, Winterhold anim door) **157/157 `NiMultiTargetTransformController` have flags=108 (0x6C)** and every other controller — `NiTransformController`, `NiControllerManager`, `NiVisController`, `NiFloatExtraDataController` — has **76 (0x4C)**; both set 0x40, and 108 vs our 44 differs *only* in this bit. Fix ORs 0x40 into every `NiTimeController` in the tree before the version upgrade, so activators/doors/traps/levers are all covered. This generalizes the emitter-controller rule below (which had it only for `NiPSysEmitterCtlr`/`NiPSysUpdateCtlr`) and the `0x48` already hardcoded on the flip-book `BSEffectShaderPropertyFloatController`.
   - **Things that were NOT the cause** (all verified fine, don't re-investigate): the Papyrus conversion (`PlayGroup` correctly routed to `PlayAnimation` via base-signature lookup); the dropped `prisonSecretWall01`/`... NonAccum` controlled blocks (genuinely empty — `data=None`, zero translation — the real motion is on the `bed`/`wall` transform tracks, which survive with all 111/21 keys); the missing `NiStringPalette` (correct — Skyrim uses direct strings); sequence names `Forward`/`Backward` (vanilla `VolunruudLeftDoor`/`RightDoor` use exactly these); and the absent ACTI `PNAM`/`FNAM` (marker color + flags, cosmetic — 1739/1753 vanilla write FNAM=0).
   - **CORRECTION (2026-07-26): the "needs no BGED" claim previously recorded here was WRONG.** The earlier note reasoned that because 227 ACTI + 196 DOOR vanilla records ship `NiControllerManager` meshes, the in-NIF sequence was sufficient. That census is real but does not support the conclusion: `ObjectReference` exposes **two different animation paths** — `PlayGamebryoAnimation` drives an in-NIF `NiControllerSequence`, while **`PlayAnimation`/`PlayAnimationAndWait` drive the BEHAVIOUR GRAPH and require an animation graph manager**, which exists only when the root carries a `BSBehaviorGraphExtraData` naming an hkx project. `PlayGroup` converts to `PlayAnimation`, so without a BGED the call is accepted, returns immediately, logs no Papyrus error, and nothing moves. Fixed by generating the graph (below).
+
+### Morrowind objects: the timeline cut into sequences (in-game confirmed 2026-10-01)
+<a id="morrowind-object-animation"></a>
+
+**Code:** `asset_convert/nif/object_anim_morrowind.py` (`animate_timeline`, `drop_unplayed_keyframes`), called from `animate_objects` in `nif_converter_morrowind.py`; the timeline reading is shared with the creature split in `asset_convert/nif/timeline_morrowind.py`.
+
+Every animated Morrowind object shipped static, because the conversion lost all three things its animation is made of:
+
+- **The keys.** A 4.0.0.2 `NiKeyframeController` holds them in a `Data` field (`NiKeyframeData`) that nif.xml declares `until="10.1.0.103"`. At 20.2.0.7 the keys live only on an interpolator, so the version stamp silently wrote every controller empty: `TR_act_nec_uc_orb_01` shipped `interp=None data=None`. Measured before the fix: 897 Tamriel Data and 289 Morrowind.esm meshes carried such shells; vanilla carries the type in 0 of 17,216 meshes.
+- **The morphs.** `_strip_dead_geometry_controllers` deletes every `NiGeomMorpherController`; `emulate_morphs` only rebuilds one it finds inside a sequence, and a Morrowind mesh has no sequence. 392 of 392 in a 400-mesh sample were lost.
+- **The group markers.** The root's `NiTextKeyExtraData` (`Idle: Start`, `Idle2: Loop Stop`...) was not carried across the BSFadeNode swap. 391 of 391 lost.
+
+**When Morrowind plays an object** (OpenMW `mwrender/objects.cpp`, `nifosg/nifloader.cpp`): a controller under a `NiBSAnimationNode` with flag `0x20` (AutoPlay) runs on frame time forever, on any object. Text-key groups play only for the `useAnim()` classes (Activator, Container, Door, Light), and only when `x<model>.kf` sits beside the model: `correctActorModelPath` swaps to the x-pair, and the object then loops `idle`. Everything else is static. Census of 394 x-pairs: 331 plain meshes carry the same groups as their `.kf` and 329 carry the key data, so the plain mesh the record names is converted on its own.
+
+**What the pass builds**, before the version upgrade so the keys and the AutoPlay flag still exist: one `NiControllerManager` per root with one sequence per group, in the shape an Oblivion mesh arrives in, so the existing chain runs untouched (morph harvest and flipbook, `Idle` -> AutoPlay/AutoLoop, the shared `Autoplay.hkx` graph). Each group is **re-timed from 0 and sampled at 30 fps**: across 1,515 sequences in 400 vanilla meshes, none starts after 0 and no file shares an interpolator between sequences, so a sequence cannot be a window into one long track. A looping group (one with a `Loop Start` key, or one OpenMW's `isLoopingAnimation` always loops: `idle`..`idle9`, the movement groups) ships its loop segment as a LOOP sequence, plus `<Group> Intro` (Start..Loop Start) and `<Group> Outro` (Loop Stop..Stop) as CLAMP sequences where they have length; the runtime plays lead-in, loop, then lead-out, as OpenMW does. `Idle Intro` becomes the `AutoPlay` the shared graph starts on (`autoplay_ambient_sequences`), so an idle's lead-in plays once before `AutoLoop`. Every other group plays Start..Stop once and holds. Keyframe controllers nothing plays are unlinked. Gated on the fixture records (`mesh_is_fixture`), so a head or body part is never touched; doors keep their synthesized swing.
+
+Result after the rebuild: 0 empty keyframe controllers in either output; Tamriel Data meshes with a manager went from 155 (doors) to 502. Banners and shop signs carry a zero-length `Idle` and move only through `PlayGroup Idle2` / `LoopGroup Idle3` from their scripts (`OutsideBanner`), played by MorrowindRuntime ([morrowind_runtime.md](morrowind_runtime.md#object-animation); confirmed blowing in game). The lead-in/lead-out split gave 183 Tamriel Data meshes 222 intros and 222 outros, mostly banner `Idle3`s. Not carried: `Sound:` cues inside a group; an AutoPlay node inside a keyed mesh (keyed groups win; 1 mesh in a 3,146-mesh sample).
+
+### Morrowind NPC animation files: seated, sleeping and dancing NPCs (2026-10-07, PENDING in-game confirmation)
+<a id="morrowind-npc-animation-files"></a>
+
+**Code:** `asset_convert/havok/npc_anim_morrowind.py` (clips, manifest, runtime table), `npc_graph_morrowind.py` (graph), `creature_pipeline.humanoid_appends`; the export fields are `MorrowindAnim` on NPC_ and `MorrowindIdle` on a wander PACK (`tes4_export/record_types/morrowind_actors.py`, `morrowind_packages.py`).
+
+Morrowind has no furniture. An NPC that sits is authored with its own animation file (NPC_ `MODL`, whose `x<name>.kf` overrides groups of the shared base animation) and a wander package whose eight idle chances pick the override: `ANFTaverneNpc03` names `Arktwend\Ani\SitzGespräch.nif`, whose kf holds one 61.9 s `Idle9` group, with chances `0,0,0,0,0,0,0,100`. Both were lost: the exporter wrote `MODL` for creatures only and dropped the chances after parsing them. Census of Arktwend: 41 animation files on 139 NPCs; 57 wander packages are exactly "always idle9".
+
+**What is converted.** For each named file with an `x<name>.kf`, the groups `idle` and `idle2`..`idle9` (the default pose and what a wander package plays), each over its whole Start..Stop span as one looping clip; a group whose Stop is its Start (am_fishman's `Idle`) is a held pose and ships as one frame's worth. A file that defines `walkforward` is a whole base animation set, not a pose file, and is skipped (`base_animkna.nif` on 17 NPCs). A plugin's masters are read too, so a dependent's graph carries its master's clips. Arktwend: 37 files with a kf, 58 clips, 23 s.
+
+**Retarget.** `clip_retarget` with the Oblivion bone map (the `Bip01` names are shared) and `best_animation_pose_morrowind.json`. Those deltas were mined against the T-posed BIND skeleton (`skeleton_bones_morrowind.json`), so that is the source's reference pose, not `base_anim.nif`'s rest: with the rest pose the seated clip's right hand landed at (45.8, 12.2, 89.3) against the source's (20.1, -2.5, 55.2), arms out; with the bind pose (20.7, 10.0, 51.0). The rig gets a `Bip01 NonAccum` child as the creature split does, so the body height rides on `NPC COM`: the seated pelvis drops 28 units on both skeletons and the feet stay on the floor.
+
+**Graph.** `0_master`'s root machine gains one state holding a machine with a looping clip per group, each entered by its own `TES3Anim_<slug>_<group>` event on a `LOCAL|GLOBAL` wildcard, left on `IdleStop` or `TES3AnimStop`. That is the shape of vanilla's `Cart_State` (state 21: a machine of full-body clips whose `IdleCartPrisonerCIdle` wildcards carry the same flags, left on `CartExit`) and of state 122 `IdleDLC2TentacleWarpBook` (left on `IdleStop`). Clips are registered in both third-person character files and animation cache projects through `humanoid_graph.register_clips`, shared with the gun clips.
+
+🛑 **This and the FO3/FNV gun patch both ship `0_master.hkx` and the two character files, each patched from vanilla.** Installed together, one mod's copy overrides the other's and the loser's clips are unregistered. Not solved.
+
+**Switched off (2026-10-10): `creature_pipeline.NPC_ANIMS = False`.** A rebuild deletes the clips, the three patched humanoid files and the runtime table (`npc_graph_morrowind.remove_npc_graphs`). Reasons, measured in Arktwend: the retarget drops a drop authored on `Bip01 Pelvis` (fishman pelvis at 68.9 against the source's 11.9; 9 files lift 12-61 units), travelling idles move only the body (up to 991 units from the actor), every distance-0 wander became a 512-unit Sandbox, and the runtime's TranslateTo hold fights the character controller. Most of these NPCs have a vanilla equivalent instead. Stick-figure renders of each source clip beside the vanilla clip (LE `Skyrim - Animations.bsa`, `hkxcmd EXPORTKF`) matched:
+
+| Arktwend file (NPCs) | Vanilla | Fit |
+|---|---|---|
+| `SitzGespräch` (19), `SitzDrohen` (20), `anim_sit` (2) | `chair_idlebasevar1` (furniture: `InvisibleChairMarker`) | seated, pelvis ~48 both |
+| `AM_Eater` (9) | `animobjectchaireatingidlebase` (chair) | seated eating |
+| `AM_Fishman` (8) | `idlesitledge` (`SitLedgeMarker`) | exact: pelvis at the origin, legs hanging below it |
+| `AM_Beggar` (3), `AM_DreamerA` (2) | `idlesit_crosslegged` (`SitCrossLeggedMarker`) | ground sit; source knees up, vanilla cross-legged |
+| `Schlafen*`, `LiegenM_BR` | `idlelaydown` (`LayDownMarker`) or `bed_leftsleep` (a bed; lies ~50 up) | lying |
+| `PrayerDF` (1) idle8 / idle9 | `idlepray` / `idlepraycrouched_loop` (`PrayCrouchedMarker`; not `idlekneelidle`) | match |
+| `Bar`, `Bar2` (4) | `animobjectdrinkingidlebase` (standing drink; not the counter lean) | hand to mouth, standing |
+| `Miner` (1), `AM_Smith` (3), `AM_Sweeping` (1), `AM_Reader1` (2), `AM_Cough` (1) | `idlepickaxe_wall`, `hammer_table`, `animobjectsweepingidlebase`, `idlebook_read`, `nurelion_uncontrollable cough` | match |
+| `Farmer`, `Farmer2` (2) | `idlepickup_ground` | close: bend to the ground; not `idlehoe` |
+| `AM_LutePlaying` (2) | none: vanilla's lute is standing | no |
+
+Not compared: `AM_Alchemist`, `Camonna`, `SitzenBein`, `Hechtrolle`, and the travelling dances (`TanzDynamic`, `Trinken0x2`, `SexGehen`, `TanzSexlo`, `Hüpfen`, `TanzSexfnb`, `RocknRoll`, `DancingGirl`, `Aliroman`), which have no vanilla counterpart but Cicero's. The seated, lying, kneeling, counter and mining idles are furniture idles (parent `ActivateRootChar`→`Chair`, conditions `IsFurnitureAnimType`/`GetSitting`), so they play only for an actor in furniture, never through `SetVehicle` + `PlayIdle`; vanilla's carriage scripts pair `SetVehicle` with the cart idles alone.
+
+### Vanilla markers for NPC animation files (2026-10-10, PENDING in-game confirmation)
+<a id="vanilla-markers-for-npc-animation-files"></a>
+
+**Code:** `tes5_import/record_types/npc_markers_morrowind.py`, `packages/converter._pick_wander`, the `NAME.Final`/`XLKR` hooks in `record_types/world.py`.
+
+What replaces the converted clips above: the engine's own furniture and idle markers, the way vanilla seats a named NPC. A census of Skyrim.esm's package instances: `SitTarget` aims at furniture (276 instances, among them `WallLeanMarker`, `SitCrossLeggedMarker`, `KneelingMarker`, `InvisibleChairMarkerF`, `Wounded0xFloorMarker`, beds), `UseIdleMarker` at idle markers (60: `PrayerIdleMarker`, `SweepIdleMarker`, `BookReadingIdleMarker`, `TavernDrinkingMarker`, `PlayLuteMarker`), and both also aim at the actor's linked reference (PTDA type 3; 14 and 7 instances). So each own placement of an NPC whose file has a match gets that marker as a new reference (FormID derived from the placement), the placement links to it (`XLKR`, no keyword), and the NPC's wander package, when every NPC sharing it maps to the same kind, becomes `SitTarget`/`UseIdleMarker` on the linked reference. Three idle markers vanilla lacks are minted from vanilla idles: dancing (`IdleCiceroDance1-3`), coughing (`IdleUncontrollableCough`), ground pickup (`IdlePickup_Ground`).
+
+**Placement.** Every furniture model used puts the actor's root at the reference's origin facing its heading (`BSFurnitureMarker` offset 0, heading 0; the invisible chair's node sits 34 up at the seat, the root stays at the floor). Per file, the table carries the turn that lines up the body axis (mean knee minus head) and the offset that puts the vanilla clip's mean pelvis on the source clip's, measured from the clips (`hkxcmd EXPORTKF` of the LE clips beside the source kf). Chairs: 3-4 degrees, pelvis 9-14 units higher; `SitzenBein` 78 degrees; standing poses (miner, smith) take 0 degrees, their axis being too short to measure.
+
+**The markers join the cell AFTER the navmesh pass** (`flush_npc_markers`), so no navmesh input or cache key changes.
+
+Left on Skyrim's default idles: `AM_Alchemist` (the vanilla alchemy idles need the visible workbench), `Camonna` (standing fidgets), `Hechtrolle` (vanilla's roll is a sneak movement clip, not an idle), and files with no kf (`Klaps01`, `Leigen02a`, `Sitzen`).
 
 ## Animated-object behaviour graphs (`asset_convert/havok/hkx_animobject.py`)
 <a id="animated-object-behaviour-graphs"></a>
@@ -602,8 +655,10 @@ before rebuilding):
    transform). Live: Bip01 → identity, NonAccum → (−0.34,−1.64,~64) at 82.5°,
    crowd at the authored pose, looping.
 
-Ruled out along the way, do not retry: STAT→MSTT promotion (crashed on save
-load — 94 vanilla STATs carry a BGED, the record type is not the gate);
+Ruled out along the way, do not retry: promoting every BGED-bearing STAT to
+MSTT (crashed on save load, and 94 vanilla STATs carry a BGED, so the record
+type is not the animation gate; retyping itself is save-safe, see
+[STAT → MSTT](asset_convert_collision.md#stat-simulated-mstt));
 `selfTransitionMode` FORCE_TRANSITION_TO_START_STATE (looping is the
 sequence's); a generated per-mesh graph instead of the shared one (works, but
 the shared one is what vanilla ships and what is verified live).
@@ -640,6 +695,20 @@ Every one was invisible to structural inspection **and to NifSkope, which render
 - **`hkbCharacterData`'s field list is not what the name suggests** — copy `clutter\beehive\characters\Character00.hkx`: `characterControllerInfo, modelUpMS, modelForwardMS, modelRightMS, characterPropertyInfos, numBonesPerLod, characterPropertyValues (this is where the hkbVariableValueSet hangs), footIkDriverInfo (null POINTER, not an array), handIkDriverInfo (null), stringData, mirroredSkeletonInfo, scale`. There is **no `variableInitialValues` and no `aiControlDriverInfo`**. Getting it wrong made hkxcmd silently drop the `hkbVariableValueSet` — detectable by diffing the packfile's `__classnames__` string table against vanilla's, which is a fast sanity check for any generated hkx.
 - Vanilla lays these files out in the mesh's OWN folder (`clutter\beehive\{behaviors,characters,characterassets}\`), not a `<stem>_behavior\` subfolder; ours nests them so two animated NIFs in one directory cannot collide on `Character01.hkx`. Both work — the paths inside the character file resolve relative to the project file's folder. Our project hkx is byte-identical to vanilla's (880 bytes).
 - Final step is `convert_hkx_to_amd64` on every file: SSE loads only 64-bit packfiles (verified pointer-size byte 8 on all 161×4 outputs).
+
+## <a id="cyclic-blend-no-ease"></a>BSCyclicBlendTransitionGenerator does not ease Direction changes
+
+`BSCyclicBlendTransitionGenerator::update` (1.6.1170 `0xb97260`) copies
+`fBlendParameter` (+0x78, bound to `Direction`) straight into the child blender's
+`blendParameter` (+0x4c) every frame unless frozen. Its `fTransitionDuration` and
+`BLEND_CURVE_SMOOTH` cross-blend run only after the `CyclicCrossBlend` event; no
+vanilla graph sends it, and the only engine sender (around `0x696720`) branches on
+an event state value, not on a direction change. The engine's `Direction` steps in
+hard 1/8s on a key change, so vanilla direction blends switch instantly too, and
+raising `fTransitionDuration` changes nothing (0.5 s measured: no effect in game).
+A strafe or direction snap is therefore not fixed by that generator; look at what
+differs between the directional clips, or the skeleton against the render camera.
+`DirectionDamped` exists as a graph variable but no vanilla graph binds it.
 
 ## Accum-bone bind pose leaks into every clip (user patches, 2026-08-30)
 <a id="accum-bind-pose-leak"></a>
