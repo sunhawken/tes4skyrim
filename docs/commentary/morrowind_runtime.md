@@ -2677,6 +2677,17 @@ tick or this one) become that glide's goal instead. Scripts close a
 +2/−4/+2 degrees and then runs `SetAngle, y, GetStartingAngle, y` — and the
 native there faded the sign out and back in once per loop. Confirmed in-game.
 
+A chain that ends is set once more with the natives so collision follows
+(`SettleGlides`), and that set fades the 3D too. It waits until **two** ticks
+pass unfed, not one: when a sign's swings net to zero, the reset `SetAngle`
+asks for the angle the chain already holds and is skipped, so that tick feeds
+nothing. With a one-tick wait every sign faded once per cycle again
+(headless, Balmora, 1,500 ticks: 391 settles across 11 `SignRotate` signs,
+39 on the Mages' Guild sign; with two ticks, 1 in all, a sign once just
+after it loaded). Arktwend's harbor gate pole still settles where its rise
+ends, and the player walks through it. The settle log line is
+`move: <id> glide settled` under `TESRUNTIME_VERBOSE`.
+
 ### <a id="ai-packages-are-real-packages"></a>The AI commands are real Skyrim packages
 
 **Code:** `tes5_import/dialogue/ai_packages_morrowind.py`,
@@ -5305,6 +5316,18 @@ spell of that type in the list (OpenMW's own read), else an active effect from o
 dialogue functions `PcCommonDisease` / `PcBlightDisease` answer the same hook, and
 `PcCorprus` asks `GetEffect`'s hook for effect 132 (TES3's name: "Corpus"); before, all three
 answered a constant 0. Old `SPEL.txt` files without the field read as type -1.
+
+<a id="cures-purge-by-class"></a>**A cure takes a base-list disease off too.**
+`ApplyCure` (`game_calls_spell.cpp`) purges every staged spell of the cured
+class from the actor, as OpenMW's spelleffects.cpp does. Skyrim's
+`Actor.RemoveSpell` reaches only spells added at runtime, so a disease in an
+NPC's BASE spell list stayed, `HoldsSpell` kept answering yes, and
+`GetCommonDisease` never fell to 0. A script's `RemoveSpell` already records
+such a removal (`spell|removed`); the cure's purge did not. Assantus Hansar
+(Droops in his base list, `assantusScript` waiting on `GetCommonDisease == 0`)
+stayed diseased after Cure Common Disease on Other hit him:
+tt_ministry_cure 0/2. The purge now records the removal for a spell the actor
+holds; both runs that started then passed.
 
 Reading the list brought one catch: Skyrim's `Actor.RemoveSpell` only takes off spells added
 at runtime, never one from the actor's BASE list, and `HasSpell` still sees that one. OpenMW's

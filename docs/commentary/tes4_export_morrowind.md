@@ -153,16 +153,25 @@ character replaced by a letter.
 
 | Char | `_` | space | `,` | `'` | `:` | `-` | `.` |
 |---|---|---|---|---|---|---|---|
-| Code | `U` | `S` | `V` | `A` | `X` | `D` | `P` |
+| Code | `U` | `S` | `V` | `A` | `X` | `T` | `P` |
 
 `ex_redoran_hut_01` becomes `0exUredoranUhutU01`;
 `Sadrith Mora, Volmyni Dral's House` becomes
-`0SadrithSMoraVSVolmyniSDralAsSHouse`.
+`0SadrithSMoraVSVolmyniSDralAsSHouse`;
+`bonemold_armun-an_helm` becomes `0bonemoldUarmunTanUhelm`.
 
 Measured **96.2% exact agreement** (8,662/9,002) with the shipped plugin across
 13 base types and all three masters. The 340 differences are objects
 Morroblivion authored itself (`NOSIT`, `Static`, `PNIF` variants), not encoding
 failures.
+
+`-` is `T`. It was written `D`, which Morroblivion never uses: of Morrowind's
+413 hyphenated ids, 336 exist in Morroblivion under `T` and none under `D` (the
+other 77, like `ex_de_scaffold_01-3`, are not in Morroblivion at all). Every
+hyphenated id therefore failed to pair: the compatibility patch filled 328 of
+them (267 NPCs) with duplicates of Morroblivion's own records, and hybrid mode
+never offered them for review (the Armun-An bonemold helm). Fixing it removed
+those patch records, so Morroblivion-mode saves referencing them broke once.
 
 The escape is used in ONE direction only. Decoding back is ambiguous, because
 `A`/`S`/`U`/`V`/`X` are themselves legal ID characters — build the index by
@@ -605,7 +614,9 @@ FormID with the union bounds, which the importer applies as an override.
 Morrowind source in the GUI): `vanilla` borrows from the declared masters;
 `morroblivion` puts every converted `Morrowind_ob*` export first and drops the
 three vanilla ESMs from the list, so a mod shares Morroblivion's objects
-instead of shipping a second copy of every static. Choosing Morroblivion in
+instead of shipping a second copy of every static; `hybrid` borrows as
+`vanilla` does and swaps in Morroblivion's reviewed meshes
+([hybrid mode](#hybrid-mode)). Choosing Morroblivion in
 the GUI builds the [gap patch](#morroblivion-gap-patch) when it is missing,
 and asks whether to rebuild it when it exists; the mode refuses every
 conversion without the patch, so the two are one choice. Morroblivion's cells and
@@ -723,6 +734,189 @@ The value travels as `Model.OriginShift` on the base record; the importer
 subtracts it from every placed reference through the same `_BASE_ORIGIN_SHIFT`
 path the furniture re-origin uses, which already handles scale and rotation
 (see [asset_convert_nif.md](asset_convert_nif.md#master-owned-furniture)).
+
+## <a id="hybrid-mode"></a>Hybrid mode: authored Morrowind wearing Morroblivion's reviewed meshes
+
+**Code:** `tes4_export/morroblivion_hybrid.py`; the whitelist
+`tes4_export/morroblivion_whitelist.json`; the companion plugin
+`tes4_export/morroblivion_companion.py`.
+
+`morrowindSource = hybrid` keeps the authored path: the plugin's own records,
+its own masters, MorrowindRuntime, the Morrowind dialogue menu. Only models
+and textures change, and only where Morroblivion's is a real improvement. Most
+Morroblivion meshes are vanilla's re-exported with broken collision, so no
+mesh swaps by default.
+
+- **World models** swap when the reviewed whitelist approves the pair, keyed on
+  the vanilla mesh path. The pairs come from the same record pairing as
+  [Morroblivion meshes](#morroblivion-meshes); every candidate was reviewed by
+  eye, side by side, textured.
+- **Furniture always swaps**: a record-paired replacement carrying
+  `BSFurnitureMarker` is taken without review, for its markers.
+- **Wearables swap as a whole.** The whitelist approves Morroblivion's worn
+  model; the item then takes Morroblivion's worn AND ground models (ground
+  models were never reviewed apart). A left or right piece pairs through the
+  right's id, as [split pairs](#split-pairs) do, and wears its half of the
+  two-handed item (`split_models`). Outside the three vanilla ESMs an item swaps
+  only when its body parts are the vanilla record's of the same id.
+- A swapped model's references take Morroblivion's measured pitch and Z
+  corrections and the [origin shift](#morroblivion-origin-shift), as in
+  Morroblivion mode, including references to a master's swapped bases.
+- **Assets ship with the plugin.** Each swapped mesh and every texture it names
+  (with `_n`/`_g` maps) is copied into the plugin's own asset tree, unless a
+  master's tree already holds it, so the mode never needs Morroblivion's output
+  installed. The copies are listed in `morroblivion_hybrid_assets.txt` and
+  deleted by the next export in any mode.
+- **Textures use the [one map](asset_convert_texture.md#one-map)**, which a
+  hybrid export proves itself when it is missing or stale (the patch is never
+  needed) and ships the twins, each with its `_n`/`_g` maps (`with_maps`): the
+  mesh converter derives a shape's normal from its diffuse and falls back to
+  the flat `default_n.dds` when none is shipped. Copying only the diffuse left
+  1,366 of the 1,576 twins Morroblivion ships a normal for rendering flat. Outside the vanilla ESMs a texture the plugin
+  ships itself, and that differs from vanilla's file, is listed in
+  `morroblivion_textures_keep.txt` and never swaps.
+- <a id="hybrid-ground"></a>**Land textures** match by Morroblivion's own
+  renaming rule: `Tx_sand_01` is Morroblivion's `TxUsandU01`. Each LTEX whose
+  renamed stem names a Morroblivion LTEX takes that record's ICON, and the
+  texture with its `_n` map ships under `textures\landscape\`. The mesh map
+  never reaches land: an LTEX is not a mesh, so `substitute` never sees it.
+  Morrowind matches 106 of its 107 (all but `tx_lavacrust00`); 25 of the
+  twins list grass.
+  **Morroblivion repainted the landmass, so a vanilla plugin's LAND takes
+  Morroblivion's layers verbatim** wherever Morroblivion has land on the same
+  grid of its `WrldMorrowind` (`morroblivion_ground.py`). Only textures
+  change; heights and normals stay Morrowind's. Seyda Neen showed why: in
+  Morrowind's own land moss is the dominant texture of every quadrant, so it
+  became the BASE layer and, by the planting rule in
+  [groundcover-density](#groundcover-density) (full density wherever a
+  texture shows; base = 1 - sum of alphas), grew grass on 62% of cell
+  (-3,-18)'s vertices. Morroblivion paints dirt or mud as base there and
+  moss over it: 30%. Its towns also use Oblivion's `...NoGrass` textures.
+  A Morroblivion texture with no own LTEX takes a master's paired one, else
+  a new LTEX keyed by Morroblivion's EditorID.
+  **Grass follows the Morroblivion record painted on the same vertices**, not
+  the texture file: Morroblivion has two records on some files (West Gash
+  `mwWGScrubPlainTex` lists 6 grasses, `mwComScrubPlainTex` none). Each own
+  LTEX pairs with the same-file record most often dominant on the vertices
+  where it is dominant in the vanilla land; else the pair Morrowind.esm
+  recorded for its same EditorID; else the file's only record. A texture
+  with none of these gets no grass. Pairs go to
+  `morroblivion_ground.txt` beside the records, where the companion reads
+  them.
+- The worn-armor assembler writes only models under `armor\morrowind\`, so a
+  swapped worn model is never overwritten by the vanilla assembly.
+
+Any Morrowind-format plugin may use it, masterless ones included: Arktwend
+takes Morroblivion's meshes wherever it names a vanilla mesh it does not ship.
+
+```bash
+python convert.py -f Morrowind.esm Tribunal.esm Bloodmoon.esm --morrowind-source hybrid
+python convert.py -f Arktwend_English.esm --morrowind-source hybrid
+```
+
+### <a id="hybrid-placement-check"></a>Checking where whitelisted meshes sit
+
+**Tool:** `tools/audit/hybrid_placement_check.py`. Morroblivion's own placement
+of a reference is where its mesh was authored to sit, so every hybrid
+reference to a whitelisted world mesh is paired with Morroblivion's (same
+cell, nearest horizontally, the placement audit's pairing) and the height,
+after the origin shift times scale, and rotation are compared per mesh.
+
+First run (whitelist after round 3): 394 approved world meshes, 274 placed by
+both, **35 off**. It reports the overhangs 03 and 07 at +150 and +87 units
+(the user saw 04 hovering in game), the Dwemer ruins 50/60 at +317/+216, the
+Dwemer scopes at +256/+116/-100, skull-on-a-stick at +57 (514 refs), the lava
+planes at -25, Dwemer stools turned about 87 degrees, and 1 to 5 unit offsets
+on sacks, urns and pitchers. The corrections the hybrid applies come only from
+the placement audit's applied rows (80% agreement), and the origin shift
+measures mesh bottoms, which cannot place a mesh hung from above.
+
+### <a id="hybrid-companion"></a>The companion plugin: furniture and grass
+
+**Code:** `tes4_export/morroblivion_companion.py`; `export_companion` runs at the
+end of a Morrowind-format plugin's Export step, `_import_companion` (calling
+`import_companion`) at the end of its Import step (`convert.py`); `companion_owner` in
+`asset_convert/sources/source_registry.py` puts it in its owner's folders.
+
+Each hybrid plugin gets `<plugin> - Morroblivion Hybrid.esp`, built by the
+plugin's own Export and Import steps and written beside it:
+`output/Morrowind.esm/Morrowind - Morroblivion Hybrid.esp`, its records in
+`export/Morrowind.esm/Morrowind - Morroblivion Hybrid.esp/`. It is not a
+separate mod or a separate target. An export in any other mode deletes it,
+and the next Import deletes its converted file. Its masters are the plugin's
+masters, the plugin, then each master's own companion, so Tribunal's loads
+after Morrowind's.
+
+<a id="companion-import"></a>**It changes only furniture and grass.** The
+companion never goes through the full import, whose pre-scans and side files
+(music, crime factions, idle tables, runtime sidecars) serve whatever plugin
+they are handed. `import_companion` (`tes5_import/companion_import.py`) reads
+only FURN, GRAS, LTEX, CELL, WRLD and REFR from its export, converts the FURN
+and GRAS, writes the LTEX and REFR overrides through the override builder (which
+adds only the cells and worldspace holding them, the worldspace verbatim, and
+the master's LAND under each cell it rewrites), then the plugin and its
+`.manifest.json`. Through the full import the first build had also written a
+second copy of all 29 music tracks with a combat-music DOBJ pointing at them, a
+crime faction and global, sidecars, and a worldspace whose map rectangle grew
+from X -50 to -58; its FURN, GRAS, LTEX, REFR, CELL and LAND bytes are identical
+to the dedicated import's. That import also renamed
+`navmesh_pins/Morrowind.esm.json` to the companion's name, since the pins
+migration took a file named for the shared folder; a folder named as a plugin
+is now never migrated (`use_plugin` in `tes5_import/base/navmesh_pins.py`).
+First build: 69 FURN, 3,202 placements, 39 GRAS on 25 LTEX.
+
+**Furniture.** Morrowind places its beds, benches and stools as STAT and ACTI
+records (of the 40 vanilla records Morroblivion pairs with a FURN, 32 are
+`Bed_Standard` activators and 8 are statics), so a Morroblivion furniture mesh
+on them still seats nobody, and an override cannot change a record's type. The
+companion adds one FURN per base of the plugin whose hybrid model carries
+`BSFurnitureMarker`, keeping its EditorID, name, model, origin shift and
+script, and overrides each placement of a furniture base in the plugin to place
+the FURN. A master's base keeps the FURN its master's companion made (matched
+by EditorID); a base the plugin overrides re-states that FURN. The FURN's id
+hashes the base's EditorID in its own `mwfurn` site; its `MNAM.Flags` are
+Morroblivion's own FURN's for that model, which open its seats and mark a bed.
+Every placement a master's companion overrides that the plugin also edits is
+restated, deletion included, so the plugin's own edit stays on top. Every
+copied FormID field (`FormID`, `NAME`, `ParentCELL`, `XOWN.Owner`,
+`XTEL.Door`, `XLOC.Key`, `SCRI`) is re-keyed from its file's own list into the
+companion's, since Tribunal and Bloodmoon both number their records `01`.
+
+A bed's `Bed_Standard` keeps running: the master's runtime sidecar binds
+object scripts per PLACEMENT FormID (`SCPT_instances.txt`), and the override
+keeps that FormID. The FURN carries the script too, for the record.
+
+<a id="hybrid-furniture-raises-onactivate"></a>**A scripted bed must still hear
+`OnActivate`.** The script stayed bound, but MorrowindRuntime swaps `Activate`
+per form type and `TESFurniture` (vtable id 189309, Activate id 17420) was not
+in `kActivateTargets` (`plugin/ids.h`), so the player's click on a FURN went
+straight to Skyrim's bed and the script never saw it. `Bed_Standard` hid this
+(the engine opens the same Sleep menu), but Arktwend's `EnderalLagerAufbauBett`
+advances its quest inside `if ( OnActivate == 1 )`: the Sleep menu opened, the
+state never moved, and enderal_burg_camp failed with "no MessageBox opened".
+With furniture hooked (17 of 17 slots) the script claims the click and calls
+`ShowRestMenu` itself, as it did while the bed was an activator.
+
+**Grass.** Morrowind's land has none; Morroblivion lists it on its LTEX
+records (75 grass references, all to its own 41 GRAS). Each of the plugin's
+LTEX whose [land twin](#hybrid-ground) lists grass is overridden in the
+companion with that list, and each GRAS is copied in (id hashed from its
+EditorID in the `mwgras` site, or a master's companion's copy reused). The
+grass meshes ship in the plugin's asset tree like any swapped mesh.
+
+Measured on the first hybrid build of the three vanilla ESMs: Morrowind swaps
+1,367 world and 221 worn models (copying 833 meshes, 2,751 textures, and 1,114
+proven texture twins), Tribunal 48 and 45, Bloodmoon 49 and 61. With the
+one map and land twins, Morrowind copies 781 meshes and 3,098 textures,
+1,593 map twins and 106 land textures. Reference
+corrections touch 21 Morrowind bases: Morroblivion's sideways candles (pitch)
+and the `mip\` barrels (+3.00 Z). Morroblivion also ships files at a few
+VANILLA paths (`l\Light_Fire.nif`, `o\Contain_chest_small_02.nif`), so a
+correction requires a model no vanilla archive or loose file also holds, and a
+base the origin shift already lowers takes no Z re-seat.
+Arktwend ships its own copy of all 11,761 meshes its records name, 5,254 of
+them byte-identical to vanilla's; a plugin's own copy blocks a swap only when
+it differs from vanilla's archived file, which leaves Arktwend 1,902 swaps.
 
 ## <a id="morroblivion-gap-patch"></a>The Morroblivion gap patch
 

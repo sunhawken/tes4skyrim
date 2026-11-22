@@ -11,6 +11,7 @@ nothing written to the player's install, INIs, saves or logs.
 python -m tools.live.test_instance build      # once, and after any rebuild (see below)
 python -m tools.live.test_instance launch
 python -m tools.live.test_instance smoke      # coc, no pausing menu, time runs, screenshot
+python -m tools.live.test_instance launch --hd  # High preset at 2560x1440 for proof shots; `stop` restores Low
 python -m tools.live.test_instance menus | shot | status | close <Menu> | stop
 ```
 
@@ -58,6 +59,10 @@ refuses to run unless it gets both `--instance N` and the matching `--token T`.
 `C:\Other Games\Skyrim Test checkouts\<N>.json`. Each use of the lease refreshes
 it. A lease that has gone unused for 2 hours, on an instance whose game is not
 running, is stale, and the next `checkout` takes it over and prints that it did.
+A lease taken with `while_running` (OBRConversion's `play`, which the user starts
+by hand) is stale as soon as its game is not running. The module is game-neutral:
+OBRConversion's `obr_convert.instance` leases its own instances
+(`C:\Other Games\OBR Test checkouts`) with its own slots and command line.
 
 ```bash
 python -m tools.live.test_instance checkout --who "Hlaalu quest run"   # -> instance 2  token 1a2b3c4d
@@ -136,10 +141,17 @@ table (everything bound later: SKSE, every plugin) and the exe's import slot
 Verified: the player's `skse64.log`, `Skyrim.ini`, `SkyrimPrefs.ini` and
 `Plugins.txt` kept their timestamps across every run.
 
-With `TES_SANDBOX_MUTE=1` a thread re-mutes the process's Windows audio
-session every 2 s (`hr=0` logged), on top of `fAudioMasterVolume=0`. Master
-volume rather than `bEnableAudio=0` keeps sound-timed behaviour, such as line
-durations, real.
+<a id="sandbox-mute"></a>With `TES_SANDBOX_MUTE=1` a thread re-mutes the process's Windows audio
+session every 2 s (`hr=0` logged). Windows remembers that mute per exe path, so a later launch of the
+same exe meant to be heard sets `TES_SANDBOX_MUTE=0`: the session is unmuted for its first minute. That mute is the ONLY silencing: the game
+itself runs at `fAudioMasterVolume=1`, and never at 0. At game volume 0 the
+engine does not wait out a line's voice file; it moves to the next response by
+the text alone. Measured 2026-11-20 at real speed on the Emperor's greeting
+(`chargen_emperor_in_cell`, `pace 1`): at volume 0 each response ended 0.85 to
+2.98 s before its voice file did; at volume 1, with the session still muted,
+0.07 to 0.93 s (the measure takes the longest voice type's file). The instance
+ran at volume 0 from 2026-10-26 until then, so every line-timing reading in
+between (`quiet`, `hear` waits, gaps) came from text-timed lines.
 
 ## <a id="startup-popups"></a>Startup popups that pause the game
 
@@ -231,6 +243,7 @@ A case is a list of steps, run in file order:
 | `expect <condition>` | wraps it as `if ( cond ) set TestResult to 1 else ... 0`; -1 means the probe did not compile or run |
 | `talk <npc>` | activates the NPC as the player does, then waits up to 90 ticks for the conversation to open; a conversation already open with `npc` is taken as is, one left open with someone else gets its Goodbye first (MW backend; `approach` likewise) |
 | `ask <topic>` | clicks a topic the list shows; fails naming the listed topics when it is not there |
+| `unlisted <topic>` | a check, at once: the open conversation does not list the topic (whole text, any case); fails naming the listed topics. Baurus's `unlisted "Rumors"` (`0040_chargen_baurus`) guards the No Rumors flag |
 | `choose <n>` | answers pending choice `n`; fails naming the pending choices |
 | `bye` | clicks Goodbye; fails while a choice locks it |
 | `button <n>` | clicks button `n` of the open MessageBox once it has been up 2 ticks, then waits (up to 30 ticks) for that box to close, so the next `button` never clicks a box that is still closing. MorrowindRuntime's class quiz raises its next box at once; before the wait, one `button` answered two questions (2026-11-17) |
@@ -509,14 +522,24 @@ came up over his 9.82 s line.
   reads as game time multiplied by the speed: at 17-23x, 0.25 real seconds is
   4-6 game seconds. Socucius's fixed gap measured 0.6, 1.9, 2.7 and 5.5 s on
   four runs (2026-11-17), against 11.3 s before the fix. Cases use
-  `quiet <= 6`, which still catches the 8-11 s gaps that were bugs. A case
-  that needs a tighter bound can lower its own speed with `pace`.
+  `quiet <= 6`, which still catches the 8-11 s gaps that were bugs.
+- `pace 1` does NOT give real timing under `--fast`, and lasts only for the case
+  that sets it. The governor keeps steering the frame step, and Papyrus's
+  `GetCurrentRealTime` (what converted timers count) drifts against the wall
+  clock the audio plays to: within one `pace 1` run the two clocks moved up to
+  5 s apart (2026-11-20). The Emperor's greeting then started 2.67-3.59 s after
+  a 3.07 s line, fixed or not. To judge a cut line or a gap of a few tenths, run
+  WITHOUT `--fast`, setting `--ini Skyrim.ini:General:iFPSClamp=0 --ini
+  Skyrim.ini:Display:iVSyncPresentInterval=1 --ini
+  Skyrim.ini:Display:bLockFramerate=1` (the profile keeps `--fast`'s values):
+  the same case read 3.59-3.94 s, five runs in a row
+  ([script_convert.md](script_convert.md#a-stage-fragment-runs-before-its-poll)).
 - A pair where the second line is the next response of the same INFO is not
-  measured: the engine plays an INFO's responses back to back on its own, and
-  on the muted test instance it times each response by its text length in game
-  time, not by its voice file. In run `ob_before` (2026-11-17) the Emperor's
-  four greeting responses came 3.6-6.9 game seconds apart but 0.17 real
-  seconds apart. That would read as false gaps.
+  measured: the engine plays an INFO's responses back to back on its own. In
+  run `ob_before` (2026-11-17) the Emperor's four greeting responses came
+  3.6-6.9 game seconds apart but 0.17 real seconds apart, read as false gaps.
+  That run was at game volume 0, which times responses by text, not by voice
+  file ([sandbox mute](#sandbox-mute)); the instance no longer runs that way.
 - `expect quiet <= N since <text>` measures from the first line of the case
   containing `<text>` (any case and spacing) and judges -1 when no line does.
   Scope it to NPC-driven stretches: NPCs walking to their marks are silence

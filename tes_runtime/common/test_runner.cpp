@@ -583,13 +583,16 @@ void PersuadedUntil(const TestCase& test, const TestStep& step) {
     Expect(test.actor, condition);
 }
 
-// `bye if open` closes a greeting the fight may or may not have forced.
+// `bye if open` closes a greeting the fight may or may not have forced; `bye locked` is a Goodbye the game must
+// refuse while a choice is pending.
 void Click(const TestStep& step) {
     const auto listed = [](std::vector<std::string> (*list)()) {
         return list ? Joined(list()) : std::string("(not readable)");
     };
     if (!Talking()) {
         if (step.kind != Kind::kBye || step.text != "if open") g_case.error = "no conversation is open";
+    } else if (step.kind == Kind::kBye && step.text == "locked") {
+        if (g_game.bye && g_game.bye()) g_case.error = "Goodbye was not locked: the conversation was left";
     } else if (step.kind == Kind::kChoose && !(g_game.choose && g_game.choose(step.number))) {
         g_case.error = "no choice " + std::to_string(step.number) + "; pending: " + listed(g_game.choices);
     } else if (step.kind == Kind::kBye && !(g_game.bye && g_game.bye())) {
@@ -615,6 +618,22 @@ bool Asked(const TestStep& step) {
     return done;
 }
 
+// `unlisted`: the open conversation does not list the topic (its whole text, any case), as a player sees it.
+bool Unlisted(const TestStep& step) {
+    if (!Talking() || !g_game.topics) {
+        g_case.error = "unlisted: no conversation is open, or its topics are not readable";
+        return true;
+    }
+    const std::vector<std::string> listed = g_game.topics();
+    for (const std::string& text : listed) {
+        if (Lower(text) == Lower(step.text)) {
+            g_case.error = "topic '" + step.text + "' is listed: " + Joined(listed);
+            break;
+        }
+    }
+    return true;
+}
+
 // The conversation's steps: each first waits for a posted conversation to open.
 bool Conversed(const TestCase& test, const TestStep& step) {
     // A greeting posts its menu, which opens a frame or more later, and
@@ -622,6 +641,7 @@ bool Conversed(const TestCase& test, const TestStep& step) {
     if (!Talking() && (MenuStillOpening() || ++g_case.talkWait < kTalkWaitTicks)) return false;
     g_case.talkWait = 0;
     if (step.kind == Kind::kAsk) return Asked(step);
+    if (step.kind == Kind::kUnlisted) return Unlisted(step);
     if (step.kind == Kind::kPersuade && step.text.find(kUntilWord) != std::string::npos) {
         PersuadedUntil(test, step);
     } else {
@@ -1023,7 +1043,7 @@ void KeepFollowing() {
 
 bool IsAction(Kind kind) {
     return kind != Kind::kWait && kind != Kind::kExpect && kind != Kind::kUntil && kind != Kind::kHear &&
-           kind != Kind::kUnsaid && kind != Kind::kSaid;
+           kind != Kind::kUnsaid && kind != Kind::kSaid && kind != Kind::kUnlisted;
 }
 
 void Report(const TestCase& test) {
@@ -1177,7 +1197,7 @@ const std::vector<std::string>& TestStepNames() {
     static const std::vector<std::string> kNames = {
         "run",  "wait",  "expect", "talk", "ask",     "choose",   "bye",   "button",   "activate",
         "until", "pick", "close",  "take", "console", "persuade", "sleep", "walk",     "follow",
-        "defend", "punch", "rest", "steer", "approach", "pace", "hear", "unsaid", "said"};
+        "defend", "punch", "rest", "steer", "approach", "pace", "hear", "unsaid", "said", "unlisted"};
     return kNames;
 }
 

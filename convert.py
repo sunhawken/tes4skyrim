@@ -62,10 +62,11 @@ SCRIPT_DIR = Path(__file__).parent.resolve()  # TESConversion root
 
 
 from output_layout import (BODY_SLOTS_PATCH, configured_output, finished_dir,
-                           plugin_out_root, record_dir, tree_members,
+                           paths, plugin_out_root, record_dir, tree_members,
                            write_mod_zip)
 from papyrus_compile import phase_compile
 from tes4_export.tes3_reader import is_tes3
+from tes4_export.morroblivion_companion import export_companion
 from tes4_export.morrowind_patch import (
     PATCH_NAME, register_source as register_patch_source, run_patch_export,
     stage_pair_scripts)
@@ -101,6 +102,7 @@ create_pool_job()
 from source_paths import (get_paths, is_asset_only,
                           load_config, resolve_plugin_path)
 from asset_convert.sources import source_registry
+from asset_convert.sources.source_registry import companion_name
 from asset_convert import video
 from convert_cli import (SCOPED_STEPS, apply_config_overrides, build_parser,
                          selected_steps, unscoped_steps)
@@ -462,7 +464,7 @@ def phase_export(file_name: str, tes4_data: str, export_dir: str,
 
     if is_tes3(source):
         from tes4_export.export_morrowind import run_export
-        return run_export(file_name, source, export_dir, config)
+        return run_export(file_name, source, export_dir, config) and export_companion(export_dir, file_name)
 
     print(f"[{file_name}] Exporting...")
     t0 = time.time()
@@ -780,6 +782,26 @@ def phase_import(file_name: str, tes4_data: str, tes5_data: str,
         print(f"[{file_name}] ERROR: {e}")
         return False
 
+    return errors == 0 and _import_companion(file_name, export_dir, out_root)
+
+
+def _import_companion(file_name: str, export_dir: str, out_root: str) -> bool:
+    """Import `file_name`'s hybrid companion beside it, or delete a stale converted one.
+
+    See: docs/commentary/tes4_export_morrowind.md#hybrid-companion
+    """
+    from tes5_import.companion_import import import_companion
+    from tes5_import.overrides.master_index import MissingMasterOutputError
+    companion = paths(companion_name(file_name), export_dir, out_root)
+    if not (companion.records / '_HEADER.txt').is_file():
+        companion.esm.unlink(missing_ok=True)
+        return True
+    print(f"[{companion.plugin}] Importing...")
+    try:
+        errors = import_companion(str(companion.records), str(companion.esm), out_root)
+    except MissingMasterOutputError as e:
+        print(f"[{companion.plugin}] ERROR: {e}")
+        return False
     return errors == 0
 
 # ===========================================================================

@@ -130,6 +130,7 @@ HEAD_BONES = ('Bip01 Head', 'NPC Head [Head]')
 DELTA_SMOOTH_PASSES = 12
 
 _FIELD_CACHE: dict = {}
+_EXACT_CACHE: dict = {}
 
 
 from asset_convert.character.wrap_mesh import (
@@ -138,7 +139,8 @@ from asset_convert.character.wrap_mesh import (
     group_mean as _group_mean, smooth_group_field as _smooth_group_field,
     weld_groups)
 from asset_convert.character.skin_retarget import (
-    SKEL_OBLIVION, deform_vertices_animation_fk, load_animation_deltas, load_skeleton, m44_to_np)
+    SKEL_OBLIVION, SKYRIM, deform_vertices_animation_fk, load_animation_deltas, load_skeleton,
+    m44_to_np)
 from asset_convert.character import head_fit
 
 
@@ -251,12 +253,16 @@ def field_path(female: bool, morrowind: bool = False) -> Path:
 
 
 def get_field(female: bool, morrowind: bool = False):
-    """Load (and cache) the wrap field for a gender and source, or None."""
-    key = (female, morrowind)
+    """Load (and cache) Skyrim's wrap field for a gender and source, or None."""
+    return load_field(field_path(female, morrowind))
+
+
+def load_field(path: Path):
+    """Load (and cache) the wrap field npz at `path`, or None."""
+    key = str(path)
     if key in _FIELD_CACHE:
         return _FIELD_CACHE[key]
     field = None
-    path = field_path(female, morrowind)
     if path.exists() and _PYFFI:
         try:
             with np.load(path, allow_pickle=False) as z:
@@ -300,7 +306,7 @@ def _field_corrections(field, pts, abc, weight=0):
     wrong-side penalty.  Normalized blending extrapolates the regional
     correction as a constant for far-away points.
 
-    CHUNKED for memory, exactly like _blended_clearance."""
+    CHUNKED for memory, exactly like blended_clearance."""
     pts = np.asarray(pts, dtype=np.float64)
     if len(pts) > _WRAP_CHUNK:
         return np.concatenate([
@@ -362,47 +368,31 @@ def _field_corrections(field, pts, abc, weight=0):
 _WRAP_CHUNK = 4096         # max pts per closest-point solve (memory)
 
 
-def _blended_clearance(field, pts, verts_surf, tri_normals, tree,
-                       tri_rel=None, k=12):
-    """Smooth signed clearance of pts against a body surface, plus the
-    blended outward normal.  Gaussian blend over nearby triangles so the
-    result is a smooth field (safe to use for pushing vertices).
+def blended_clearance(field, pts, verts_surf, tri_normals, tree, tri_rel=None, k=12):
+    """(signed clearance, outward normal, reliability or None) of `pts` against a body surface.
 
-    CHUNKED: this expands to ~10 (P,K,3) intermediates at CLEAR_K=24, i.e.
-    ~1.15 GB for a 200k-vert armor mesh -- times the mesh-stage worker pool,
-    which exhausted memory and froze the machine (2026-08-25).  Peak is now
-    bounded by _WRAP_CHUNK no matter how large the mesh is.
+    A Gaussian blend over the `k` nearest of `field.tris` (on `verts_surf`),
+    so the result is smooth enough to push vertices along. Solved in chunks
+    of _WRAP_CHUNK points; a member None in every chunk stays None.
+    See: docs/commentary/asset_convert_armor.md#blended-clearance
     """
     pts = np.asarray(pts, dtype=np.float64)
-    if len(pts) > _WRAP_CHUNK:
-        outs = []
-        for i in range(0, len(pts), _WRAP_CHUNK):
-            outs.append(_blended_clearance(field, pts[i:i + _WRAP_CHUNK],
-                                           verts_surf, tri_normals, tree,
-                                           tri_rel=tri_rel, k=k))
-        # `rel_out` is None when tri_rel is not supplied, and None cannot be
-        # concatenated ("zero-dimensional arrays cannot be concatenated").
-        # That exception propagated out of deform_geoms_wrap, which catches
-        # it and falls back to plain FK -- so every mesh LARGER than
-        # _WRAP_CHUNK silently lost the wrap entirely.  On the mythic dawn
-        # robe (1936-vert Hand shape) FK alone left the hands 84.6 units out
-        # of place and the whole robe offset; smaller meshes such as the
-        # iron cuirass never chunked, which is why only some armor broke
-        # (in-game 2026-08-25).  Members that are None in every chunk stay
-        # None; the rest concatenate.
-        return tuple(
-            None if outs[0][j] is None
-            else np.concatenate([o[j] for o in outs])
-            for j in range(len(outs[0])))
+    outs = [_clearance_chunk(field, pts[i:i + _WRAP_CHUNK], (verts_surf, tri_normals, tree), tri_rel, k)
+            for i in range(0, max(len(pts), 1), _WRAP_CHUNK)]
+    return tuple(None if outs[0][j] is None else np.concatenate([o[j] for o in outs])
+                 for j in range(3))
+
+
+def _clearance_chunk(field, pts, surface, tri_rel, k) -> tuple:
+    """`blended_clearance` of one chunk; `surface` is (verts, triangle normals, centroid tree)."""
+    verts_surf, tri_normals, tree = surface
     k = min(k, len(field.tris))
     _, tri = tree.query(pts, k=k)
     if k == 1:
         tri = tri[:, None]
     t = field.tris[tri]
-    a = verts_surf[t[..., 0]]
-    b = verts_surf[t[..., 1]]
-    c = verts_surf[t[..., 2]]
-    cp = closest_point_on_triangles(pts[:, None, :], a, b, c)
+    cp = closest_point_on_triangles(pts[:, None, :], verts_surf[t[..., 0]], verts_surf[t[..., 1]],
+                                    verts_surf[t[..., 2]])
     off = pts[:, None, :] - cp
     d = np.linalg.norm(off, axis=2)
     gamma = np.einsum('pki,pki->pk', off, tri_normals[tri])
@@ -410,29 +400,23 @@ def _blended_clearance(field, pts, verts_surf, tri_normals, tree,
     sig_d = 1.5 + 0.5 * d_best
     w = np.exp(-((d - d_best[:, None]) ** 2) / (2.0 * sig_d[:, None] ** 2))
     w /= w.sum(axis=1, keepdims=True)
-    sign = np.where(gamma >= 0.0, 1.0, -1.0)
-    c_out = (w * sign * d).sum(axis=1)
+    c_out = (w * np.where(gamma >= 0.0, 1.0, -1.0) * d).sum(axis=1)
     n_out = (w[:, :, None] * tri_normals[tri]).sum(axis=1)
-    ln = np.linalg.norm(n_out, axis=1, keepdims=True)
-    n_out /= np.maximum(ln, 1e-12)
-    if tri_rel is None:
-        rel_out = None
-    else:
-        # zero-rel triangles (hand/foot parts) ABSTAIN from the reliability
-        # vote instead of vetoing it: a sleeve cuff whose neighbourhood is
-        # half forearm / half hand must keep the forearm's reliability, or
-        # wrist clearance enforcement dies exactly where cuffs clip.  BUT
-        # only triangles near the closest surface may vote (d_best + 2):
-        # otherwise boot-shaft verts hugging the (abstaining) foot inherit
-        # reliability from calf triangles 8+ units away and get pushed
-        # around by an estimate that has nothing to do with their surface.
-        # Verts with no nearby voting triangles get 0 (protected).
-        r = tri_rel[tri]
-        voting = w * (r > 0.0) * (d <= (d_best + 2.0)[:, None])
-        vsum = voting.sum(axis=1)
-        rel_out = (voting * r).sum(axis=1) / np.maximum(vsum, 1e-12)
-        rel_out[vsum < 1e-12] = 0.0
+    n_out /= np.maximum(np.linalg.norm(n_out, axis=1, keepdims=True), 1e-12)
+    rel_out = None if tri_rel is None else _clearance_reliability(tri_rel[tri], w, d, d_best)
     return c_out, n_out, rel_out
+
+
+def _clearance_reliability(r, w, d, d_best) -> np.ndarray:
+    """Fit reliability voted by the near triangles with any; 0 where none votes.
+
+    See: docs/commentary/asset_convert_armor.md#blended-clearance
+    """
+    voting = w * (r > 0.0) * (d <= (d_best + 2.0)[:, None])
+    vsum = voting.sum(axis=1)
+    rel_out = (voting * r).sum(axis=1) / np.maximum(vsum, 1e-12)
+    rel_out[vsum < 1e-12] = 0.0
+    return rel_out
 
 
 def _shape_world(block, skel_root):
@@ -563,22 +547,45 @@ def _fit_head_gear(s, new_w, female, race, src_skel):
     return new_w
 
 
-def _push_clear(s, new_w, field, weight):
-    """`new_w` pushed out to the authored clearance plus margin from the fitted Skyrim body.
+def _fitted_target(field, weight) -> tuple:
+    """`field`'s fitted body as a push target: (tris owner, verts, normals, tree, reliability)."""
+    return field, field.dst[weight], field.dst_tri_n[weight], field.dst_tree[weight], field.tri_rel[weight]
+
+
+def _exact_target(destination, female: bool, weight: int) -> tuple:
+    """The destination's own body as a push target (see `_fitted_target`), every triangle reliable.
+
+    See: docs/commentary/asset_convert_armor.md#retarget-destinations
+    """
+    key = (id(destination), female, weight)
+    if key not in _EXACT_CACHE:
+        from scipy.spatial import cKDTree
+        verts, tris = destination.surfaces('female' if female else 'male', 'body', weight)
+        normals = np.cross(verts[tris[:, 1]] - verts[tris[:, 0]], verts[tris[:, 2]] - verts[tris[:, 0]])
+        normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+        _EXACT_CACHE[key] = (SimpleNamespace(tris=tris), verts, normals, cKDTree(verts[tris].mean(axis=1)),
+                             np.ones(len(tris)))
+    return _EXACT_CACHE[key]
+
+
+def _push_clear(s, new_w, field, target, keep_depth=True):
+    """`new_w` pushed out to the authored clearance plus margin from the `target` body surface.
 
     PUSH_ITERS rounds; each deficit is diffused over the armor graph, keeping PUSH_RAW_KEEP
-    of the raw deficit as a floor.
+    of the raw deficit as a floor. Without `keep_depth` (a body not hidden under worn gear) a
+    vertex authored inside the source body counts as touching it.
     See: docs/commentary/asset_convert_armor.md#body-wrap-armor-fitting
     """
-    c0, _n0, _r0 = _blended_clearance(field, s.PRE, field.src, field.src_tri_n,
+    c0, _n0, _r0 = blended_clearance(field, s.PRE, field.src, field.src_tri_n,
                                       field.src_tree, k=CLEAR_K)
+    c0 = c0 if keep_depth else np.maximum(c0, 0.0)
     margin = CLEAR_MARGIN * np.exp(-(np.maximum(c0, 0.0) / CLEAR_MARGIN_RANGE) ** 2) * np.exp(
         -(np.minimum(c0, 0.0) / CLEAR_INNER_FADE) ** 2)
     prox = np.exp(-(np.maximum(c0, 0.0) / CLEAR_PROX) ** 2)
     adj = _build_adjacency(s.TRIS, s.wg, s.n_g) if len(s.TRIS) else None
     for _ in range(PUSH_ITERS):
-        c1, n1, rel1 = _blended_clearance(field, new_w, field.dst[weight], field.dst_tri_n[weight],
-                                          field.dst_tree[weight], field.tri_rel[weight], k=CLEAR_K)
+        owner, verts, normals, tree, reliability = target
+        c1, n1, rel1 = blended_clearance(owner, new_w, verts, normals, tree, reliability, k=CLEAR_K)
         deficit = raw = ((c0 + margin) - c1) * prox * rel1 * (1.0 - s.HF)
         if adj is not None:
             smooth = _smooth_group_field(_group_mean(raw[:, None], s.wg, s.n_g), adj[0], adj[1],
@@ -599,16 +606,18 @@ def _write_back(metas, new_w, skel_root) -> None:
             vert.x, vert.y, vert.z = (float(c) for c in out[vi])
 
 
-def deform_geoms_wrap(skinned_geoms, skel_root, field, female: bool,
-                      weight: int = 0, race=None, src_skel: dict = None) -> int:
+def deform_geoms_wrap(skinned_geoms, skel_root, field, female: bool, weight: int = 0, race=None,
+                      src_skel: dict = None, destination=None) -> int:
     """FK deform + exact body-fit correction for all non-PRN skinned shapes; how many (0 = run plain FK).
 
-    FK first, then the wrap field cancels FK's measured error against the Skyrim body,
-    all shapes solved as one system. `weight` picks the _0/_1 body, `race` a beast head
-    pack, `src_skel` (the source rest skeleton) the pose cache and head origin.
+    FK first, then the wrap field cancels FK's measured error against the destination's body
+    (Skyrim's by default), all shapes solved as one system. `weight` picks the _0/_1 body, `race` a
+    beast head pack, `src_skel` the pose cache and head origin; head gear is fitted only onto a
+    destination with a head group.
     See: docs/commentary/asset_convert_armor.md#body-wrap-armor-fitting
     """
-    bone_deltas, alias = load_animation_deltas(src_skel), oblivion_alias_map(src_skel)
+    destination = destination or SKYRIM
+    bone_deltas, alias = load_animation_deltas(src_skel, destination), oblivion_alias_map(src_skel)
     if not bone_deltas:
         return 0
     pre_fk = _pre_fk_world(skinned_geoms, skel_root)
@@ -618,7 +627,10 @@ def deform_geoms_wrap(skinned_geoms, skel_root, field, female: bool,
         return 0
     _weld(s)
     new_w = s.VW + _field_corrections(field, s.VW, s.ABC, weight) * (1.0 - s.HF)[:, None]
-    new_w = _push_clear(s, _fit_head_gear(s, new_w, female, race, src_skel), field, weight)
+    if 'head' in destination.groups:
+        new_w = _fit_head_gear(s, new_w, female, race, src_skel)
+    target = _fitted_target(field, weight) if destination.hides_body else _exact_target(destination, female, weight)
+    new_w = _push_clear(s, new_w, field, target, destination.hides_body)
     _write_back(s.metas, _group_mean(new_w, s.wg, s.n_g)[s.wg], skel_root)
     return len(s.metas)
 

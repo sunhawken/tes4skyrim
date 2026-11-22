@@ -26,7 +26,7 @@ struct TestStep {
     enum class Kind {
         kRun, kWait, kExpect, kTalk, kAsk, kChoose, kBye, kButton, kActivate, kUntil, kPick, kClose,
         kTake, kConsole, kPersuade, kSleep, kWalk, kFollow, kDefend, kPunch, kRest, kSteer, kApproach,
-        kPace, kHear, kUnsaid, kSaid
+        kPace, kHear, kUnsaid, kSaid, kUnlisted
     };
     Kind kind = Kind::kRun;
     std::string text;   // the script, condition, reference or topic
@@ -150,7 +150,7 @@ bool TestCasesRequested();
 // The cases in a case file:
 //   case <name> / actor <id> / run, then script lines / wait <ticks> /
 //   expect <condition> / talk <npc> / ask <topic or service row> / choose <n>
-//   (a choice, or row n of an open Travel or Persuasion list) / bye [if open] /
+//   (a choice, or row n of an open Travel or Persuasion list) / bye [if open | locked] /
 //   button <n> / activate <ref> / until <ticks> <condition> / pick <class or
 //   sign> / close <menu> / take <ref> / console <Skyrim console command> /
 //   persuade <admire|intimidate|taunt|bribe10|bribe100|bribe1000> [until <condition>] /

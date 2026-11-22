@@ -56,11 +56,12 @@ void ParsesTheGrammar() {
         "coc ImperialPrison\n"
         "until 900 GetStage Tutorial >= 10\n"
         "ask \"The Emperor\"\n"
+        "unlisted \"Rumors\"\n"
         "end\n");
     const std::vector<TestCase> cases = ParseTestCases(in);
     Check(cases.size() == 1 && cases[0].name == "escape", "one case, named");
     const std::vector<TestStep>& steps = cases[0].steps;
-    Check(steps.size() == 5, "run, settle, until, ask, settle");
+    Check(steps.size() == 6, "run, settle, until, ask, settle, unlisted (a check: no settle)");
     Check(steps[0].kind == TestStep::Kind::kRun &&
               steps[0].text == "player.moveto CellDoorRef\ncoc ImperialPrison\n",
           "a run body takes every line up to the next step");
@@ -70,6 +71,7 @@ void ParsesTheGrammar() {
           "until keeps its ticks and condition");
     Check(steps[3].kind == TestStep::Kind::kAsk && steps[3].text == "The Emperor",
           "ask drops the quotes");
+    Check(steps[5].kind == TestStep::Kind::kUnlisted && steps[5].text == "Rumors", "unlisted drops the quotes");
 }
 
 // Ticks until the runner writes `count` result lines, or gives up.
@@ -255,6 +257,27 @@ void ButtonsClickEachBoxOnce(const std::string& dir) {
     Check(g_pressedOn == std::vector<int>({1, 2, 3}), "each button clicks the next box, not a closing one");
 }
 
+// `bye locked` passes when the game refuses the Goodbye and fails when the conversation is left.
+void ByeLockedNeedsARefusal(const std::string& dir) {
+    const std::string cases = dir + "\\bye_locked.tes4test";
+    const std::string results = dir + "\\bye_locked.jsonl";
+    Write(cases, "case refused\nbye locked\nend\ncase left\nbye locked\nend\n");
+    Fresh(results);
+    SetEnvironmentVariableA("TES_TEST_CASES", cases.c_str());
+    SetEnvironmentVariableA("TES_TEST_RESULTS", results.c_str());
+    static int byes = 0;
+    TestBackend game;
+    game.inWorld = InWorld;
+    game.talking = Talking;
+    game.bye = []() { return ++byes > 1; };
+    SetTestBackend(game);
+    ResetTestRunner();
+    const std::vector<std::string> lines = TickUntil(results, 3);
+    Check(lines.size() == 3 && lines[0].find("\"ok\":true") != std::string::npos &&
+              lines[1].find("Goodbye was not locked") != std::string::npos,
+          "bye locked passes on a refused Goodbye and fails on a left conversation");
+}
+
 }  // namespace
 
 int main() {
@@ -267,6 +290,7 @@ int main() {
     HearsAndWalks(dir);
     HearsAcrossCases(dir);
     ButtonsClickEachBoxOnce(dir);
+    ByeLockedNeedsARefusal(dir);
     std::printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;
 }
